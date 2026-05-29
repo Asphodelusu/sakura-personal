@@ -43,7 +43,7 @@ class ChatWindow(QWidget):
         )
         self.tts_provider = tts_provider
         self.messages: list[dict[str, str]] = []
-        self.thread: QThread | None = None
+        self.worker_thread: QThread | None = None
         self.worker: ChatWorker | None = None
 
         self.setWindowTitle("夜乃桜")
@@ -109,7 +109,7 @@ class ChatWindow(QWidget):
     @Slot()
     def send_message(self) -> None:
         text = self.input_edit.text().strip()
-        if not text or self.thread is not None:
+        if not text or self.worker_thread is not None:
             return
 
         self.input_edit.clear()
@@ -118,16 +118,16 @@ class ChatWindow(QWidget):
         self.messages = next_messages
         self._set_busy(True)
 
-        self.thread = QThread(self)
+        self.worker_thread = QThread(self)
         self.worker = ChatWorker(self.agent_runtime, next_messages)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._handle_reply)
         self.worker.failed.connect(self._handle_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._cleanup_worker)
+        self.worker_thread.start()
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:
@@ -149,10 +149,10 @@ class ChatWindow(QWidget):
     def _cleanup_worker(self) -> None:
         if self.worker is not None:
             self.worker.deleteLater()
-        if self.thread is not None:
-            self.thread.deleteLater()
+        if self.worker_thread is not None:
+            self.worker_thread.deleteLater()
         self.worker = None
-        self.thread = None
+        self.worker_thread = None
         self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:

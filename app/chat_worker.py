@@ -46,12 +46,13 @@ class EventWorker(QObject):
     def __init__(self, agent_runtime: AgentRuntime, event: AgentEvent) -> None:
         super().__init__()
         self.agent_runtime = agent_runtime
-        self.event = event
+        # 避免覆盖 QObject.event() 虚函数名；PySide 在 moveToThread 时会访问该方法。
+        self.agent_event = event
 
     @Slot()
     def run(self) -> None:
         try:
-            result = self.agent_runtime.handle_event(self.event)
+            result = self.agent_runtime.handle_event(self.agent_event)
         except Exception as exc:  # 主动事件同样在 UI 边界转成可读错误。
             self.failed.emit(str(exc))
             return

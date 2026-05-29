@@ -105,8 +105,8 @@ class PetWindow(QWidget):
         self.history_window: HistoryWindow | None = None
         self.messages: list[dict[str, Any]] = []
         self.portrait_pixmap_cache: dict[Path, QPixmap] = {}
-        self.thread: QThread | None = None
-        self.worker: ChatWorker | None = None
+        self.worker_thread: QThread | None = None
+        self.worker: ChatWorker | EventWorker | None = None
         self.drag_offset: QPoint | None = None
         self.stage_size = (860, 640)
         self.speech_text = ""
@@ -490,7 +490,7 @@ class PetWindow(QWidget):
     @Slot()
     def send_message(self) -> None:
         text = self.input_edit.text().strip()
-        if not text or self.thread is not None:
+        if not text or self.worker_thread is not None:
             return
 
         self._set_pending_tool_action(None)
@@ -508,19 +508,19 @@ class PetWindow(QWidget):
 
     def _start_chat_worker(self, request_messages: list[dict[str, Any]]) -> None:
         self._set_busy(True)
-        self.thread = QThread(self)
+        self.worker_thread = QThread(self)
         self.worker = ChatWorker(
             self.agent_runtime,
             request_messages,
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._handle_reply)
         self.worker.failed.connect(self._handle_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._cleanup_worker)
+        self.worker_thread.start()
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:
@@ -560,7 +560,7 @@ class PetWindow(QWidget):
 
     @Slot()
     def confirm_pending_action(self) -> None:
-        if self.pending_tool_action is None or self.thread is not None:
+        if self.pending_tool_action is None or self.worker_thread is not None:
             return
         action = self.pending_tool_action
         self._set_pending_tool_action(None)
@@ -568,7 +568,7 @@ class PetWindow(QWidget):
 
     @Slot()
     def cancel_pending_action(self) -> None:
-        if self.pending_tool_action is None or self.thread is not None:
+        if self.pending_tool_action is None or self.worker_thread is not None:
             return
         action = self.pending_tool_action
         self._set_pending_tool_action(None)
@@ -580,20 +580,20 @@ class PetWindow(QWidget):
         cancelled_action: PendingToolAction | None = None,
     ) -> None:
         self._set_busy(True)
-        self.thread = QThread(self)
+        self.worker_thread = QThread(self)
         self.worker = ChatWorker(
             self.agent_runtime,
             confirmed_action=confirmed_action,
             cancelled_action=cancelled_action,
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._handle_action_reply)
         self.worker.failed.connect(self._handle_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._cleanup_worker)
+        self.worker_thread.start()
 
     @Slot(object)
     def _handle_action_reply(self, result: AgentResult) -> None:
@@ -625,25 +625,25 @@ class PetWindow(QWidget):
         self.cancel_action_button.setVisible(has_action)
 
     def _run_event_worker(self, event: AgentEvent, reminder_id: str) -> None:
-        if self.thread is not None or self.active_reminder_id is not None:
+        if self.worker_thread is not None or self.active_reminder_id is not None:
             return
 
         self.active_reminder_id = reminder_id
         self.active_reminder_text = str(event.payload.get("text", ""))
         self._set_busy(True)
-        self.thread = QThread(self)
+        self.worker_thread = QThread(self)
         self.worker = EventWorker(
             self.agent_runtime,
             event,
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._handle_event_reply)
         self.worker.failed.connect(self._handle_event_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._cleanup_worker)
+        self.worker_thread.start()
 
     @Slot(object)
     def _handle_event_reply(self, result: AgentResult) -> None:
@@ -697,10 +697,10 @@ class PetWindow(QWidget):
     def _cleanup_worker(self) -> None:
         if self.worker is not None:
             self.worker.deleteLater()
-        if self.thread is not None:
-            self.thread.deleteLater()
+        if self.worker_thread is not None:
+            self.worker_thread.deleteLater()
         self.worker = None
-        self.thread = None
+        self.worker_thread = None
         if self.pending_screen_observation_messages is not None:
             request_messages = self.pending_screen_observation_messages
             self.pending_screen_observation_messages = None
@@ -905,7 +905,7 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_due_reminders(self) -> None:
-        if self.thread is not None or self.active_reminder_id is not None:
+        if self.worker_thread is not None or self.active_reminder_id is not None:
             return
         try:
             due_reminders = self.reminder_store.due_reminders()
