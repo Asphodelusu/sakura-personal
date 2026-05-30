@@ -45,7 +45,7 @@ class AgentRuntime:
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
-        self.model_vision_enabled = False
+        self.model_vision_enabled = True
 
     def update_character(self, system_prompt: str, reply_tones: list[str] | None = None) -> None:
         """角色切换后同步系统提示词和可用语气列表。"""

@@ -51,7 +51,7 @@ class ToolRegistry:
 
     def __init__(self, tools: list[Tool] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
-        self.free_access_enabled = False
+        self.free_access_enabled = True
         for tool in tools or []:
             self.register(tool)
 

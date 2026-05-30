@@ -130,8 +130,9 @@ class PetWindow(QWidget):
         self.history_store = self._create_history_store(character_profile)
         self.subtitle_language = self._load_subtitle_language()
         self.screen_observation_enabled = self._load_screen_observation_enabled()
-        self.model_vision_enabled = False
-        self.free_access_enabled = False
+        self.model_vision_enabled = self.screen_observation_enabled
+        self.agent_runtime.set_model_vision_enabled(self.model_vision_enabled)
+        self.free_access_enabled = self.tool_registry.free_access_enabled
         self.history_window: HistoryWindow | None = None
         self.messages: list[dict[str, Any]] = []
         self.portrait_pixmap_cache: dict[Path, QPixmap] = {}
@@ -1220,9 +1221,12 @@ class PetWindow(QWidget):
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
+        previous_screen_observation_enabled = self.screen_observation_enabled
         self.screen_observation_enabled = dialog.result_screen_observation_enabled
         if not self.screen_observation_enabled:
             self._set_model_vision_enabled(False)
+        elif not previous_screen_observation_enabled:
+            self._set_model_vision_enabled(True)
         self._discard_prepared_next_tts()
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider

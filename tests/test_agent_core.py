@@ -124,6 +124,7 @@ def test_tool_registry_requires_confirmation_returns_pending_action() -> None:
             )
         ]
     )
+    registry.set_free_access_enabled(False)
 
     result = registry.prepare_or_execute(
         "open_url",
@@ -136,7 +137,7 @@ def test_tool_registry_requires_confirmation_returns_pending_action() -> None:
     assert result.arguments == {"url": "https://example.com"}
 
 
-def test_tool_registry_free_access_executes_normal_confirmation_tool() -> None:
+def test_tool_registry_free_access_is_enabled_by_default() -> None:
     registry = ToolRegistry(
         [
             Tool(
@@ -147,8 +148,6 @@ def test_tool_registry_free_access_executes_normal_confirmation_tool() -> None:
             )
         ]
     )
-    registry.set_free_access_enabled(True)
-
     result = registry.prepare_or_execute("open_url", {"url": "https://example.com"})
 
     assert not isinstance(result, PendingToolAction)
@@ -432,6 +431,7 @@ def test_browser_confirmation_tools_return_pending_actions() -> None:
         Path(__file__).resolve().parents[1],
         browser_executor=_FakeBrowserExecutor(),
     )
+    registry.set_free_access_enabled(False)
 
     open_result = registry.prepare_or_execute("browser_open_url", {"url": "https://example.com"})
     scroll_result = registry.prepare_or_execute("browser_scroll", {"direction": "down"})
@@ -564,7 +564,7 @@ def test_trim_messages_for_model_keeps_recent_messages_without_mutating_history(
     assert len(messages) == MAX_MODEL_CONTEXT_MESSAGES + 5
 
 
-def test_model_vision_enabled_allows_model_to_request_screen_observation() -> None:
+def test_model_vision_is_enabled_by_default_for_screen_observation() -> None:
     class ScreenRequestClient:
         def __init__(self) -> None:
             self.prompts: list[str] = []
@@ -582,8 +582,6 @@ def test_model_vision_enabled_allows_model_to_request_screen_observation() -> No
         system_prompt="你是 Sakura。",
         tools=ToolRegistry([create_screen_observation_tool()]),
     )
-    runtime.set_model_vision_enabled(True)
-
     result = runtime.handle_user_message([{"role": "user", "content": "这个界面哪里不对"}])
 
     assert "observe_screen" in client.prompts[0]
@@ -606,6 +604,7 @@ def test_model_vision_disabled_hides_screen_observation_tool() -> None:
         system_prompt="你是 Sakura。",
         tools=ToolRegistry([create_screen_observation_tool()]),
     )
+    runtime.set_model_vision_enabled(False)
 
     runtime.handle_user_message([{"role": "user", "content": "普通聊天"}])
 
@@ -667,6 +666,7 @@ def test_hidden_screen_observation_call_returns_failure_without_action() -> None
         system_prompt="你是 Sakura。",
         tools=ToolRegistry([create_screen_observation_tool()]),
     )
+    runtime.set_model_vision_enabled(False)
 
     result = runtime.handle_user_message([{"role": "user", "content": "普通聊天"}])
 
