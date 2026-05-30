@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -132,6 +134,7 @@ def register_mcp_tools_from_config(
         print(f"[MCP] 配置读取失败，已跳过 MCP：{exc}")
         debug_log("MCP", "配置读取失败，已跳过 MCP", {"error": str(exc)})
         return None
+    config = _resolve_runtime_tokens(config, base_dir)
     provider = MCPToolProvider(config, bridge_factory=bridge_factory)
     registered = provider.register_tools(registry)
     if registered == 0:
@@ -150,6 +153,29 @@ def _build_internal_tool_name(server: MCPServerConfig, external_name: str) -> st
 def _build_description(server: MCPServerConfig, tool_spec: MCPToolSpec) -> str:
     description = tool_spec.description.strip() or "MCP Server 提供的外部工具。"
     return f"[MCP:{server.name}] {description}"
+
+
+def _resolve_runtime_tokens(config: MCPConfig, base_dir: Path) -> MCPConfig:
+    """解析本地运行时占位符，避免 MCP 配置写死 Python 路径和项目目录。"""
+
+    servers = [
+        replace(
+            server,
+            command=_expand_runtime_tokens(server.command, base_dir),
+            args=[_expand_runtime_tokens(arg, base_dir) for arg in server.args],
+            env={
+                key: _expand_runtime_tokens(value, base_dir)
+                for key, value in server.env.items()
+            },
+            url=_expand_runtime_tokens(server.url, base_dir),
+        )
+        for server in config.servers
+    ]
+    return replace(config, servers=servers)
+
+
+def _expand_runtime_tokens(value: str, base_dir: Path) -> str:
+    return value.replace("{python}", sys.executable).replace("{base_dir}", str(base_dir))
 
 
 def _close_quietly(bridge: MCPBridgeLike) -> None:

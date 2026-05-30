@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -28,7 +29,9 @@ class MCPBridge:
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._closed = False
-        self._stack: AsyncExitStack | None = None
+        self._connection_task: asyncio.Task[None] | None = None
+        self._close_requested: asyncio.Event | None = None
+        self._connect_error: BaseException | None = None
         self._session: Any | None = None
 
     def connect(self) -> None:
@@ -90,6 +93,15 @@ class MCPBridge:
         return future.result(timeout=timeout)
 
     async def _connect(self) -> None:
+        ready = asyncio.Event()
+        self._close_requested = asyncio.Event()
+        self._connect_error = None
+        self._connection_task = asyncio.create_task(self._connection_main(ready))
+        await ready.wait()
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    async def _connection_main(self, ready: asyncio.Event) -> None:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.sse import sse_client
         from mcp.client.stdio import stdio_client
@@ -120,11 +132,19 @@ class MCPBridge:
 
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
             await session.initialize()
-            self._stack = stack
             self._session = session
+            ready.set()
+            close_requested = self._close_requested
+            if close_requested is not None:
+                await close_requested.wait()
         except Exception:
-            await stack.aclose()
+            self._connect_error = sys.exc_info()[1]
+            ready.set()
+            self._session = None
             raise
+        finally:
+            self._session = None
+            await stack.aclose()
 
     async def _list_tools(self) -> list[MCPToolSpec]:
         session = self._require_session()
@@ -152,9 +172,12 @@ class MCPBridge:
         return _format_call_tool_result(result)
 
     async def _close_async(self) -> None:
-        if self._stack is not None:
-            await self._stack.aclose()
-        self._stack = None
+        if self._close_requested is not None:
+            self._close_requested.set()
+        if self._connection_task is not None:
+            await self._connection_task
+        self._connection_task = None
+        self._close_requested = None
         self._session = None
 
     def _require_session(self) -> Any:

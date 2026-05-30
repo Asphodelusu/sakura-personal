@@ -1,0 +1,10 @@
+enabled: true
+default_call_timeout: 20
+servers:
+  web:
+    transport: stdio
+    command: "{python}"
+    args: ["{base_dir}/app/agent/mcp/web_search_server.py"]
+    name_prefix: web__
+    risk: low
+    requires_confirmation: false
