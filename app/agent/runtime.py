@@ -129,6 +129,7 @@ class AgentRuntime:
         *,
         allow_screen_observation: bool,
         turn_started_at: float,
+        proactive_mode: bool = False,
         planning_extra_instructions: str = "",
         initial_actions: list[AgentAction] | None = None,
         vision_unsupported_reply: ChatReply | None = None,
@@ -166,15 +167,24 @@ class AgentRuntime:
             )
             try:
                 planning_started_at = time.perf_counter()
-                turn = self.api_client.complete_with_tools(
-                    self._build_tool_system_prompt(
+                system_prompt = (
+                    self._build_proactive_tool_system_prompt(
+                        step_index=step_index,
+                        remaining_steps=MAX_AGENT_STEPS_PER_TURN - step_index - 1,
+                        extra_instructions=planning_extra_instructions,
+                    )
+                    if proactive_mode
+                    else self._build_tool_system_prompt(
                         allow_screen_observation=allow_screen_observation,
                         step_index=step_index,
                         remaining_steps=MAX_AGENT_STEPS_PER_TURN - step_index - 1,
                         extra_instructions=planning_extra_instructions,
                         browser_page_mode=browser_page_guard_active,
                         visible_browser_mode=visible_browser_guard_active,
-                    ),
+                    )
+                )
+                turn = self.api_client.complete_with_tools(
+                    system_prompt,
                     working_messages,
                     tools=tool_defs,
                     tool_choice="auto",
@@ -614,6 +624,7 @@ class AgentRuntime:
                 event_messages,
                 allow_screen_observation=allow_screen_observation,
                 turn_started_at=time.perf_counter(),
+                proactive_mode=True,
                 planning_extra_instructions=_build_proactive_tool_loop_rules(),
                 initial_actions=[event_action],
                 vision_unsupported_reply=_build_proactive_vision_unsupported_reply(),
@@ -717,6 +728,53 @@ class AgentRuntime:
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
 - 长期记忆由后台整理器自动维护；你不要尝试写入记忆。
 - 只有用户明确要求忘掉信息时，才使用 forget_memory。
+""".strip()
+
+    def _build_proactive_tool_system_prompt(
+        self,
+        step_index: int = 0,
+        remaining_steps: int = MAX_AGENT_STEPS_PER_TURN - 1,
+        extra_instructions: str = "",
+    ) -> str:
+        memory_summary = self._memory_summary()
+        current_time = datetime.now().astimezone().isoformat(timespec='seconds')
+        reply_protocol = build_event_reply_protocol(
+            self.reply_tones,
+            self.reply_portraits,
+            example_tone="中性",
+        )
+        return f"""
+{self.system_prompt.strip()}
+
+你现在正在处理【主动屏幕检查事件】。这不是用户直接发来的请求，而是系统定时触发的低打扰搭话。
+
+请基于看到的屏幕内容（多张连续截图）和近期对话记录，自然接话。
+
+【核心目标】
+- 根据连续截图概括用户这段时间在做什么、屏幕上发生了什么变化
+- 不要逐张机械描述截图，而是总结活动趋势
+- 围绕真实可见的内容自然接话或提一个轻问题
+- 如果你能看明白用户在做什么，就围绕具体内容聊；不确定时就普通问候
+
+{reply_protocol}
+
+{extra_instructions.strip()}
+
+长期记忆摘要：
+{memory_summary}
+
+当前本地时间：
+{current_time}
+
+当前 Agent 循环：
+- 这是第 {step_index + 1} 步，之后最多还可以继续 {remaining_steps} 步。
+- 如果信息足够或已经完成，不要再发起 tool_calls。
+- 每步最多请求 {MAX_TOOL_CALLS_PER_STEP} 个工具，整轮最多 {MAX_TOOL_CALLS_PER_TURN} 个工具。
+
+- 你可以使用只读或低风险工具补充上下文（当前时间、搜索记忆、列出待办和笔记、查看已有提醒）。
+- 如果事件已有 screen_contexts（多张截图），不要再请求 observe_screen。
+- 不要循环调用工具；工具结果足够后直接给最终回复。
+- 最终回复只说给用户听的自然搭话、提问或轻提醒，不要提及内部事件或工具协议。
 """.strip()
     def _build_final_reply_prompt(self) -> str:
         return f"""
