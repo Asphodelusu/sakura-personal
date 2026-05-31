@@ -45,27 +45,18 @@ from app.agent import (
     AgentEvent,
     AgentProgress,
     AgentResult,
-    AgentRuntime,
-    MemoryStore,
     PendingToolAction,
-    ReminderStore,
-    create_builtin_tool_registry,
 )
 from app.agent.memory_curator import (
-    MemoryCurator,
     MemoryCurationResult,
-    MemoryCurationSettings,
-    MemoryCurationState,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
-from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider, register_mcp_tools_from_config
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
-from app.api_client import OpenAICompatibleClient
+from app.app_context import AppContext
 from app.character_loader import (
     DEFAULT_CHARACTER_ID,
     CharacterConfigError,
     CharacterProfile,
-    CharacterRegistry,
     load_character_system_prompt,
 )
 from app.chat_history import ChatHistoryEntry, ChatHistoryStore
@@ -80,7 +71,6 @@ from app.proactive_care import (
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER,
     PROACTIVE_TIMER_DUE_GRACE_SECONDS,
     PROACTIVE_TIMER_POLL_INTERVAL_MS,
-    ProactiveCareSettings,
 )
 from app.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -111,7 +101,6 @@ from app.visual_observation import (
 from app.ui.fonts import _rounded_chinese_font, _rounded_japanese_font
 from app.ui import (
     FrostedGlassFrame,
-    MANUAL_SCREENSHOT_MIN_SIZE,
     ManualScreenshotOverlay,
     PET_WINDOW_STYLEHEET,
     build_pet_tray_menu,
@@ -134,53 +123,34 @@ MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
 class PetWindow(QWidget):
     def __init__(
         self,
-        base_dir: Path,
-        character_registry: CharacterRegistry,
-        character_profile: CharacterProfile,
-        api_client: OpenAICompatibleClient,
-        tts_provider: TTSProvider,
+        context: AppContext,
     ) -> None:
         super().__init__()
-        self.base_dir = base_dir
-        self.env_path = base_dir / ".env"
-        self.character_registry = character_registry
-        self.character_profile = character_profile
-        self.portrait_path = character_profile.default_portrait_path
-        self.api_client = api_client
-        self.system_prompt = load_character_system_prompt(character_profile)
-        self.memory_store = MemoryStore(base_dir / "data" / "memory.json")
-        self.reminder_store = ReminderStore(base_dir / "data" / "reminders.json")
-        self.tool_registry = create_builtin_tool_registry(
-            base_dir,
-            self.memory_store,
-            self.reminder_store,
-        )
-        self.mcp_tool_provider: MCPToolProvider | None = register_mcp_tools_from_config(
-            base_dir,
-            self.tool_registry,
-        )
-        self.agent_runtime = AgentRuntime(
-            api_client=api_client,
-            system_prompt=self.system_prompt,
-            reply_tones=character_profile.reply_tones,
-            reply_portraits=character_profile.portrait_choices,
-            tools=self.tool_registry,
-            memory=self.memory_store,
-        )
-        self.tts_provider = tts_provider
+        self.context = context
+        self.base_dir = context.base_dir
+        self.env_path = context.env_path
+        self.character_registry = context.character_registry
+        self.character_profile = context.character_profile
+        self.portrait_path = context.character_profile.default_portrait_path
+        self.api_client = context.api_client
+        self.system_prompt = context.system_prompt
+        self.memory_store = context.memory_store
+        self.reminder_store = context.reminder_store
+        self.tool_registry = context.tool_registry
+        self.mcp_tool_provider = context.mcp_tool_provider
+        self.agent_runtime = context.agent_runtime
+        self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
-        self.history_store = self._create_history_store(character_profile)
-        self.visual_observation_store = self._create_visual_observation_store(character_profile)
-        self.mcp_settings = MCPRuntimeSettings.load(self.env_path)
-        self.memory_curation_settings = MemoryCurationSettings.load(self.env_path)
-        self.memory_curation_state = MemoryCurationState(
-            base_dir / "data" / "memory_curation_state.json"
-        )
-        self.memory_curator = MemoryCurator(api_client, self.memory_store)
+        self.history_store = context.history_store
+        self.visual_observation_store = context.visual_observation_store
+        self.mcp_settings = context.mcp_settings
+        self.memory_curation_settings = context.memory_curation_settings
+        self.memory_curation_state = context.memory_curation_state
+        self.memory_curator = context.memory_curator
         self.subtitle_language = self._load_subtitle_language()
         self.screen_observation_enabled = self._load_screen_observation_enabled()
         self.autonomous_screen_observation_enabled = self._load_autonomous_screen_observation_enabled()
-        self.proactive_care_settings = ProactiveCareSettings.load(self.env_path)
+        self.proactive_care_settings = context.proactive_care_settings
         self.model_vision_enabled = self.screen_observation_enabled
         self.agent_runtime.set_model_vision_enabled(self.model_vision_enabled)
         self.agent_runtime.set_autonomous_screen_observation_enabled(
@@ -253,12 +223,12 @@ class PetWindow(QWidget):
             "PetWindow",
             "窗口运行状态初始化",
             {
-                "character_id": character_profile.id,
-                "character_name": character_profile.display_name,
+                "character_id": self.character_profile.id,
+                "character_name": self.character_profile.display_name,
                 "tool_count": len(self.tool_registry.all()),
                 "mcp_enabled": self.mcp_tool_provider is not None,
                 "windows_mcp_enabled": self.mcp_settings.windows_enabled,
-                "tts_provider": type(tts_provider).__name__,
+                "tts_provider": type(self.tts_provider).__name__,
                 "subtitle_language": self.subtitle_language,
                 "screen_observation_enabled": self.screen_observation_enabled,
                 "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
@@ -267,7 +237,7 @@ class PetWindow(QWidget):
             },
         )
 
-        self.setWindowTitle(character_profile.display_name)
+        self.setWindowTitle(self.character_profile.display_name)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -297,10 +267,10 @@ class PetWindow(QWidget):
         self.bubble.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.bubble.customContextMenuRequested.connect(self._show_context_menu)
 
-        self.name_label = QLabel(character_profile.display_name, self.bubble)
+        self.name_label = QLabel(self.character_profile.display_name, self.bubble)
         self.name_label.setObjectName("speakerName")
 
-        self.speech_label = QLabel(character_profile.initial_message, self.bubble)
+        self.speech_label = QLabel(self.character_profile.initial_message, self.bubble)
         self.speech_label.setObjectName("speechText")
         self.speech_label.setWordWrap(True)
         self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -325,7 +295,7 @@ class PetWindow(QWidget):
 
         self.input_edit = QLineEdit(self.input_bar)
         self.input_edit.setObjectName("petInput")
-        self.input_edit.setPlaceholderText(f"和{character_profile.display_name}说点什么...")
+        self.input_edit.setPlaceholderText(f"和{self.character_profile.display_name}说点什么...")
         self.input_edit.setFixedHeight(38)
         self.input_edit.installEventFilter(self)
         self.input_edit.returnPressed.connect(self._handle_return_pressed)

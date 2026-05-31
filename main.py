@@ -24,13 +24,7 @@ def main() -> int:
         print(f"[Character] 配置无效：{exc}")
         return 1
 
-    pet_window = PetWindow(
-        base_dir=context.base_dir,
-        character_registry=context.character_registry,
-        character_profile=context.character_profile,
-        api_client=context.api_client,
-        tts_provider=context.tts_provider,
-    )
+    pet_window = PetWindow(context)
     pet_window.show()
 
     return app.exec()
