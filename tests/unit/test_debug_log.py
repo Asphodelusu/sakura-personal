@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.debug_log import debug_body_enabled, debug_enabled, debug_log, sanitize_debug_data
+from app.core.debug_log import debug_body_enabled, debug_enabled, debug_log, sanitize_debug_data
 
 
 def test_debug_log_disabled_by_default(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]

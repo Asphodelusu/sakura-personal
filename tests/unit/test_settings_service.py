@@ -7,7 +7,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
-from app.proactive_care import ProactiveCareSettings
+from app.agent.proactive_care import ProactiveCareSettings
 from app.voice.tts import GPTSoVITSTTSSettings
 
 

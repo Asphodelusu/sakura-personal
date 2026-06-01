@@ -4,7 +4,7 @@ import json
 import uuid
 from pathlib import Path
 
-from app.screen_observation import ScreenObservation
+from app.agent.screen_observation import ScreenObservation
 from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationRecord,

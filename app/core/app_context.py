@@ -11,7 +11,7 @@ from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.config.character_loader import CharacterProfile, CharacterRegistry
 from app.storage.chat_history import ChatHistoryStore
 from app.core.extensions import ExtensionRegistry
-from app.proactive_care import ProactiveCareSettings
+from app.agent.proactive_care import ProactiveCareSettings
 from app.voice.tts import TTSProvider
 from app.storage.visual_observation import VisualObservationStore
 from app.core.plugin_manager import SakuraPluginManager

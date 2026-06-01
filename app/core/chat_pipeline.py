@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.agent import AgentEvent, AgentProgress, AgentResult, AgentRuntime, PendingToolAction
-from app.debug_log import debug_log, summarize_messages
+from app.core.debug_log import debug_log, summarize_messages
 from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationRecord,

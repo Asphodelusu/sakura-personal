@@ -10,7 +10,7 @@ from app.agent.mcp.bridge import MCPBridge, MCPToolSpec
 from app.agent.mcp.config import MCPConfig, MCPServerConfig, load_mcp_config
 from app.agent.mcp.settings import MCPRuntimeSettings, apply_mcp_runtime_settings
 from app.agent.tool_registry import Tool, ToolRegistry
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 
 
 class MCPBridgeLike(Protocol):

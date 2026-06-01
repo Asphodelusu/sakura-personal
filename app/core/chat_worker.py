@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from app.agent import AgentEvent, AgentProgress, AgentResult, AgentRuntime, PendingToolAction
 from app.core.chat_pipeline import ChatPipeline
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationStore,

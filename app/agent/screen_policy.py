@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.screen_observation import (
+from app.agent.screen_observation import (
     MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
     SCREEN_OBSERVATION_HISTORY_MARKER,
 )

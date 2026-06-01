@@ -6,7 +6,7 @@ from PySide6.QtCore import QObject, QTimer, Slot
 from PySide6.QtWidgets import QLabel
 
 from app.llm.chat_reply import ChatSegment
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 from app.voice import VoicePlaybackController
 
 

@@ -37,7 +37,7 @@ from app.ui.portrait_controller import (
     PORTRAIT_SCALE_MIN_PERCENT,
     normalize_portrait_scale_percent,
 )
-from app.proactive_care import (
+from app.agent.proactive_care import (
     PROACTIVE_MAX_COOLDOWN_MINUTES,
     PROACTIVE_MAX_CHECK_INTERVAL_MINUTES,
     PROACTIVE_MAX_SCREEN_CONTEXT_BATCH_LIMIT,

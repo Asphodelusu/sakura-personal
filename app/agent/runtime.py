@@ -32,7 +32,18 @@ from app.llm.api_client import (
     messages_contain_image,
 )
 from app.llm.chat_reply import ChatReply, parse_chat_reply
-from app.debug_log import debug_log, summarize_messages
+from app.core.debug_log import debug_log, summarize_messages
+from app.agent.runtime_limits import (
+    MAX_AGENT_STEPS_PER_TURN,
+    MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS,
+    MAX_EVENT_RECENT_CONVERSATION_MESSAGES,
+    MAX_PENDING_CONTEXT_MESSAGES,
+    MAX_PENDING_CONTEXT_TEXT_CHARS,
+    MAX_TOOL_CALLS_PER_STEP,
+    MAX_TOOL_CALLS_PER_TURN,
+    MAX_TOOL_RESULT_CHARS,
+    ProgressCallback,
+)
 from app.llm.prompt_templates import (
     build_agent_reply_protocol,
     build_context_acquisition_strategy,
@@ -40,16 +51,6 @@ from app.llm.prompt_templates import (
     build_proactive_check_tool_system_prompt,
 )
 
-
-MAX_AGENT_STEPS_PER_TURN = 4
-MAX_TOOL_CALLS_PER_STEP = 3
-MAX_TOOL_CALLS_PER_TURN = 8
-MAX_TOOL_RESULT_CHARS = 6000
-MAX_PENDING_CONTEXT_MESSAGES = 12
-MAX_PENDING_CONTEXT_TEXT_CHARS = 4000
-MAX_EVENT_RECENT_CONVERSATION_MESSAGES = 12
-MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS = 800
-ProgressCallback = Callable[[AgentProgress], None]
 
 
 class AgentRuntime:

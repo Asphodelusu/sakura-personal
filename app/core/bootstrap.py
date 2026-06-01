@@ -18,7 +18,7 @@ from app.config.character_loader import (
     load_character_system_prompt,
 )
 from app.storage.chat_history import ChatHistoryStore
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 from app.voice.tts import GPTSoVITSTTSProvider, NullTTSProvider, TTSConfigError, TTSProvider
 from app.storage.visual_observation import VisualObservationStore
 from app.core.plugin_manager import SakuraPluginManager

@@ -61,15 +61,15 @@ from app.config.character_loader import (
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.llm.chat_reply import ChatReply, ChatSegment
 from app.llm.context_trimming import trim_messages_for_model
-from app.chat_worker import ChatWorker, EventWorker
-from app.debug_log import debug_log, summarize_messages
+from app.core.chat_worker import ChatWorker, EventWorker
+from app.core.debug_log import debug_log, summarize_messages
 from app.ui.history_window import HistoryWindow
-from app.proactive_care import (
+from app.agent.proactive_care import (
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER,
     PROACTIVE_TIMER_DUE_GRACE_SECONDS,
     PROACTIVE_TIMER_POLL_INTERVAL_MS,
 )
-from app.screen_observation import (
+from app.agent.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
     ScreenObservation,
     append_manual_observation_marker,

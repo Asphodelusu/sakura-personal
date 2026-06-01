@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.llm.chat_reply import ChatReply, parse_chat_reply
-from app.debug_log import debug_log, summarize_messages
+from app.core.debug_log import debug_log, summarize_messages
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
 

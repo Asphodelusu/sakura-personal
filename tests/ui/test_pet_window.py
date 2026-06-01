@@ -11,9 +11,9 @@ from app.agent.mcp import MCPRuntimeSettings
 from app.config.settings_service import DebugLogSettings
 from app.llm.api_client import ApiSettings
 from app.llm.chat_reply import ChatSegment
-from app.portrait_utils import portrait_kind_key, should_crossfade_portrait
-from app.proactive_care import ProactiveCareSettings
-from app.screen_observation import ScreenObservation
+from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
+from app.agent.proactive_care import ProactiveCareSettings
+from app.agent.screen_observation import ScreenObservation
 from app.voice.tts import GPTSoVITSTTSSettings
 from app.storage.visual_observation import VisualObservationRecord, VisualObservationStore
 
@@ -693,7 +693,7 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
 
 
 def test_proactive_care_event_includes_recent_conversation() -> None:
-    from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+    from app.agent.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
     from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
 
     window = _build_minimal_proactive_window(
@@ -724,7 +724,7 @@ def test_proactive_care_event_includes_recent_conversation() -> None:
 
 
 def test_proactive_care_event_reads_recent_conversation_from_history_store() -> None:
-    from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+    from app.agent.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
     from app.storage.chat_history import ChatHistoryStore
     from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
 

@@ -8,7 +8,7 @@ from typing import Any
 import yaml
 
 from app.agent.tool_registry import Tool, ToolRegistry
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 from sdk.plugin import PluginBase
 from sdk.plugin_host_context import PluginHostContext
 from sdk.register import PluginCapabilityRegistry

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from app.llm.chat_reply import ChatSegment
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 from app.voice.tts import TTSPreparedAudio, TTSProvider
 
 

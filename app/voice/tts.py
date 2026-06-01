@@ -17,7 +17,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 from app.config.character_loader import CharacterProfile
 from app.llm.chat_reply import DEFAULT_TONE
-from app.debug_log import debug_log
+from app.core.debug_log import debug_log
 
 
 TTSCallback = Callable[[], None]

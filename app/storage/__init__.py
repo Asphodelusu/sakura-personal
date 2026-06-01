@@ -1,1 +1,3 @@
-"""本地持久化存储模块。"""
+from app.storage.paths import StoragePaths
+
+__all__ = ["StoragePaths"]

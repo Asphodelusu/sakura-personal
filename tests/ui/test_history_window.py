@@ -65,8 +65,8 @@ if importlib.util.find_spec("PySide6") is None:
     sys.modules["PySide6.QtCore"] = qtcore_module
     sys.modules["PySide6.QtWidgets"] = qtwidgets_module
 
-from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
-from app.screen_observation import (
+from app.agent.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+from app.agent.screen_observation import (
     MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
     SCREEN_OBSERVATION_HISTORY_MARKER,
 )

@@ -22,7 +22,7 @@ def test_event_worker_can_move_to_qthread_without_overriding_qobject_event() -> 
     QWidget = qtwidgets.QWidget
 
     from app.agent import AgentEvent
-    from app.chat_worker import EventWorker
+    from app.core.chat_worker import EventWorker
 
     app = QApplication.instance() or QApplication([])
     parent = QWidget()
@@ -48,7 +48,7 @@ def test_chat_worker_forwards_progress_signal() -> None:
 
     from app.agent import AgentProgress, AgentResult
     from app.llm.chat_reply import parse_chat_reply
-    from app.chat_worker import ChatWorker
+    from app.core.chat_worker import ChatWorker
 
     class Runtime:
         def handle_user_message(self, _messages, progress_callback=None):  # type: ignore[no-untyped-def]
@@ -91,8 +91,8 @@ def test_chat_worker_records_visual_observation_before_reply() -> None:
 
     from app.agent import AgentResult
     from app.llm.chat_reply import parse_chat_reply
-    from app.chat_worker import ChatWorker
-    from app.screen_observation import ScreenObservation
+    from app.core.chat_worker import ChatWorker
+    from app.agent.screen_observation import ScreenObservation
     from app.storage.visual_observation import VisualObservationJob, VisualObservationStore
 
     class Client:
@@ -167,7 +167,7 @@ def test_event_worker_forwards_progress_signal() -> None:
 
     from app.agent import AgentEvent, AgentProgress, AgentResult
     from app.llm.chat_reply import parse_chat_reply
-    from app.chat_worker import EventWorker
+    from app.core.chat_worker import EventWorker
 
     class Runtime:
         def handle_event(self, _event, progress_callback=None):  # type: ignore[no-untyped-def]

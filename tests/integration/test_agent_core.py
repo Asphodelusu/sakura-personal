@@ -44,10 +44,10 @@ from app.llm.prompt_templates import (
     build_event_system_prompt,
     build_proactive_check_tool_system_prompt,
 )
-from app.proactive_care import (
+from app.agent.proactive_care import (
     ProactiveCareSettings,
 )
-from app.screen_observation import (
+from app.agent.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
     ScreenObservation,
     append_observation_marker,

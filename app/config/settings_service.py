@@ -8,7 +8,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
-from app.proactive_care import ProactiveCareSettings
+from app.agent.proactive_care import ProactiveCareSettings
 from app.voice.tts import GPTSoVITSTTSSettings
 
 
