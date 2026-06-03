@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    Signal,
     Slot,
 )
 from PySide6.QtGui import (
@@ -125,6 +126,8 @@ if TYPE_CHECKING:
 REMINDER_CHECK_INTERVAL_MS = 30_000
 STARTUP_INITIALIZING_TEXT = "初始化中……"
 TTS_ERROR_DISPLAY_MS = 8_000
+MEMORY_STATUS_DISPLAY_MS = 7_000
+MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
@@ -144,6 +147,8 @@ DEFAULT_STAGE_HEIGHT = 640
 
 
 class PetWindow(QWidget):
+    memory_status_changed = Signal(str, str)
+
     def __init__(
         self,
         context: AppContext,
@@ -214,6 +219,8 @@ class PetWindow(QWidget):
         self.active_reminder_text = ""
         self.active_event_type = ""
         self.active_event: AgentEvent | None = None
+        self.memory_status_message_active = False
+        self.memory_status_last_message = ""
         self.last_user_activity_at = time.perf_counter()
         self.last_proactive_care_at: float | None = None
         self.last_proactive_screen_context_at: float | None = None
@@ -455,6 +462,8 @@ class PetWindow(QWidget):
 
         self.portrait_controller.apply_current()
         self._create_tray_icon()
+        self.memory_status_changed.connect(self._handle_memory_status_changed)
+        self._connect_memory_status_listener()
         self._move_to_default_position()
         if getattr(self, "startup_initializing", False):
             self._apply_startup_initializing_state()
@@ -1954,6 +1963,11 @@ class PetWindow(QWidget):
         self.startup_initializing = False
         self.input_edit.setPlaceholderText(f"和{self.character_profile.display_name}说点什么...")
         self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
+        if self.memory_status_message_active:
+            QTimer.singleShot(
+                MEMORY_STATUS_STARTUP_DELAY_MS,
+                self._show_pending_memory_status_after_startup,
+            )
         self._set_busy(False)
         self.reminder_timer.start()
         self._sync_proactive_care_timer()
@@ -2065,6 +2079,79 @@ class PetWindow(QWidget):
     @Slot(str)
     def set_speech(self, text: str) -> None:
         self.subtitle_controller.set_speech(text)
+
+    def _connect_memory_status_listener(self) -> None:
+        add_listener = getattr(self.memory_store, "add_status_listener", None)
+        if not callable(add_listener):
+            return
+        try:
+            add_listener(self.memory_status_changed.emit)
+        except (TypeError, RuntimeError) as exc:
+            debug_log("Memory", "连接长期记忆状态监听失败", {"error": str(exc)})
+
+    @Slot(str, str)
+    def _handle_memory_status_changed(self, status: str, message: str) -> None:
+        message = str(message).strip()
+        if not message:
+            return
+        debug_log("Memory", "长期记忆状态变化", {"status": status, "message": message})
+        if status in {"loading", "reloading", "failed"}:
+            self._show_memory_status_message(status, message)
+            return
+        if status == "ready":
+            self._show_memory_ready_message(message)
+
+    def _show_memory_status_message(self, status: str, message: str) -> None:
+        self.memory_status_message_active = True
+        self.memory_status_last_message = message
+        if (
+            not self.startup_initializing
+            and not self.active_interaction_id
+            and not self.reply_history_review_active
+        ):
+            self.subtitle_controller.show_text_immediately(message)
+        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+            icon = (
+                QSystemTrayIcon.MessageIcon.Critical
+                if status == "failed"
+                else QSystemTrayIcon.MessageIcon.Information
+            )
+            self.tray_icon.showMessage("Sakura 长期记忆", message, icon, MEMORY_STATUS_DISPLAY_MS)
+
+    @Slot()
+    def _show_pending_memory_status_after_startup(self) -> None:
+        if (
+            not self.memory_status_message_active
+            or self.startup_initializing
+            or self.active_interaction_id
+            or self.reply_history_review_active
+            or not self.memory_status_last_message
+        ):
+            return
+        self.subtitle_controller.show_text_immediately(self.memory_status_last_message)
+
+    def _show_memory_ready_message(self, message: str) -> None:
+        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(
+                "Sakura 长期记忆",
+                message,
+                QSystemTrayIcon.MessageIcon.Information,
+                MEMORY_STATUS_DISPLAY_MS,
+            )
+        if not self.memory_status_message_active:
+            return
+        self.memory_status_message_active = False
+        if self.active_interaction_id or self.reply_history_review_active:
+            return
+        QTimer.singleShot(MEMORY_STATUS_DISPLAY_MS, self._restore_memory_status_speech)
+
+    @Slot()
+    def _restore_memory_status_speech(self) -> None:
+        if self.memory_status_message_active:
+            return
+        if self.active_interaction_id or self.reply_history_review_active:
+            return
+        self.subtitle_controller.show_text_immediately(self.character_profile.initial_message)
 
     @Slot(str)
     def _show_tts_error(self, message: str) -> None:

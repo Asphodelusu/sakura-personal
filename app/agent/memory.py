@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from app.storage.chat_history import ChatHistoryEntry
 
@@ -17,12 +17,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+os.environ.setdefault("MEM0_TELEMETRY", "False")
+
 MEM0_VENDOR_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mem0"
 DEFAULT_MEMORY_SCOPE = "sakura"
 DEFAULT_COLLECTION_NAME = "sakura_memories"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBEDDING_DIMS = 384
 DEFAULT_MEMORY_LIMIT = 20
+_MEM0_CREATE_LOCK = threading.Lock()
 DEFAULT_MEMORY_LANGUAGE_INSTRUCTIONS = (
     "Sakura 的长期记忆必须使用简体中文记录。"
     "无论用户或助手消息使用什么语言，都要把可记忆事实翻译、归纳为自然的简体中文；"
@@ -74,6 +77,13 @@ class MemoryStore:
     _reloading: bool = field(default=False, init=False, repr=False)
     _reload_error: str = field(default="", init=False, repr=False)
     _reload_generation: int = field(default=0, init=False, repr=False)
+    _status: str = field(default="idle", init=False, repr=False)
+    _status_message: str = field(default="", init=False, repr=False)
+    _status_listeners: list[Callable[[str, str], None]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -81,6 +91,29 @@ class MemoryStore:
         self.scope_id = _normalize_scope_id(self.scope_id)
         if self.memory_client is not None:
             self._memory = self.memory_client
+            self._status = "ready"
+            self._status_message = "长期记忆系统已就绪。"
+
+    def add_status_listener(
+        self,
+        listener: Callable[[str, str], None],
+        *,
+        replay: bool = True,
+    ) -> None:
+        """监听 mem0 加载状态，供 UI 显示后台初始化进度。"""
+
+        with self._lock:
+            if listener not in self._status_listeners:
+                self._status_listeners.append(listener)
+            status = self._status
+            message = self._status_message
+        if replay and message:
+            self._notify_status_listener(listener, status, message)
+
+    def remove_status_listener(self, listener: Callable[[str, str], None]) -> None:
+        with self._lock:
+            if listener in self._status_listeners:
+                self._status_listeners.remove(listener)
 
     def set_scope(self, scope_id: str) -> None:
         """切换角色后更新 mem0 user_id 作用域。"""
@@ -104,12 +137,23 @@ class MemoryStore:
             self._reloading = False
             self._reload_error = ""
             self._reload_generation += 1
+            if self._memory is not None:
+                self._status = "ready"
+                self._status_message = "长期记忆系统已就绪。"
+            else:
+                self._status = "idle"
+                self._status_message = ""
 
     def is_ready(self) -> bool:
         """返回长期记忆运行时是否已经可直接使用。"""
 
         with self._lock:
             return self._memory is not None
+
+    def needs_embedding_model_download(self) -> bool:
+        """返回首次初始化是否可能需要下载本地嵌入模型。"""
+
+        return not _embedding_model_cached(DEFAULT_EMBEDDING_MODEL, self.base_dir)
 
     def preload(self, *, wait: bool = False) -> None:
         """提前启动 mem0 加载，避免首次打开设置或聊天时才初始化。"""
@@ -122,7 +166,8 @@ class MemoryStore:
                 return
             if self._load_error:
                 self._load_error = ""
-            self._start_loading_locked()
+            status_event = self._start_loading_locked()
+        self._notify_status_event(status_event)
 
     def reload_api_settings(self, api_settings: "ApiSettings", *, wait: bool = False) -> None:
         """后台使用新 API 配置重建 mem0，成功前保留旧实例继续服务。"""
@@ -137,34 +182,53 @@ class MemoryStore:
 
         if wait:
             try:
+                self._publish_status("reloading", "长期记忆系统正在根据新的 API 设置重载。")
                 memory = self._create_memory_client(api_settings)
             except Exception as exc:
                 logger.exception("mem0 后台重载失败")
+                current_generation = False
                 with self._lock:
                     if generation == self._reload_generation:
                         self._reload_error = str(exc)
+                        current_generation = True
+                if current_generation:
+                    self._publish_status("failed", f"长期记忆系统重载失败：{exc}")
                 return
+            applied = False
             with self._lock:
                 if generation == self._reload_generation:
                     self._memory = memory
                     self._load_error = ""
                     self._loading = False
                     self._reloading = False
+                    applied = True
+            if applied:
+                self._publish_status("ready", "长期记忆系统已就绪。")
             return
 
         with self._lock:
             self._reloading = True
+            status_event = self._set_status_locked(
+                "reloading",
+                "长期记忆系统正在根据新的 API 设置重载。",
+            )
+        self._notify_status_event(status_event)
 
         def reload() -> None:
             try:
                 memory = self._create_memory_client(api_settings)
             except Exception as exc:
                 logger.exception("mem0 后台重载失败")
+                current_generation = False
                 with self._lock:
                     if generation == self._reload_generation:
                         self._reload_error = str(exc)
                         self._reloading = False
+                        current_generation = True
+                if current_generation:
+                    self._publish_status("failed", f"长期记忆系统重载失败：{exc}")
                 return
+            applied = False
             with self._lock:
                 if generation != self._reload_generation:
                     return
@@ -173,6 +237,9 @@ class MemoryStore:
                 self._reload_error = ""
                 self._loading = False
                 self._reloading = False
+                applied = True
+            if applied:
+                self._publish_status("ready", "长期记忆系统已就绪。")
 
         thread = threading.Thread(target=reload, name="sakura-mem0-reloader", daemon=True)
         thread.start()
@@ -216,7 +283,7 @@ class MemoryStore:
                 "config": {
                     "model": DEFAULT_EMBEDDING_MODEL,
                     "embedding_dims": DEFAULT_EMBEDDING_DIMS,
-                    "model_kwargs": _local_embedding_model_kwargs(DEFAULT_EMBEDDING_MODEL),
+                    "model_kwargs": _local_embedding_model_kwargs(DEFAULT_EMBEDDING_MODEL, self.base_dir),
                 },
             },
             "history_db_path": str(memory_dir / "mem0_history.db"),
@@ -335,9 +402,16 @@ class MemoryStore:
             if self._load_error and not self._loading:
                 raise RuntimeError(self._load_error)
             if not self._loading:
-                self._start_loading_locked()
+                status_event = self._start_loading_locked()
+            else:
+                status_event = None
             if not wait:
+                if status_event is not None:
+                    self._notify_status_event(status_event)
                 return None
+
+        if status_event is not None:
+            self._notify_status_event(status_event)
 
         while True:
             with self._lock:
@@ -354,12 +428,21 @@ class MemoryStore:
                 raise RuntimeError(self._load_error)
         raise RuntimeError("mem0 加载失败")
 
-    def _start_loading_locked(self) -> None:
+    def _start_loading_locked(self) -> tuple[list[Callable[[str, str], None]], str, str] | None:
         self._loading = True
         self._loading_started_at = time.time()
         self._load_error = ""
         generation = self._reload_generation
         api_settings = self.api_settings
+        report_dependency_loading = not _embedding_model_cached(DEFAULT_EMBEDDING_MODEL, self.base_dir)
+        status_event = (
+            self._set_status_locked(
+                "loading",
+                "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。",
+            )
+            if report_dependency_loading
+            else None
+        )
 
         def load() -> None:
             try:
@@ -370,6 +453,8 @@ class MemoryStore:
                     if generation == self._reload_generation:
                         self._load_error = str(exc)
                         self._loading = False
+                if report_dependency_loading:
+                    self._publish_status("failed", f"长期记忆系统初始化失败：{exc}")
                 return
             with self._lock:
                 if generation != self._reload_generation or self.api_settings != api_settings:
@@ -377,15 +462,54 @@ class MemoryStore:
                     return
                 self._memory = mem
                 self._loading = False
+            if report_dependency_loading:
+                self._publish_status("ready", "长期记忆系统已就绪。")
 
         thread = threading.Thread(target=load, name="sakura-mem0-loader", daemon=True)
         thread.start()
+        return status_event
 
     def _create_memory_client(self, api_settings: "ApiSettings | None" = None) -> Any:
-        install_mem0_vendor()
-        from mem0 import Memory
+        with _MEM0_CREATE_LOCK:
+            install_mem0_vendor()
+            from mem0 import Memory
 
-        return Memory.from_config(self.build_mem0_config(api_settings))
+            return Memory.from_config(self.build_mem0_config(api_settings))
+
+    def _set_status_locked(
+        self,
+        status: str,
+        message: str,
+    ) -> tuple[list[Callable[[str, str], None]], str, str]:
+        self._status = status
+        self._status_message = message
+        return list(self._status_listeners), status, message
+
+    def _publish_status(self, status: str, message: str) -> None:
+        with self._lock:
+            status_event = self._set_status_locked(status, message)
+        self._notify_status_event(status_event)
+
+    def _notify_status_event(
+        self,
+        status_event: tuple[list[Callable[[str, str], None]], str, str] | None,
+    ) -> None:
+        if status_event is None:
+            return
+        listeners, status, message = status_event
+        for listener in listeners:
+            self._notify_status_listener(listener, status, message)
+
+    def _notify_status_listener(
+        self,
+        listener: Callable[[str, str], None],
+        status: str,
+        message: str,
+    ) -> None:
+        try:
+            listener(status, message)
+        except Exception:  # noqa: BLE001
+            logger.debug("mem0 状态监听器执行失败", exc_info=True)
 
     def _loading_response(self) -> dict[str, Any]:
         elapsed = int(time.time() - self._loading_started_at) if self._loading_started_at else 0
@@ -413,8 +537,16 @@ def _normalize_scope_id(scope_id: str | None) -> str:
     return text if text and not any(ch.isspace() for ch in text) else DEFAULT_MEMORY_SCOPE
 
 
-def _local_embedding_model_kwargs(model_name: str) -> dict[str, Any]:
+def _local_embedding_model_kwargs(model_name: str, base_dir: Path | None = None) -> dict[str, Any]:
     """本地已有 HuggingFace 缓存时禁止联网探测，避免设置页反复卡顿。"""
+
+    if _embedding_model_cached(model_name, base_dir):
+        return {"local_files_only": True}
+    return {}
+
+
+def _embedding_model_cached(model_name: str, base_dir: Path | None = None) -> bool:
+    """判断本地是否已有嵌入模型缓存，避免每次启动误报下载提示。"""
 
     cache_root = (
         os.environ.get("SENTENCE_TRANSFORMERS_HOME")
@@ -425,6 +557,9 @@ def _local_embedding_model_kwargs(model_name: str) -> dict[str, Any]:
     if cache_root:
         cache_path = Path(cache_root)
         cache_candidates.extend([cache_path, cache_path / "hub"])
+    if base_dir is not None:
+        runtime_cache = Path(base_dir) / "runtime" / "hf-cache"
+        cache_candidates.extend([runtime_cache, runtime_cache / "hub"])
     default_hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     cache_candidates.append(default_hf_home / "hub")
 
@@ -432,8 +567,8 @@ def _local_embedding_model_kwargs(model_name: str) -> dict[str, Any]:
     for root in cache_candidates:
         snapshot_dir = root / model_cache_name / "snapshots"
         if snapshot_dir.exists() and any(snapshot_dir.iterdir()):
-            return {"local_files_only": True}
-    return {}
+            return True
+    return False
 
 
 def _normalize_memory_results(raw: Any) -> list[dict[str, Any]]:
