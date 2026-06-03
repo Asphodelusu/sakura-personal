@@ -32,6 +32,9 @@ def test_event_worker_can_move_to_qthread_without_overriding_qobject_event() -> 
     worker.moveToThread(thread)
 
     assert worker.thread() is thread
+    # 确保 QThread 事件循环正常退出再删除，避免测试结束时 hang
+    thread.quit()
+    thread.wait(1000)
     thread.deleteLater()
     parent.deleteLater()
     app.processEvents()
