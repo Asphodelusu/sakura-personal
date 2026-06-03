@@ -879,9 +879,16 @@ def test_settings_dialog_import_character_archive_refreshes_combo(monkeypatch) -
         lambda *_args, **_kwargs: (str(archive_path), ""),
     )
     monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
 
     dialog._import_character_archive()
 
+    assert warnings == []
     assert dialog.character_combo.currentData() == "nanami"
     assert dialog._selected_character_profile().display_name == "Nanami"
 
