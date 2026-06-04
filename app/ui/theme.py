@@ -102,13 +102,19 @@ def theme_from_mapping(data: Any) -> ThemeSettings:
 
 
 def theme_to_mapping(settings: ThemeSettings) -> dict[str, object]:
+    data = theme_colors_to_mapping(settings)
+    data["ai_enabled"] = bool(settings.normalized().ai_enabled)
+    return data
+
+
+def theme_colors_to_mapping(settings: ThemeSettings) -> dict[str, object]:
     normalized = settings.normalized()
-    data = {
+    return {
         field: getattr(normalized, field)
         for field, _label, _default in THEME_COLOR_FIELDS
     }
-    data["ai_enabled"] = bool(normalized.ai_enabled)
-    return data
+
+
 def _extract_json_text(raw_text: str) -> str:
     """从 AI 返回的原始文本中提取 JSON，兼容纯 JSON 和 Markdown 代码块。"""
     text = raw_text.strip()

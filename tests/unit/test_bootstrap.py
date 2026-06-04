@@ -121,6 +121,39 @@ def test_build_deferred_services_creates_genie_tts_provider(
     assert services.tts_provider is genie_provider
 
 
+def test_build_deferred_services_disables_tts_for_voice_less_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.core.bootstrap as bootstrap
+    from app.voice.tts import NullTTSProvider
+
+    root = _build_startup_root()
+    (root / "data" / "config" / "api.yaml").write_text(
+        """
+llm:
+  base_url: https://api.example.com/v1
+  api_key: test-key
+  model: test-model
+tts:
+  provider: gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+    ref_lang: ja
+    text_lang: ja
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", lambda *_args: None)
+    monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", lambda *_args, **_kwargs: None)
+
+    context = bootstrap.build_initial_app_context(root)
+    services = bootstrap.build_deferred_services(root, context)
+
+    assert isinstance(services.tts_provider, NullTTSProvider)
+    assert not any(error.startswith("TTS") for error in services.errors)
+
+
 def _build_startup_root() -> Path:
     root = (
         Path(__file__).resolve().parents[2]

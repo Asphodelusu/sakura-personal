@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from app.agent.mcp.settings import MCPRuntimeSettings
+from app.config.character_loader import CharacterRegistry
 from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
@@ -17,7 +18,7 @@ from app.ui.theme import (
     build_pet_window_stylesheet,
     parse_ai_theme_response,
 )
-from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, GPTSoVITSTTSSettings
+from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, TTS_PROVIDER_NONE, GPTSoVITSTTSSettings
 
 
 class CharacterRegistryStub:
@@ -146,6 +147,48 @@ tts:
     legacy_settings = service.load_tts_settings(validate_enabled=False)
 
     assert legacy_settings.work_dir is None
+
+
+def test_settings_service_disables_tts_for_voice_less_character() -> None:
+    root = _runtime_root("yaml_tts_no_voice_character")
+    service = AppSettingsService(root)
+    service.api_config_path.parent.mkdir(parents=True)
+    service.api_config_path.write_text(
+        """
+tts:
+  provider: gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+    ref_lang: ja
+    text_lang: ja
+""".lstrip(),
+        encoding="utf-8",
+    )
+    character_dir = root / "characters" / "demo"
+    character_dir.mkdir(parents=True)
+    (character_dir / "card.md").write_text("system prompt", encoding="utf-8")
+    (character_dir / "portrait.png").write_bytes(b"portrait")
+    (character_dir / "character.json").write_text(
+        json.dumps(
+            {
+                "id": "demo",
+                "display_name": "Demo",
+                "initial_message": "hello",
+                "card": "card.md",
+                "portrait": {"default": "portrait.png"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    profile = CharacterRegistry(root).get("demo")
+
+    settings = service.load_tts_settings(character_profile=profile)
+
+    assert not settings.enabled
+    assert settings.provider == TTS_PROVIDER_NONE
+    assert settings.character_name == "Demo"
 
 
 def test_settings_service_saves_and_loads_genie_tts_settings() -> None:

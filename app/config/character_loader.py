@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.llm.prompt_templates import with_desktop_pet_context
+
+if TYPE_CHECKING:
+    from app.ui.theme import ThemeSettings
 
 
 DEFAULT_CHARACTER_ID = "sakura"
 DEFAULT_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
 FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的桌宠陪伴人格。
 用户需要中文解释、开发或调试时，可以使用中文。"""
+THEME_SOURCE_PACKAGE = "package"
+THEME_SOURCE_COMPAT_DEFAULT = "compat_default"
+CharacterThemeSource = Literal["package", "compat_default"]
 
 
 class CharacterConfigError(RuntimeError):
@@ -38,6 +44,12 @@ class CharacterProfile:
     expression_portraits: dict[str, Path] = field(default_factory=dict)
     voice: CharacterVoice | None = None
     reply_tones: list[str] = field(default_factory=lambda: [*DEFAULT_TONES])
+    theme_settings: ThemeSettings | None = None
+    theme_source: CharacterThemeSource = THEME_SOURCE_COMPAT_DEFAULT
+
+    def __post_init__(self) -> None:
+        if self.theme_settings is None:
+            object.__setattr__(self, "theme_settings", _default_theme_settings())
 
     @property
     def portrait_choices(self) -> list[str]:
@@ -133,6 +145,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
     reply_data = raw_data.get("reply")
     reply_tones = _load_reply_tones(reply_data)
     voice = _load_voice(package_dir, raw_data.get("voice"), manifest_path)
+    theme_settings, theme_source, _missing_theme = character_theme_from_mapping(raw_data.get("theme"))
 
     return CharacterProfile(
         id=character_id,
@@ -144,7 +157,48 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         expression_portraits=expression_portraits,
         voice=voice,
         reply_tones=reply_tones,
+        theme_settings=theme_settings,
+        theme_source=theme_source,
     )
+
+
+def character_theme_from_mapping(data: Any) -> tuple[ThemeSettings, CharacterThemeSource, bool]:
+    from app.ui.theme import ThemeSettings, theme_colors_to_mapping, theme_from_mapping
+
+    if isinstance(data, dict):
+        source = _theme_source_from_text(data.get("source"))
+        theme = theme_from_mapping(data).normalized()
+        return ThemeSettings(**theme_colors_to_mapping(theme)), source, False
+    return _default_theme_settings(), THEME_SOURCE_COMPAT_DEFAULT, True
+
+
+def character_theme_to_mapping(
+    settings: ThemeSettings | None,
+    *,
+    source: CharacterThemeSource = THEME_SOURCE_PACKAGE,
+) -> dict[str, object]:
+    from app.ui.theme import theme_colors_to_mapping
+
+    settings = settings or _default_theme_settings()
+    data = theme_colors_to_mapping(settings)
+    data["source"] = _theme_source_from_text(source)
+    return data
+
+
+def save_character_theme(
+    profile: CharacterProfile,
+    settings: ThemeSettings,
+    *,
+    source: CharacterThemeSource = THEME_SOURCE_PACKAGE,
+) -> None:
+    manifest_path = profile.package_dir / "character.json"
+    try:
+        raw_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CharacterConfigError(f"角色清单无法读取：{manifest_path}") from exc
+    if not isinstance(raw_data, dict):
+        raise CharacterConfigError(f"角色清单必须是 JSON 对象：{manifest_path}")
+    _write_character_theme_manifest(manifest_path, raw_data, settings, source=source)
 
 
 def _load_expression_portraits(package_dir: Path, portrait_data: dict[str, Any]) -> dict[str, Path]:
@@ -193,6 +247,37 @@ def _load_voice(package_dir: Path, voice_data: Any, manifest_path: Path) -> Char
         ref_lang=_optional_text(voice_data, "ref_lang", "ja"),
         text_lang=_optional_text(voice_data, "text_lang", "ja"),
     )
+
+
+def _theme_source_from_text(value: object) -> CharacterThemeSource:
+    return (
+        THEME_SOURCE_COMPAT_DEFAULT
+        if str(value or "").strip() == THEME_SOURCE_COMPAT_DEFAULT
+        else THEME_SOURCE_PACKAGE
+    )
+
+
+def _default_theme_settings() -> ThemeSettings:
+    from app.ui.theme import DEFAULT_THEME_SETTINGS
+
+    return DEFAULT_THEME_SETTINGS
+
+
+def _write_character_theme_manifest(
+    manifest_path: Path,
+    raw_data: dict[str, Any],
+    settings: ThemeSettings,
+    *,
+    source: CharacterThemeSource,
+) -> None:
+    raw_data["theme"] = character_theme_to_mapping(settings, source=source)
+    try:
+        manifest_path.write_text(
+            json.dumps(raw_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise CharacterConfigError(f"角色主题写回失败：{manifest_path}") from exc
 
 
 def _required_dict(data: dict[str, Any], key: str, manifest_path: Path) -> dict[str, Any]:

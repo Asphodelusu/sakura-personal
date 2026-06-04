@@ -59,9 +59,12 @@ from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.core.app_context import AppContext
 from app.config.character_loader import (
     DEFAULT_CHARACTER_ID,
+    THEME_SOURCE_PACKAGE,
     CharacterConfigError,
     CharacterProfile,
+    CharacterRegistry,
     load_character_system_prompt,
+    save_character_theme,
 )
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply_result
@@ -262,7 +265,10 @@ class PetWindow(QWidget):
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
         self.debug_log_settings = context.debug_log_settings
-        self.theme_settings = self.settings_service.load_theme_settings()
+        self.theme_settings = _theme_settings_for_character(
+            self.settings_service.load_theme_settings(),
+            self.character_profile,
+        )
         self.memory_curation_settings = context.memory_curation_settings
         self.memory_curation_state = context.memory_curation_state
         self.memory_curator = context.memory_curator
@@ -2462,10 +2468,20 @@ class PetWindow(QWidget):
             return
 
         api_changed = dialog.result_api_settings != self.api_client.settings
+        theme_write_mode = getattr(dialog, "result_theme_write_mode", "unchanged")
+        should_write_character_theme = _should_write_character_theme(theme_write_mode, selected_profile)
         try:
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
+            if should_write_character_theme:
+                save_character_theme(
+                    selected_profile,
+                    result_theme_settings,
+                    source=THEME_SOURCE_PACKAGE,
+                )
+                dialog_character_registry = CharacterRegistry(self.base_dir)
+                selected_profile = dialog_character_registry.get(selected_profile.id)
             self.character_registry = dialog_character_registry
             self.settings_service.save_current_character_id(
                 self.character_registry,
@@ -2486,7 +2502,7 @@ class PetWindow(QWidget):
                     "reply_segment_pause_ms": result_reply_segment_pause_ms,
                 },
             )
-        except OSError as exc:
+        except (CharacterConfigError, OSError) as exc:
             show_themed_critical(self, "保存失败", f"无法保存设置：{exc}")
             return
 
@@ -3224,6 +3240,19 @@ def _build_status_tray_icon(color_text: str) -> QIcon:
     painter.end()
 
     return QIcon(pixmap)
+
+
+def _should_write_character_theme(theme_write_mode: object, profile: CharacterProfile) -> bool:
+    return theme_write_mode in {"manual", "ai"}
+
+
+def _theme_settings_for_character(
+    saved_settings: ThemeSettings,
+    profile: CharacterProfile,
+) -> ThemeSettings:
+    if profile.theme_source == THEME_SOURCE_PACKAGE:
+        return (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+    return saved_settings.normalized()
 
 
 def _set_macos_window_topmost(window_id: int, enabled: bool) -> None:

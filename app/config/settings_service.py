@@ -120,6 +120,10 @@ class AppSettingsService:
         else:
             provider = TTS_PROVIDER_GPT_SOVITS if enabled else TTS_PROVIDER_NONE
 
+        # 无语音角色不能启用 TTS，启动和设置页加载时直接降级为关闭。
+        if enabled and character_profile is not None and character_profile.voice is None:
+            enabled = False
+
         provider_data = genie_tts if provider == TTS_PROVIDER_GENIE else gpt_sovits
         default_api_url = DEFAULT_GENIE_TTS_API_URL if provider == TTS_PROVIDER_GENIE else DEFAULT_GPT_SOVITS_API_URL
         api_url = str(provider_data.get("api_url", default_api_url)).strip()

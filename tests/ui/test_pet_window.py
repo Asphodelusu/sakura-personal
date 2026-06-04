@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import time
+import zipfile
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import uuid
@@ -1074,6 +1076,8 @@ def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # ty
     assert custom_index >= 0
     assert "macOS/Linux" in dialog.tts_provider_combo.itemText(custom_index)
     assert dialog.tts_bundle_download_button.text() == "一键下载 TTS 整合包"
+    assert dialog.tts_bundle_download_button.parentWidget() is dialog.tts_enabled_check.parentWidget()
+    assert dialog.tts_voice_import_button.parentWidget() is dialog.character_import_button.parentWidget()
     assert not dialog.tts_provider_combo.isEnabled()
     assert dialog.tts_bundle_download_button.isEnabled()
     dialog.tts_enabled_check.setChecked(True)
@@ -1344,7 +1348,63 @@ def test_settings_dialog_skips_tts_test_when_tts_disabled(monkeypatch) -> None: 
     app.processEvents()
 
 
-def test_settings_dialog_enabled_tts_skips_test_when_character_unchanged(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_settings_dialog_enabled_tts_skips_test_when_settings_unchanged(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_success")
+    character_kwargs = _settings_dialog_character_kwargs(root)
+    profile = character_kwargs["current_character"]
+    assert hasattr(profile, "voice")
+    assert profile.voice is not None
+    tts_settings = GPTSoVITSTTSSettings.from_character_profile(
+        character_profile=profile,
+        enabled=True,
+        api_url="http://127.0.0.1:9880/tts",
+        ref_lang=profile.voice.ref_lang,
+        text_lang=profile.voice.text_lang,
+        timeout_seconds=1,
+        work_dir=root / "tts" / "g50",
+    )
+    monkeypatch.setattr(
+        settings_dialog_module,
+        "default_provider_bundle_work_dir",
+        lambda _provider, _base_dir: root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro",
+    )
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=tts_settings,
+        base_dir=root,
+        **character_kwargs,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_tts_settings_test",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("TTS 配置未变时不应检测")),
+    )
+
+    dialog.accept()
+
+    assert dialog.result_tts_settings is not None
+    assert dialog.result_tts_settings.enabled
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_enabled_tts_tests_when_provider_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -1354,30 +1414,35 @@ def test_settings_dialog_enabled_tts_skips_test_when_character_unchanged(monkeyp
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
-    root = _ui_runtime_root("tts_save_success")
+    root = _ui_runtime_root("tts_save_provider_changed")
     dialog = SettingsDialog(
         api_settings=ApiSettings(
             base_url="https://api.example.com/v1",
             api_key="test-key",
             model="test-model",
         ),
-        tts_settings=_minimal_tts_settings(),
+        tts_settings=replace(_minimal_tts_settings(), enabled=True),
         base_dir=root,
         **_settings_dialog_character_kwargs(root),
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.tts_enabled_check.setChecked(True)
-    monkeypatch.setattr(
-        dialog,
-        "_start_tts_settings_test",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("角色未变时不应检测 TTS")),
-    )
+    genie_index = dialog.tts_provider_combo.findData("genie-tts")
+    assert genie_index >= 0
+    dialog.tts_provider_combo.setCurrentIndex(genie_index)
+    calls: list[str] = []
+
+    def fake_start_tts_test(settings, accept_values):  # type: ignore[no-untyped-def]
+        calls.append(settings.provider)
+        dialog._complete_accept(accept_values)
+
+    monkeypatch.setattr(dialog, "_start_tts_settings_test", fake_start_tts_test)
 
     dialog.accept()
 
+    assert calls == ["genie-tts"]
     assert dialog.result_tts_settings is not None
-    assert dialog.result_tts_settings.enabled
+    assert dialog.result_tts_settings.provider == "genie-tts"
     dialog.deleteLater()
     app.processEvents()
 
@@ -1427,6 +1492,57 @@ def test_settings_dialog_enabled_tts_tests_when_character_changes(monkeypatch) -
     assert dialog.result_character_id == "nanami"
     assert dialog.result_tts_settings is not None
     assert dialog.result_tts_settings.enabled
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_disables_tts_when_selected_character_has_no_voice(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_no_voice")
+    current_profile = _build_settings_dialog_character(root, "sakura", "Sakura", with_voice=False)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=current_profile,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    dialog.tts_enabled_check.setChecked(True)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_tts_settings_test",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("无语音角色不应进入 TTS 服务检测")),
+    )
+
+    dialog.accept()
+
+    assert warnings and "当前角色没有语音包" in warnings[0]
+    assert "参考文本" not in warnings[0]
+    assert not dialog.tts_enabled_check.isChecked()
+    assert dialog.result_tts_settings is not None
+    assert not dialog.result_tts_settings.enabled
     dialog.deleteLater()
     app.processEvents()
 
@@ -1766,6 +1882,65 @@ def test_settings_dialog_import_character_archive_refreshes_combo(monkeypatch) -
     app.processEvents()
 
 
+def test_settings_dialog_import_voice_less_character_archive_disables_tts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.config.character_archive import export_character_archive
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    case_root = _ui_runtime_root("char_import_no_voice")
+    root = case_root / "runtime"
+    source_root = case_root / "source"
+    current_profile = _build_settings_dialog_character(root, "sakura", "Sakura")
+    imported_profile = _build_settings_dialog_character(source_root, "nanami", "Nanami", with_voice=False)
+    archive_path = case_root / "nanami.char"
+    export_character_archive(imported_profile, archive_path)
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=current_profile,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    dialog.tts_enabled_check.setChecked(True)
+    messages: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(archive_path), ""),
+    )
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "information",
+        lambda _parent, _title, message: messages.append(message),
+    )
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+
+    dialog._import_character_archive()
+
+    assert dialog.character_combo.currentData() == "nanami"
+    assert dialog._selected_character_profile().voice is None
+    assert not dialog.tts_enabled_check.isChecked()
+    assert messages and "没有语音包" in messages[-1]
+    assert "TTS 已自动关闭" in messages[-1]
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_pet_window_retires_tts_provider_by_closing_it() -> None:
     from app.ui.pet_window import PetWindow
 
@@ -1871,6 +2046,131 @@ def test_settings_dialog_allows_import_without_existing_character_registry(monke
     app.processEvents()
 
 
+def test_settings_dialog_imports_voice_archive_for_selected_character(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    case_root = _ui_runtime_root("voice_archive_import")
+    root = case_root / "runtime"
+    profile = _build_settings_dialog_character(root, "sakura", "Sakura")
+    archive_path = _build_settings_dialog_voice_archive(case_root)
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=profile,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    monkeypatch.setattr(
+        settings_dialog_module.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(archive_path), ""),
+    )
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+
+    dialog._import_character_voice_archive()
+
+    imported = CharacterRegistry(root).get("sakura")
+    assert warnings == []
+    assert dialog.character_combo.currentData() == "sakura"
+    assert imported.voice is not None
+    assert imported.voice.gpt_model_path is not None
+    assert imported.voice.gpt_model_path.read_bytes() == b"imported-gpt"
+    assert dialog.ref_lang_edit.text() == "zh"
+    assert dialog.text_lang_edit.text() == "zh"
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    case_root = _ui_runtime_root("char_export_menu")
+    root = case_root / "runtime"
+    profile = _build_settings_dialog_character(root, "sakura", "Sakura")
+    _build_settings_dialog_character(root, "nanami", "Nanami", with_voice=False)
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=profile,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    save_dialogs: list[tuple[str, str, str]] = []
+
+    def fake_get_save_file_name(_parent, title, default_path, file_filter):  # type: ignore[no-untyped-def]
+        save_dialogs.append((title, Path(default_path).name, file_filter))
+        return ("", "")
+
+    monkeypatch.setattr(settings_dialog_module.QFileDialog, "getSaveFileName", fake_get_save_file_name)
+
+    assert dialog.character_export_button.text() == "导出"
+    assert dialog.character_export_button.menu() is dialog.character_export_menu
+    assert [action.text() for action in dialog.character_export_menu.actions()] == [
+        "导出完整包 (.char)",
+        "导出单角色包 (.char)",
+        "导出语音包 (.voice)",
+    ]
+    assert dialog.character_export_voice_action.isEnabled()
+
+    dialog.character_export_full_action.trigger()
+    dialog.character_export_card_action.trigger()
+    dialog.character_export_voice_action.trigger()
+
+    assert save_dialogs == [
+        ("导出 Sakura 完整角色包", "sakura.char", "Sakura 角色包 (*.char)"),
+        ("导出 Sakura 单角色包", "sakura.card.char", "Sakura 角色包 (*.char)"),
+        ("导出 Sakura TTS 模型包", "sakura.voice", "Sakura TTS 模型包 (*.voice)"),
+    ]
+
+    nanami_index = dialog.character_combo.findData("nanami")
+    assert nanami_index >= 0
+    dialog.character_combo.setCurrentIndex(nanami_index)
+    assert not dialog.character_export_voice_action.isEnabled()
+    assert "没有可导出的语音包" in dialog.character_export_voice_action.toolTip()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_exports_character_archive_in_background(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -1890,9 +2190,10 @@ def test_settings_dialog_exports_character_archive_in_background(monkeypatch) ->
     exported: dict[str, object] = {}
     messages: list[str] = []
 
-    def fake_export_character_archive(export_profile, export_path):  # type: ignore[no-untyped-def]
+    def fake_export_character_archive(export_profile, export_path, *, include_voice=True):  # type: ignore[no-untyped-def]
         exported["profile"] = export_profile
         exported["path"] = export_path
+        exported["include_voice"] = include_voice
         started.set()
         assert release.wait(2)
         Path(export_path).write_text("done", encoding="utf-8")
@@ -1937,6 +2238,7 @@ def test_settings_dialog_exports_character_archive_in_background(monkeypatch) ->
         assert dialog._character_export_thread is not None
         assert exported["profile"] == profile
         assert exported["path"] == output_path
+        assert exported["include_voice"] is True
         assert not dialog.character_import_button.isEnabled()
         assert not dialog.character_export_button.isEnabled()
         assert not dialog.button_box.button(QDialogButtonBox.StandardButton.Save).isEnabled()
@@ -3382,6 +3684,63 @@ def test_settings_dialog_returns_theme_settings() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_character_selection_loads_character_theme() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    root = _ui_runtime_root("character_theme_switch")
+    sakura = _build_settings_dialog_character(
+        root,
+        "sakura",
+        "Sakura",
+        theme={"primary_color": "#102030", "accent_color": "#405060", "source": "package"},
+    )
+    _build_settings_dialog_character(
+        root,
+        "nanami",
+        "Nanami",
+        theme={"primary_color": "#abcdef", "accent_color": "#123456", "source": "package"},
+    )
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=sakura,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(primary_color="#999999"),
+    )
+
+    assert dialog.theme_primary_edit.text() == "#102030"
+    assert dialog.theme_accent_edit.text() == "#405060"
+
+    target_index = dialog.character_combo.findData("nanami")
+    assert target_index >= 0
+    dialog.character_combo.setCurrentIndex(target_index)
+    app.processEvents()
+    dialog.accept()
+
+    assert dialog.theme_primary_edit.text() == "#abcdef"
+    assert dialog.theme_accent_edit.text() == "#123456"
+    assert dialog.result_theme_write_mode == "character"
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_resets_default_theme_colors() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -3419,9 +3778,90 @@ def test_settings_dialog_resets_default_theme_colors() -> None:
     assert dialog.theme_accent_edit.text() == DEFAULT_THEME_SETTINGS.accent_color
     assert dialog.theme_text_edit.text() == DEFAULT_THEME_SETTINGS.text_color
     assert dialog.theme_color_edits["input_background_color"].text() == DEFAULT_THEME_SETTINGS.input_background_color
-    assert dialog._selected_theme_settings() == ThemeSettings(ai_enabled=True).normalized()
+    assert dialog._selected_theme_settings() == ThemeSettings(ai_enabled=False).normalized()
     dialog.deleteLater()
     app.processEvents()
+
+
+def test_settings_dialog_resets_to_character_package_theme() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.config.character_loader import CharacterRegistry
+    from app.ui.settings_dialog import SettingsDialog
+
+    root = _ui_runtime_root("theme_reset_character_package")
+    profile = _build_settings_dialog_character(
+        root,
+        "sakura",
+        "Sakura",
+        theme={"primary_color": "#102030", "accent_color": "#405060", "source": "package"},
+    )
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        character_registry=CharacterRegistry(root),
+        current_character=profile,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(primary_color="#999999", accent_color="#888888", ai_enabled=True),
+    )
+
+    dialog._reset_theme_colors()
+
+    assert dialog.theme_primary_edit.text() == "#102030"
+    assert dialog.theme_accent_edit.text() == "#405060"
+    assert dialog._selected_theme_settings() == profile.theme_settings
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_theme_write_rule_persists_manual_and_ai_theme() -> None:
+    from app.config.character_loader import (
+        THEME_SOURCE_COMPAT_DEFAULT,
+        THEME_SOURCE_PACKAGE,
+        CharacterProfile,
+    )
+    from app.ui.pet_window import _should_write_character_theme
+
+    root = _ui_runtime_root("theme_write_rule")
+    profile = CharacterProfile(
+        id="demo",
+        display_name="Demo",
+        package_dir=root,
+        card_path=root / "card.md",
+        initial_message="hello",
+        default_portrait_path=root / "portrait.png",
+        theme_settings=DEFAULT_THEME_SETTINGS,
+        theme_source=THEME_SOURCE_PACKAGE,
+    )
+    compat_profile = CharacterProfile(
+        id="legacy",
+        display_name="Legacy",
+        package_dir=root,
+        card_path=root / "card.md",
+        initial_message="hello",
+        default_portrait_path=root / "portrait.png",
+        theme_settings=DEFAULT_THEME_SETTINGS,
+        theme_source=THEME_SOURCE_COMPAT_DEFAULT,
+    )
+
+    assert _should_write_character_theme("ai", profile)
+    assert _should_write_character_theme("ai", compat_profile)
+    assert _should_write_character_theme("manual", profile)
+    assert not _should_write_character_theme("reset", profile)
+    assert not _should_write_character_theme("character", profile)
 
 
 def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -4892,45 +5332,85 @@ memory_curation:
     return root
 
 
-def _build_settings_dialog_character(root: Path, character_id: str, display_name: str):
+def _build_settings_dialog_character(
+    root: Path,
+    character_id: str,
+    display_name: str,
+    theme: dict[str, object] | None = None,
+    *,
+    with_voice: bool = True,
+):
     from app.config.character_loader import CharacterRegistry
 
     character_dir = root / "characters" / character_id
     character_dir.mkdir(parents=True, exist_ok=True)
-    (character_dir / "voice" / "models").mkdir(parents=True, exist_ok=True)
-    (character_dir / "voice" / "refs" / "tone_refs").mkdir(parents=True, exist_ok=True)
     (character_dir / "card.md").write_text("system prompt", encoding="utf-8")
     (character_dir / "portrait.png").write_bytes(b"portrait")
-    (character_dir / "voice" / "models" / "gpt.ckpt").write_bytes(b"gpt")
-    (character_dir / "voice" / "models" / "sovits.pth").write_bytes(b"sovits")
-    (character_dir / "voice" / "refs" / "tone_refs" / "neutral.wav").write_bytes(b"wav")
-    (character_dir / "voice" / "refs" / "ref.txt").write_text(
-        "voice/refs/tone_refs/neutral.wav|JA|テスト|中性\n",
-        encoding="utf-8",
-    )
+    character_data = {
+        "id": character_id,
+        "display_name": display_name,
+        "initial_message": "hello",
+        "card": "card.md",
+        "portrait": {
+            "default": "portrait.png",
+        },
+    }
+    if with_voice:
+        (character_dir / "voice" / "models").mkdir(parents=True, exist_ok=True)
+        (character_dir / "voice" / "refs" / "tone_refs").mkdir(parents=True, exist_ok=True)
+        (character_dir / "voice" / "models" / "gpt.ckpt").write_bytes(b"gpt")
+        (character_dir / "voice" / "models" / "sovits.pth").write_bytes(b"sovits")
+        (character_dir / "voice" / "refs" / "tone_refs" / "neutral.wav").write_bytes(b"wav")
+        (character_dir / "voice" / "refs" / "ref.txt").write_text(
+            "voice/refs/tone_refs/neutral.wav|JA|テスト|中性\n",
+            encoding="utf-8",
+        )
+        character_data["voice"] = {
+            "gpt_model": "voice/models/gpt.ckpt",
+            "sovits_model": "voice/models/sovits.pth",
+            "tone_refs": "voice/refs/ref.txt",
+            "ref_lang": "ja",
+            "text_lang": "ja",
+        }
+    if theme is not None:
+        character_data["theme"] = theme
     (character_dir / "character.json").write_text(
         json.dumps(
-            {
-                "id": character_id,
-                "display_name": display_name,
-                "initial_message": "hello",
-                "card": "card.md",
-                "portrait": {
-                    "default": "portrait.png",
-                },
-                "voice": {
-                    "gpt_model": "voice/models/gpt.ckpt",
-                    "sovits_model": "voice/models/sovits.pth",
-                    "tone_refs": "voice/refs/ref.txt",
-                    "ref_lang": "ja",
-                    "text_lang": "ja",
-                },
-            },
+            character_data,
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
     return CharacterRegistry(root).get(character_id)
+
+
+def _build_settings_dialog_voice_archive(root: Path) -> Path:
+    from app.config.character_archive import VOICE_ARCHIVE_FORMAT, VOICE_ARCHIVE_VERSION
+
+    archive_path = root / f"voice_{uuid.uuid4().hex}.voice"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "format": VOICE_ARCHIVE_FORMAT,
+                    "version": VOICE_ARCHIVE_VERSION,
+                    "voice": {
+                        "gpt_model": "voice/models/imported.ckpt",
+                        "sovits_model": "voice/models/imported.pth",
+                        "tone_refs": "voice/refs/ref.txt",
+                        "ref_lang": "zh",
+                        "text_lang": "zh",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+        zf.writestr("voice/models/imported.ckpt", b"imported-gpt")
+        zf.writestr("voice/models/imported.pth", b"imported-sovits")
+        zf.writestr("voice/refs/tone_refs/imported.wav", b"wav")
+        zf.writestr("voice/refs/ref.txt", "voice/refs/tone_refs/imported.wav|ZH|你好|中性\n")
+    return archive_path
 
 
 def _settings_dialog_character_kwargs(root: Path) -> dict[str, object]:
