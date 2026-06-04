@@ -129,6 +129,8 @@ tts:
     settings = service.load_tts_settings(validate_enabled=False)
 
     assert settings.work_dir == root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro"
+    assert settings.python_path is None
+    assert settings.tts_config_path is None
 
     service.api_config_path.write_text(
         """
@@ -189,6 +191,8 @@ def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
         ref_text_path=root / "ref.txt",
         ref_text="hello",
         work_dir=root / "external" / "GPT-SoVITS",
+        python_path=root / "external" / "miniforge3" / "envs" / "gpt-sovits" / "bin" / "python",
+        tts_config_path=root / "external" / "GPT-SoVITS" / "GPT_SoVITS" / "configs" / "tts_infer.yaml",
         ref_lang="ja",
         text_lang="ja",
         timeout_seconds=44,
@@ -201,9 +205,13 @@ def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
     assert saved["tts"]["provider"] == TTS_PROVIDER_CUSTOM_GPT_SOVITS
     assert saved["tts"]["gpt_sovits"]["api_url"] == "http://192.168.1.20:9880/tts"
     assert saved["tts"]["gpt_sovits"]["work_dir"] == "external/GPT-SoVITS"
+    assert saved["tts"]["gpt_sovits"]["python_path"] == "external/miniforge3/envs/gpt-sovits/bin/python"
+    assert saved["tts"]["gpt_sovits"]["tts_config_path"] == "external/GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml"
     assert loaded.provider == TTS_PROVIDER_CUSTOM_GPT_SOVITS
     assert loaded.api_url == "http://192.168.1.20:9880/tts"
     assert loaded.work_dir == root / "external" / "GPT-SoVITS"
+    assert loaded.python_path == root / "external" / "miniforge3" / "envs" / "gpt-sovits" / "bin" / "python"
+    assert loaded.tts_config_path == root / "external" / "GPT-SoVITS" / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
     assert loaded.timeout_seconds == 44
 
 

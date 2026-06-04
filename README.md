@@ -76,6 +76,8 @@ Release 里常见的文件含义如下：
 
 - **[百度网盘](https://pan.baidu.com/s/5ZXvAi6n6i7-OJAYeWDpprg)**：包含所有已发布的角色包.
 
+角色包会携带角色卡、立绘、语音参考音频，以及该角色可用的 GPT-SoVITS 权重（例如 `voice/models/*.ckpt`、`voice/models/*.pth`）。源码仓库和 TTS 运行环境安装脚本不会单独下载这些角色声线权重；如果完整包中没有对应角色资源，需要先通过角色包渠道获取并导入。
+
 #### 安装方式
 
 1. 下载角色包
@@ -281,6 +283,27 @@ tts:
     timeout_seconds: 60
 ```
 
+Windows 用户可以在设置窗口的 TTS 页点击“一键下载 TTS 整合包”安装当前内置的 Windows 整合包。macOS 用户会看到“GPT-SoVITS macOS 源码安装包”，点击后会在 `data/tts_bundles/installed/gpt_sovits_macos/` 下自动安装 Miniforge、创建 Python 3.10 环境、拉取 GPT-SoVITS 源码并生成 macOS 可用的推理配置。脚本会下载固定版本的 Miniforge 并校验 SHA256；GPT-SoVITS 官方安装脚本默认按 MPS 依赖安装，推理配置默认使用 CPU 与关闭半精度以保持兼容，可通过 `GPT_SOVITS_INSTALL_DEVICE` 和 `GPT_SOVITS_INFER_DEVICE` 覆盖。这个 macOS 安装项只负责 GPT-SoVITS 源码、Python 环境和官方预训练基础模型；Sakura 等角色声线权重仍来自角色包的 `voice/models/`，由 `character.json` 读取后在启动 TTS 时切换。下载窗口会按当前系统过滤整合包；Windows 不会展示 macOS 安装项，macOS 也不会展示只包含 Windows 运行时的整合包。
+
+设置页新增的 `TTS Python` 和 `推理配置` 字段只用于自定义或 macOS 源码版 GPT-SoVITS；Windows 内置整合包无需填写。
+
+如果已经在 macOS / Linux 上自行安装了 GPT-SoVITS 源码版，也可以在设置窗口把 TTS 提供器切到“自定义 GPT-SoVITS（macOS/Linux）”，并配置本地源码目录、Python 解释器和可选推理配置：
+
+```yaml
+tts:
+  provider: custom-gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+    work_dir: /path/to/GPT-SoVITS
+    python_path: /path/to/miniforge3/envs/gpt-sovits/bin/python
+    tts_config_path: /path/to/GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml
+    ref_lang: ja
+    text_lang: ja
+```
+
+自定义 GPT-SoVITS 启动时会使用配置的 `python_path` 运行工作目录下的 `api_v2.py`；如果配置了 `tts_config_path`，会追加 `-c` 参数，并根据 `api_url` 追加监听地址和端口。macOS 一键安装完成后会自动回填这些字段。内置整合包如果只包含其他平台的运行时，Sakura 会提示运行时不兼容，而不会直接执行到系统级 `Exec format error`。
+
 ## 配置项
 
 所有配置集中在 `data/config/` 下的 YAML 文件中。
@@ -293,6 +316,8 @@ tts:
 | `api.yaml: llm.timeout_seconds` | 超时时间 | `60` |
 | `api.yaml: tts.enabled` | 启用 TTS | `false` |
 | `api.yaml: tts.gpt_sovits.api_url` | TTS 接口 | `http://127.0.0.1:9880/tts` |
+| `api.yaml: tts.gpt_sovits.python_path` | 自定义 GPT-SoVITS Python | 空 |
+| `api.yaml: tts.gpt_sovits.tts_config_path` | 自定义 GPT-SoVITS 推理配置 | 空 |
 | `system_config.yaml: ui.subtitle_language` | 气泡语言 `ja`/`zh` | `ja` |
 | `system_config.yaml: ui.portrait_scale_percent` | 立绘缩放 | `100` |
 | `system_config.yaml: proactive_care.enabled` | 主动关怀 | `false` |

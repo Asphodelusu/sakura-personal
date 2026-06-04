@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from app.voice.runtime_compat import current_platform_label, current_system_name, find_usable_runtime_python
 
 
 ProgressCallback = Callable[[int], None]
@@ -40,11 +43,25 @@ class UrlOpenCallable(Protocol):
 class TTSBundleEntry:
     key: str
     label: str
-    filename: str
-    download_url: str
-    size: int
-    sha256: str
+    filename: str = ""
+    download_url: str = ""
+    size: int = 0
+    sha256: str = ""
     provider: str = "gpt-sovits"
+    supported_systems: tuple[str, ...] = ()
+    install_method: str = "archive"
+    installer_script: str | None = None
+    work_dir_name: str | None = None
+    python_path_name: str | None = None
+    tts_config_path_name: str | None = None
+
+
+@dataclass(frozen=True)
+class TTSBundleInstallResult:
+    work_dir: Path
+    provider: str
+    python_path: Path | None = None
+    tts_config_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +102,7 @@ GENIE_TTS = TTSBundleEntry(
     size=1041915345,
     sha256="8f06077b6102aa29f1c9473926db9a74890d627f077393aa8ebb928b52f15de1",
     provider="genie-tts",
+    supported_systems=("windows",),
 )
 GPT_SOVITS_STANDARD = TTSBundleEntry(
     key="gpt_sovits_v2pro",
@@ -96,6 +114,7 @@ GPT_SOVITS_STANDARD = TTSBundleEntry(
     ),
     size=8185086602,
     sha256="bd60d0796553ff05d8568136e199c13e0dc22ebe2ed24273134e34ed6f215cd6",
+    supported_systems=("windows",),
 )
 GPT_SOVITS_NVIDIA50 = TTSBundleEntry(
     key="gpt_sovits_nvidia50",
@@ -107,11 +126,28 @@ GPT_SOVITS_NVIDIA50 = TTSBundleEntry(
     ),
     size=8835144925,
     sha256="97b4edcd451c42357db7e26e6c1c877ca5d85144fe97beaff6d7005d35bee008",
+    supported_systems=("windows",),
+)
+GPT_SOVITS_MACOS_INSTALLER = TTSBundleEntry(
+    key="gpt_sovits_macos",
+    label="GPT-SoVITS macOS 源码安装包",
+    provider="custom-gpt-sovits",
+    supported_systems=("macos",),
+    install_method="script",
+    installer_script="scripts/install_gpt_sovits_macos.sh",
+    work_dir_name="GPT-SoVITS",
+    python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
+    tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
 )
 GPT_SOVITS_BUNDLES = (GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50)
-TTS_BUNDLES = (GENIE_TTS, GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50)
+TTS_BUNDLES = (GENIE_TTS, GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50, GPT_SOVITS_MACOS_INSTALLER)
 MIN_GPT_SOVITS_VRAM_GB = 6.0
 _GPT_SOVITS_VRAM_TOLERANCE_GB = 0.25
+_SYSTEM_LABELS = {
+    "windows": "Windows",
+    "macos": "macOS",
+    "linux": "Linux",
+}
 _SHORT_BUNDLE_DIRS = {
     GENIE_TTS.key: "cpu",
     GPT_SOVITS_STANDARD.key: "gpt",
@@ -169,12 +205,22 @@ def list_nvidia_gpus() -> list[GPUInfo]:
 
 
 def format_gpu_summary(gpus: list[GPUInfo]) -> str:
+    if not compatible_tts_bundles():
+        return (
+            f"当前平台 {current_platform_label()} 暂无可一键下载的 TTS 整合包；"
+            "可在设置中选择“自定义 GPT-SoVITS（macOS/Linux）”接入本机源码版运行环境。"
+        )
     if not gpus:
+        recommended = recommend_tts_bundle(gpus)
+        if recommended is not None and recommended != GENIE_TTS:
+            return f"未检测到 NVIDIA GPU，将推荐 {format_bundle_label(recommended)}。"
         return "未检测到 NVIDIA GPU，将推荐 Genie TTS CPU 整合包。"
     return "\n".join(f"#{i} NVIDIA | {gpu.name} | {gpu.vram_gb} GB" for i, gpu in enumerate(gpus, start=1))
 
 
 def format_bundle_size(entry: TTSBundleEntry) -> str:
+    if entry.install_method == "script":
+        return "在线安装"
     gb = entry.size / 1_000_000_000
     if gb >= 1:
         return f"约 {gb:.1f} GB"
@@ -182,28 +228,60 @@ def format_bundle_size(entry: TTSBundleEntry) -> str:
 
 
 def format_bundle_label(entry: TTSBundleEntry) -> str:
-    return f"{entry.label}（{format_bundle_size(entry)}）"
+    details = [format_bundle_size(entry)]
+    if entry.supported_systems:
+        details.append(f"仅 {format_supported_systems(entry.supported_systems)}")
+    return f"{entry.label}（{'，'.join(details)}）"
 
 
-def recommend_gpt_sovits_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry:
+def format_supported_systems(supported_systems: tuple[str, ...]) -> str:
+    if not supported_systems:
+        return "全部平台"
+    return "、".join(_SYSTEM_LABELS.get(system, system) for system in supported_systems)
+
+
+def is_bundle_supported(entry: TTSBundleEntry) -> bool:
+    supported_systems = tuple(system.lower() for system in entry.supported_systems)
+    return not supported_systems or current_system_name() in supported_systems
+
+
+def compatible_tts_bundles() -> tuple[TTSBundleEntry, ...]:
+    return tuple(entry for entry in TTS_BUNDLES if is_bundle_supported(entry))
+
+
+def recommend_gpt_sovits_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry | None:
+    compatible_gpt_bundles = tuple(entry for entry in GPT_SOVITS_BUNDLES if is_bundle_supported(entry))
+    if not compatible_gpt_bundles:
+        return None
     gpus = list_nvidia_gpus() if gpus is None else gpus
-    if any(_is_rtx_50_series(gpu.name) for gpu in gpus):
+    if GPT_SOVITS_NVIDIA50 in compatible_gpt_bundles and any(_is_rtx_50_series(gpu.name) for gpu in gpus):
         return GPT_SOVITS_NVIDIA50
+    if GPT_SOVITS_STANDARD not in compatible_gpt_bundles:
+        return compatible_gpt_bundles[0]
     return GPT_SOVITS_STANDARD
 
 
-def recommend_tts_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry:
+def recommend_tts_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry | None:
+    compatible_bundles = compatible_tts_bundles()
+    if not compatible_bundles:
+        return None
     gpus = list_nvidia_gpus() if gpus is None else gpus
     capable_nvidia = [gpu for gpu in gpus if _has_gpt_sovits_vram(gpu)]
     if not capable_nvidia:
-        return GENIE_TTS
-    if any(_is_rtx_50_series(gpu.name) for gpu in capable_nvidia):
+        return GENIE_TTS if GENIE_TTS in compatible_bundles else compatible_bundles[0]
+    if GPT_SOVITS_NVIDIA50 in compatible_bundles and any(_is_rtx_50_series(gpu.name) for gpu in capable_nvidia):
         return GPT_SOVITS_NVIDIA50
-    return GPT_SOVITS_STANDARD
+    return GPT_SOVITS_STANDARD if GPT_SOVITS_STANDARD in compatible_bundles else compatible_bundles[0]
 
 
 def default_bundle_work_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
     """返回整合包对应的工作目录；已安装时解析真实解压根目录，未安装时返回预期目录。"""
+
+    if entry.install_method == "script":
+        installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
+        if entry.work_dir_name:
+            return installed_dir / entry.work_dir_name
+        return installed_dir
 
     short_dir = _short_bundle_install_dir(entry, base_dir)
     if _is_installed_bundle_ready(short_dir):
@@ -226,15 +304,19 @@ def default_provider_bundle_work_dir(provider: str, base_dir: Path) -> Path | No
 
     normalized = provider.strip().lower().replace("_", "-")
     if normalized in {"genie", "genie-tts", "genietts"}:
-        return default_bundle_work_dir(GENIE_TTS, base_dir)
+        return default_bundle_work_dir(GENIE_TTS, base_dir) if is_bundle_supported(GENIE_TTS) else None
     if normalized not in {"gpt-sovits", "gpt-so-vits", "gptsovits"}:
         return None
 
+    if not any(is_bundle_supported(entry) for entry in GPT_SOVITS_BUNDLES):
+        return None
     for entry in GPT_SOVITS_BUNDLES:
+        if not is_bundle_supported(entry):
+            continue
         if _is_bundle_installed(entry, base_dir):
             return default_bundle_work_dir(entry, base_dir)
     recommended = recommend_gpt_sovits_bundle()
-    return default_bundle_work_dir(recommended, base_dir)
+    return default_bundle_work_dir(recommended, base_dir) if recommended is not None else None
 
 
 def is_provider_bundle_work_dir(path: Path, base_dir: Path) -> bool:
@@ -385,6 +467,38 @@ def normalize_bundle_work_dir(path: Path | None, base_dir: Path) -> Path | None:
     return path
 
 
+def install_tts_bundle(
+    entry: TTSBundleEntry,
+    base_dir: Path,
+    *,
+    check_cancel: Callable[[], None] | None = None,
+    on_progress: ProgressCallback | None = None,
+    on_status: StatusCallback | None = None,
+    urlopen: UrlOpenCallable = urllib.request.urlopen,
+    extractor: Callable[[Path, Path], str | None] | None = None,
+) -> TTSBundleInstallResult:
+    if entry.install_method == "archive":
+        work_dir = download_and_extract_bundle(
+            entry,
+            base_dir,
+            check_cancel=check_cancel,
+            on_progress=on_progress,
+            on_status=on_status,
+            urlopen=urlopen,
+            extractor=extractor,
+        )
+        return TTSBundleInstallResult(work_dir=work_dir, provider=entry.provider)
+    if entry.install_method == "script":
+        return _run_script_bundle_installer(
+            entry,
+            base_dir,
+            check_cancel=check_cancel,
+            on_progress=on_progress,
+            on_status=on_status,
+        )
+    raise RuntimeError(f"不支持的 TTS 整合包安装方式：{entry.install_method}")
+
+
 def download_and_extract_bundle(
     entry: TTSBundleEntry,
     base_dir: Path,
@@ -395,6 +509,14 @@ def download_and_extract_bundle(
     urlopen: UrlOpenCallable = urllib.request.urlopen,
     extractor: Callable[[Path, Path], str | None] | None = None,
 ) -> Path:
+    if entry.install_method != "archive":
+        raise RuntimeError(f"{entry.label} 不是压缩包整合包，请使用安装器入口。")
+    if not is_bundle_supported(entry):
+        raise RuntimeError(
+            f"{entry.label} 不支持当前平台：{current_platform_label()}；"
+            f"支持平台：{format_supported_systems(entry.supported_systems)}。"
+        )
+
     bundle_base = base_dir / "tts"
     downloads_dir = bundle_base / "_dl"
     tmp_dir = bundle_base / "_tmp" / entry.key
@@ -427,6 +549,8 @@ def cleanup_stale_download_archives(base_dir: Path) -> list[Path]:
 
     cleaned: list[Path] = []
     for entry in TTS_BUNDLES:
+        if entry.install_method != "archive" or not entry.filename:
+            continue
         if not _is_bundle_installed(entry, base_dir):
             continue
         for downloads_dir in (base_dir / "tts" / "_dl", base_dir / "data" / "tts_bundles" / "downloads"):
@@ -438,9 +562,182 @@ def cleanup_stale_download_archives(base_dir: Path) -> list[Path]:
     return cleaned
 
 
+def _run_script_bundle_installer(
+    entry: TTSBundleEntry,
+    base_dir: Path,
+    *,
+    check_cancel: Callable[[], None] | None,
+    on_progress: ProgressCallback | None,
+    on_status: StatusCallback | None,
+) -> TTSBundleInstallResult:
+    if not is_bundle_supported(entry):
+        raise RuntimeError(
+            f"{entry.label} 不支持当前平台：{current_platform_label()}；"
+            f"支持平台：{format_supported_systems(entry.supported_systems)}。"
+        )
+    if not entry.installer_script:
+        raise RuntimeError(f"{entry.label} 缺少安装脚本。")
+
+    script = _resolve_installer_script(entry.installer_script, base_dir)
+    bundle_base = base_dir / "data" / "tts_bundles"
+    installed_dir = bundle_base / "installed" / entry.key
+    install_tmp_dir = bundle_base / "tmp" / entry.key
+    downloads_dir = bundle_base / "downloads"
+    if install_tmp_dir.exists():
+        shutil.rmtree(install_tmp_dir, ignore_errors=True)
+    install_tmp_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    _emit_status(on_status, "install")
+    _emit_progress(on_progress, 0)
+    env = os.environ.copy()
+    env["SAKURA_TTS_INSTALL_DIR"] = str(install_tmp_dir)
+    env["SAKURA_TTS_DOWNLOADS_DIR"] = str(downloads_dir)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    cmd = ["bash", str(script), str(install_tmp_dir)]
+    popen_kwargs: dict[str, Any] = {
+        "args": cmd,
+        "cwd": str(base_dir),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = _WIN_NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    process: subprocess.Popen[str] | None = None
+    tail: list[str] = []
+    try:
+        process = subprocess.Popen(**popen_kwargs)
+        assert process.stdout is not None
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if line:
+                    tail.append(line)
+                    tail = tail[-20:]
+                    _handle_installer_progress_line(line, on_progress=on_progress, on_status=on_status)
+                if check_cancel is not None:
+                    check_cancel()
+        except Exception:
+            _terminate_process_tree(process)
+            raise
+        finally:
+            process.stdout.close()
+
+        return_code = process.wait()
+        if return_code != 0:
+            detail = "\n".join(tail) or f"exit {return_code}"
+            raise RuntimeError(f"{entry.label} 安装失败：\n{detail}"[:2000])
+
+        _build_script_install_result(entry, install_tmp_dir)
+        _replace_installed_bundle_dir(install_tmp_dir, installed_dir)
+        result = _build_script_install_result(entry, installed_dir)
+        _emit_status(on_status, "cleanup")
+        _emit_progress(on_progress, 100)
+        return result
+    except Exception:
+        if process is not None:
+            _terminate_process_tree(process)
+        shutil.rmtree(install_tmp_dir, ignore_errors=True)
+        raise
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        process.terminate()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.terminate()
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if sys.platform == "win32":
+        process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.kill()
+    process.wait()
+
+
+def _replace_installed_bundle_dir(source_dir: Path, target_dir: Path) -> None:
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = target_dir.with_name(f".{target_dir.name}.previous")
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    had_previous = target_dir.exists()
+    if had_previous:
+        target_dir.rename(backup_dir)
+    try:
+        shutil.move(str(source_dir), str(target_dir))
+    except Exception:
+        if had_previous and backup_dir.exists() and not target_dir.exists():
+            backup_dir.rename(target_dir)
+        raise
+    if had_previous:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _resolve_installer_script(relative_script: str, base_dir: Path) -> Path:
+    candidates = [base_dir / relative_script, _project_root() / relative_script]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"未找到 TTS 整合包安装脚本：{relative_script}")
+
+
+def _handle_installer_progress_line(
+    line: str,
+    *,
+    on_progress: ProgressCallback | None,
+    on_status: StatusCallback | None,
+) -> None:
+    match = re.search(r"::sakura-progress\s+status=([a-z_]+)\s+progress=(\d+)", line)
+    if match is None:
+        return
+    _emit_status(on_status, match.group(1))
+    _emit_progress(on_progress, int(match.group(2)))
+
+
+def _build_script_install_result(entry: TTSBundleEntry, installed_dir: Path) -> TTSBundleInstallResult:
+    work_dir = installed_dir / entry.work_dir_name if entry.work_dir_name else installed_dir
+    python_path = installed_dir / entry.python_path_name if entry.python_path_name else None
+    tts_config_path = installed_dir / entry.tts_config_path_name if entry.tts_config_path_name else None
+    if not work_dir.is_dir():
+        raise RuntimeError(f"{entry.label} 安装后未找到工作目录：{work_dir}")
+    if not (work_dir / "api_v2.py").is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到 api_v2.py：{work_dir}")
+    if python_path is not None and not python_path.is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到 Python：{python_path}")
+    if tts_config_path is not None and not tts_config_path.is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到推理配置：{tts_config_path}")
+    return TTSBundleInstallResult(
+        work_dir=work_dir.resolve(),
+        provider=entry.provider,
+        python_path=python_path.resolve() if python_path is not None else None,
+        tts_config_path=tts_config_path.resolve() if tts_config_path is not None else None,
+    )
+
+
 def _entries_for_provider(provider: str | None) -> tuple[TTSBundleEntry, ...]:
     if provider is None:
-        return TTS_BUNDLES
+        return tuple(entry for entry in TTS_BUNDLES if entry.install_method == "archive")
     normalized = provider.strip().lower().replace("_", "-")
     if normalized in {"genie", "genie-tts", "genietts"}:
         return (GENIE_TTS,)
@@ -673,7 +970,7 @@ def _is_installed_bundle_ready(installed_dir: Path) -> bool:
         root = _resolve_extracted_root(installed_dir)
     except OSError:
         return False
-    return (root / "runtime" / "python.exe").is_file()
+    return find_usable_runtime_python(root / "runtime") is not None
 
 
 def _emit_progress(callback: ProgressCallback | None, value: int) -> None:

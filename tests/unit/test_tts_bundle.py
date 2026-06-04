@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from app.voice.tts_bundle import (
     default_provider_bundle_work_dir,
     download_and_extract_bundle,
     find_pending_bundle_migrations,
+    install_tts_bundle,
     migrate_bundle_to_short_path,
     normalize_bundle_work_dir,
 )
@@ -173,7 +175,8 @@ def test_tts_bundle_flattens_single_extracted_root() -> None:
     assert not (work_dir / "GPT-SoVITS").exists()
 
 
-def test_tts_bundle_cleans_legacy_archive_when_bundle_is_installed() -> None:
+def test_tts_bundle_cleans_legacy_archive_when_bundle_is_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
     root = _runtime_root("cleanup_legacy_archive")
     entry = tts_bundle.GPT_SOVITS_STANDARD
     archive = root / "data" / "tts_bundles" / "downloads" / entry.filename
@@ -215,7 +218,8 @@ def test_tts_bundle_legacy_cleanup_preserves_uninstalled_and_unknown_archives() 
     assert unknown_archive.exists()
 
 
-def test_tts_bundle_default_provider_work_dir_uses_installed_root() -> None:
+def test_tts_bundle_default_provider_work_dir_uses_installed_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
     root = _runtime_root("default_provider_work_dir")
     work_dir = (
         root
@@ -458,12 +462,14 @@ def test_tts_bundle_normalizes_legacy_config_path_after_migration() -> None:
     assert normalize_bundle_work_dir(legacy_work_dir, root) == short_work_dir.resolve()
 
 
-def test_tts_bundle_recommends_genie_for_cpu_or_small_gpu() -> None:
+def test_tts_bundle_recommends_genie_for_cpu_or_small_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
     assert tts_bundle.recommend_tts_bundle([]).key == "genie_tts_server"
     assert tts_bundle.recommend_tts_bundle([GPUInfo("NVIDIA GeForce GTX 1050 Ti", 4.0)]).key == "genie_tts_server"
 
 
-def test_tts_bundle_recommends_gptsovits_for_capable_nvidia() -> None:
+def test_tts_bundle_recommends_gptsovits_for_capable_nvidia(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
     assert tts_bundle.recommend_tts_bundle([GPUInfo("NVIDIA GeForce GTX 1060", 6.0)]).key == "gpt_sovits_v2pro"
     assert tts_bundle.recommend_tts_bundle([GPUInfo("NVIDIA GeForce GTX 1060", 5.96)]).key == "gpt_sovits_v2pro"
     assert tts_bundle.recommend_tts_bundle([GPUInfo("NVIDIA GeForce RTX 4070", 12.0)]).key == "gpt_sovits_v2pro"
@@ -472,7 +478,169 @@ def test_tts_bundle_recommends_gptsovits_for_capable_nvidia() -> None:
 
 
 def test_tts_bundle_label_includes_approx_size() -> None:
-    assert tts_bundle.format_bundle_label(tts_bundle.GPT_SOVITS_NVIDIA50).endswith("（约 8.8 GB）")
+    assert tts_bundle.format_bundle_label(tts_bundle.GPT_SOVITS_NVIDIA50).endswith("（约 8.8 GB，仅 Windows）")
+
+
+def test_tts_bundle_filters_incompatible_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "darwin")
+
+    assert tts_bundle.compatible_tts_bundles() == (tts_bundle.GPT_SOVITS_MACOS_INSTALLER,)
+    assert tts_bundle.recommend_tts_bundle([]) == tts_bundle.GPT_SOVITS_MACOS_INSTALLER
+    assert "GPT-SoVITS macOS" in tts_bundle.format_gpu_summary([])
+
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
+
+    assert tts_bundle.GPT_SOVITS_MACOS_INSTALLER not in tts_bundle.compatible_tts_bundles()
+    assert tts_bundle.GENIE_TTS in tts_bundle.compatible_tts_bundles()
+    assert tts_bundle.GPT_SOVITS_STANDARD in tts_bundle.compatible_tts_bundles()
+
+
+def test_tts_bundle_rejects_incompatible_platform_before_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_bundle.sys, "platform", "darwin")
+    root = _runtime_root("bundle_incompatible_platform")
+
+    def fail_urlopen(_request, _timeout: int):  # type: ignore[no-untyped-def]
+        raise AssertionError("平台不兼容时不应开始下载")
+
+    with pytest.raises(RuntimeError, match="不支持当前平台"):
+        download_and_extract_bundle(
+            tts_bundle.GPT_SOVITS_STANDARD,
+            root,
+            urlopen=fail_urlopen,
+            extractor=lambda *_args: None,
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
+def test_tts_bundle_runs_script_installer_and_returns_runtime_paths() -> None:
+    root = _runtime_root("bundle_script_installer")
+    script = root / "fake_installer.sh"
+    script.write_text(
+        """#!/bin/bash
+set -e
+install_root="$1"
+echo "::sakura-progress status=install progress=50"
+mkdir -p "$install_root/GPT-SoVITS/GPT_SoVITS/configs"
+mkdir -p "$install_root/miniforge3/envs/gpt-sovits310/bin"
+echo "fake api" > "$install_root/GPT-SoVITS/api_v2.py"
+echo "custom: {}" > "$install_root/GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml"
+echo '#!/bin/sh' > "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
+chmod +x "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    entry = TTSBundleEntry(
+        key="script_demo",
+        label="Script Demo",
+        provider="custom-gpt-sovits",
+        install_method="script",
+        installer_script="fake_installer.sh",
+        work_dir_name="GPT-SoVITS",
+        python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
+        tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
+    )
+    progress: list[int] = []
+    statuses: list[str] = []
+
+    result = install_tts_bundle(entry, root, on_progress=progress.append, on_status=statuses.append)
+
+    assert result.provider == "custom-gpt-sovits"
+    assert result.work_dir == (
+        root / "data" / "tts_bundles" / "installed" / entry.key / "GPT-SoVITS"
+    ).resolve()
+    assert result.python_path == (
+        root / "data" / "tts_bundles" / "installed" / entry.key / "miniforge3/envs/gpt-sovits310/bin/python"
+    ).resolve()
+    assert result.tts_config_path == (
+        root
+        / "data"
+        / "tts_bundles"
+        / "installed"
+        / entry.key
+        / "GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml"
+    ).resolve()
+    assert "install" in statuses
+    assert 50 in progress
+    assert progress[-1] == 100
+    assert not (root / "data" / "tts_bundles" / "tmp" / entry.key).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
+def test_tts_bundle_script_installer_cleans_tmp_dir_on_failure() -> None:
+    root = _runtime_root("bundle_script_installer_failure")
+    script = root / "fake_installer_failure.sh"
+    script.write_text(
+        """#!/bin/bash
+set -e
+install_root="$1"
+mkdir -p "$install_root/GPT-SoVITS"
+echo "partial" > "$install_root/GPT-SoVITS/api_v2.py"
+echo "boom"
+exit 1
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    entry = TTSBundleEntry(
+        key="script_failure",
+        label="Script Failure",
+        provider="custom-gpt-sovits",
+        install_method="script",
+        installer_script="fake_installer_failure.sh",
+        work_dir_name="GPT-SoVITS",
+        python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
+        tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
+    )
+
+    with pytest.raises(RuntimeError, match="安装失败"):
+        install_tts_bundle(entry, root)
+
+    assert not (root / "data" / "tts_bundles" / "tmp" / entry.key).exists()
+    assert not (root / "data" / "tts_bundles" / "installed" / entry.key).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
+def test_tts_bundle_script_installer_preserves_existing_install_on_failure() -> None:
+    root = _runtime_root("bundle_script_installer_preserve_existing")
+    entry = TTSBundleEntry(
+        key="script_existing",
+        label="Script Existing",
+        provider="custom-gpt-sovits",
+        install_method="script",
+        installer_script="fake_installer_failure.sh",
+        work_dir_name="GPT-SoVITS",
+        python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
+        tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
+    )
+    installed_dir = root / "data" / "tts_bundles" / "installed" / entry.key
+    (installed_dir / "GPT-SoVITS/GPT_SoVITS/configs").mkdir(parents=True, exist_ok=True)
+    (installed_dir / "miniforge3/envs/gpt-sovits310/bin").mkdir(parents=True, exist_ok=True)
+    (installed_dir / "GPT-SoVITS/api_v2.py").write_text("existing", encoding="utf-8")
+    (installed_dir / "GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml").write_text(
+        "custom: {}\n",
+        encoding="utf-8",
+    )
+    (installed_dir / "miniforge3/envs/gpt-sovits310/bin/python").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    script = root / "fake_installer_failure.sh"
+    script.write_text(
+        """#!/bin/bash
+set -e
+install_root="$1"
+mkdir -p "$install_root/GPT-SoVITS"
+echo "partial" > "$install_root/GPT-SoVITS/api_v2.py"
+exit 1
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="安装失败"):
+        install_tts_bundle(entry, root)
+
+    assert not (root / "data" / "tts_bundles" / "tmp" / entry.key).exists()
+    assert (installed_dir / "GPT-SoVITS/api_v2.py").read_text(encoding="utf-8") == "existing"
 
 
 def test_extract_archive_prefers_py7zz(monkeypatch: pytest.MonkeyPatch) -> None:
