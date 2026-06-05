@@ -513,6 +513,32 @@ def test_pet_window_loads_normalized_portrait_scale_percent() -> None:
     assert MinimalWindow({"portrait_scale_percent": 180})._load_portrait_scale_percent() == 150
 
 
+def test_stage_size_shrinks_with_portrait_scale_below_default_height() -> None:
+    from app.ui.pet_window import _stage_size_for_portrait_scale_percent, MIN_STAGE_HEIGHT
+
+    # scale=100 → 默认 640px，不受影响
+    width, height = _stage_size_for_portrait_scale_percent(100)
+    assert width == 860
+    assert height == 640
+
+    # scale=65 → 640*0.65 = 416，触及下限 420
+    _, height = _stage_size_for_portrait_scale_percent(65)
+    assert height == MIN_STAGE_HEIGHT
+
+    # scale=50 → 640*0.5 = 320，下限保护
+    _, height = _stage_size_for_portrait_scale_percent(50)
+    assert height == MIN_STAGE_HEIGHT
+
+    # scale=150 → 640*1.5 = 960，正常放大
+    _, height = _stage_size_for_portrait_scale_percent(150)
+    assert height == 960
+
+    # 宽度始终固定 860，不随缩放变化
+    for percent in (50, 65, 100, 150):
+        width, _ = _stage_size_for_portrait_scale_percent(percent)
+        assert width == 860
+
+
 def test_pet_window_loads_normalized_subtitle_display_speed() -> None:
     from app.ui.pet_window import PetWindow
 

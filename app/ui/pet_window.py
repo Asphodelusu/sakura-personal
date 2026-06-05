@@ -155,6 +155,9 @@ REPLY_HISTORY_PREVIOUS_SYMBOL = "▲"
 REPLY_HISTORY_NEXT_SYMBOL = "▼"
 DEFAULT_STAGE_WIDTH = 860
 DEFAULT_STAGE_HEIGHT = 640
+# 立绘缩放时碰撞箱高度下限：底部 UI 区（气泡 128 + 输入框 52 + 间距 94 = 274px）
+# 加上立绘顶部约 146px 可见区，合计 ~420px。
+MIN_STAGE_HEIGHT = 420
 
 
 def _message_box_theme(parent: QWidget | None, theme_settings: ThemeSettings | None) -> ThemeSettings:
@@ -3204,7 +3207,7 @@ def _stage_size_for_portrait_scale_percent(portrait_scale_percent: int) -> tuple
     scale = normalize_portrait_scale_percent(portrait_scale_percent) / 100
     return (
         DEFAULT_STAGE_WIDTH,
-        max(DEFAULT_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
+        max(MIN_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
     )
 
 
