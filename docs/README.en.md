@@ -1,10 +1,10 @@
-[中文](README.md)
+[中文](../README.md)
 
 # Sakura Desktop Pet
 
 A desktop companion Agent — chats, changes expressions, speaks, remembers what you allow, and helps with tasks after confirmation. It is not just a "desktop pet + chat" but a desktop companion Agent.
 
-![Sakura Preview](_pet_style_preview.png)
+![Sakura Preview](../assets/sakura_01.png)
 
 ## Quick Start
 
