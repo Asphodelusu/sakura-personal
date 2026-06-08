@@ -330,6 +330,8 @@ def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch)
 
     monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
     monkeypatch.setattr("app.voice.tts.subprocess.Popen", fake_popen)
+    # TCP 探测成功后还会做 HTTP 探测，这里 mock 掉避免真实网络请求
+    monkeypatch.setattr("app.voice.tts._probe_gpt_sovits_http", lambda *_: True)
 
     assert GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
     assert messages == []
@@ -410,6 +412,8 @@ def test_tts_service_waits_past_thirty_seconds_for_slow_gptsovits_start(monkeypa
     monkeypatch.setattr("app.voice.tts.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
     monkeypatch.setattr("app.voice.tts.time.monotonic", lambda: elapsed)
     monkeypatch.setattr("app.voice.tts.time.sleep", fake_sleep)
+    # TCP 探测成功后还会做 HTTP 探测，这里 mock 掉避免真实网络请求
+    monkeypatch.setattr("app.voice.tts._probe_gpt_sovits_http", lambda *_: True)
     monkeypatch.setattr(
         "app.voice.tts.debug_log",
         lambda _category, message, data=None: debug_messages.append((message, data)),
