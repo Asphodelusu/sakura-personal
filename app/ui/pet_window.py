@@ -107,6 +107,18 @@ from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
     normalize_portrait_scale_percent,
 )
+from app.ui.control_panel_layout import (
+    CONTROL_PANEL_BOTTOM_MARGIN,
+    CONTROL_PANEL_GAP,
+    DEFAULT_BUBBLE_HEIGHT,
+    DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+    DEFAULT_CONTROL_PANEL_WIDTH,
+    INPUT_BAR_HEIGHT,
+    MIN_CONTROL_PANEL_WIDTH,
+    normalize_bubble_height,
+    normalize_control_panel_vertical_offset,
+    normalize_control_panel_width,
+)
 from app.ui.subtitle_controller import (
     REPLY_SEGMENT_PAUSE_MS,
     SPEECH_TYPING_INTERVAL_MS,
@@ -376,11 +388,18 @@ class PetWindow(QWidget):
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
         self.portrait_scale_percent = self._load_portrait_scale_percent()
+        self.control_panel_width = self._load_control_panel_width()
+        self.bubble_height = self._load_bubble_height()
+        self.control_panel_vertical_offset = self._load_control_panel_vertical_offset()
         (
             self.subtitle_typing_interval_ms,
             self.reply_segment_pause_ms,
         ) = self._load_subtitle_display_speed()
-        self.stage_size = _stage_size_for_portrait_scale_percent(self.portrait_scale_percent)
+        self.stage_size = _stage_size_for_layout(
+            self.portrait_scale_percent,
+            self.control_panel_width,
+            self.bubble_height,
+        )
         self.pending_tool_action: PendingToolAction | None = None
         self.pending_manual_screen_observation: ScreenObservation | None = None
         self.manual_screenshot_overlay: ManualScreenshotOverlay | None = None
@@ -1130,16 +1149,22 @@ class PetWindow(QWidget):
             max(0, height - transition_height - 62),
         )
 
-        bubble_width = min(640, width - 96)
-        bubble_height = 128
-        input_height = 52
-        input_gap = 10
+        bubble_width = min(self.control_panel_width, max(MIN_CONTROL_PANEL_WIDTH, width - 32))
+        bubble_height = self.bubble_height
         bubble_x = (width - bubble_width) // 2
-        bubble_y = height - bubble_height - input_height - input_gap - 84
+        # vertical_offset 正值向上抬升整组（减小 y），负值向下沉。
+        bubble_y = (
+            height
+            - bubble_height
+            - INPUT_BAR_HEIGHT
+            - CONTROL_PANEL_GAP
+            - CONTROL_PANEL_BOTTOM_MARGIN
+            - self.control_panel_vertical_offset
+        )
         self._bubble_local_rect = QRect(bubble_x, bubble_y, bubble_width, bubble_height)
 
-        input_y = bubble_y + bubble_height + input_gap
-        self._input_local_rect = QRect(bubble_x, input_y, bubble_width, input_height)
+        input_y = bubble_y + bubble_height + CONTROL_PANEL_GAP
+        self._input_local_rect = QRect(bubble_x, input_y, bubble_width, INPUT_BAR_HEIGHT)
         self._reposition_child_windows()
 
     def _reposition_child_windows(self) -> None:
@@ -2964,21 +2989,43 @@ class PetWindow(QWidget):
             getattr(self.plugin_manager, "settings_panels", []),
             parent=self,
             portrait_scale_percent=self.portrait_scale_percent,
+            control_panel_width=self.control_panel_width,
+            bubble_height=self.bubble_height,
+            control_panel_vertical_offset=self.control_panel_vertical_offset,
             subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
             reply_segment_pause_ms=self.reply_segment_pause_ms,
             theme_settings=getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS),
             startup_settings=getattr(self, "startup_settings", StartupSettings()),
             bubble_settings=getattr(self, "bubble_settings", BubbleSettings()),
+            on_control_panel_layout_preview=self._preview_control_panel_layout,
         )
         self.settings_dialog = dialog
         # 始终置顶，避免被桌宠卡片（同为置顶窗口）盖住。
         _mark_dialog_always_on_top(dialog)
+        # 记录打开前的控制组布局，便于取消时回滚实时预览。
+        original_control_panel_layout = (
+            self.control_panel_width,
+            self.bubble_height,
+            self.control_panel_vertical_offset,
+        )
+        # 设置期间保持气泡常显并停掉自动隐藏倒计时，方便实时观察调整效果。
+        bubble_auto_hide = getattr(self, "bubble_auto_hide", None)
+        if bubble_auto_hide is not None:
+            bubble_auto_hide.notify_speaking()
         try:
             dialog_result = dialog.exec()
         finally:
             if getattr(self, "settings_dialog", None) is dialog:
                 self.settings_dialog = None
+            # 关闭设置后恢复气泡自动隐藏计时（开关关闭时控制器空转）。
+            if bubble_auto_hide is not None:
+                bubble_auto_hide.notify_settled()
         if dialog_result != QDialog.DialogCode.Accepted:
+            # 取消/关闭：回滚到打开前的布局，撤销实时预览的改动。
+            self._apply_control_panel_layout(
+                *original_control_panel_layout,
+                persist=False,
+            )
             return
         result_subtitle_typing_interval_ms = getattr(
             dialog,
@@ -3005,6 +3052,17 @@ class PetWindow(QWidget):
             dialog,
             "result_bubble_settings",
             getattr(self, "bubble_settings", BubbleSettings()),
+        )
+        result_control_panel_width = getattr(
+            dialog, "result_control_panel_width", self.control_panel_width
+        )
+        result_bubble_height = getattr(
+            dialog, "result_bubble_height", self.bubble_height
+        )
+        result_control_panel_vertical_offset = getattr(
+            dialog,
+            "result_control_panel_vertical_offset",
+            self.control_panel_vertical_offset,
         )
         if (
             dialog.result_api_settings is None
@@ -3088,6 +3146,11 @@ class PetWindow(QWidget):
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
         self._apply_portrait_scale_percent(dialog.result_portrait_scale_percent)
+        self._apply_control_panel_layout(
+            result_control_panel_width,
+            result_bubble_height,
+            result_control_panel_vertical_offset,
+        )
         self._apply_subtitle_display_speed(
             result_subtitle_typing_interval_ms,
             result_reply_segment_pause_ms,
@@ -3419,6 +3482,27 @@ class PetWindow(QWidget):
             system_values.get("portrait_scale_percent", PORTRAIT_SCALE_DEFAULT_PERCENT)
         )
 
+    def _load_control_panel_width(self) -> int:
+        system_values = self._load_system_config_values("ui")
+        return normalize_control_panel_width(
+            system_values.get("control_panel_width", DEFAULT_CONTROL_PANEL_WIDTH)
+        )
+
+    def _load_bubble_height(self) -> int:
+        system_values = self._load_system_config_values("ui")
+        return normalize_bubble_height(
+            system_values.get("bubble_height", DEFAULT_BUBBLE_HEIGHT)
+        )
+
+    def _load_control_panel_vertical_offset(self) -> int:
+        system_values = self._load_system_config_values("ui")
+        return normalize_control_panel_vertical_offset(
+            system_values.get(
+                "control_panel_vertical_offset",
+                DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+            )
+        )
+
     def _load_subtitle_display_speed(self) -> tuple[int, int]:
         system_values = self._load_system_config_values("ui")
         return normalize_subtitle_display_speed(
@@ -3530,10 +3614,72 @@ class PetWindow(QWidget):
 
     def _apply_portrait_scale_percent(self, portrait_scale_percent: int) -> None:
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
-        self.stage_size = _stage_size_for_portrait_scale_percent(self.portrait_scale_percent)
+        self.stage_size = _stage_size_for_layout(
+            self.portrait_scale_percent,
+            self.control_panel_width,
+            self.bubble_height,
+        )
         self.portrait_controller.set_stage_size(self.stage_size)
         self.portrait_controller.set_portrait_scale_percent(self.portrait_scale_percent)
         self.portrait_controller.apply_current()
+
+    def _apply_control_panel_layout(
+        self,
+        control_panel_width: object,
+        bubble_height: object,
+        vertical_offset: object,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """应用控制组宽度/气泡高度/上下偏移：归一化 → 更新状态 → 重算舞台并重新布局，可选持久化。"""
+        next_width = normalize_control_panel_width(control_panel_width)
+        next_bubble_height = normalize_bubble_height(bubble_height)
+        next_offset = normalize_control_panel_vertical_offset(vertical_offset)
+        changed = (
+            next_width != self.control_panel_width
+            or next_bubble_height != self.bubble_height
+            or next_offset != self.control_panel_vertical_offset
+        )
+        self.control_panel_width = next_width
+        self.bubble_height = next_bubble_height
+        self.control_panel_vertical_offset = next_offset
+        self.stage_size = _stage_size_for_layout(
+            self.portrait_scale_percent,
+            self.control_panel_width,
+            self.bubble_height,
+        )
+        self.portrait_controller.set_stage_size(self.stage_size)
+        self.resize(*self.stage_size)
+        self._layout_stage()
+        if changed and persist:
+            self._save_control_panel_layout()
+
+    def _save_control_panel_layout(self) -> None:
+        try:
+            self._save_system_config_values(
+                "ui",
+                {
+                    "control_panel_width": self.control_panel_width,
+                    "bubble_height": self.bubble_height,
+                    "control_panel_vertical_offset": self.control_panel_vertical_offset,
+                },
+            )
+        except OSError as exc:
+            debug_log("PetWindow", "保存控制组布局失败", {"error": str(exc)})
+
+    def _preview_control_panel_layout(
+        self,
+        control_panel_width: object,
+        bubble_height: object,
+        vertical_offset: object,
+    ) -> None:
+        """设置对话框滑块拖动时的实时预览：立即应用到界面但不持久化。"""
+        self._apply_control_panel_layout(
+            control_panel_width,
+            bubble_height,
+            vertical_offset,
+            persist=False,
+        )
 
     def _apply_subtitle_display_speed(
         self,
@@ -3910,12 +4056,30 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _stage_size_for_portrait_scale_percent(portrait_scale_percent: int) -> tuple[int, int]:
+def _stage_size_for_layout(
+    portrait_scale_percent: int,
+    control_panel_width: object = DEFAULT_CONTROL_PANEL_WIDTH,
+    bubble_height: object = DEFAULT_BUBBLE_HEIGHT,
+) -> tuple[int, int]:
+    """按立绘缩放、控制组宽度、气泡高度计算舞台（主窗口）尺寸。
+
+    宽度：以默认舞台宽度（860）保底；控制组加宽时随之扩展，保证气泡水平居中不越界。
+    高度：沿用按立绘缩放的高度，并叠加气泡相对默认高度的增量，使气泡变高时舞台同步增高。
+    """
     scale = normalize_portrait_scale_percent(portrait_scale_percent) / 100
-    return (
-        DEFAULT_STAGE_WIDTH,
-        max(MIN_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
+    panel_width = normalize_control_panel_width(control_panel_width)
+    normalized_bubble_height = normalize_bubble_height(bubble_height)
+    width = max(DEFAULT_STAGE_WIDTH, panel_width + 96)
+    height = max(
+        MIN_STAGE_HEIGHT,
+        round(DEFAULT_STAGE_HEIGHT * scale) + normalized_bubble_height - DEFAULT_BUBBLE_HEIGHT,
     )
+    return width, height
+
+
+def _stage_size_for_portrait_scale_percent(portrait_scale_percent: int) -> tuple[int, int]:
+    """兼容旧调用：按默认控制组宽度与气泡高度计算舞台尺寸。"""
+    return _stage_size_for_layout(portrait_scale_percent)
 
 
 def _is_screen_change_event(event: object) -> bool:

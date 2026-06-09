@@ -975,6 +975,75 @@ def test_stage_size_shrinks_with_portrait_scale_below_default_height() -> None:
         assert width == 860
 
 
+def test_control_panel_layout_normalization() -> None:
+    from app.ui.control_panel_layout import (
+        DEFAULT_BUBBLE_HEIGHT,
+        DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+        DEFAULT_CONTROL_PANEL_WIDTH,
+        MAX_BUBBLE_HEIGHT,
+        MAX_CONTROL_PANEL_VERTICAL_OFFSET,
+        MAX_CONTROL_PANEL_WIDTH,
+        MIN_BUBBLE_HEIGHT,
+        MIN_CONTROL_PANEL_VERTICAL_OFFSET,
+        MIN_CONTROL_PANEL_WIDTH,
+        normalize_bubble_height,
+        normalize_control_panel_vertical_offset,
+        normalize_control_panel_width,
+    )
+
+    # 非法输入回退默认值
+    assert normalize_control_panel_width("invalid") == DEFAULT_CONTROL_PANEL_WIDTH
+    assert normalize_bubble_height(None) == DEFAULT_BUBBLE_HEIGHT
+    assert normalize_control_panel_vertical_offset("x") == DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET
+
+    # 越界裁剪到上下限
+    assert normalize_control_panel_width(1) == MIN_CONTROL_PANEL_WIDTH
+    assert normalize_control_panel_width(9999) == MAX_CONTROL_PANEL_WIDTH
+    assert normalize_bubble_height(1) == MIN_BUBBLE_HEIGHT
+    assert normalize_bubble_height(9999) == MAX_BUBBLE_HEIGHT
+    assert normalize_control_panel_vertical_offset(-9999) == MIN_CONTROL_PANEL_VERTICAL_OFFSET
+    assert normalize_control_panel_vertical_offset(9999) == MAX_CONTROL_PANEL_VERTICAL_OFFSET
+
+    # 合法值（含字符串/0/负值）原样保留
+    assert normalize_control_panel_width(512) == 512
+    assert normalize_control_panel_width("700") == 700
+    assert normalize_bubble_height(180) == 180
+    assert normalize_control_panel_vertical_offset(40) == 40
+    assert normalize_control_panel_vertical_offset(-40) == -40
+    assert normalize_control_panel_vertical_offset(0) == 0
+
+
+def test_stage_size_for_layout_respects_panel_and_bubble() -> None:
+    from app.ui.pet_window import DEFAULT_STAGE_WIDTH, _stage_size_for_layout
+    from app.ui.control_panel_layout import (
+        DEFAULT_BUBBLE_HEIGHT,
+        DEFAULT_CONTROL_PANEL_WIDTH,
+        MAX_CONTROL_PANEL_WIDTH,
+        MIN_CONTROL_PANEL_WIDTH,
+    )
+
+    # 默认参数：宽度保底为默认舞台宽度 860，高度 640
+    width, height = _stage_size_for_layout(
+        100, DEFAULT_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT
+    )
+    assert width == DEFAULT_STAGE_WIDTH
+    assert height == 640
+
+    # 控制组加宽到上限：舞台宽度扩展为 panel + 96
+    wide_width, _ = _stage_size_for_layout(100, MAX_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT)
+    assert wide_width == MAX_CONTROL_PANEL_WIDTH + 96
+
+    # 控制组窄于默认时仍保底 860
+    narrow_width, _ = _stage_size_for_layout(100, MIN_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT)
+    assert narrow_width == DEFAULT_STAGE_WIDTH
+
+    # 气泡变高：舞台高度随气泡增量同步增高
+    _, taller = _stage_size_for_layout(
+        100, DEFAULT_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT + 60
+    )
+    assert taller == 640 + 60
+
+
 def test_pet_window_defaults_subtitle_language_to_chinese() -> None:
     from app.ui.pet_window import PetWindow, SUBTITLE_LANGUAGE_JA, SUBTITLE_LANGUAGE_ZH
 
@@ -4646,6 +4715,95 @@ def test_settings_dialog_returns_portrait_scale_percent() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_returns_control_panel_layout() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("control_panel_layout_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        control_panel_width=600,
+        bubble_height=150,
+        control_panel_vertical_offset=30,
+    )
+
+    # 构造时把当前值回填到控件
+    assert dialog.control_panel_width_spin.value() == 600
+    assert dialog.bubble_height_spin.value() == 150
+    assert dialog.control_panel_offset_spin.value() == 30
+
+    # 修改后 accept 回收归一化结果
+    dialog.control_panel_width_spin.setValue(720)
+    dialog.bubble_height_spin.setValue(200)
+    dialog.control_panel_offset_spin.setValue(-40)
+    dialog.accept()
+
+    assert dialog.result_control_panel_width == 720
+    assert dialog.result_bubble_height == 200
+    assert dialog.result_control_panel_vertical_offset == -40
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_emits_control_panel_layout_preview() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("control_panel_preview_dialog")
+    previews: list[tuple[int, int, int]] = []
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        control_panel_width=600,
+        bubble_height=150,
+        control_panel_vertical_offset=0,
+        on_control_panel_layout_preview=lambda w, h, o: previews.append((w, h, o)),
+    )
+
+    # 构造时的初始 setValue 不应触发预览（信号连接在赋值之后）
+    assert previews == []
+
+    # 修改某个滑块即实时触发预览，参数为当前三项取值
+    dialog.bubble_height_spin.setValue(180)
+    assert previews
+    assert previews[-1] == (600, 180, 0)
+
+    dialog.control_panel_width_spin.setValue(720)
+    assert previews[-1] == (720, 180, 0)
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_returns_subtitle_display_speed() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -6728,6 +6886,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     class MinimalSettingsWindow:
         show_settings = pet_window_cls.show_settings
         _activate_settings_dialog = pet_window_cls._activate_settings_dialog
+        _preview_control_panel_layout = pet_window_cls._preview_control_panel_layout
         _retire_tts_provider = pet_window_cls._retire_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings
@@ -6738,6 +6897,18 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
 
         def _apply_portrait_scale_percent(self, percent: int) -> None:
             self.portrait_scale_percent = percent
+
+        def _apply_control_panel_layout(  # type: ignore[no-untyped-def]
+            self,
+            control_panel_width,
+            bubble_height,
+            vertical_offset,
+            *,
+            persist: bool = True,
+        ) -> None:
+            self.control_panel_width = control_panel_width
+            self.bubble_height = bubble_height
+            self.control_panel_vertical_offset = vertical_offset
 
         def _sync_proactive_care_timer(self) -> None:
             pass
@@ -6764,6 +6935,9 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.memory_store = memory_store
     window.plugin_manager = PluginManagerStub()
     window.portrait_scale_percent = 100
+    window.control_panel_width = 640
+    window.bubble_height = 128
+    window.control_panel_vertical_offset = 0
     window.subtitle_typing_interval_ms = 35
     window.reply_segment_pause_ms = 100
     window.retired_tts_providers = []

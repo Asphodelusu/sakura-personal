@@ -396,6 +396,37 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget, QComboBox {{
     color: {theme.text_color};
     selection-background-color: {rgba(theme.primary_color, 71)};
 }}
+QSlider {{
+    min-height: 22px;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {rgba(theme.border_color, 130)};
+    border-radius: 2px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {theme.accent_color};
+    border-radius: 2px;
+}}
+QSlider::add-page:horizontal {{
+    background: {rgba(theme.border_color, 92)};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 7px;
+    background: {theme.accent_color};
+    border: 2px solid {rgba(theme.input_background_color, 235)};
+}}
+QSlider::handle:horizontal:hover {{
+    background: {theme.primary_color};
+}}
+QSlider::handle:horizontal:disabled {{
+    background: {rgba(theme.muted_text_color, 130)};
+    border: 2px solid {rgba(theme.border_color, 92)};
+}}
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTextEdit:disabled, QComboBox:disabled {{
     background: {rgba(mix(theme.panel_background_color, "#808080", 0.16), 172)};
     border: 1px solid {rgba(mix(theme.border_color, "#808080", 0.28), 102)};
