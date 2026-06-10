@@ -83,7 +83,9 @@ from app.voice.tts import (
     _load_tone_references,
     _local_tts_subprocess_env,
     _resolve_request_text_lang,
+    _resolve_tts_cache_dir,
     _write_genie_audio,
+    purge_tts_cache,
 )
 from app.voice import VoicePlaybackController
 from app.voice.text_language_guard import should_skip_tts_text
@@ -1543,3 +1545,31 @@ def test_playback_backend_is_configurable() -> None:
     sink_settings = dc_replace(settings, playback_backend=TTS_PLAYBACK_BACKEND_AUDIO_SINK)
     sink_provider = GPTSoVITSTTSProvider(sink_settings)
     assert sink_provider._playback_backend == TTS_PLAYBACK_BACKEND_AUDIO_SINK
+
+
+# === 新增：TTS 缓存目录（data/cache/tts）测试 ===
+
+def test_resolve_tts_cache_dir_creates_data_cache_tts() -> None:
+    """缓存目录应位于 base_dir/data/cache/tts 且被自动创建。"""
+    root = _runtime_root("tts_cache_resolve")
+
+    cache_dir = _resolve_tts_cache_dir(root)
+
+    assert cache_dir == root / "data" / "cache" / "tts"
+    assert cache_dir.is_dir()
+
+
+def test_purge_tts_cache_removes_residual_files_keeps_dir() -> None:
+    """启动清理应删除残留临时文件，但保留缓存目录与其中的子目录。"""
+    root = _runtime_root("tts_cache_purge")
+    cache_dir = _resolve_tts_cache_dir(root)
+    (cache_dir / "sakura_tts_a.wav").write_bytes(b"x")
+    (cache_dir / "sakura_genie_tts_b.wav").write_bytes(b"y")
+    sub_dir = cache_dir / "keep"
+    sub_dir.mkdir()
+
+    purge_tts_cache(root)
+
+    assert cache_dir.is_dir()
+    assert sub_dir.is_dir()  # 非文件项不应被删除
+    assert not any(entry.is_file() for entry in cache_dir.iterdir())

@@ -58,6 +58,35 @@ _SUPPORTED_TTS_PROVIDERS = {
 }
 
 
+def _resolve_tts_cache_dir(base_dir: Path | None = None) -> Path:
+    """返回 TTS 临时音频缓存目录（data/cache/tts），并确保存在。
+
+    不再写入系统 Temp，改用 Sakura 自有数据目录，便于集中管理与启动清理。
+    base_dir 为空时基于 __file__ 推算项目根（app/voice/tts.py → 项目根），
+    与 main.py 的路径惯例一致。
+    """
+    root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parents[2]
+    cache_dir = root / "data" / "cache" / "tts"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def purge_tts_cache(base_dir: Path | None = None) -> None:
+    """启动时清空 data/cache/tts 残留（崩溃/强退遗留的临时 wav）。
+
+    该目录完全归 Sakura 所有、仅存放 TTS 临时音频，清空安全。
+    逐个删除并忽略个别占用错误，不影响启动。
+    """
+    cache_dir = _resolve_tts_cache_dir(base_dir)
+    for entry in cache_dir.iterdir():
+        if not entry.is_file():
+            continue
+        try:
+            entry.unlink()
+        except OSError as exc:
+            debug_log("TTS", "启动清理缓存文件失败，已跳过", {"path": str(entry), "error": str(exc)})
+
+
 @dataclass
 class TTSPreparedAudio:
     """一段已提交预生成的 TTS 音频句柄。"""
@@ -364,11 +393,16 @@ class GPTSoVITSTTSProvider(QObject):
         self,
         settings: GPTSoVITSTTSSettings,
         *,
+        base_dir: Path | None = None,
         adopt_existing_service: bool = True,
     ) -> None:
         super().__init__()
         settings.validate()
         self.settings = settings
+        # TTS 临时音频缓存目录（data/cache/tts）。由调用方注入 base_dir，
+        # 与启动清理 purge_tts_cache(base_dir) 同源，避免写入目录与清理目录错位。
+        # base_dir 为空时退回 _resolve_tts_cache_dir 的 __file__ 推算，保持向后兼容。
+        self._tts_cache_dir = _resolve_tts_cache_dir(base_dir)
         self._pending_audio: list[
             tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None]
         ] = []
@@ -693,6 +727,7 @@ class GPTSoVITSTTSProvider(QObject):
                 prefix="sakura_tts_",
                 suffix=".wav",
                 delete=False,
+                dir=str(self._tts_cache_dir),
             ) as audio_file:
                 audio_file.write(audio_data)
                 audio_path = audio_file.name
@@ -1523,9 +1558,14 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         self,
         settings: GPTSoVITSTTSSettings,
         *,
+        base_dir: Path | None = None,
         adopt_existing_service: bool = True,
     ) -> None:
-        super().__init__(settings, adopt_existing_service=adopt_existing_service)
+        super().__init__(
+            settings,
+            base_dir=base_dir,
+            adopt_existing_service=adopt_existing_service,
+        )
         self._loaded_character_name: str | None = None
         self._reference_audio_key: str | None = None
 
@@ -1585,6 +1625,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
                 prefix="sakura_genie_tts_",
                 suffix=".wav",
                 delete=False,
+                dir=str(self._tts_cache_dir),
             ) as audio_file:
                 audio_path = Path(audio_file.name)
             try:

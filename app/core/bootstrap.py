@@ -27,6 +27,7 @@ from app.voice.tts import (
     NullTTSProvider,
     TTSConfigError,
     TTSProvider,
+    purge_tts_cache,
 )
 from app.storage.visual_observation import VisualObservationStore
 from app.core.plugin_manager import SakuraPluginManager
@@ -213,6 +214,12 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
     settings_service = context.settings_service
     character_profile = context.character_profile
 
+    # 启动时清空 data/cache/tts 残留（崩溃/强退遗留的临时 wav），失败不影响启动
+    try:
+        purge_tts_cache(base_dir)
+    except OSError as exc:
+        debug_log("Startup", "TTS 缓存启动清理失败，已忽略", {"error": str(exc)})
+
     try:
         tts_settings = settings_service.load_tts_settings(
             character_profile=character_profile,
@@ -220,9 +227,9 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
         if not tts_settings.enabled:
             tts_provider = NullTTSProvider()
         elif tts_settings.provider == TTS_PROVIDER_GENIE:
-            tts_provider = GenieTTSProvider(tts_settings)
+            tts_provider = GenieTTSProvider(tts_settings, base_dir=base_dir)
         else:
-            tts_provider = GPTSoVITSTTSProvider(tts_settings)
+            tts_provider = GPTSoVITSTTSProvider(tts_settings, base_dir=base_dir)
     except TTSConfigError as exc:
         print(f"[TTS] 配置无效，已禁用 TTS：{exc}")
         debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})

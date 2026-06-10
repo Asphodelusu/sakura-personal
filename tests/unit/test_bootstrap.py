@@ -51,6 +51,7 @@ def test_build_deferred_services_loads_injectable_runtime_services(
     context = bootstrap.build_initial_app_context(root)
     tts_provider = object()
     mcp_provider = object()
+    provider_base_dirs: list[Path | None] = []
 
     monkeypatch.setattr(
         type(context.settings_service),
@@ -66,7 +67,11 @@ def test_build_deferred_services_loads_injectable_runtime_services(
             timeout_seconds=1,
         ),
     )
-    monkeypatch.setattr(bootstrap, "GPTSoVITSTTSProvider", lambda _settings: tts_provider)
+    def fake_gpt_provider(_settings, *, base_dir: Path | None = None):  # type: ignore[no-untyped-def]
+        provider_base_dirs.append(base_dir)
+        return tts_provider
+
+    monkeypatch.setattr(bootstrap, "GPTSoVITSTTSProvider", fake_gpt_provider)
 
     def fake_load_plugins(self, registry):  # type: ignore[no-untyped-def]
         registry.register(Tool(name="plugin_demo", description="plugin"))
@@ -85,6 +90,7 @@ def test_build_deferred_services_loads_injectable_runtime_services(
     assert services.tool_registry.get("plugin_demo") is not None
     assert services.tool_registry.get("mcp_demo") is not None
     assert services.errors == ()
+    assert provider_base_dirs == [root]
 
 
 def test_build_deferred_services_creates_genie_tts_provider(
@@ -96,6 +102,7 @@ def test_build_deferred_services_creates_genie_tts_provider(
     root = _build_startup_root()
     context = bootstrap.build_initial_app_context(root)
     genie_provider = object()
+    provider_base_dirs: list[Path | None] = []
 
     monkeypatch.setattr(
         type(context.settings_service),
@@ -112,13 +119,18 @@ def test_build_deferred_services_creates_genie_tts_provider(
             timeout_seconds=1,
         ),
     )
-    monkeypatch.setattr(bootstrap, "GenieTTSProvider", lambda _settings: genie_provider)
+    def fake_genie_provider(_settings, *, base_dir: Path | None = None):  # type: ignore[no-untyped-def]
+        provider_base_dirs.append(base_dir)
+        return genie_provider
+
+    monkeypatch.setattr(bootstrap, "GenieTTSProvider", fake_genie_provider)
     monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", lambda *_args: None)
     monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", lambda *_args, **_kwargs: None)
 
     services = bootstrap.build_deferred_services(root, context)
 
     assert services.tts_provider is genie_provider
+    assert provider_base_dirs == [root]
 
 
 def test_build_deferred_services_disables_tts_for_voice_less_character(

@@ -35,6 +35,7 @@ data/runtime_events/
 data/notes/
 data/tts_bundles/
 data/logs/
+data/cache/
 tts/
 data/config/api.yaml
 data/config/characters.yaml
