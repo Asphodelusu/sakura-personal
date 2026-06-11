@@ -88,6 +88,7 @@ from app.platforms.launch_at_login import (
     set_launch_at_login_enabled,
 )
 from app.ui.history_window import HistoryWindow
+from app.ui.log_window import RuntimeLogWindow
 from app.agent.proactive_care import (
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER,
     PROACTIVE_TIMER_DUE_GRACE_SECONDS,
@@ -377,6 +378,7 @@ class PetWindow(QWidget):
         self.tool_registry.set_free_access_enabled(self.free_access_enabled)
         self.always_on_top_enabled = self._load_always_on_top_enabled()
         self.history_window: HistoryWindow | None = None
+        self.runtime_log_window: RuntimeLogWindow | None = None
         self.settings_dialog: SettingsDialog | None = None
         self.messages: list[dict[str, Any]] = []
         self.worker_thread: QThread | None = None
@@ -1116,10 +1118,11 @@ class PetWindow(QWidget):
         self._raise_open_dialogs()
 
     def _raise_open_dialogs(self) -> None:
-        # 设置/历史窗口打开时应始终在桌宠卡片之上，避免说话时被卡片盖住。
+        # 独立窗口打开时应始终在桌宠卡片之上，避免说话时被卡片盖住。
         for dialog in (
             getattr(self, "settings_dialog", None),
             getattr(self, "history_window", None),
+            getattr(self, "runtime_log_window", None),
         ):
             if dialog is not None and dialog.isVisible():
                 dialog.raise_()
@@ -1294,6 +1297,7 @@ class PetWindow(QWidget):
             on_toggle_free_access=self._toggle_free_access,
             on_toggle_always_on_top=self._toggle_always_on_top,
             on_show_history=self.show_history,
+            on_show_runtime_log=self.show_runtime_log,
             on_show_settings=self.show_settings,
         )
 
@@ -2911,6 +2915,19 @@ class PetWindow(QWidget):
         self.history_window.raise_()
         self.history_window.activateWindow()
 
+    @Slot()
+    def show_runtime_log(self) -> None:
+        if self.runtime_log_window is None:
+            self.runtime_log_window = RuntimeLogWindow(
+                theme_settings=self.theme_settings,
+                parent=self,
+            )
+        self.runtime_log_window.set_theme_settings(self.theme_settings)
+        self.runtime_log_window.refresh(reset=True)
+        self.runtime_log_window.show()
+        self.runtime_log_window.raise_()
+        self.runtime_log_window.activateWindow()
+
     def _save_history_to_memory_and_clear(self) -> None:
         if self.memory_curation_thread is not None:
             if self.memory_curation_mode in {"auto", "backfill"}:
@@ -3762,6 +3779,8 @@ class PetWindow(QWidget):
         self._apply_card_window_theme()
         if self.history_window is not None:
             self.history_window.set_theme_settings(self.theme_settings)
+        if self.runtime_log_window is not None:
+            self.runtime_log_window.set_theme_settings(self.theme_settings)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 

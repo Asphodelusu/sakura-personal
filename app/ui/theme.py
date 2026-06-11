@@ -884,6 +884,112 @@ QPushButton#secondaryButton:default {{
 """
 
 
+def build_runtime_log_window_stylesheet(settings: ThemeSettings) -> str:
+    theme = settings.normalized()
+    return f"""
+QDialog {{
+    background: {theme.page_background_color};
+    color: {theme.text_color};
+    font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
+    font-size: 14px;
+}}
+QLabel#runtimeLogTitle {{
+    color: {theme.secondary_text_color};
+    font-size: 22px;
+    font-weight: 700;
+}}
+QLabel#runtimeLogSummary {{
+    color: {theme.muted_text_color};
+    background: {rgba(theme.panel_background_color, 205)};
+    border: 1px solid {rgba(theme.border_color, 122)};
+    border-radius: 11px;
+    padding: 5px 10px;
+    font-size: 13px;
+}}
+QTabWidget#runtimeLogTabs::pane {{
+    background: transparent;
+    border: none;
+}}
+QTabBar::tab {{
+    background: {rgba(theme.input_background_color, 214)};
+    border: 1px solid {rgba(theme.border_color, 132)};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {theme.muted_text_color};
+    padding: 8px 20px;
+    margin-right: 4px;
+    font-size: 14px;
+    font-weight: 700;
+}}
+QTabBar::tab:selected {{
+    background: {rgba(theme.panel_background_color, 245)};
+    color: {theme.secondary_text_color};
+    border: 1px solid {rgba(theme.primary_color, 145)};
+    border-bottom: none;
+}}
+QTabBar::tab:hover {{
+    color: {theme.secondary_text_color};
+    background: {rgba(theme.panel_background_color, 230)};
+}}
+QFrame#runtimeLogPage {{
+    background: {rgba(mix(theme.page_background_color, "#ffffff", 0.12), 238)};
+    border: 1px solid {rgba(theme.border_color, 138)};
+    border-radius: 12px;
+}}
+QListWidget#runtimeLogList {{
+    background: transparent;
+    border: none;
+    outline: 0;
+    color: {theme.text_color};
+    font-size: 13px;
+}}
+QPushButton {{
+    background: {rgba(theme.input_background_color, 230)};
+    border: 1px solid {rgba(theme.border_color, 148)};
+    border-radius: 8px;
+    color: {theme.secondary_text_color};
+    min-width: 72px;
+    padding: 7px 11px;
+    font-size: 14px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background: {rgba(theme.panel_background_color, 245)};
+    border: 1px solid {rgba(theme.primary_color, 158)};
+}}
+QPushButton#dangerButton {{
+    background: #fff1f5;
+    border: 1px solid rgba(199, 88, 122, 0.52);
+    color: #b13e5a;
+}}
+QPushButton#dangerButton:hover {{
+    background: #ffe1ea;
+}}
+QCheckBox {{
+    color: {theme.secondary_text_color};
+    font-size: 13px;
+    spacing: 8px;
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid {rgba(theme.primary_color, 173)};
+    background: {theme.input_background_color};
+}}
+QCheckBox::indicator:hover {{
+    border: 1px solid {rgba(theme.primary_color, 210)};
+    background: {rgba(theme.panel_background_color, 210)};
+}}
+QCheckBox::indicator:checked {{
+    image: url("{_MENU_CHECK_URL}");
+    background: {theme.primary_color};
+    border: 1px solid {theme.accent_color};
+}}
+"""
+
+
 def rgba(hex_color: str, alpha: int) -> str:
     red, green, blue = _rgb(hex_color)
     return f"rgba({red}, {green}, {blue}, {max(0, min(255, alpha))})"
@@ -948,3 +1054,4 @@ def _bool_value(value: object, default: bool) -> bool:
 DEFAULT_PET_WINDOW_STYLESHEET = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
 DEFAULT_SETTINGS_DIALOG_STYLESHEET = build_settings_dialog_stylesheet(DEFAULT_THEME_SETTINGS)
 DEFAULT_HISTORY_WINDOW_STYLESHEET = build_history_window_stylesheet(DEFAULT_THEME_SETTINGS)
+DEFAULT_RUNTIME_LOG_WINDOW_STYLESHEET = build_runtime_log_window_stylesheet(DEFAULT_THEME_SETTINGS)

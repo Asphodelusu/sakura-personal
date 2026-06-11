@@ -82,11 +82,13 @@ from app.voice.tts import (
     _format_gpt_sovits_http_error,
     _load_tone_references,
     _local_tts_subprocess_env,
+    _read_local_tts_output,
     _resolve_request_text_lang,
     _resolve_tts_cache_dir,
     _write_genie_audio,
     purge_tts_cache,
 )
+from app.core.gui_log import GUI_LOG_SCOPE_TTS, clear_gui_logs, get_gui_log_buffer
 from app.voice import VoicePlaybackController
 from app.voice.text_language_guard import should_skip_tts_text
 
@@ -829,6 +831,43 @@ def test_local_tts_subprocess_env_uses_utf8_stdio_without_forcing_interpreter(
     assert env["PYTHONIOENCODING"] == "utf-8"
 
 
+def test_local_tts_output_reader_writes_file_and_gui_log() -> None:
+    clear_gui_logs()
+
+    class Stream:
+        def __init__(self) -> None:
+            self.closed = False
+            self._lines = iter(
+                [
+                    "########## 合成音频 ##########\n",
+                    'INFO: 127.0.0.1:49840 - "POST /tts HTTP/1.1" 200 OK\n',
+                ]
+            )
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __next__(self) -> str:
+            return next(self._lines)
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = Stream()
+    log_path = _runtime_root("local_tts_output_reader") / "service.log"
+
+    _read_local_tts_output(stream, log_path, "GPT-SoVITS")
+
+    assert stream.closed
+    assert "合成音频" in log_path.read_text(encoding="utf-8")
+    records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_TTS)
+    assert [record.message for record in records] == [
+        "开始合成音频",
+        "HTTP POST /tts -> 200 OK",
+    ]
+    clear_gui_logs()
+
+
 def test_gptsovits_charmap_http_error_gets_actionable_message() -> None:
     message = _format_gpt_sovits_http_error(
         400,
@@ -900,7 +939,7 @@ def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) ->
 
     assert calls == ["timer", "audio", "player"]
 
-    provider._pending_audio.append((Path("dummy.wav"), None, None, None))
+    provider._pending_audio.append((Path("dummy.wav"), None, None, None, ""))
     provider._play_next()
 
     assert calls == ["timer", "audio", "player", "source", "play"]
@@ -961,6 +1000,7 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
             lambda: events.append("first_started"),
             lambda: events.append("first_finished"),
             None,
+            "",
         )
     )
     provider._pending_audio.append(
@@ -969,6 +1009,7 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
             lambda: events.append("second_started"),
             lambda: events.append("second_finished"),
             None,
+            "",
         )
     )
 
@@ -1048,6 +1089,7 @@ def test_tts_provider_finish_fallback_advances_queue_without_player_end_signal(m
             lambda: events.append("first_started"),
             lambda: events.append("first_finished"),
             None,
+            "",
         )
     )
     provider._pending_audio.append(
@@ -1056,6 +1098,7 @@ def test_tts_provider_finish_fallback_advances_queue_without_player_end_signal(m
             lambda: events.append("second_started"),
             lambda: events.append("second_finished"),
             None,
+            "",
         )
     )
 

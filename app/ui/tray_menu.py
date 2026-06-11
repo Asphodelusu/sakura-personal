@@ -19,6 +19,7 @@ def build_pet_tray_menu(
     on_toggle_free_access: Callable[[bool], None],
     on_toggle_always_on_top: Callable[[bool], None],
     on_show_history: Callable[[], None],
+    on_show_runtime_log: Callable[[], None],
     on_show_settings: Callable[[], None],
     window_visible: bool = True,
     interactions_enabled: bool = True,
@@ -68,6 +69,11 @@ def build_pet_tray_menu(
     history_action.setEnabled(interactions_enabled)
     history_action.triggered.connect(on_show_history)
     menu.addAction(history_action)
+
+    runtime_log_action = QAction("运行日志", parent)
+    runtime_log_action.setEnabled(interactions_enabled)
+    runtime_log_action.triggered.connect(on_show_runtime_log)
+    menu.addAction(runtime_log_action)
 
     settings_action = QAction("设置", parent)
     settings_action.setEnabled(interactions_enabled)

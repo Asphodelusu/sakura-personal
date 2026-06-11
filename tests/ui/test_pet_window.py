@@ -81,6 +81,7 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     host._toggle_free_access = lambda _checked: None
     host._toggle_always_on_top = lambda _checked: None
     host.show_history = lambda: None
+    host.show_runtime_log = lambda: None
     host.show_settings = lambda: None
     host.show()
     app.processEvents()
@@ -94,6 +95,7 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     assert "启用模型视觉" not in texts
     assert "允许自主看屏幕" not in texts
     assert "自由访问权限" not in texts
+    assert "运行日志" in texts
     assert "显示中文字幕" in checkable_texts
     assert "完整访问权限" in checkable_texts
     assert "保持置顶" in checkable_texts
@@ -131,6 +133,7 @@ def test_pet_window_menu_shows_restore_action_when_hidden() -> None:
     host._toggle_free_access = lambda _checked: None
     host._toggle_always_on_top = lambda _checked: None
     host.show_history = lambda: None
+    host.show_runtime_log = lambda: None
     host.show_settings = lambda: None
 
     menu = PetWindow._build_menu(host)  # type: ignore[arg-type]
@@ -140,6 +143,256 @@ def test_pet_window_menu_shows_restore_action_when_hidden() -> None:
 
     menu.deleteLater()
     host.deleteLater()
+    app.processEvents()
+
+
+def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QWidget"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.pet_window as pet_window_module
+
+    events: list[str] = []
+
+    class RuntimeLogWindowStub:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.kwargs = kwargs
+            self.visible = False
+
+        def set_theme_settings(self, settings):  # type: ignore[no-untyped-def]
+            events.append("theme")
+            self.theme_settings = settings
+
+        def refresh(self, *, reset: bool = False) -> None:
+            events.append(f"refresh:{reset}")
+
+        def show(self) -> None:
+            events.append("show")
+            self.visible = True
+
+        def raise_(self) -> None:
+            events.append("raise")
+
+        def activateWindow(self) -> None:
+            events.append("activate")
+
+        def exec(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("运行日志窗口不应使用 exec() 打开")
+
+    class Host(qtwidgets.QWidget):
+        show_runtime_log = pet_window_module.PetWindow.show_runtime_log
+        _any_dialog_open = pet_window_module.PetWindow._any_dialog_open
+
+    monkeypatch.setattr(pet_window_module, "RuntimeLogWindow", RuntimeLogWindowStub)
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    host = Host()
+    host.theme_settings = DEFAULT_THEME_SETTINGS
+    host.runtime_log_window = None
+    host.settings_dialog = None
+    host.history_window = None
+
+    host.show_runtime_log()
+
+    assert events == ["theme", "refresh:True", "show", "raise", "activate"]
+    assert host.runtime_log_window.kwargs["parent"] is host
+    assert host._any_dialog_open() is False
+
+    host.deleteLater()
+    app.processEvents()
+
+
+def test_runtime_log_window_is_non_modal() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.log_window import RuntimeLogWindow
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    window = RuntimeLogWindow(theme_settings=DEFAULT_THEME_SETTINGS)
+
+    assert window.windowModality() == qtcore.Qt.WindowModality.NonModal
+    assert window.tabs.count() == 2
+    assert window.tabs.tabText(0) == "软件"
+    assert window.tabs.tabText(1) == "TTS"
+    assert "runtimeLogPage" in window.styleSheet()
+    assert "QCheckBox::indicator:checked" in window.styleSheet()
+    assert DEFAULT_THEME_SETTINGS.page_background_color in window.styleSheet()
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_runtime_log_window_collapses_consecutive_duplicate_rows() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.gui_log import GUI_LOG_LEVEL_INFO, GUI_LOG_SCOPE_PROGRAM, GuiLogBuffer
+    from app.ui.log_window import RuntimeLogWindow
+
+    buffer = GuiLogBuffer()
+    for _index in range(2):
+        buffer.append(
+            timestamp="2026-06-11T18:43:44+08:00",
+            scope=GUI_LOG_SCOPE_PROGRAM,
+            level=GUI_LOG_LEVEL_INFO,
+            category="TTS",
+            message="准备：GPT-SoVITS 服务已就绪",
+        )
+    buffer.append(
+        timestamp="2026-06-11T18:43:45+08:00",
+        scope=GUI_LOG_SCOPE_PROGRAM,
+        level=GUI_LOG_LEVEL_INFO,
+        category="TTS",
+        message="准备：TTS 角色权重切换完成",
+    )
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+
+    assert window.program_list.count() == 2
+    first_item = window.program_list.item(0)
+    assert first_item.text() == "18:43:44  [TTS]  准备：GPT-SoVITS 服务已就绪  ×2"
+    assert "信息" not in first_item.text()
+    assert "连续重复：2 次" in str(first_item.data(qtcore.Qt.ItemDataRole.UserRole))
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_runtime_log_window_row_shows_category_level_and_detail_summary() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.gui_log import (
+        GUI_LOG_LEVEL_ERROR,
+        GUI_LOG_LEVEL_INFO,
+        GUI_LOG_SCOPE_PROGRAM,
+        GuiLogBuffer,
+    )
+    from app.ui.log_window import RuntimeLogWindow
+
+    buffer = GuiLogBuffer()
+    buffer.append(
+        timestamp="2026-06-11T18:51:27+08:00",
+        scope=GUI_LOG_SCOPE_PROGRAM,
+        level=GUI_LOG_LEVEL_INFO,
+        category="API",
+        message="发送请求",
+        detail='{"model": "gpt-4o-mini", "stream": true, "messages": {"type": "list", "items": 4}}',
+    )
+    buffer.append(
+        timestamp="2026-06-11T18:51:31+08:00",
+        scope=GUI_LOG_SCOPE_PROGRAM,
+        level=GUI_LOG_LEVEL_ERROR,
+        category="API",
+        message="请求失败",
+        detail='{"error": "connection timeout", "api_key": "<redacted>"}',
+    )
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+
+    info_item = window.program_list.item(0)
+    # 行内带分类标签，detail 中的标量字段提取为行尾摘要，嵌套结构与脱敏值不出现
+    assert info_item.text() == "18:51:27  [API]  发送请求  model=gpt-4o-mini · stream=True"
+    error_item = window.program_list.item(1)
+    assert error_item.text() == "18:51:31  [API]  错误  请求失败  error=connection timeout"
+    assert "<redacted>" not in error_item.text()
+
+    # 两个列表都应使用自定义 delegate 做分层着色
+    assert window.program_list.itemDelegate() is window._item_delegate
+    assert window.tts_list.itemDelegate() is window._item_delegate
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_runtime_log_window_shows_tts_text_preview_as_detail() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.gui_log import GUI_LOG_LEVEL_INFO, GUI_LOG_SCOPE_PROGRAM, GuiLogBuffer
+    from app.ui.log_window import RuntimeLogWindow
+
+    buffer = GuiLogBuffer()
+    buffer.append(
+        timestamp="2026-06-11T18:51:35+08:00",
+        scope=GUI_LOG_SCOPE_PROGRAM,
+        level=GUI_LOG_LEVEL_INFO,
+        category="TTS",
+        message="开始播放",
+        detail='{"audio_path": "x.wav"}',
+        text_preview="今天天气真好喵",
+    )
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+
+    item = window.program_list.item(0)
+    # 合成/播放记录的灰字摘要优先显示文本内容而不是 detail 字段
+    assert item.text() == "18:51:35  [TTS]  开始播放  「今天天气真好喵」"
+    assert "文本：今天天气真好喵" in item.toolTip()
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_runtime_log_window_updates_progress_rows_in_place() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.gui_log import GUI_LOG_LEVEL_INFO, GUI_LOG_SCOPE_TTS, GuiLogBuffer
+    from app.ui.log_window import RuntimeLogWindow
+
+    buffer = GuiLogBuffer()
+    buffer.append(
+        timestamp="2026-06-11T18:51:31+08:00",
+        scope=GUI_LOG_SCOPE_TTS,
+        level=GUI_LOG_LEVEL_INFO,
+        category="GPT-SoVITS 服务",
+        message="语义 token 预测 4%（60/1500，104.91 it/s）",
+        merge_key="semantic-token-progress",
+    )
+
+    app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+    window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+    assert window.tts_list.count() == 1
+
+    # 已展示的进度行在新进度到达后应原地刷新，而不是追加新行
+    buffer.append(
+        timestamp="2026-06-11T18:51:34+08:00",
+        scope=GUI_LOG_SCOPE_TTS,
+        level=GUI_LOG_LEVEL_INFO,
+        category="GPT-SoVITS 服务",
+        message="语义 token 预测 24%（363/1500，105.23 it/s）",
+        merge_key="semantic-token-progress",
+    )
+    window.refresh()
+
+    assert window.tts_list.count() == 1
+    assert "24%" in window.tts_list.item(0).text()
+
+    window.close()
+    window.deleteLater()
     app.processEvents()
 
 

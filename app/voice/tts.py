@@ -32,6 +32,7 @@ TTS_PLAYBACK_BACKEND_MEDIA_PLAYER = "media_player"
 _DEFAULT_PLAYBACK_BACKEND = TTS_PLAYBACK_BACKEND_AUDIO_SINK
 
 from app.config.character_loader import CharacterProfile
+from app.core.gui_log import record_tts_service_output
 from app.llm.chat_reply import DEFAULT_TONE
 from app.core.debug_log import debug_log
 from app.voice.runtime_compat import find_usable_runtime_python, format_runtime_python_issue
@@ -382,7 +383,7 @@ class GPTSoVITSTTSSettings:
 
 class GPTSoVITSTTSProvider(QObject):
     error_occurred = Signal(str)
-    _audio_ready = Signal(str, object, object)
+    _audio_ready = Signal(str, object, object, str)
     _prepared_audio_ready = Signal(object, str)
     _prepared_audio_failed = Signal(object, str)
     _failed = Signal(str)
@@ -403,10 +404,13 @@ class GPTSoVITSTTSProvider(QObject):
         # 与启动清理 purge_tts_cache(base_dir) 同源，避免写入目录与清理目录错位。
         # base_dir 为空时退回 _resolve_tts_cache_dir 的 __file__ 推算，保持向后兼容。
         self._tts_cache_dir = _resolve_tts_cache_dir(base_dir)
+        # 队列元素：(音频路径, 开始回调, 完成回调, 预生成句柄, 合成文本)
         self._pending_audio: list[
-            tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None]
+            tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None, str]
         ] = []
         self._current_audio: Path | None = None
+        # 当前正在播放的音频对应的合成文本，仅用于日志展示
+        self._current_text: str = ""
         self._current_started: TTSCallback | None = None
         self._current_finished: TTSCallback | None = None
         self._current_started_emitted = False
@@ -522,13 +526,13 @@ class GPTSoVITSTTSProvider(QObject):
             ]
 
         pending_audio: list[
-            tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None]
+            tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None, str]
         ] = []
-        for audio_path, on_started, on_finished, prepared_audio in self._pending_audio:
+        for audio_path, on_started, on_finished, prepared_audio, text in self._pending_audio:
             if prepared_audio is handle:
                 self._schedule_audio_cleanup(audio_path)
                 continue
-            pending_audio.append((audio_path, on_started, on_finished, prepared_audio))
+            pending_audio.append((audio_path, on_started, on_finished, prepared_audio, text))
         self._pending_audio = pending_audio
 
         if handle.audio_path is not None:
@@ -733,7 +737,12 @@ class GPTSoVITSTTSProvider(QObject):
                 audio_path = audio_file.name
             debug_log("TTS", "临时音频已写入", {"audio_path": audio_path, "bytes": len(audio_data)})
             if tts_request.prepared_audio is None:
-                self._audio_ready.emit(audio_path, tts_request.on_started, tts_request.on_finished)
+                self._audio_ready.emit(
+                    audio_path,
+                    tts_request.on_started,
+                    tts_request.on_finished,
+                    tts_request.text,
+                )
             else:
                 self._prepared_audio_ready.emit(tts_request.prepared_audio, audio_path)
         finally:
@@ -905,18 +914,27 @@ class GPTSoVITSTTSProvider(QObject):
             kwargs: dict[str, object] = {
                 "cwd": str(work_dir),
                 "env": _local_tts_subprocess_env(),
+                "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
             }
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW")
             with log_path.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 GPT-SoVITS：{work_dir}\n")
                 log_file.flush()
-                kwargs["stdout"] = log_file
-                self._server_process = subprocess.Popen(
-                    _build_gpt_sovits_start_command(python_exe, api_script, self.settings),
-                    **kwargs,
-                )
+            self._server_process = subprocess.Popen(
+                _build_gpt_sovits_start_command(python_exe, api_script, self.settings),
+                **kwargs,
+            )
+            _start_local_tts_output_reader(
+                self._server_process,
+                log_path,
+                "GPT-SoVITS",
+            )
         except OSError as exc:
             debug_log("TTS", "本地 GPT-SoVITS 服务启动失败", {"work_dir": str(work_dir), "error": str(exc)})
             fail_callback(f"GPT-SoVITS 服务启动失败：{exc}")
@@ -1060,12 +1078,14 @@ class GPTSoVITSTTSProvider(QObject):
         audio_path: str,
         on_started: TTSCallback | None,
         on_finished: TTSCallback | None,
+        text: str = "",
     ) -> None:
-        self._pending_audio.append((Path(audio_path), on_started, on_finished, None))
+        self._pending_audio.append((Path(audio_path), on_started, on_finished, None, text))
         debug_log(
             "TTS",
             "音频加入播放队列",
             {
+                "text": text,
                 "audio_path": audio_path,
                 "pending_audio": len(self._pending_audio),
                 "current_audio": str(self._current_audio) if self._current_audio else None,
@@ -1198,7 +1218,7 @@ class GPTSoVITSTTSProvider(QObject):
             return
         handle.enqueued = True
         self._pending_audio.append(
-            (handle.audio_path, handle.on_started, handle.on_finished, handle)
+            (handle.audio_path, handle.on_started, handle.on_finished, handle, handle.text)
         )
         debug_log(
             "TTS",
@@ -1226,8 +1246,10 @@ class GPTSoVITSTTSProvider(QObject):
             on_started,
             on_finished,
             _prepared_audio,
+            text,
         ) = self._pending_audio.pop(0)
         self._current_audio = audio_path
+        self._current_text = text
         self._current_started = on_started
         self._current_finished = on_finished
         self._current_started_emitted = False
@@ -1237,6 +1259,7 @@ class GPTSoVITSTTSProvider(QObject):
             "TTS",
             "开始播放音频",
             {
+                "text": text,
                 "backend": self._playback_backend,
                 "audio_path": str(audio_path),
                 "file_size": audio_path.stat().st_size if audio_path.exists() else 0,
@@ -1416,6 +1439,7 @@ class GPTSoVITSTTSProvider(QObject):
                 "TTS",
                 "音频播放完成",
                 {
+                    "text": self._current_text,
                     "reason": reason,
                     "audio_path": str(audio_path),
                     "pending_audio": len(self._pending_audio),
@@ -1445,6 +1469,7 @@ class GPTSoVITSTTSProvider(QObject):
 
     def _reset_current_audio_state(self) -> None:
         self._current_audio = None
+        self._current_text = ""
         self._current_started = None
         self._current_finished = None
         self._current_started_emitted = False
@@ -1640,7 +1665,12 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
 
             debug_log("TTS", "Genie 临时音频已写入", {"audio_path": audio_path, "bytes": len(audio_data)})
             if tts_request.prepared_audio is None:
-                self._audio_ready.emit(str(audio_path), tts_request.on_started, tts_request.on_finished)
+                self._audio_ready.emit(
+                    str(audio_path),
+                    tts_request.on_started,
+                    tts_request.on_finished,
+                    tts_request.text,
+                )
             else:
                 self._prepared_audio_ready.emit(tts_request.prepared_audio, str(audio_path))
         finally:
@@ -1768,14 +1798,28 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         try:
             kwargs: dict[str, object] = {
                 "cwd": str(work_dir),
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
             }
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW")
+            log_path = _local_tts_service_log_path(self.settings.provider)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 Genie TTS：{work_dir}\n")
+                log_file.flush()
             self._server_process = subprocess.Popen(
                 _build_genie_start_command(python_exe, host, port),
                 **kwargs,
+            )
+            _start_local_tts_output_reader(
+                self._server_process,
+                log_path,
+                "Genie TTS",
             )
         except OSError as exc:
             fail_callback(f"Genie TTS 服务启动失败：{exc}")
@@ -2289,6 +2333,67 @@ def _local_tts_service_log_path(provider: str) -> Path:
 
     safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "-", provider.strip().lower()) or "tts"
     return Path.cwd() / "data" / "logs" / f"{safe_provider}-service.log"
+
+
+def _start_local_tts_output_reader(
+    process: subprocess.Popen[str],
+    log_path: Path,
+    provider: str,
+) -> None:
+    stream = getattr(process, "stdout", None)
+    if stream is None:
+        return
+    thread = threading.Thread(
+        target=_read_local_tts_output,
+        args=(stream, log_path, provider),
+        daemon=True,
+    )
+    thread.start()
+
+
+def _iter_tts_service_segments(stream):  # type: ignore[no-untyped-def]
+    """逐段产出服务输出。
+
+    tqdm 进度条用 \r 原地刷新且长时间不输出 \n，按行读取要等进度条整条结束
+    才能一次性收到，无法实时展示推理进度，因此优先按字符读取并以 \r/\n 切段；
+    不支持 read() 的流（如测试桩）退回按行迭代。
+    """
+    if hasattr(stream, "read"):
+        buffer = ""
+        while True:
+            chunk = stream.read(1)
+            if not chunk:
+                break
+            if chunk in ("\r", "\n"):
+                if buffer:
+                    yield buffer
+                buffer = ""
+                continue
+            buffer += chunk
+        if buffer:
+            yield buffer
+        return
+    for raw_line in stream:
+        yield str(raw_line)
+
+
+def _read_local_tts_output(stream, log_path: Path, provider: str) -> None:  # type: ignore[no-untyped-def]
+    try:
+        with log_path.open("a", encoding="utf-8") as log_file:
+            for segment in _iter_tts_service_segments(stream):
+                line = segment.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                log_file.write(f"{line}\n")
+                log_file.flush()
+                record_tts_service_output(provider, line)
+    except Exception as exc:  # noqa: BLE001
+        debug_log("TTS", "本地 TTS 服务输出读取失败", {"provider": provider, "error": str(exc)})
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
 def _resolve_path(path_text: str, base_dir: Path) -> Path:
