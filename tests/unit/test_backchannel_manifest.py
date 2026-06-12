@@ -149,22 +149,21 @@ def test_profile_unknown_tone_warns_but_keeps_entry(tmp_path: Path) -> None:
     assert manifest.templates[0].tone == "困惑"
 
 
-_DRAFT_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "feats"
-    / "backchannel-layer"
-    / "sakura-backchannels.manifest.draft.json"
-)
-
-
-@pytest.mark.skipif(not _DRAFT_PATH.exists(), reason="草案 manifest 不在仓库中")
-def test_load_sakura_draft_manifest() -> None:
-    """集成自检:sakura 草案应整体可加载且无条目/变体被静默跳过(词表对齐探针)。"""
-    raw = json.loads(_DRAFT_PATH.read_text(encoding="utf-8"))
-    manifest = load_backchannel_manifest(_DRAFT_PATH)
-    assert len(manifest.templates) == len(raw["templates"])
+def test_load_representative_manifest(tmp_path: Path) -> None:
+    """框架级自检:样例清单应整体可加载且无条目/变体被静默跳过。"""
+    templates = [
+        _entry(id="fb", intent="fallback", emotion="neutral"),
+        _entry(id="greeting_return", intent="greeting_return", emotion="neutral"),
+        _entry(id="support_sad", intent="support", emotion="sad"),
+        _entry(id="repeat", intent="error", emotion="frustrated", phase="repeated_issue"),
+        _entry(id="tool", intent=None, emotion=None, phase="tool_running"),
+        _entry(id="wait", intent=None, emotion=None, phase="long_wait"),
+    ]
+    path = _write_manifest(tmp_path, templates)
+    manifest = load_backchannel_manifest(path)
+    assert len(manifest.templates) == len(templates)
     assert sum(len(t.variants) for t in manifest.templates) == sum(
-        len(entry["variants"]) for entry in raw["templates"]
+        len(entry["variants"]) for entry in templates
     )
     assert {t.phase for t in manifest.templates if t.phase} == {
         "repeated_issue",
