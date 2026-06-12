@@ -9,6 +9,8 @@ from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot, QtMsgType
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QStyleFactory
 
+from app.config.app_version import record_app_version
+from app.config.default_configs import ensure_default_configs
 from app.config.migration_runner import MigrationRunner
 from app.core.app_context import AppContext
 from app.core.bootstrap import build_deferred_services, build_initial_app_context
@@ -277,6 +279,11 @@ def main() -> int:
     if self_check.fatal_issues:
         QMessageBox.critical(None, "启动检查未通过", self_check.fatal_message())
         return 1
+
+    # 发布包不携带 mcp.yaml/plugins.yaml（避免覆盖升级冲掉用户配置），缺失时生成默认
+    ensure_default_configs(BASE_DIR)
+    # 记录/比对 app_version，覆盖升级后第一时间在日志中留痕
+    record_app_version(BASE_DIR)
 
     # 版本化数据迁移：失败不阻断启动（原文件保持原位，按旧形态继续运行，下次启动重试）
     migration_report = MigrationRunner(BASE_DIR).run()

@@ -46,6 +46,9 @@ tts/
 data/config/api.yaml
 data/config/characters.yaml
 data/config/system_config.yaml
+data/config/mcp.yaml
+data/config/plugins.yaml
+plugins/playwright_browser/config.json
 task.md
 log.txt
 
