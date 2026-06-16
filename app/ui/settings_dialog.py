@@ -158,6 +158,7 @@ class SettingsDialog(QDialog):
         backchannel_settings: BackchannelSettings | None = None,
         on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
         proactive_care_settings: ScreenAwarenessSettings | None = None,
+        memory_curation_settings=None,
     ) -> None:
         super().__init__(parent)
         if screen_awareness_settings is None:
@@ -167,6 +168,10 @@ class SettingsDialog(QDialog):
         self.startup_settings = startup_settings or StartupSettings()
         self.bubble_settings = bubble_settings or BubbleSettings()
         self.backchannel_settings = (backchannel_settings or BackchannelSettings()).normalized()
+        # 延迟导入避免与 app.agent 形成导入环（与 settings_service 一致）。
+        from app.agent.memory_curator import MemoryCurationSettings as _MemoryCurationSettings
+
+        self.memory_curation_settings = memory_curation_settings or _MemoryCurationSettings()
         self._initial_api_settings = api_settings
         self._initial_tts_settings = tts_settings
         self._initial_character_id = current_character.id if current_character is not None else None
@@ -222,6 +227,7 @@ class SettingsDialog(QDialog):
         self.result_startup_settings: StartupSettings | None = None
         self.result_bubble_settings: BubbleSettings | None = None
         self.result_backchannel_settings: BackchannelSettings | None = None
+        self.result_memory_curation_settings = None
         self.result_theme_settings: ThemeSettings | None = None
         self.result_theme_write_mode: Literal["unchanged", "manual", "ai", "reset", "character"] = "unchanged"
         self.result_plugin_config_changed = False
@@ -1799,6 +1805,20 @@ class SettingsDialog(QDialog):
             )
         )
 
+    def _collect_memory_curation_settings(self):
+        from dataclasses import replace
+
+        spin = getattr(self, "memory_trigger_turns_spin", None)
+        if spin is None:
+            # 记忆页未构建时回退到初始值，保留 backfill_limit 等未暴露字段。
+            return self.memory_curation_settings
+        # 自动整理始终开启，设置页只调整触发轮数。
+        return replace(
+            self.memory_curation_settings,
+            enabled=True,
+            trigger_turns=int(spin.value()),
+        )
+
     def _collect_accept_values(self) -> dict[str, object] | None:
         api_settings = self._validated_api_settings()
         if api_settings is None:
@@ -1871,6 +1891,7 @@ class SettingsDialog(QDialog):
                 # timeout_ms 设置页不暴露，保存时保留 YAML 已配置值，避免覆盖回默认。
                 timeout_ms=self.backchannel_settings.timeout_ms,
             ),
+            "memory_curation_settings": self._collect_memory_curation_settings(),
         }
 
     def _complete_accept(self, values: dict[str, object]) -> None:
@@ -1891,6 +1912,7 @@ class SettingsDialog(QDialog):
         startup_settings = values["startup_settings"]
         bubble_settings = values["bubble_settings"]
         backchannel_settings = values["backchannel_settings"]
+        memory_curation_settings = values["memory_curation_settings"]
 
         if not isinstance(api_settings, ApiSettings):
             return
@@ -1917,6 +1939,9 @@ class SettingsDialog(QDialog):
         if not isinstance(bubble_settings, BubbleSettings):
             return
         if not isinstance(backchannel_settings, BackchannelSettings):
+            return
+        from app.agent.memory_curator import MemoryCurationSettings as _MemoryCurationSettings
+        if not isinstance(memory_curation_settings, _MemoryCurationSettings):
             return
 
         try:
@@ -1956,6 +1981,7 @@ class SettingsDialog(QDialog):
         self.result_startup_settings = startup_settings
         self.result_bubble_settings = bubble_settings
         self.result_backchannel_settings = backchannel_settings.normalized()
+        self.result_memory_curation_settings = memory_curation_settings
         self.result_plugin_config_changed = plugin_config_changed
         super().accept()
 

@@ -1019,6 +1019,23 @@ class MemorySettingsPage:
         tab.setObjectName("settingsNavPage")
         _ = memory_store
 
+        # 自动整理设置（需求3）：自动整理始终开启，这里只暴露触发频率（轮数）。
+        from app.agent.memory_curator import MemoryCurationSettings
+
+        curation_settings = (
+            getattr(owner, "memory_curation_settings", None) or MemoryCurationSettings()
+        )
+        owner.memory_trigger_turns_spin = _NoWheelSpinBox(tab)
+        owner.memory_trigger_turns_spin.setRange(1, 50)
+        owner.memory_trigger_turns_spin.setSuffix(" 轮对话")
+        owner.memory_trigger_turns_spin.setValue(int(curation_settings.trigger_turns))
+        curation_form = QFormLayout()
+        curation_form.setContentsMargins(16, 12, 16, 12)
+        curation_form.setSpacing(12)
+        curation_form.addRow("自动整理频率", owner.memory_trigger_turns_spin)
+        owner.memory_curation_group = QGroupBox("自动整理", tab)
+        owner.memory_curation_group.setLayout(curation_form)
+
         owner.memory_search_edit = QLineEdit(tab)
         owner.memory_search_edit.setPlaceholderText("搜索记忆内容或 ID")
         owner.memory_search_edit.textChanged.connect(owner._refresh_memory_table)
@@ -1108,6 +1125,7 @@ class MemorySettingsPage:
         layout = QVBoxLayout()
         layout.setContentsMargins(16, 18, 16, 16)
         layout.setSpacing(10)
+        layout.addWidget(owner.memory_curation_group)
         layout.addLayout(filter_layout)
         layout.addLayout(status_layout)
         layout.addWidget(owner.memory_table, 1)

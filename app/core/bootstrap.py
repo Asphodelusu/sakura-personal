@@ -157,7 +157,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     memory_curation_state = MemoryCurationState(
         StoragePaths(base_dir).memory_curation_state()
     )
-    memory_curator = MemoryCurator(api_client, memory_store)
+    memory_curator = MemoryCurator(api_client, memory_store, system_prompt=system_prompt)
     screen_awareness_settings = settings_service.load_screen_awareness_settings()
 
     debug_log(

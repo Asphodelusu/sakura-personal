@@ -167,6 +167,34 @@ def test_save_bubble_settings_preserves_other_ui_keys() -> None:
     assert system["ui"]["bubble_auto_hide_delay_seconds"] == 8
 
 
+def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
+    from app.agent.memory_curator import MemoryCurationSettings
+
+    root = _runtime_root("yaml_memory_curation")
+    service = AppSettingsService(root)
+
+    # 默认：启用、每 8 轮触发、回填上限 200。
+    assert service.load_memory_curation_settings() == MemoryCurationSettings(
+        enabled=True,
+        trigger_turns=8,
+        backfill_limit=200,
+    )
+
+    # 仅改 UI 暴露的 enabled/trigger_turns，backfill_limit 用非默认值确认会被一并持久化。
+    service.save_memory_curation_settings(
+        MemoryCurationSettings(enabled=False, trigger_turns=20, backfill_limit=150)
+    )
+
+    loaded = service.load_memory_curation_settings()
+    assert loaded.enabled is False
+    assert loaded.trigger_turns == 20
+    assert loaded.backfill_limit == 150
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["memory_curation"]["enabled"] is False
+    assert system["memory_curation"]["trigger_turns"] == 20
+    assert system["memory_curation"]["backfill_limit"] == 150
+
+
 def test_settings_service_loads_tts_work_dir_and_keeps_legacy_blank() -> None:
     root = _runtime_root("yaml_tts_work_dir")
     service = AppSettingsService(root)

@@ -538,7 +538,6 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
-        self.pending_history_clear_after_curation = False
         self.drag_anchor: QPoint | None = None
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
@@ -4146,8 +4145,6 @@ class PetWindow(QWidget):
             return
         if not self.memory_curation_settings.enabled:
             return
-        if self.pending_history_clear_after_curation:
-            return
         state = self.memory_curation_state.snapshot()
         if state.get("backfill_completed"):
             return
@@ -4229,25 +4226,6 @@ class PetWindow(QWidget):
                 "consumed_turns": self.memory_curation_consumed_turns,
             },
         )
-        if mode == "history_clear":
-            if result.processed_entries > 0 and result.returned == 0:
-                show_themed_warning(
-                    self,
-                    "整理失败",
-                    "记忆整理没有写入任何结果，已保留聊天历史。请检查日志后再重试。",
-                )
-                return
-            try:
-                self.history_store.clear()
-                self.memory_curation_state.mark_history_cleared()
-            except OSError as exc:
-                show_themed_warning(self, "清空失败", f"记忆已整理，但清空历史失败：{exc}")
-            else:
-                if self.history_window is not None:
-                    self.history_window.refresh()
-                show_themed_information(self, "整理完成", result.summary())
-            return
-
         self.memory_curation_state.mark_processed(
             self.memory_curation_target_history_count,
             consumed_turns=self.memory_curation_consumed_turns,
@@ -4266,8 +4244,6 @@ class PetWindow(QWidget):
                 "error": message,
             },
         )
-        if self.memory_curation_mode == "history_clear":
-            show_themed_warning(self, "整理失败", f"历史没有清空，原因：{message}")
 
     @Slot()
     def _cleanup_memory_curation_worker(self) -> None:
@@ -4275,35 +4251,8 @@ class PetWindow(QWidget):
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
         if getattr(self, "_shutdown_in_progress", False):
-            self.pending_history_clear_after_curation = False
             return
-        if self.pending_history_clear_after_curation:
-            self.pending_history_clear_after_curation = False
-            if self._start_pending_history_clear_after_curation():
-                return
-        if self.history_window is not None:
-            self.history_window.set_memory_save_busy(False)
         QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
-
-    def _start_pending_history_clear_after_curation(self) -> bool:
-        if not self._memory_curation_can_start():
-            return False
-        entries = self.history_store.load()
-        if not entries:
-            if self.history_window is not None:
-                self.history_window.refresh()
-            return False
-        if not self._memory_store_ready_for_history_clear():
-            self._show_memory_not_ready_for_history_clear()
-            return False
-        self._reset_memory_curation_cache_for_history_clear()
-        self._start_memory_curation(
-            entries,
-            mode="history_clear",
-            target_history_count=len(entries),
-            consumed_turns=self.memory_curation_state.pending_turns(),
-        )
-        return self.memory_curation_thread is not None
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:
@@ -4790,7 +4739,6 @@ class PetWindow(QWidget):
             self.history_window = HistoryWindow(
                 self.history_store,
                 self.subtitle_language,
-                self._save_history_to_memory_and_clear,
                 self.theme_settings,
                 self,
             )
@@ -4819,72 +4767,6 @@ class PetWindow(QWidget):
         )
         self.runtime_log_window.refresh(reset=True)
         _present_secondary_window(self.runtime_log_window)
-
-    def _save_history_to_memory_and_clear(self) -> None:
-        if self.memory_curation_thread is not None:
-            if self.memory_curation_mode in {"auto", "backfill"}:
-                self.pending_history_clear_after_curation = True
-                show_themed_information(
-                    self,
-                    "整理中",
-                    "当前正在自动整理记忆，结束后会继续清空并保存历史。",
-                )
-                return
-            show_themed_information(self, "整理中", "记忆整理已经在进行中，请稍后再试。")
-            if self.history_window is not None:
-                self.history_window.set_memory_save_busy(False)
-            return
-        if self.worker_thread is not None:
-            show_themed_information(self, "正在回复", "当前聊天还没处理完，稍后再整理历史。")
-            if self.history_window is not None:
-                self.history_window.set_memory_save_busy(False)
-            return
-        entries = self.history_store.load()
-        if not entries:
-            if self.history_window is not None:
-                self.history_window.set_memory_save_busy(False)
-                self.history_window.refresh()
-            return
-        if not self._memory_store_ready_for_history_clear():
-            self._show_memory_not_ready_for_history_clear()
-            if self.history_window is not None:
-                self.history_window.set_memory_save_busy(False)
-            return
-        self._reset_memory_curation_cache_for_history_clear()
-        self._start_memory_curation(
-            entries,
-            mode="history_clear",
-            target_history_count=len(entries),
-            consumed_turns=self.memory_curation_state.pending_turns(),
-        )
-
-    def _memory_store_ready_for_history_clear(self) -> bool:
-        is_ready = getattr(self.memory_store, "is_ready", None)
-        if not callable(is_ready):
-            return True
-        try:
-            return bool(is_ready())
-        except Exception as exc:  # noqa: BLE001
-            debug_log("Memory", "检查长期记忆就绪状态失败", {"error": str(exc)})
-            return False
-
-    def _show_memory_not_ready_for_history_clear(self) -> None:
-        message = getattr(self, "memory_status_last_message", "") or (
-            "长期记忆系统还在初始化。首次启动或覆盖更新后，"
-            "可能需要准备本地嵌入模型，请稍等就绪后再试。"
-        )
-        show_themed_information(self, "记忆初始化中", message)
-
-    def _reset_memory_curation_cache_for_history_clear(self) -> None:
-        reset_cache = getattr(self.memory_store, "reset_curation_cache", None)
-        if not callable(reset_cache):
-            return
-        try:
-            reset_counts = reset_cache()
-        except Exception as exc:  # noqa: BLE001
-            debug_log("Memory", "重置 mem0 整理缓存失败", {"error": str(exc)})
-            return
-        debug_log("Memory", "已重置 mem0 整理缓存", reset_counts)
 
     @Slot()
     def show_settings(self) -> None:
@@ -4936,6 +4818,7 @@ class PetWindow(QWidget):
             bubble_settings=getattr(self, "bubble_settings", BubbleSettings()),
             backchannel_settings=getattr(self, "backchannel_settings", BackchannelSettings()),
             on_layout_preview=self._preview_layout,
+            memory_curation_settings=getattr(self, "memory_curation_settings", None),
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮；
@@ -5021,6 +4904,11 @@ class PetWindow(QWidget):
             dialog,
             "result_backchannel_settings",
             getattr(self, "backchannel_settings", BackchannelSettings()),
+        )
+        # result_memory_curation_settings 在用户未改动时可能为 None，用当前配置兜底。
+        result_memory_curation_settings = (
+            getattr(dialog, "result_memory_curation_settings", None)
+            or getattr(self, "memory_curation_settings", None)
         )
         result_screen_awareness_settings = getattr(
             dialog,
@@ -5145,6 +5033,10 @@ class PetWindow(QWidget):
             )
             if callable(save_backchannel_settings):
                 save_backchannel_settings(result_backchannel_settings)
+            if result_memory_curation_settings is not None:
+                self.settings_service.save_memory_curation_settings(
+                    result_memory_curation_settings
+                )
         except (CharacterConfigError, OSError) as exc:
             show_themed_critical(self, "保存失败", f"无法保存设置：{exc}")
             return
@@ -5165,6 +5057,8 @@ class PetWindow(QWidget):
             result_reply_segment_pause_ms,
         )
         self._apply_bubble_settings(result_bubble_settings)
+        if result_memory_curation_settings is not None:
+            self.memory_curation_settings = result_memory_curation_settings
         apply_theme_settings = getattr(self, "_apply_theme_settings", None)
         if callable(apply_theme_settings):
             apply_theme_settings(result_theme_settings)

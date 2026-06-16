@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable
 
 from PySide6.QtCore import QTimer, Qt
 
@@ -56,14 +55,12 @@ class HistoryWindow(QDialog):
         self,
         history_store: ChatHistoryStore,
         subtitle_language: str = "ja",
-        on_save_and_clear: Callable[[], None] | None = None,
         theme_settings: ThemeSettings | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
         self.history_store = history_store
         self.subtitle_language = subtitle_language
-        self.on_save_and_clear = on_save_and_clear
         self.theme_settings = (theme_settings or DEFAULT_THEME_SETTINGS).normalized()
         self._bubble_frames: list[QFrame] = []
         self._pending_entries: list[ChatHistoryEntry] = []
@@ -97,10 +94,6 @@ class HistoryWindow(QDialog):
         self.clear_button.setObjectName("dangerButton")
         self.clear_button.clicked.connect(self.clear_history)
 
-        self.save_and_clear_button = QPushButton("清除并保存至记忆", self)
-        self.save_and_clear_button.setObjectName("primaryButton")
-        self.save_and_clear_button.clicked.connect(self.save_and_clear_history)
-
         self.close_button = QPushButton("关闭", self)
         self.close_button.setObjectName("secondaryButton")
         self.close_button.clicked.connect(self.close)
@@ -113,7 +106,6 @@ class HistoryWindow(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.refresh_button)
         button_layout.addStretch(1)
-        button_layout.addWidget(self.save_and_clear_button)
         button_layout.addWidget(self.clear_button)
         button_layout.addWidget(self.close_button)
 
@@ -196,34 +188,6 @@ class HistoryWindow(QDialog):
             return
         self.history_store.clear()
         self.refresh()
-
-    def save_and_clear_history(self) -> None:
-        if self.on_save_and_clear is None:
-            QMessageBox.warning(self, "不可用", "当前没有可用的记忆整理器。")
-            return
-        entries = self.history_store.load()
-        if not entries:
-            self.refresh()
-            return
-        result = QMessageBox.question(
-            self,
-            "清除并保存至记忆",
-            "会先让模型整理当前历史并写入长期记忆，成功后再清空历史。继续吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if result != QMessageBox.StandardButton.Yes:
-            return
-        self.set_memory_save_busy(True)
-        self.on_save_and_clear()
-
-    def set_memory_save_busy(self, busy: bool) -> None:
-        if not hasattr(self, "save_and_clear_button"):
-            return
-        self.save_and_clear_button.setEnabled(not busy)
-        self.clear_button.setEnabled(not busy)
-        self.refresh_button.setEnabled(not busy)
-        self.save_and_clear_button.setText("整理中..." if busy else "清除并保存至记忆")
 
     def _clear_entries(self) -> None:
         self._render_generation += 1

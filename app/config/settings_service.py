@@ -483,6 +483,18 @@ class AppSettingsService:
             backfill_limit=_int_value(memory.get("backfill_limit"), 200),
         )
 
+    def save_memory_curation_settings(self, settings) -> None:
+        # 仅写入 memory_curation section 的三个字段；backfill_limit 不在 UI 暴露，
+        # 但持久化时一并保留，避免被默认值覆盖。
+        self.save_system_values(
+            "memory_curation",
+            {
+                "enabled": bool(settings.enabled),
+                "trigger_turns": int(settings.trigger_turns),
+                "backfill_limit": int(settings.backfill_limit),
+            },
+        )
+
     def load_current_character_id(self, character_registry: CharacterRegistry) -> str:
         data = load_yaml_mapping(self.characters_config_path)
         configured = str(data.get("current_character_id", "")).strip()
