@@ -401,11 +401,17 @@ def test_memory_store_returns_failed_response_for_nonblocking_memory_tools() -> 
     store._load_error = "Cannot send a request, as the client has been closed."
 
     result = store.search_memory({"query": "偏好"}, wait=False)
+    update_result = store.update_memory(
+        {"id": "memory-001", "content": "主人喜欢低糖咖啡"},
+        wait=False,
+    )
 
     assert result["status"] == "failed"
     assert "普通聊天仍可继续" in result["message"]
     assert result["memories"] == []
     assert "client has been closed" in result["error"]
+    assert update_result["status"] == "failed"
+    assert "client has been closed" in update_result["error"]
 
 
 def test_memory_store_downgrades_closed_client_during_search() -> None:
@@ -866,7 +872,33 @@ def test_builtin_registry_registers_mem0_memory_tools() -> None:
 
     assert descriptions["memory_search"]["group"] == "memory"
     assert descriptions["memory_remember"]["group"] == "memory"
+    assert descriptions["memory_update"]["group"] == "memory"
     assert descriptions["memory_forget"]["group"] == "memory"
+
+
+def test_builtin_memory_update_tool_updates_existing_memory() -> None:
+    fake = FakeMem0()
+    registry = create_builtin_tool_registry(
+        _runtime_root_path("builtin_memory_update_tool"),
+        memory=MemoryStore(memory_client=fake),
+    )
+    remember_result = registry.execute(
+        "memory_remember",
+        {"content": "主人喜欢热咖啡"},
+    )
+    memory_id = remember_result.content["memory"]["id"]
+
+    update_result = registry.execute(
+        "memory_update",
+        {
+            "memory_id": memory_id,
+            "content": "主人喜欢低糖热咖啡",
+        },
+    )
+
+    assert update_result.success
+    assert update_result.content["memory"]["id"] == memory_id
+    assert update_result.content["memory"]["content"] == "主人喜欢低糖热咖啡"
 
 
 def test_tool_registry_requires_confirmation_returns_pending_action() -> None:

@@ -1047,7 +1047,7 @@ class AgentRuntime:
                 web_tool_capability_rule,
                 "- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。",
                 "- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。",
-                "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_forget",
+                "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_update、memory_forget",
             ]
         )
         tool_rules = "\n".join(
@@ -1068,6 +1068,7 @@ class AgentRuntime:
                 "- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。",
                 "- 需要跨会话信息、用户偏好或项目状态时，优先使用 memory_search。",
                 "- 只有用户明确要求记住，或信息明显长期有用且不包含敏感凭据时，才使用 memory_remember。",
+                "- 需要纠正、补充或合并已有长期记忆时，先用 memory_search 找到 id，再用 memory_update 写入更新后的完整记忆。",
                 "- 只有用户明确要求忘掉信息时，才使用 memory_forget。",
             ]
         )

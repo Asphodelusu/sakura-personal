@@ -186,6 +186,26 @@ class BuiltinToolProvider:
                 group="memory",
             ),
             Tool(
+                name="memory_update",
+                description="按 memory_id 更新已存在的长期记忆；先用 memory_search 获取 id。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id。"},
+                        "content": {"type": "string", "description": "更新后的完整记忆内容。"},
+                    },
+                    "required": ["memory_id", "content"],
+                },
+                handler=lambda args: self.memory.update_memory(
+                    {
+                        "id": args.get("memory_id") or args.get("id"),
+                        "content": args.get("content"),
+                    },
+                    wait=False,
+                ),
+                group="memory",
+            ),
+            Tool(
                 name="memory_forget",
                 description="按 memory_id 删除长期记忆。",
                 parameters={

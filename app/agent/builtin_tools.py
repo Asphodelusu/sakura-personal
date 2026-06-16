@@ -196,6 +196,26 @@ def create_builtin_tool_registry(
                 group="memory",
             ),
             Tool(
+                name="memory_update",
+                description=(
+                    "更新一条已存在的长期记忆。先用 memory_search 找到 memory_id；"
+                    "只在用户明确纠正、补充、合并旧记忆，或已有记忆明显过时时使用。"
+                    "不要写入密码、token、密钥、身份证、银行卡等敏感凭据。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                        "content": {"type": "string", "description": "更新后的完整长期记忆内容。"},
+                    },
+                    "required": ["memory_id", "content"],
+                },
+                handler=lambda arguments: memory.update_memory(
+                    _memory_update_arguments(arguments), wait=False
+                ),
+                group="memory",
+            ),
+            Tool(
                 name="memory_forget",
                 description="在用户明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
                 parameters={
@@ -253,6 +273,11 @@ def get_current_time() -> dict[str, str]:
 def _memory_forget_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     memory_id = arguments.get("memory_id") or arguments.get("id")
     return {"id": memory_id}
+
+
+def _memory_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    memory_id = arguments.get("memory_id") or arguments.get("id")
+    return {"id": memory_id, "content": arguments.get("content")}
 
 
 class TodoStore:

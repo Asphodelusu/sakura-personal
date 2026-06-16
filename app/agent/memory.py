@@ -514,16 +514,24 @@ class MemoryStore:
         arguments: dict[str, Any],
         *,
         allow_sensitive: bool = False,
+        wait: bool = True,
     ) -> dict[str, Any]:
         _ = allow_sensitive
         memory_id = _required_text(arguments, "id")
         content = _required_text(arguments, "content")
-        mem = self._get_memory()
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
+        if mem is None:
+            return self._loading_response()
         metadata = _memory_metadata(arguments)
         raw = mem.update(memory_id, content, metadata=metadata or None)
         current = _normalize_memory_record(mem.get(memory_id))
         memory = current or _first_memory_result(raw) or {"id": memory_id, "content": content, "memory": content}
-        return {"memory": memory}
+        return {"memory": memory, "ok": True}
 
     def delete_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
