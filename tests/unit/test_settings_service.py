@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from app.agent.mcp.settings import MCPRuntimeSettings
+from app.agent.runtime_limits import RuntimeLoopSettings
 from app.config.character_loader import CharacterRegistry
 from app.config.settings_service import (
     AppSettingsService,
@@ -193,6 +194,30 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     assert system["memory_curation"]["enabled"] is False
     assert system["memory_curation"]["trigger_turns"] == 20
     assert system["memory_curation"]["backfill_limit"] == 150
+
+
+def test_settings_service_loads_and_saves_runtime_loop_settings() -> None:
+    root = _runtime_root("yaml_runtime_loop")
+    service = AppSettingsService(root)
+
+    assert service.load_runtime_loop_settings() == RuntimeLoopSettings()
+
+    service.save_runtime_loop_settings(
+        RuntimeLoopSettings(
+            max_agent_steps_per_turn=20,
+            max_tool_calls_per_step=6,
+            max_tool_calls_per_turn=4,
+        )
+    )
+
+    loaded = service.load_runtime_loop_settings()
+    assert loaded.max_agent_steps_per_turn == 12
+    assert loaded.max_tool_calls_per_step == 6
+    assert loaded.max_tool_calls_per_turn == 6
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["tool_loop"]["max_agent_steps_per_turn"] == 12
+    assert system["tool_loop"]["max_tool_calls_per_step"] == 6
+    assert system["tool_loop"]["max_tool_calls_per_turn"] == 6
 
 
 def test_settings_service_loads_tts_work_dir_and_keeps_legacy_blank() -> None:

@@ -35,6 +35,7 @@ from app.agent.runtime_limits import (
     MAX_TOOL_CALLS_PER_STEP,
     MAX_TOOL_CALLS_PER_TURN,
     MAX_TOOL_RESULT_CHARS,
+    RuntimeLoopSettings,
 )
 from app.agent.tools import Tool, ToolRegistry
 from app.llm.api_client import ApiRequestError, ChatMessage, NativeToolCall, OpenAICompatibleClient
@@ -100,6 +101,22 @@ class TestRuntimeLimits:
     def test_event_context_limits_positive(self) -> None:
         assert MAX_EVENT_RECENT_CONVERSATION_MESSAGES > 0
         assert MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS > 0
+
+    def test_runtime_loop_settings_are_used_in_prompt(self) -> None:
+        runtime = AgentRuntime(
+            _dummy_api_client(),
+            _dummy_system_prompt(),
+            runtime_loop_settings=RuntimeLoopSettings(
+                max_agent_steps_per_turn=6,
+                max_tool_calls_per_step=4,
+                max_tool_calls_per_turn=12,
+            ),
+        )
+
+        prompt = runtime._build_tool_system_prompt()
+
+        assert "之后最多还可以继续 5 步" in prompt
+        assert "每步最多请求 4 个工具，整轮最多 12 个工具" in prompt
 
 
 class TestToolCallCountLimits:

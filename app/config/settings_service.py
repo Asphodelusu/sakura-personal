@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_settings
+from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
@@ -338,6 +339,37 @@ class AppSettingsService:
         self.save_system_values(
             "mcp",
             {"windows_enabled": bool(normalized_settings.windows_enabled)},
+        )
+
+    def load_runtime_loop_settings(self) -> RuntimeLoopSettings:
+        tool_loop = self._system_section("tool_loop")
+        defaults = RuntimeLoopSettings()
+        return normalize_runtime_loop_settings(
+            RuntimeLoopSettings(
+                max_agent_steps_per_turn=_int_value(
+                    tool_loop.get("max_agent_steps_per_turn"),
+                    defaults.max_agent_steps_per_turn,
+                ),
+                max_tool_calls_per_step=_int_value(
+                    tool_loop.get("max_tool_calls_per_step"),
+                    defaults.max_tool_calls_per_step,
+                ),
+                max_tool_calls_per_turn=_int_value(
+                    tool_loop.get("max_tool_calls_per_turn"),
+                    defaults.max_tool_calls_per_turn,
+                ),
+            )
+        )
+
+    def save_runtime_loop_settings(self, settings: RuntimeLoopSettings) -> None:
+        normalized = normalize_runtime_loop_settings(settings)
+        self.save_system_values(
+            "tool_loop",
+            {
+                "max_agent_steps_per_turn": int(normalized.max_agent_steps_per_turn),
+                "max_tool_calls_per_step": int(normalized.max_tool_calls_per_step),
+                "max_tool_calls_per_turn": int(normalized.max_tool_calls_per_turn),
+            },
         )
 
     def load_debug_log_settings(self) -> DebugLogSettings:

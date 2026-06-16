@@ -140,6 +140,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     extension_registry.apply_tools(tool_registry)
     plugin_manager = PluginManager(base_dir=base_dir, resource_registry=resource_registry)
     mcp_settings = settings_service.load_mcp_runtime_settings()
+    runtime_loop_settings = settings_service.load_runtime_loop_settings()
     agent_runtime = AgentRuntime(
         api_client=api_client,
         system_prompt=system_prompt,
@@ -147,6 +148,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         reply_portraits=character_profile.portrait_choices,
         tools=tool_registry,
         memory=memory_store,
+        runtime_loop_settings=runtime_loop_settings,
     )
     history_store = create_history_store(base_dir, character_profile)
     runtime_event_log = create_runtime_event_log(base_dir, character_profile)
@@ -169,6 +171,11 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
             "plugins_deferred": True,
             "tts_deferred": True,
             "auto_memory": memory_curation_settings.enabled,
+            "tool_loop": {
+                "max_agent_steps_per_turn": runtime_loop_settings.max_agent_steps_per_turn,
+                "max_tool_calls_per_step": runtime_loop_settings.max_tool_calls_per_step,
+                "max_tool_calls_per_turn": runtime_loop_settings.max_tool_calls_per_turn,
+            },
         },
     )
 

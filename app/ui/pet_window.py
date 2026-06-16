@@ -60,6 +60,7 @@ from app.agent.memory_curator import (
     MemoryCurationResult,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
+from app.agent.runtime_limits import RuntimeLoopSettings
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.core.app_context import AppContext
 from app.config.character_loader import (
@@ -4833,6 +4834,11 @@ class PetWindow(QWidget):
             startup_settings=getattr(self, "startup_settings", StartupSettings()),
             bubble_settings=getattr(self, "bubble_settings", BubbleSettings()),
             backchannel_settings=getattr(self, "backchannel_settings", BackchannelSettings()),
+            runtime_loop_settings=getattr(
+                self.agent_runtime,
+                "runtime_loop_settings",
+                RuntimeLoopSettings(),
+            ),
             on_layout_preview=self._preview_layout,
             memory_curation_settings=getattr(self, "memory_curation_settings", None),
         )
@@ -4921,6 +4927,10 @@ class PetWindow(QWidget):
             "result_backchannel_settings",
             getattr(self, "backchannel_settings", BackchannelSettings()),
         )
+        result_runtime_loop_settings = (
+            getattr(dialog, "result_runtime_loop_settings", None)
+            or getattr(self.agent_runtime, "runtime_loop_settings", RuntimeLoopSettings())
+        )
         # result_memory_curation_settings 在用户未改动时可能为 None，用当前配置兜底。
         result_memory_curation_settings = (
             getattr(dialog, "result_memory_curation_settings", None)
@@ -4964,6 +4974,7 @@ class PetWindow(QWidget):
             or result_theme_settings is None
             or result_subtitle_typing_interval_ms is None
             or result_reply_segment_pause_ms is None
+            or not isinstance(result_runtime_loop_settings, RuntimeLoopSettings)
         ):
             return
         if result_backchannel_settings is None or not isinstance(
@@ -5049,6 +5060,13 @@ class PetWindow(QWidget):
             )
             if callable(save_backchannel_settings):
                 save_backchannel_settings(result_backchannel_settings)
+            save_runtime_loop_settings = getattr(
+                self.settings_service,
+                "save_runtime_loop_settings",
+                None,
+            )
+            if callable(save_runtime_loop_settings):
+                save_runtime_loop_settings(result_runtime_loop_settings)
             if result_memory_curation_settings is not None:
                 self.settings_service.save_memory_curation_settings(
                     result_memory_curation_settings
@@ -5060,6 +5078,7 @@ class PetWindow(QWidget):
         if api_changed:
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
+        self.agent_runtime.set_runtime_loop_settings(result_runtime_loop_settings)
         self._apply_layout_settings(
             portrait_scale_percent=dialog.result_portrait_scale_percent,
             control_panel_width=result_control_panel_width,

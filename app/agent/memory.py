@@ -859,9 +859,10 @@ class MemoryStore:
             return {"memory": previous or {"id": memory_id, "content": ""}, "curation_cache_reset": {"messages": 0, "history": 0}}
         mem = self._get_memory()
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
-        mem.delete(memory_id)
+        already_missing = _delete_memory_idempotently(mem, memory_id)
         cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
-        return {"memory": previous or {"id": memory_id, "content": ""}, "curation_cache_reset": cache_reset}
+        memory = previous or {"id": memory_id, "content": ""}
+        return {"memory": memory, "curation_cache_reset": cache_reset, "already_missing": already_missing}
 
     def forget_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
@@ -878,10 +879,15 @@ class MemoryStore:
         if mem is None:
             return self._loading_response()
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
-        mem.delete(memory_id)
+        already_missing = _delete_memory_idempotently(mem, memory_id)
         cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
         forgotten = previous or {"id": memory_id, "content": ""}
-        return {"forgotten": forgotten, "memory": forgotten, "curation_cache_reset": cache_reset}
+        return {
+            "forgotten": forgotten,
+            "memory": forgotten,
+            "curation_cache_reset": cache_reset,
+            "already_missing": already_missing,
+        }
 
     def reset_curation_cache(self, *, wait: bool = True) -> dict[str, int]:
         """清理当前角色的 mem0 整理缓存，不影响 Sakura 自己的聊天历史文件。"""
@@ -1458,6 +1464,37 @@ def _format_memory_load_error(exc: Exception, *, embedding_download: bool) -> st
 
 def _is_closed_client_error(exc: Exception) -> bool:
     return "client has been closed" in str(exc).lower()
+
+
+def _is_missing_memory_error(exc: Exception, memory_id: str) -> bool:
+    message = str(exc).lower()
+    has_missing_marker = any(
+        marker in message
+        for marker in (
+            "not found",
+            "does not exist",
+            "not exist",
+            "no memory",
+            "未找到",
+            "不存在",
+        )
+    )
+    if not has_missing_marker:
+        return False
+    normalized_id = str(memory_id).lower()
+    return bool(normalized_id and normalized_id in message) or "memory" in message or "记忆" in message
+
+
+def _delete_memory_idempotently(mem: Any, memory_id: str) -> bool:
+    """删除长期记忆；底层已不存在时视为删除完成，避免清理工具误报异常。"""
+
+    try:
+        mem.delete(memory_id)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_memory_error(exc, memory_id):
+            raise
+        return True
+    return False
 
 
 def _close_memory_client(memory: Any | None) -> None:

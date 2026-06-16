@@ -22,6 +22,7 @@ from app.config.character_loader import CharacterConfigError
 from app.config.settings_service import AppSettingsService, StartupSettings
 from app.agent.mcp import MCPRuntimeSettings
 from app.agent.proactive_care import ProactiveCareSettings
+from app.agent.runtime_limits import RuntimeLoopSettings
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
     ensure_launch_at_login_state,
@@ -417,6 +418,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         proactive_care_settings=settings_service.load_proactive_care_settings(),
         mcp_settings=settings_service.load_mcp_runtime_settings(),
         debug_log_settings=settings_service.load_debug_log_settings(),
+        runtime_loop_settings=settings_service.load_runtime_loop_settings(),
         portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
         subtitle_typing_interval_ms=SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms=REPLY_SEGMENT_PAUSE_MS,
@@ -443,6 +445,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         or dialog.result_character_id is None
         or dialog.result_proactive_care_settings is None
         or dialog.result_mcp_settings is None
+        or dialog.result_runtime_loop_settings is None
         or dialog.result_debug_log_settings is None
         or dialog.result_startup_settings is None
         or dialog.result_portrait_scale_percent is None
@@ -462,6 +465,9 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         dialog.result_proactive_care_settings or ProactiveCareSettings()
     )
     settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings or MCPRuntimeSettings())
+    settings_service.save_runtime_loop_settings(
+        dialog.result_runtime_loop_settings or RuntimeLoopSettings()
+    )
     settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
     if dialog.result_startup_settings != startup_settings:
         _apply_launch_at_login_settings(base_dir, dialog.result_startup_settings)

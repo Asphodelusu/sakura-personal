@@ -41,6 +41,7 @@ from app.agent.memory import (
     MemoryStore,
 )
 from app.agent.mcp import MCPRuntimeSettings
+from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.backchannel.model_cache import (
     DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
     BackchannelModelImportResult,
@@ -165,6 +166,7 @@ class SettingsDialog(QDialog):
         startup_settings: StartupSettings | None = None,
         bubble_settings: BubbleSettings | None = None,
         backchannel_settings: BackchannelSettings | None = None,
+        runtime_loop_settings: RuntimeLoopSettings | None = None,
         on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
         proactive_care_settings: ScreenAwarenessSettings | None = None,
         memory_curation_settings=None,
@@ -177,6 +179,7 @@ class SettingsDialog(QDialog):
         self.startup_settings = startup_settings or StartupSettings()
         self.bubble_settings = bubble_settings or BubbleSettings()
         self.backchannel_settings = (backchannel_settings or BackchannelSettings()).normalized()
+        self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
         # 延迟导入避免与 app.agent 形成导入环（与 settings_service 一致）。
         from app.agent.memory_curator import MemoryCurationSettings as _MemoryCurationSettings
 
@@ -232,6 +235,7 @@ class SettingsDialog(QDialog):
         self.result_screen_awareness_settings: ScreenAwarenessSettings | None = None
         self.result_proactive_care_settings: ScreenAwarenessSettings | None = None
         self.result_mcp_settings: MCPRuntimeSettings | None = None
+        self.result_runtime_loop_settings: RuntimeLoopSettings | None = None
         self.result_debug_log_settings: DebugLogSettings | None = None
         self.result_startup_settings: StartupSettings | None = None
         self.result_bubble_settings: BubbleSettings | None = None
@@ -296,6 +300,7 @@ class SettingsDialog(QDialog):
                 self._build_scrollable_tab(
                     ToolsSettingsPage(self).build(
                         mcp_settings or MCPRuntimeSettings(),
+                        self.runtime_loop_settings,
                         tools_tab_contributions or [],
                     )
                 ),
@@ -1945,6 +1950,11 @@ class SettingsDialog(QDialog):
             "mcp_settings": MCPRuntimeSettings(
                 windows_enabled=self.windows_mcp_enabled_check.isChecked(),
             ),
+            "runtime_loop_settings": RuntimeLoopSettings(
+                max_agent_steps_per_turn=self.agent_steps_per_turn_spin.value(),
+                max_tool_calls_per_step=self.tool_calls_per_step_spin.value(),
+                max_tool_calls_per_turn=self.tool_calls_per_turn_spin.value(),
+            ).normalized(),
             "debug_log_settings": DebugLogSettings(
                 enabled=self.debug_log_enabled_check.isChecked(),
                 body_enabled=(
@@ -1992,6 +2002,7 @@ class SettingsDialog(QDialog):
         theme_settings = values["theme_settings"]
         screen_awareness_settings = values["screen_awareness_settings"]
         mcp_settings = values["mcp_settings"]
+        runtime_loop_settings = values["runtime_loop_settings"]
         debug_log_settings = values["debug_log_settings"]
         startup_settings = values["startup_settings"]
         bubble_settings = values["bubble_settings"]
@@ -2015,6 +2026,8 @@ class SettingsDialog(QDialog):
         if not isinstance(screen_awareness_settings, ScreenAwarenessSettings):
             return
         if not isinstance(mcp_settings, MCPRuntimeSettings):
+            return
+        if not isinstance(runtime_loop_settings, RuntimeLoopSettings):
             return
         if not isinstance(debug_log_settings, DebugLogSettings):
             return
@@ -2061,6 +2074,7 @@ class SettingsDialog(QDialog):
         self.result_screen_awareness_settings = screen_awareness_settings
         self.result_proactive_care_settings = screen_awareness_settings
         self.result_mcp_settings = mcp_settings
+        self.result_runtime_loop_settings = runtime_loop_settings
         self.result_debug_log_settings = debug_log_settings
         self.result_startup_settings = startup_settings
         self.result_bubble_settings = bubble_settings

@@ -12,6 +12,7 @@ from app.agent.runtime_limits import (
     MAX_TOOL_CALLS_PER_STEP,
     MAX_TOOL_CALLS_PER_TURN,
     ProgressCallback,
+    RuntimeLoopSettings,
 )
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "PendingToolAction",
     "ProgressCallback",
     "ReminderStore",
+    "RuntimeLoopSettings",
     "ScheduledReminder",
     "Tool",
     "ToolExecutionResult",

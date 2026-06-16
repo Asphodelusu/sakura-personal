@@ -30,6 +30,14 @@ from PySide6.QtWidgets import (
 )
 
 from app.agent.mcp import MCPRuntimeSettings, WINDOWS_MCP_EXPERIMENTAL_TEXT
+from app.agent.runtime_limits import (
+    MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,
+    MAX_CONFIGURABLE_TOOL_CALLS_PER_STEP,
+    MAX_CONFIGURABLE_TOOL_CALLS_PER_TURN,
+    MIN_AGENT_STEPS_PER_TURN,
+    MIN_TOOL_CALLS_PER_STEP,
+    RuntimeLoopSettings,
+)
 from app.agent.memory import MEMORY_LAYER_LABELS, MEMORY_LAYERS, MemoryStore
 from app.backchannel.model_cache import (
     BACKCHANNEL_MODEL_CACHE_NAME,
@@ -665,10 +673,12 @@ class ToolsSettingsPage:
     def build(
         self,
         settings: MCPRuntimeSettings,
+        runtime_loop_settings: RuntimeLoopSettings,
         tools_tab_contributions: list[ToolsTabContribution],
     ) -> QWidget:
         owner = self.dialog
         tab = QWidget(owner)
+        runtime_loop_settings = runtime_loop_settings.normalized()
         owner.windows_mcp_enabled_check = QCheckBox("启用 Windows MCP 桌面控制（实验性）", tab)
         owner.windows_mcp_enabled_check.setChecked(settings.windows_enabled)
         owner.windows_mcp_enabled_check.setToolTip(WINDOWS_MCP_EXPERIMENTAL_TEXT)
@@ -685,6 +695,7 @@ class ToolsSettingsPage:
         form_layout.setSpacing(12)
         form_layout.addRow("", owner.windows_mcp_enabled_check)
         form_layout.addRow("生效方式", restart_hint)
+        form_layout.addRow("", self._build_runtime_loop_group(runtime_loop_settings, tab))
         for contribution in sorted(tools_tab_contributions, key=lambda item: item.order):
             try:
                 widget = contribution.build(None)
@@ -694,6 +705,66 @@ class ToolsSettingsPage:
             form_layout.addRow(contribution.title, widget)
         tab.setLayout(form_layout)
         return tab
+
+    def _build_runtime_loop_group(
+        self,
+        settings: RuntimeLoopSettings,
+        parent: QWidget,
+    ) -> QGroupBox:
+        owner = self.dialog
+        group = QGroupBox("工具循环", parent)
+
+        owner.agent_steps_per_turn_spin = _NoWheelSpinBox(group)
+        owner.agent_steps_per_turn_spin.setRange(
+            MIN_AGENT_STEPS_PER_TURN,
+            MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,
+        )
+        owner.agent_steps_per_turn_spin.setSuffix(" 步")
+        owner.agent_steps_per_turn_spin.setValue(settings.max_agent_steps_per_turn)
+        owner.agent_steps_per_turn_spin.setToolTip(
+            "每轮对话中，模型最多连续规划和执行工具的轮数。"
+        )
+
+        owner.tool_calls_per_step_spin = _NoWheelSpinBox(group)
+        owner.tool_calls_per_step_spin.setRange(
+            MIN_TOOL_CALLS_PER_STEP,
+            MAX_CONFIGURABLE_TOOL_CALLS_PER_STEP,
+        )
+        owner.tool_calls_per_step_spin.setSuffix(" 个")
+        owner.tool_calls_per_step_spin.setValue(settings.max_tool_calls_per_step)
+        owner.tool_calls_per_step_spin.setToolTip(
+            "单次规划返回多个工具调用时，本步骤最多执行的数量。"
+        )
+
+        owner.tool_calls_per_turn_spin = _NoWheelSpinBox(group)
+        owner.tool_calls_per_turn_spin.setRange(
+            settings.max_tool_calls_per_step,
+            MAX_CONFIGURABLE_TOOL_CALLS_PER_TURN,
+        )
+        owner.tool_calls_per_turn_spin.setSuffix(" 个")
+        owner.tool_calls_per_turn_spin.setValue(settings.max_tool_calls_per_turn)
+        owner.tool_calls_per_turn_spin.setToolTip(
+            "一轮用户消息内最多执行的工具调用总数。"
+        )
+        owner.tool_calls_per_step_spin.valueChanged.connect(
+            owner.tool_calls_per_turn_spin.setMinimum
+        )
+
+        hint = QLabel(
+            "数值越大，复杂任务可连续推进得更久，但也会增加响应时间和接口消耗。",
+            group,
+        )
+        hint.setWordWrap(True)
+
+        layout = QFormLayout()
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+        layout.addRow("循环步数", owner.agent_steps_per_turn_spin)
+        layout.addRow("每步工具数", owner.tool_calls_per_step_spin)
+        layout.addRow("整轮工具数", owner.tool_calls_per_turn_spin)
+        layout.addRow("说明", hint)
+        group.setLayout(layout)
+        return group
 
 
 class PluginSettingsPage:

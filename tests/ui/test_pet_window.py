@@ -12,6 +12,7 @@ import uuid
 import pytest
 
 from app.agent.mcp import MCPRuntimeSettings
+from app.agent.runtime_limits import RuntimeLoopSettings
 from app.config.settings_service import BackchannelSettings, DebugLogSettings, StartupSettings
 from app.llm.api_client import ApiSettings
 from app.agent import AgentEvent, AgentResult
@@ -3497,6 +3498,53 @@ def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> N
     app.processEvents()
 
 
+def test_settings_dialog_saves_runtime_loop_settings() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("runtime_loop_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        runtime_loop_settings=RuntimeLoopSettings(
+            max_agent_steps_per_turn=5,
+            max_tool_calls_per_step=4,
+            max_tool_calls_per_turn=9,
+        ),
+    )
+
+    assert dialog.agent_steps_per_turn_spin.value() == 5
+    assert dialog.tool_calls_per_step_spin.value() == 4
+    assert dialog.tool_calls_per_turn_spin.value() == 9
+
+    dialog.agent_steps_per_turn_spin.setValue(6)
+    dialog.tool_calls_per_step_spin.setValue(5)
+    dialog.tool_calls_per_turn_spin.setValue(11)
+    dialog.accept()
+
+    assert dialog.result_runtime_loop_settings == RuntimeLoopSettings(
+        max_agent_steps_per_turn=6,
+        max_tool_calls_per_step=5,
+        max_tool_calls_per_turn=11,
+    )
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -6086,6 +6134,87 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
     assert calls == {"save_api": 0, "update_api": 0, "reload_memory": 0}
 
 
+def test_show_settings_saves_and_applies_runtime_loop_settings(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
+    tts_settings = _minimal_tts_settings()
+    runtime_settings = RuntimeLoopSettings(
+        max_agent_steps_per_turn=6,
+        max_tool_calls_per_step=5,
+        max_tool_calls_per_turn=11,
+    )
+    saved_runtime_settings: list[RuntimeLoopSettings] = []
+
+    class SettingsServiceStub:
+        def load_tts_settings(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return tts_settings
+
+        def save_api_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_tts_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_current_character_id(self, *_args):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_proactive_care_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_mcp_runtime_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_runtime_loop_settings(self, settings):  # type: ignore[no-untyped-def]
+            saved_runtime_settings.append(settings)
+
+        def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_system_values(self, *_args):  # type: ignore[no-untyped-def]
+            pass
+
+    class ApiClientStub:
+        settings = api_settings
+
+        def update_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+    class MemoryStoreStub:
+        def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+    class DialogStub(_NonModalSettingsDialogStub):
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+            self.result_api_settings = api_settings
+            self.result_tts_settings = tts_settings
+            self.result_character_id = "sakura"
+            self.result_proactive_care_settings = ProactiveCareSettings(screen_context_enabled=True)
+            self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
+            self.result_runtime_loop_settings = runtime_settings
+            self.result_debug_log_settings = DebugLogSettings()
+            self.result_portrait_scale_percent = 100
+
+    window = _minimal_settings_window(
+        PetWindow,
+        SettingsServiceStub(),
+        ApiClientStub(),
+        MemoryStoreStub(),
+    )
+    monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
+
+    window.show_settings()
+
+    assert saved_runtime_settings == [runtime_settings]
+    assert window.agent_runtime.runtime_loop_settings == runtime_settings
+
+
 def test_show_settings_applies_launch_at_login_change(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -6975,6 +7104,7 @@ def test_main_first_run_settings_saves_imported_character_and_builds_context(mon
             self.result_character_id = "imported"
             self.result_proactive_care_settings = ProactiveCareSettings(screen_context_enabled=True)
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
+            self.result_runtime_loop_settings = RuntimeLoopSettings()
             self.result_debug_log_settings = DebugLogSettings(enabled=True, body_enabled=False)
             self.result_startup_settings = StartupSettings()
             self.result_portrait_scale_percent = 125
@@ -9788,6 +9918,13 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         def set_provider(self, _provider):  # type: ignore[no-untyped-def]
             pass
 
+    class AgentRuntimeStub:
+        def __init__(self) -> None:
+            self.runtime_loop_settings = RuntimeLoopSettings()
+
+        def set_runtime_loop_settings(self, settings):  # type: ignore[no-untyped-def]
+            self.runtime_loop_settings = settings
+
     class MinimalSettingsWindow:
         show_settings = pet_window_cls.show_settings
         _on_settings_dialog_finished = pet_window_cls._on_settings_dialog_finished
@@ -9847,6 +9984,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.debug_log_settings = DebugLogSettings()
     window.startup_settings = StartupSettings()
     window.memory_store = memory_store
+    window.agent_runtime = AgentRuntimeStub()
     window.plugin_manager = PluginManagerStub()
     window.portrait_scale_percent = 100
     window.control_panel_width = 640

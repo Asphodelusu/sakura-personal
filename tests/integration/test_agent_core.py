@@ -853,6 +853,17 @@ def test_memory_store_create_update_search_and_delete() -> None:
     assert store.list_memories() == []
 
 
+def test_memory_store_forget_missing_id_is_idempotent() -> None:
+    fake = FakeMem0RaisesOnMissingDelete()
+    store = MemoryStore(base_dir=_runtime_root_path("memory_missing_forget"), scope_id="sakura", memory_client=fake)
+
+    result = store.forget_memory({"id": "missing-id"})
+
+    assert result["forgotten"] == {"id": "missing-id", "content": ""}
+    assert result["memory"] == {"id": "missing-id", "content": ""}
+    assert result["already_missing"] is True
+
+
 def test_memory_store_defaults_legacy_records_to_semantic_layer() -> None:
     fake = FakeMem0()
     store = MemoryStore(base_dir=_runtime_root_path("memory_legacy_layer"), scope_id="sakura", memory_client=fake)
@@ -3594,6 +3605,13 @@ class FakeMem0:
             for record in self.records
             if user_id is None or record.get("user_id") == user_id
         ]
+
+
+class FakeMem0RaisesOnMissingDelete(FakeMem0):
+    def delete(self, memory_id):  # type: ignore[no-untyped-def]
+        if self.get(memory_id) is None:
+            raise ValueError(f"Memory with id {memory_id} not found")
+        return super().delete(memory_id)
 
 
 class ClosableClient:
