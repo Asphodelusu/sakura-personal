@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTextEdit,
     QVBoxLayout,
@@ -703,7 +704,7 @@ class PluginSettingsPage:
         owner = self.dialog
         tab = QWidget(owner)
         tab.setObjectName("settingsPluginTab")
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 18, 16, 16)
         layout.setSpacing(12)
 
@@ -714,49 +715,107 @@ class PluginSettingsPage:
 
         owner.plugin_table = QTableWidget(tab)
         owner.plugin_table.setObjectName("pluginManagerTable")
-        owner.plugin_table.setColumnCount(6)
-        owner.plugin_table.setHorizontalHeaderLabels(["启用", "名称", "版本", "优先级", "来源", "介绍"])
+        owner.plugin_table.setColumnCount(2)
+        owner.plugin_table.setHorizontalHeaderLabels(["启用", "插件"])
         owner.plugin_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         owner.plugin_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        owner.plugin_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        owner.plugin_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         owner.plugin_table.setAlternatingRowColors(True)
         owner.plugin_table.setWordWrap(True)
         owner.plugin_table.verticalHeader().setVisible(False)
+        owner.plugin_table.setMinimumWidth(190)
+        owner.plugin_table.setMaximumWidth(320)
+        owner.plugin_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         owner.plugin_table.setRowCount(len(owner.plugin_specs))
         header = owner.plugin_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for row, spec in enumerate(owner.plugin_specs):
             owner._populate_plugin_table_row(row, spec)
         owner.plugin_table.resizeRowsToContents()
-        layout.addWidget(owner.plugin_table, 1)
 
-        panel_title = QLabel("插件自定义设置", tab)
-        panel_title.setObjectName("pluginSettingsTitleLabel")
-        layout.addWidget(panel_title)
-        panel_container = QWidget(tab)
-        form_layout = QFormLayout()
-        form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(10)
-        for contribution in sorted(settings_panel_contributions, key=lambda item: item.order):
-            try:
-                widget = contribution.build(tab)
-            except Exception as exc:  # noqa: BLE001
-                widget = QLabel(f"{contribution.title} 设置加载失败：{exc}", tab)
-                widget.setWordWrap(True)
-            form_layout.addRow(contribution.title, widget)
-        if not settings_panel_contributions:
-            empty_label = QLabel("暂无插件自定义设置。", tab)
-            empty_label.setWordWrap(True)
-            form_layout.addRow("", empty_label)
-        panel_container.setLayout(form_layout)
-        layout.addWidget(panel_container)
-        tab.setLayout(layout)
+        detail_panel = self._build_detail_panel(tab, settings_panel_contributions)
+        detail_panel.setMinimumWidth(260)
+        splitter = QSplitter(Qt.Orientation.Horizontal, tab)
+        splitter.setObjectName("pluginManagerSplitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(owner.plugin_table)
+        splitter.addWidget(detail_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([240, 460])
+        layout.addWidget(splitter, 1)
+
+        owner.plugin_table.currentCellChanged.connect(
+            lambda current_row, _current_column, _previous_row, _previous_column:
+            owner._refresh_plugin_detail_panel(current_row)
+        )
+        if owner.plugin_specs:
+            owner.plugin_table.setCurrentCell(0, 1)
+        owner._refresh_plugin_detail_panel(owner.plugin_table.currentRow())
         return tab
+
+    def _build_detail_panel(
+        self,
+        parent: QWidget,
+        settings_panel_contributions: list[SettingsPanelContribution],
+    ) -> QWidget:
+        owner = self.dialog
+        panel = QWidget(parent)
+        panel.setObjectName("pluginDetailPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        detail_group = QGroupBox("插件详情", panel)
+        detail_layout = QFormLayout(detail_group)
+        detail_layout.setContentsMargins(14, 14, 14, 14)
+        detail_layout.setSpacing(10)
+        owner.plugin_detail_title_label = QLabel("请选择插件", detail_group)
+        owner.plugin_detail_title_label.setObjectName("pluginDetailTitleLabel")
+        owner.plugin_detail_title_label.setWordWrap(True)
+        owner.plugin_detail_meta_label = QLabel("", detail_group)
+        owner.plugin_detail_meta_label.setObjectName("pluginDetailMetaLabel")
+        owner.plugin_detail_meta_label.setWordWrap(True)
+        owner.plugin_detail_permissions_label = QLabel("", detail_group)
+        owner.plugin_detail_permissions_label.setObjectName("pluginDetailPermissionsLabel")
+        owner.plugin_detail_permissions_label.setWordWrap(True)
+        owner.plugin_detail_description_label = QLabel("", detail_group)
+        owner.plugin_detail_description_label.setObjectName("pluginDetailDescriptionLabel")
+        owner.plugin_detail_description_label.setWordWrap(True)
+        detail_layout.addRow("名称", owner.plugin_detail_title_label)
+        detail_layout.addRow("信息", owner.plugin_detail_meta_label)
+        detail_layout.addRow("权限", owner.plugin_detail_permissions_label)
+        detail_layout.addRow("介绍", owner.plugin_detail_description_label)
+        layout.addWidget(detail_group)
+
+        # 详细设置改为按钮触发的独立对话框：启停页保持聚焦，插件设置控件在独立窗口
+        # 里整宽展示并可滚动，避免嵌套挤压。这里只按 plugin_id 暂存贡献，按需构建。
+        owner._plugin_settings_contributions_by_id = self._group_settings_panels(
+            settings_panel_contributions
+        )
+        owner.plugin_open_settings_button = QPushButton("打开设置…", panel)
+        owner.plugin_open_settings_button.setObjectName("pluginOpenSettingsButton")
+        owner.plugin_open_settings_button.clicked.connect(owner._open_plugin_settings_dialog)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addWidget(owner.plugin_open_settings_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        layout.addStretch(1)
+        return panel
+
+    @staticmethod
+    def _group_settings_panels(
+        contributions: list[SettingsPanelContribution],
+    ) -> dict[str, list[SettingsPanelContribution]]:
+        grouped: dict[str, list[SettingsPanelContribution]] = {}
+        for contribution in contributions:
+            plugin_id = contribution.plugin_id.strip()
+            if not plugin_id:
+                plugin_id = "__unscoped__"
+            grouped.setdefault(plugin_id, []).append(contribution)
+        return grouped
 
 
 class SystemSettingsPage:

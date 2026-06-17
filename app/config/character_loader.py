@@ -49,6 +49,8 @@ class CharacterProfile:
     reply_tones: list[str] = field(default_factory=lambda: [*DEFAULT_TONES])
     theme_settings: ThemeSettings | None = None
     theme_source: CharacterThemeSource = THEME_SOURCE_COMPAT_DEFAULT
+    # 角色渲染后端配置（renderer 段原样保留；路径解析交由对应渲染插件处理）。
+    renderer_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.theme_settings is None:
@@ -167,6 +169,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         reply_tones=reply_tones,
         theme_settings=theme_settings,
         theme_source=theme_source,
+        renderer_config=_load_renderer_config(raw_data),
     )
 
 
@@ -232,6 +235,17 @@ def _load_reply_tones(reply_data: Any) -> list[str]:
         return [*DEFAULT_TONES]
     tones = [tone.strip() for tone in raw_tones if isinstance(tone, str) and tone.strip()]
     return tones or [*DEFAULT_TONES]
+
+
+def _load_renderer_config(raw_data: dict[str, Any]) -> dict[str, Any] | None:
+    """读取角色清单的 renderer 段（原样保留）。
+
+    本函数只做轻量校验（必须是对象），不解析模型/动作路径——那部分依赖具体
+    渲染插件，由插件相对角色目录解析，避免在
+    角色加载期因模型文件尚未就位而报错。
+    """
+    cfg = raw_data.get("renderer")
+    return cfg if isinstance(cfg, dict) else None
 
 
 def _load_voice(package_dir: Path, voice_data: Any, manifest_path: Path) -> CharacterVoice | None:

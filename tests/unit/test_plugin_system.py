@@ -28,11 +28,13 @@ from app.plugins.models import (
     PERMISSION_CHAT_UI,
     PERMISSION_EVENT_MESSAGE,
     PERMISSION_PROMPT_PATCH,
+    PERMISSION_RENDERER,
     PERMISSION_SETTINGS_PANEL,
     PERMISSION_TOOL,
     PERMISSION_TOOLS_TAB,
     ChatUIWidgetContribution,
     PromptPatchContribution,
+    RendererContribution,
     SettingsPanelContribution,
     ToolContribution,
     ToolsTabContribution,
@@ -87,6 +89,18 @@ class TestPluginCapabilityRegistry:
         assert len(reg.settings_panels) == 1
         assert len(reg.chat_ui_widgets) == 1
         assert len(reg.prompt_patches) == 1
+
+    def test_register_renderer(self) -> None:
+        reg = PluginCapabilityRegistry()
+        reg.register_renderer(
+            RendererContribution(
+                renderer_type="mmd",
+                display_name="MMD",
+                create=lambda context: None,
+            )
+        )
+        assert len(reg.renderers) == 1
+        assert reg.renderers[0].renderer_type == "mmd"
 
     def test_empty_registry(self) -> None:
         reg = PluginCapabilityRegistry()
@@ -228,6 +242,7 @@ class TestPluginManager:
         assert registry.execute("demo_echo", {"text": "hi"}).content == {"text": "hi"}
         assert [tab.title for tab in mgr.tools_tabs] == ["Demo 工具"]
         assert [panel.title for panel in mgr.settings_panels] == ["Demo 设置"]
+        assert [panel.plugin_id for panel in mgr.settings_panels] == ["demo"]
         assert [widget.widget_id for widget in mgr.chat_ui_widgets] == ["demo_widget"]
         assert mgr.prompt_patches[0].system_prompt_append == "demo system"
 
@@ -272,6 +287,44 @@ class TestPluginManager:
 
         assert not results[0].loaded
         assert "tools_tab" in str(results[0].error)
+
+    def test_renderer_contribution_loads_with_permission(self) -> None:
+        base = _runtime_root("renderer_contribution")
+        _write_renderer_plugin(base, "mmd_renderer", renderer_type="mmd")
+        mgr = PluginManager(base)
+
+        results = mgr.load_all()
+
+        assert results[0].loaded, results[0].error
+        assert [renderer.renderer_type for renderer in mgr.collect_renderers()] == ["mmd"]
+        assert mgr.collect_renderers()[0].plugin_id == "mmd_renderer"
+
+    def test_renderer_contribution_without_permission_fails(self) -> None:
+        base = _runtime_root("renderer_no_permission")
+        _write_renderer_plugin(
+            base,
+            "mmd_renderer",
+            renderer_type="mmd",
+            permissions=(PERMISSION_TOOL,),
+        )
+        mgr = PluginManager(base)
+
+        results = mgr.load_all()
+
+        assert not results[0].loaded
+        assert "renderer" in str(results[0].error)
+
+    def test_duplicate_renderer_type_marks_plugin_failed(self) -> None:
+        base = _runtime_root("duplicate_renderer")
+        _write_renderer_plugin(base, "renderer_a", renderer_type="mmd", priority=200)
+        _write_renderer_plugin(base, "renderer_b", renderer_type="mmd", priority=100)
+        mgr = PluginManager(base)
+
+        results = mgr.load_all()
+
+        assert results[0].loaded
+        assert not results[1].loaded
+        assert "渲染器类型重复" in str(results[1].error)
 
     def test_plugin_failure_isolated_from_later_plugin(self) -> None:
         base = _runtime_root("failure_isolation")
@@ -369,6 +422,17 @@ class TestContributionTypes:
         pp = PromptPatchContribution(patch_id="p1", system_prompt_append="extra prompt")
         assert pp.patch_id == "p1"
         assert pp.system_prompt_append == "extra prompt"
+
+    def test_renderer_contribution(self) -> None:
+        rc = RendererContribution(
+            renderer_type="mmd",
+            display_name="MMD",
+            create=lambda context: None,
+            priority=50.0,
+        )
+        assert rc.renderer_type == "mmd"
+        assert rc.display_name == "MMD"
+        assert rc.priority == 50.0
 
 
 def _runtime_root(name: str) -> Path:
@@ -472,6 +536,40 @@ class DemoPlugin(PluginBase):
         register.register_settings_panel(SettingsPanelContribution("demo_settings", "Demo 设置", lambda parent=None: None))
         register.register_chat_ui_widget(ChatUIWidgetContribution("demo_widget", lambda parent=None: None))
         register.register_prompt_patch(PromptPatchContribution("demo_patch", system_prompt_append="demo system"))
+'''.strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_renderer_plugin(
+    base: Path,
+    plugin_id: str,
+    *,
+    renderer_type: str,
+    priority: int = 100,
+    permissions: tuple[str, ...] | None = (PERMISSION_RENDERER,),
+) -> None:
+    plugin_dir = _write_plugin_manifest(
+        base,
+        plugin_id,
+        priority=priority,
+        permissions=permissions,
+    )
+    plugin_dir.joinpath("plugin.py").write_text(
+        f'''
+from app.plugins import PluginBase, RendererContribution
+
+
+class DemoPlugin(PluginBase):
+    plugin_id = "{plugin_id}"
+    plugin_version = "1.0.0"
+
+    def initialize(self, register, context):
+        register.register_renderer(RendererContribution(
+            renderer_type="{renderer_type}",
+            display_name="{renderer_type}",
+            create=lambda create_context: None,
+        ))
 '''.strip(),
         encoding="utf-8",
     )

@@ -9,11 +9,18 @@ from typing import Any, Callable
 
 PLUGIN_API_VERSION = 1
 
+# 宿主当前支持的插件 API 版本集合。
+# 引入不兼容的新版本时，把新版本号一并加入此集合（如 {1, 2}），即可让宿主
+# 同时加载已发布的旧版插件与新版插件，避免一次性破坏全部存量插件。
+SUPPORTED_API_VERSIONS = frozenset({PLUGIN_API_VERSION})
+
 PERMISSION_TOOL = "tool"
 PERMISSION_TOOLS_TAB = "tools_tab"
 PERMISSION_SETTINGS_PANEL = "settings_panel"
 PERMISSION_CHAT_UI = "chat_ui"
 PERMISSION_PROMPT_PATCH = "prompt_patch"
+PERMISSION_CONTEXT_PROVIDER = "context_provider"
+PERMISSION_RENDERER = "renderer"
 PERMISSION_EVENT_APP = "event.app"
 PERMISSION_EVENT_MESSAGE = "event.message"
 PERMISSION_EVENT_TTS = "event.tts"
@@ -26,6 +33,8 @@ KNOWN_PLUGIN_PERMISSIONS = frozenset(
         PERMISSION_SETTINGS_PANEL,
         PERMISSION_CHAT_UI,
         PERMISSION_PROMPT_PATCH,
+        PERMISSION_CONTEXT_PROVIDER,
+        PERMISSION_RENDERER,
         PERMISSION_EVENT_APP,
         PERMISSION_EVENT_MESSAGE,
         PERMISSION_EVENT_TTS,
@@ -66,6 +75,7 @@ class SettingsPanelContribution:
     title: str
     build: Callable[[Any], Any]
     order: float = 100.0
+    plugin_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,52 @@ class PromptPatchContribution:
     patch_id: str
     system_prompt_append: str = ""
     reply_protocol_append: str = ""
+
+
+@dataclass(frozen=True)
+class ContextProviderContribution:
+    """插件贡献的动态上下文提供者。
+
+    与 ``PromptPatchContribution`` 区分职责：
+    - PromptPatch 用于修改系统提示词、回复协议（相对静态）。
+    - ContextProvider 在每次构建 prompt 时动态生成一段局部上下文（如情绪、
+      屏幕摘要），由宿主统一组装，插件不拼完整 prompt。
+
+    ``build_context`` 接收宿主传入的上下文字典（本轮预留为空字典），返回字符串。
+    """
+
+    provider_id: str
+    description: str
+    build_context: Callable[[dict[str, Any]], str]
+    order: float = 100.0
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class RendererCreateContext:
+    """插件创建角色渲染器时收到的宿主上下文。
+
+    宿主只传递稳定、受限的信息；具体模型路径、动作表等仍由插件根据
+    ``renderer_config`` 和 ``package_dir`` 自行解析。
+    """
+
+    character_id: str
+    character_name: str
+    package_dir: Path
+    renderer_config: dict[str, Any]
+    owner_window: Any | None = None
+    event_bus: Any | None = None
+
+
+@dataclass(frozen=True)
+class RendererContribution:
+    """插件贡献的角色渲染后端工厂。"""
+
+    renderer_type: str
+    display_name: str
+    create: Callable[[RendererCreateContext], Any]
+    priority: float = 100.0
+    plugin_id: str = ""
 
 
 @dataclass(frozen=True)

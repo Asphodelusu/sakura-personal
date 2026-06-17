@@ -7,7 +7,7 @@
 - 这是 Sakura Desktop Pet，一个基于 Python/PySide6 的桌面 Agent / 桌宠项目。
 - 应用入口为 `main.py`。
 - 主要源码位于 `app/`。
-- 插件相关代码位于 `plugins/`、`app/plugins/` 和 `sdk/`。
+- 插件相关代码位于 `plugins/`（插件实现）和 `app/plugins/`（插件系统）。
 - 配置与运行时数据主要位于 `data/`、`runtime/`。
 - 角色包位于 `characters/`。
 - 测试位于 `tests/`。

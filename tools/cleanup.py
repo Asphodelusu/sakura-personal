@@ -9,7 +9,7 @@
 1. TTS 音频缓存残留          data/cache/tts/*
 2. 过期迁移备份              data/migration_backup/*（默认 30 天前，--backup-days 可调）
 3. TTS 整合包安装半成品      data/tts_bundles/tmp/、.migrating/
-4. Python 字节码缓存         app/ sdk/ plugins/ 下的 __pycache__（可再生）
+4. Python 字节码缓存         app/ plugins/ 下的 __pycache__（可再生）
 
 附加报告（只报告、绝不删除）：
 - 孤儿字节码：存在 .pyc 但对应 .py 已不存在 —— 旧版本覆盖升级残留的直接证据
@@ -33,7 +33,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from app.storage.paths import StoragePaths  # noqa: E402
 
 DEFAULT_BACKUP_RETENTION_DAYS = 30
-_PYCACHE_SCAN_ROOTS = ("app", "sdk", "plugins")
+_PYCACHE_SCAN_ROOTS = ("app", "plugins")
 
 
 @dataclass(frozen=True)

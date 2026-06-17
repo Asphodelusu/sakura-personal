@@ -10,7 +10,8 @@ from app.agent.tools import ToolRegistry
 from app.plugins.manager import PluginManager
 
 
-def test_legacy_sdk_modules_remain_importable() -> None:
+def test_legacy_sdk_package_is_removed() -> None:
+    # 旧 SDK 兼容层已在首个正式发布前移除，整个 sdk.* 不应再可导入。
     for module_name in (
         "sdk",
         "sdk.plugin",
@@ -18,7 +19,8 @@ def test_legacy_sdk_modules_remain_importable() -> None:
         "sdk.tool_registry",
         "sdk.types",
     ):
-        assert importlib.import_module(module_name) is not None
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module_name)
 
 
 def test_removed_internal_public_module_is_not_importable() -> None:
@@ -56,7 +58,8 @@ def test_old_reexport_symbols_are_not_available_from_former_modules() -> None:
         assert not hasattr(runtime, name)
 
 
-def test_plugin_using_legacy_sdk_api_loads() -> None:
+def test_plugin_importing_removed_sdk_fails_gracefully() -> None:
+    # 针对已删除 sdk.* 编写的旧插件，应加载失败但不拖垮宿主，且其余插件不受影响。
     base = _runtime_root("old_sdk_plugin")
     plugin_dir = base / "plugins" / "old_sdk_plugin"
     plugin_dir.mkdir(parents=True)
@@ -85,49 +88,8 @@ class OldSdkPlugin(PluginBase):
     results = PluginManager(base).load_all(ToolRegistry())
 
     assert len(results) == 1
-    assert results[0].loaded
-    assert results[0].error is None
-
-
-def test_legacy_sdk_global_tool_and_three_arg_initialize_load() -> None:
-    base = _runtime_root("legacy_tool_plugin")
-    plugin_dir = base / "plugins" / "legacy_tool_plugin"
-    plugin_dir.mkdir(parents=True)
-    (plugin_dir / "plugin.yaml").write_text(
-        """
-api_version: 1
-id: legacy_tool_plugin
-name: Legacy Tool Plugin
-entry: plugin:LegacyToolPlugin
-enabled: true
-""".lstrip(),
-        encoding="utf-8",
-    )
-    (plugin_dir / "plugin.py").write_text(
-        """
-from sdk.plugin import PluginBase
-from sdk.tool_registry import tool
-
-@tool(name="legacy_add", description="add")
-def add(a: int, b: int):
-    return {"result": a + b}
-
-class LegacyToolPlugin(PluginBase):
-    plugin_id = "legacy_tool_plugin"
-
-    def initialize(self, register, plugin_root, host):
-        self.plugin_root = plugin_root
-        self.host = host
-""".lstrip(),
-        encoding="utf-8",
-    )
-
-    registry = ToolRegistry()
-    results = PluginManager(base).load_all(registry)
-
-    assert len(results) == 1
-    assert results[0].loaded
-    assert registry.execute("legacy_add", {"a": 2, "b": 3}).content == {"result": 5}
+    assert not results[0].loaded
+    assert results[0].error is not None
 
 
 def _runtime_root(name: str) -> Path:
