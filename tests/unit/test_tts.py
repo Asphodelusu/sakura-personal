@@ -225,22 +225,23 @@ def test_service_ready_property_reflects_probe_state() -> None:
 
 def test_tts_provider_close_clears_queue_and_blocks_late_requests() -> None:
     provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
-    provider._pending_requests.append(_TTSRequest(text="queued", tone=None))
+    queue = provider._synthesis_queue
+    queue._pending_requests.append(_TTSRequest(text="queued", tone=None))
 
     provider.close()
 
     assert provider._is_closed()
-    assert provider._pending_requests == []
+    assert queue._pending_requests == []
 
     provider.speak("late request")
 
-    assert provider._pending_requests == []
+    assert queue._pending_requests == []
 
-    provider._pending_requests.append(_TTSRequest(text="stale", tone=None))
-    provider._start_next_request()
+    queue._pending_requests.append(_TTSRequest(text="stale", tone=None))
+    queue._start_next_request()
 
-    assert not provider._request_running
-    assert [request.text for request in provider._pending_requests] == ["stale"]
+    assert not queue._request_running
+    assert [request.text for request in queue._pending_requests] == ["stale"]
 
 
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]

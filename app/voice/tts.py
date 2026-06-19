@@ -1,29 +1,19 @@
 from __future__ import annotations
 
-import array
-import json
-import math
-import re
-import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
-import wave
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 
 from app.core.resource_manager import ResourceManager
-from app.llm.chat_reply import DEFAULT_TONE
 from app.core.debug_log import debug_log
-from app.core.interaction import get_interaction_id, set_interaction_id
+from app.core.interaction import get_interaction_id
 from app.storage.paths import StoragePaths
 from app.voice.tts_settings import (
     GPTSoVITSTTSSettings as _GPTSoVITSTTSSettings,
     TTS_PLAYBACK_BACKEND_AUDIO_SINK as _TTS_PLAYBACK_BACKEND_AUDIO_SINK,
-    ToneReference as _ToneReference,
 )
 from app.voice import audio_checks as _audio_checks
 from app.voice.tts_types import (
@@ -35,7 +25,8 @@ from app.voice.tts_types import (
     _set_service_state,
     _TTSRequest,
 )
-# 服务监督已抽到 tts_service.py；这里 re-export 供既有测试/装配从 app.voice.tts 导入。
+# 服务监督已抽到 tts_service.py、合成队列已抽到 tts_synthesis.py。
+# 这里 re-export 供既有测试/装配从 app.voice.tts 导入。
 from app.voice.tts_service import (  # noqa: F401
     GenieServiceSupervisor,
     TTSServiceSupervisor,
@@ -54,6 +45,16 @@ from app.voice.tts_service import (  # noqa: F401
     _local_tts_subprocess_env,
     _read_local_tts_output,
     _wait_local_service_ready,
+)
+from app.voice.tts_synthesis import (  # noqa: F401
+    GenieSynthesisEngine,
+    GPTSoVITSSynthesisEngine,
+    TTSSynthesisQueue,
+    _is_voiceable_text,
+    _resolve_request_text_lang,
+    _write_genie_audio,
+    _write_raw_float_or_pcm_as_wav,
+    _write_raw_pcm_as_wav,
 )
 
 if TYPE_CHECKING:
@@ -74,22 +75,6 @@ _AUDIO_FINISH_FALLBACK_GRACE_MS = 1500
 _AUDIO_FINISH_FALLBACK_MIN_MS = 2000
 # 播放完成兜底的上限：时长无法解析或异常超长时按此值兜底，防止流程永久挂起
 _AUDIO_FINISH_FALLBACK_MAX_MS = 60_000
-_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
-# 可发音字符:数字/拉丁字母/假名/汉字/谚文(含全角)。纯标点、emoji、符号不算——
-# 这类文本喂给 GPT-SoVITS 归一化后音素为空,会触发服务端 [Errno 22] Invalid argument。
-_VOICEABLE_CHAR_RE = re.compile(
-    "[0-9A-Za-z"
-    "぀-ヿ"  # 平假名/片假名
-    "㐀-䶿"  # CJK 扩展 A
-    "一-鿿"  # CJK 基本
-    "豈-﫿"  # CJK 兼容
-    "가-힣"  # 谚文音节
-    "０-９Ａ-Ｚａ-ｚ"  # 全角数字/字母
-    "ｦ-ﾟ"  # 半角片假名
-    "]"
-)
-_CJK_TEXT_LANGS = {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"}
-_LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
 
 
 def _load_qt_multimedia() -> tuple[type[Any], type[Any]]:
@@ -282,11 +267,9 @@ class GPTSoVITSTTSProvider(QObject):
         self._current_finished: TTSCallback | None = None
         self._current_started_emitted = False
         self._finishing_audio = False
-        self._request_lock = threading.Lock()
-        self._pending_requests: list[_TTSRequest] = []
-        self._request_running = False
+        # 关闭标志由 _close_lock 守护（合成队列在自己的锁内不持有它，避免反向锁序）。
+        self._close_lock = threading.Lock()
         self._closed = False
-        self._tone_indices: dict[str, int] = {}
         self._playback_warmup_requested = False
         self._playback_finish_token = 0
         # 播放后端：audio_sink 或 media_player
@@ -298,13 +281,15 @@ class GPTSoVITSTTSProvider(QObject):
 
         self._audio_output: QAudioOutputType | None = None
         self._player: QMediaPlayerType | None = None
-        # 协调器自持一个 ResourceManager：本地子进程（及后续合成线程）都注册进去，
+        # 协调器自持一个 ResourceManager：本地子进程 + 合成线程都注册进去，
         # close() 走 stop_all 统一关闭；provider 退役/热切换沿用 close()，无需共享 RM。
         self._resource_manager = ResourceManager(self)
         # 服务进程监督拆到 TTSServiceSupervisor；settings 由 supervisor 持有（见 settings 属性）。
         self._supervisor = self._create_supervisor(
             settings, adopt_existing_service=adopt_existing_service
         )
+        # 合成队列拆到 TTSSynthesisQueue；以本协调器为 sink 把结果投回播放队列。
+        self._synthesis_queue = self._create_synthesis_queue()
         self._audio_ready.connect(self._enqueue_audio)
         self._prepared_audio_ready.connect(self._store_prepared_audio)
         self._prepared_audio_failed.connect(self._fail_prepared_audio)
@@ -327,6 +312,37 @@ class GPTSoVITSTTSProvider(QObject):
             is_closed=self._is_closed,
             adopt_existing_service=adopt_existing_service,
         )
+
+    def _create_synthesis_engine(self) -> object:
+        """装配本 Provider 的合成引擎；Genie 子类覆写为 GenieSynthesisEngine。"""
+        return GPTSoVITSSynthesisEngine()
+
+    def _create_synthesis_queue(self) -> TTSSynthesisQueue:
+        return TTSSynthesisQueue(
+            supervisor=self._supervisor,
+            engine=self._create_synthesis_engine(),
+            cache_dir=self._tts_cache_dir,
+            resource_manager=self._resource_manager,
+            sink=self,
+            is_closed=self._is_closed,
+        )
+
+    # ---- TTSSynthesisSink：合成结果交回播放队列（commit 5 前由协调器实现） ----
+
+    def deliver_audio(
+        self,
+        audio_path: str,
+        on_started: TTSCallback | None,
+        on_finished: TTSCallback | None,
+        text: str,
+    ) -> None:
+        self._audio_ready.emit(audio_path, on_started, on_finished, text)
+
+    def deliver_prepared(self, handle: TTSPreparedAudio, audio_path: str) -> None:
+        self._prepared_audio_ready.emit(handle, audio_path)
+
+    def schedule_cleanup(self, audio_path: Path) -> None:
+        self._schedule_audio_cleanup(audio_path)
 
     @property
     def settings(self) -> _GPTSoVITSTTSSettings:
@@ -356,7 +372,7 @@ class GPTSoVITSTTSProvider(QObject):
             self._finished.emit(on_finished)
             return
         debug_log("TTS", "提交播放请求", {"text": text, "tone": tone})
-        self._queue_request(
+        self._synthesis_queue.submit(
             _TTSRequest(
                 text=text,
                 tone=tone,
@@ -374,7 +390,7 @@ class GPTSoVITSTTSProvider(QObject):
             handle.failed = True
             return handle
         debug_log("TTS", "提交预生成请求", {"text": text, "tone": tone})
-        self._queue_request(
+        self._synthesis_queue.submit(
             _TTSRequest(
                 text=text,
                 tone=tone,
@@ -426,12 +442,7 @@ class GPTSoVITSTTSProvider(QObject):
     def discard_prepared(self, handle: TTSPreparedAudio) -> None:
         handle.cancelled = True
         debug_log("TTS", "取消预生成音频", {"text": handle.text, "tone": handle.tone})
-        with self._request_lock:
-            self._pending_requests = [
-                request
-                for request in self._pending_requests
-                if request.prepared_audio is not handle
-            ]
+        self._synthesis_queue.discard_pending(handle)
 
         pending_audio: list[
             tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None, str]
@@ -484,255 +495,6 @@ class GPTSoVITSTTSProvider(QObject):
         """同步检测并预热本地 TTS 服务，委托给服务监督。"""
         return self._supervisor.ensure_ready()
 
-    def _queue_request(self, request: _TTSRequest) -> None:
-        with self._request_lock:
-            if self._closed:
-                if request.prepared_audio is not None:
-                    request.prepared_audio.failed = True
-                debug_log(
-                    "TTS",
-                    "Provider 已关闭，丢弃新请求",
-                    {
-                        "text": request.text,
-                        "tone": request.tone,
-                        "prepared": request.prepared_audio is not None,
-                    },
-                )
-                return
-            self._pending_requests.append(request)
-            pending_count = len(self._pending_requests)
-        debug_log(
-            "TTS",
-            "请求加入队列",
-            {
-                "text": request.text,
-                "tone": request.tone,
-                "prepared": request.prepared_audio is not None,
-                "pending_count": pending_count,
-            },
-        )
-        self._start_next_request()
-
-    def _start_next_request(self) -> None:
-        with self._request_lock:
-            if self._closed or self._request_running or not self._pending_requests:
-                return
-            request = self._pending_requests.pop(0)
-            self._request_running = True
-
-        debug_log(
-            "TTS",
-            "开始处理队列请求",
-            {
-                "text": request.text,
-                "tone": request.tone,
-                "prepared": request.prepared_audio is not None,
-            },
-        )
-        thread = threading.Thread(
-            target=self._request_audio,
-            args=(request,),
-            daemon=True,
-        )
-        thread.start()
-
-    def _request_audio(self, tts_request: _TTSRequest) -> None:
-        # 请求线程恢复发起方的交互 ID，使本线程内日志可与该次交互串联
-        set_interaction_id(tts_request.interaction_id)
-        try:
-            if _provider_is_closed(self):
-                debug_log("TTS", "Provider 已关闭，跳过音频请求", {"text": tts_request.text})
-                return
-            if tts_request.prepared_audio is not None and tts_request.prepared_audio.cancelled:
-                debug_log("TTS", "请求已取消，跳过音频生成", {"text": tts_request.text})
-                return
-
-            # 纯标点/emoji/符号段没有可发音内容，喂给服务端会归一化成空音素并触发
-            # [Errno 22]；提前判定为“无需发音”，正常走完回调但不发请求、不报错。
-            if not _is_voiceable_text(tts_request.text):
-                debug_log("TTS", "文本无可发音内容，跳过合成", {"text": tts_request.text})
-                self._skip_audio_request(tts_request, "无可发音内容")
-                return
-
-            fail = lambda message: self._fail_audio_request(tts_request, message)
-            restart_attempted = False
-            while True:
-                if not self._supervisor._ensure_service_available(fail):
-                    return
-
-                if not self._supervisor._ensure_character_weights(fail):
-                    return
-
-                reference = self._select_reference(tts_request.tone)
-                payload = {
-                    "text": tts_request.text,
-                    "text_lang": _resolve_request_text_lang(
-                        tts_request.text,
-                        self.settings.text_lang,
-                    ),
-                    "ref_audio_path": str(reference.ref_audio_path),
-                    "prompt_text": reference.ref_text,
-                    "prompt_lang": reference.ref_lang,
-                    "text_split_method": "cut1",
-                    "batch_size": 1,
-                    "media_type": "wav",
-                    "streaming_mode": False,
-                    "top_k": 15,
-                    "top_p": 1,
-                    "temperature": 1,
-                    "repetition_penalty": 1.2,
-                }
-                debug_log(
-                    "TTS",
-                    "发送 GPT-SoVITS 请求",
-                    {
-                        "api_url": self.settings.api_url,
-                        "text": tts_request.text,
-                        "tone": tts_request.tone,
-                        "reference": {
-                            "tone": reference.tone,
-                            "ref_audio_path": reference.ref_audio_path,
-                            "ref_lang": reference.ref_lang,
-                        },
-                        "payload": payload,
-                        "attempt": 2 if restart_attempted else 1,
-                    },
-                )
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                http_request = urllib.request.Request(
-                    url=self.settings.api_url,
-                    data=body,
-                    method="POST",
-                    headers={"Content-Type": "application/json"},
-                )
-
-                try:
-                    with urllib.request.urlopen(
-                        http_request,
-                        timeout=self.settings.timeout_seconds,
-                    ) as response:
-                        audio_data = response.read()
-                        debug_log(
-                            "TTS",
-                            "GPT-SoVITS 请求成功",
-                            {
-                                "status": getattr(response, "status", None),
-                                "audio_bytes": len(audio_data),
-                                "attempt": 2 if restart_attempted else 1,
-                            },
-                        )
-                    break
-                except urllib.error.HTTPError as exc:
-                    error_body = exc.read().decode("utf-8", errors="replace")
-                    debug_log(
-                        "TTS",
-                        "GPT-SoVITS HTTP 失败",
-                        {
-                            "status": exc.code,
-                            "error_body": error_body,
-                            "attempt": 2 if restart_attempted else 1,
-                        },
-                    )
-                    if (
-                        not restart_attempted
-                        and self._supervisor._restart_local_service_after_http_failure(exc.code, error_body)
-                    ):
-                        restart_attempted = True
-                        continue
-                    message = _format_gpt_sovits_http_error(exc.code, error_body)
-                    if _is_soft_synth_failure(exc.code, error_body):
-                        # 单段合成失败（服务端 tts failed）：文本已照常显示，语音缺一段无需
-                        # 打断用户，静默跳过、正常完成回调，不向 UI 弹 TTS 异常。
-                        self._skip_audio_request(tts_request, message)
-                    else:
-                        self._fail_audio_request(tts_request, message)
-                    return
-                except urllib.error.URLError as exc:
-                    debug_log("TTS", "GPT-SoVITS 请求失败", {"reason": str(exc.reason)})
-                    self._fail_audio_request(
-                        tts_request,
-                        f"GPT-SoVITS 请求失败，请确认服务已启动并可访问 {self.settings.api_url}：{exc.reason}",
-                    )
-                    return
-                except TimeoutError:
-                    debug_log("TTS", "GPT-SoVITS 请求超时")
-                    self._fail_audio_request(tts_request, "GPT-SoVITS 请求超时。")
-                    return
-
-            if not audio_data:
-                debug_log("TTS", "GPT-SoVITS 返回空音频")
-                self._fail_audio_request(tts_request, "GPT-SoVITS 返回了空音频。")
-                return
-
-            with tempfile.NamedTemporaryFile(
-                prefix="sakura_tts_",
-                suffix=".wav",
-                delete=False,
-                dir=str(self._tts_cache_dir),
-            ) as audio_file:
-                audio_file.write(audio_data)
-                audio_path = audio_file.name
-            debug_log("TTS", "临时音频已写入", {"audio_path": audio_path, "bytes": len(audio_data)})
-            audio_issue = _audio_checks._verify_generated_audio(Path(audio_path))
-            if audio_issue is not None:
-                debug_log("TTS", "生成音频校验失败", {"audio_path": audio_path, "issue": audio_issue})
-                self._fail_audio_request(tts_request, f"GPT-SoVITS 生成的音频无效（{audio_issue}）。")
-                self._schedule_audio_cleanup(Path(audio_path))
-                return
-            if tts_request.prepared_audio is None:
-                self._audio_ready.emit(
-                    audio_path,
-                    tts_request.on_started,
-                    tts_request.on_finished,
-                    tts_request.text,
-                )
-            else:
-                self._prepared_audio_ready.emit(tts_request.prepared_audio, audio_path)
-        finally:
-            with self._request_lock:
-                self._request_running = False
-            self._start_next_request()
-
-
-    def _select_reference(self, tone: str | None) -> _ToneReference:
-        tone_key = (tone or DEFAULT_TONE).strip() or DEFAULT_TONE
-        references = self.settings.tone_references.get(tone_key)
-        if not references:
-            references = self.settings.tone_references.get(DEFAULT_TONE)
-        if not references:
-            reference = _ToneReference(
-                tone=DEFAULT_TONE,
-                ref_audio_path=self.settings.ref_audio_path,
-                ref_text=self.settings.ref_text,
-                ref_lang=self.settings.ref_lang,
-            )
-            debug_log(
-                "TTS",
-                "选择默认参考音频",
-                {
-                    "requested_tone": tone,
-                    "ref_audio_path": reference.ref_audio_path,
-                    "ref_lang": reference.ref_lang,
-                },
-            )
-            return reference
-
-        index = self._tone_indices.get(tone_key, 0) % len(references)
-        self._tone_indices[tone_key] = index + 1
-        reference = references[index]
-        debug_log(
-            "TTS",
-            "选择语气参考音频",
-            {
-                "requested_tone": tone,
-                "resolved_tone": tone_key,
-                "index": index,
-                "count": len(references),
-                "ref_audio_path": reference.ref_audio_path,
-                "ref_lang": reference.ref_lang,
-            },
-        )
-        return reference
 
     @Slot(str, object, object)
     def _enqueue_audio(
@@ -1283,18 +1045,18 @@ class GPTSoVITSTTSProvider(QObject):
             self._log_error(f"临时音频清理失败：{exc}")
 
     def close(self) -> None:
-        with self._request_lock:
+        with self._close_lock:
             self._closed = True
-            self._pending_requests.clear()
+        self._synthesis_queue.clear_pending()
         self._clear_pending_audio()
         if self._current_audio is not None:
             self._finish_current_audio("provider_closed")
         self._release_player_source()
-        # 本地子进程（及后续合成线程）由协调器自持的 RM 托管，统一经 stop_all 关闭。
+        # 本地子进程 + 合成线程由协调器自持的 RM 托管，统一经 stop_all 关闭。
         self._resource_manager.stop_all()
 
     def _is_closed(self) -> bool:
-        with self._request_lock:
+        with self._close_lock:
             return self._closed
 
     def _clear_pending_audio(self) -> None:
@@ -1311,8 +1073,8 @@ class GPTSoVITSTTSProvider(QObject):
 class GenieTTSProvider(GPTSoVITSTTSProvider):
     """Genie TTS CPU 推理 Provider，复用现有队列、预生成和播放器链路。
 
-    服务监督差异（Genie API 探测 / 备用端口 / 角色模型 / 参考音频 / ONNX 转换）
-    封装在 GenieServiceSupervisor；本类只覆写合成路径 _request_audio。
+    差异收敛到装配选型：服务监督差异（Genie API 探测 / 备用端口 / 角色模型 /
+    参考音频 / ONNX 转换）在 GenieServiceSupervisor，合成差异在 GenieSynthesisEngine。
     """
 
     def _create_supervisor(
@@ -1329,161 +1091,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
             adopt_existing_service=adopt_existing_service,
         )
 
-    def _request_audio(self, tts_request: _TTSRequest) -> None:
-        set_interaction_id(tts_request.interaction_id)
-        try:
-            if _provider_is_closed(self):
-                debug_log("TTS", "Provider 已关闭，跳过 Genie 音频请求", {"text": tts_request.text})
-                return
-            if tts_request.prepared_audio is not None and tts_request.prepared_audio.cancelled:
-                debug_log("TTS", "请求已取消，跳过 Genie 音频生成", {"text": tts_request.text})
-                return
-
-            # 与 GPT-SoVITS 同理：纯标点/符号段无可发音内容，提前静默跳过。
-            if not _is_voiceable_text(tts_request.text):
-                debug_log("TTS", "文本无可发音内容，跳过 Genie 合成", {"text": tts_request.text})
-                self._skip_audio_request(tts_request, "无可发音内容")
-                return
-
-            fail = lambda message: self._fail_audio_request(tts_request, message)
-            if not self._supervisor._ensure_service_available(fail):
-                return
-
-            reference = self._select_reference(tts_request.tone)
-            if not self._supervisor._ensure_character_model(reference.ref_lang, fail):
-                return
-            if not self._supervisor._ensure_reference_audio(reference, fail):
-                return
-
-            payload = {
-                "character_name": _encode_genie_character_name(self._supervisor._genie_character_name()),
-                "text": tts_request.text,
-                "split_sentence": False,
-            }
-            debug_log(
-                "TTS",
-                "发送 Genie TTS 请求",
-                {
-                    "api_url": self.settings.api_url,
-                    "text": tts_request.text,
-                    "tone": tts_request.tone,
-                    "payload": payload,
-                },
-            )
-            try:
-                audio_data = self._supervisor._post_json_and_read_bytes(
-                    "tts",
-                    payload,
-                    timeout=max(self.settings.timeout_seconds, 120),
-                )
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")
-                fail(f"Genie TTS HTTP {exc.code}: {error_body}")
-                return
-            except urllib.error.URLError as exc:
-                fail(f"Genie TTS 请求失败，请确认服务已启动并可访问 {self.settings.api_url}：{exc.reason}")
-                return
-            except TimeoutError:
-                fail("Genie TTS 请求超时。")
-                return
-
-            if not audio_data:
-                fail("Genie TTS 返回了空音频。")
-                return
-
-            with tempfile.NamedTemporaryFile(
-                prefix="sakura_genie_tts_",
-                suffix=".wav",
-                delete=False,
-                dir=str(self._tts_cache_dir),
-            ) as audio_file:
-                audio_path = Path(audio_file.name)
-            try:
-                if not _write_genie_audio(audio_data, audio_path):
-                    fail("Genie TTS 返回的音频无法转换为 WAV。")
-                    self._schedule_audio_cleanup(audio_path)
-                    return
-            except OSError as exc:
-                fail(f"Genie TTS 写入临时音频失败：{exc}")
-                self._schedule_audio_cleanup(audio_path)
-                return
-
-            debug_log("TTS", "Genie 临时音频已写入", {"audio_path": audio_path, "bytes": len(audio_data)})
-            audio_issue = _audio_checks._verify_generated_audio(audio_path)
-            if audio_issue is not None:
-                debug_log("TTS", "Genie 生成音频校验失败", {"audio_path": str(audio_path), "issue": audio_issue})
-                self._fail_audio_request(tts_request, f"Genie TTS 生成的音频无效（{audio_issue}）。")
-                self._schedule_audio_cleanup(audio_path)
-                return
-            if tts_request.prepared_audio is None:
-                self._audio_ready.emit(
-                    str(audio_path),
-                    tts_request.on_started,
-                    tts_request.on_finished,
-                    tts_request.text,
-                )
-            else:
-                self._prepared_audio_ready.emit(tts_request.prepared_audio, str(audio_path))
-        finally:
-            with self._request_lock:
-                self._request_running = False
-            self._start_next_request()
+    def _create_synthesis_engine(self) -> object:
+        return GenieSynthesisEngine()
 
 
-def _is_voiceable_text(text: str) -> bool:
-    """文本是否含可发音内容。纯标点/emoji/符号归一化后音素为空，会触发服务端
-    [Errno 22] Invalid argument，提前判定可避免无谓的失败往返。"""
-    return bool(_VOICEABLE_CHAR_RE.search(text))
-
-
-def _resolve_request_text_lang(text: str, configured_text_lang: str) -> str:
-    """英文混入中日韩文本时切到 auto，避免 GPT-SoVITS 按单语 BERT 处理失败。"""
-    normalized = configured_text_lang.strip().lower()
-    if normalized in _CJK_TEXT_LANGS and _LATIN_LETTER_RE.search(text):
-        return "auto_yue" if normalized in {"yue", "all_yue"} else "auto"
-    return normalized or "ja"
-
-
-def _write_genie_audio(audio_data: bytes, output_path: Path) -> bool:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if audio_data[:4] == b"RIFF":
-        output_path.write_bytes(audio_data)
-        return _audio_checks._is_valid_wav_file(output_path)
-    return _write_raw_float_or_pcm_as_wav(audio_data, output_path, sample_rate=32000)
-
-
-def _write_raw_pcm_as_wav(raw_bytes: bytes, output_path: Path, *, sample_rate: int) -> bool:
-    if not raw_bytes or len(raw_bytes) % 2 != 0:
-        return False
-    try:
-        with wave.open(str(output_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(raw_bytes)
-        return _audio_checks._is_valid_wav_file(output_path)
-    except (OSError, wave.Error):
-        return False
-
-
-def _write_raw_float_or_pcm_as_wav(raw_bytes: bytes, output_path: Path, *, sample_rate: int) -> bool:
-    pcm_bytes = b""
-    if len(raw_bytes) % 4 == 0:
-        try:
-            floats = array.array("f")
-            floats.frombytes(raw_bytes)
-            finite_values = [value for value in floats if math.isfinite(value)]
-            if finite_values and max(abs(value) for value in finite_values) <= 2.0:
-                pcm = array.array("h")
-                for value in floats:
-                    if not math.isfinite(value):
-                        value = 0.0
-                    pcm.append(int(max(-1.0, min(1.0, value)) * 32767.0))
-                pcm_bytes = pcm.tobytes()
-        except (OverflowError, ValueError):
-            pcm_bytes = b""
-    if not pcm_bytes and len(raw_bytes) % 2 == 0:
-        pcm_bytes = raw_bytes
-    if not pcm_bytes:
-        return False
-    return _write_raw_pcm_as_wav(pcm_bytes, output_path, sample_rate=sample_rate)
