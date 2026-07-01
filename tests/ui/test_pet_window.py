@@ -74,6 +74,123 @@ class _DummyPortraitLabel:
         self.visible = True
 
 
+def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    events: list[tuple[str, object]] = []
+
+    class ProfileStub:
+        id = "new-character"
+        display_name = "New Character"
+        initial_message = "你好"
+        reply_tones = ["calm"]
+        portrait_choices = ["default"]
+
+    class PreviousProfileStub:
+        id = "old-character"
+
+    class MemoryCuratorStub:
+        def set_system_prompt(self, system_prompt: str) -> None:
+            events.append(("curator_prompt", system_prompt))
+
+    class MemoryStoreStub:
+        def set_scope(self, scope: str) -> None:
+            events.append(("memory_scope", scope))
+
+    class AgentRuntimeStub:
+        def update_character(self, system_prompt, reply_tones, portrait_choices):  # type: ignore[no-untyped-def]
+            events.append(("runtime_character", (system_prompt, reply_tones, portrait_choices)))
+
+        def set_history_store(self, history_store):  # type: ignore[no-untyped-def]
+            events.append(("history_store", history_store))
+
+    class TextSink:
+        def setText(self, text: str) -> None:
+            events.append(("label", text))
+
+        def setPlaceholderText(self, text: str) -> None:
+            events.append(("placeholder", text))
+
+    class PortraitControllerStub:
+        def set_profile(self, profile):  # type: ignore[no-untyped-def]
+            events.append(("portrait", profile.id))
+
+    class SubtitleControllerStub:
+        def cancel_reply_flow(self, initial_message: str) -> None:
+            events.append(("subtitle", initial_message))
+
+    class MinimalWindow:
+        _apply_character = PetWindow._apply_character
+
+        def setWindowTitle(self, title: str) -> None:
+            events.append(("title", title))
+
+        def _normal_input_placeholder_text(self, profile):  # type: ignore[no-untyped-def]
+            return f"Message {profile.display_name}"
+
+        def _portrait_anchor_global(self):  # type: ignore[no-untyped-def]
+            return "anchor"
+
+        def updatesEnabled(self) -> bool:
+            return True
+
+        def setUpdatesEnabled(self, enabled: bool) -> None:
+            events.append(("updates", enabled))
+
+        def _apply_pet_layout(self, *, anchor_global):  # type: ignore[no-untyped-def]
+            events.append(("layout", anchor_global))
+
+        def _load_backchannel_manifest_for(self, profile):  # type: ignore[no-untyped-def]
+            events.append(("backchannel", profile.id))
+
+        def _create_history_store(self, profile):  # type: ignore[no-untyped-def]
+            return f"history:{profile.id}"
+
+        def _create_runtime_event_log(self, profile):  # type: ignore[no-untyped-def]
+            return f"events:{profile.id}"
+
+        def _create_visual_observation_store(self, profile):  # type: ignore[no-untyped-def]
+            return f"visual:{profile.id}"
+
+        def _load_reply_history_from_store(self) -> None:
+            events.append(("reply_history", None))
+
+        def _collapse_auto_fit_bubble_height(self) -> None:
+            events.append(("collapse", None))
+
+        def _emit_plugin_event(self, event_type, payload, *, source):  # type: ignore[no-untyped-def]
+            events.append(("plugin", (event_type, payload, source)))
+
+    monkeypatch.setattr(
+        pet_window_module,
+        "load_character_system_prompt",
+        lambda _profile: "新角色人格卡",
+    )
+
+    window = MinimalWindow()
+    window.character_profile = PreviousProfileStub()
+    window.memory_curator = MemoryCuratorStub()
+    window.memory_store = MemoryStoreStub()
+    window.agent_runtime = AgentRuntimeStub()
+    window.name_label = TextSink()
+    window.input_edit = TextSink()
+    window.portrait_controller = PortraitControllerStub()
+    window.history_window = None
+    window.subtitle_controller = SubtitleControllerStub()
+    window.messages = ["旧消息"]
+
+    window._apply_character(ProfileStub())
+
+    assert window.system_prompt == "新角色人格卡"
+    assert ("curator_prompt", "新角色人格卡") in events
+    assert ("memory_scope", "new-character") in events
+    assert (
+        "runtime_character",
+        ("新角色人格卡", ["calm"], ["default"]),
+    ) in events
+
+
 def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
     from app.ui.pet_window import PetWindow
 

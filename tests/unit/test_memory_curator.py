@@ -47,6 +47,23 @@ def test_curator_adds_memory_from_first_person_view() -> None:
     assert "主人喜欢猫" in user_content
 
 
+def test_curator_updates_system_prompt_for_next_curation() -> None:
+    store = FakeMemoryStore()
+    api = FakeCurationApiClient(['{"operations":[]}', '{"operations":[]}'])
+    curator = MemoryCurator(api, store, system_prompt="旧角色人格卡")
+
+    curator.curate_entries([_entry("user", "第一轮对话")])
+    curator.set_system_prompt("新角色人格卡")
+    curator.curate_entries([_entry("user", "第二轮对话")])
+
+    first_prompt = str(api.calls[0]["system_prompt"])
+    second_prompt = str(api.calls[1]["system_prompt"])
+    assert "旧角色人格卡" in first_prompt
+    assert "新角色人格卡" not in first_prompt
+    assert "新角色人格卡" in second_prompt
+    assert "旧角色人格卡" not in second_prompt
+
+
 def test_curator_updates_and_deletes_existing_memories() -> None:
     store = FakeMemoryStore(
         existing=[
