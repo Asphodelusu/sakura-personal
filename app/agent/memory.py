@@ -271,6 +271,11 @@ class MemoryStore:
 
         self.scope_id = _normalize_scope_id(scope_id)
 
+    def scoped(self, scope_id: str) -> "ScopedMemoryStore":
+        """创建固定角色 scope 的轻量视图，供后台任务隔离角色切换。"""
+
+        return ScopedMemoryStore(self, scope_id)
+
     def set_api_settings(self, api_settings: "ApiSettings") -> None:
         """API 设置变更后重置 mem0，下次使用新配置重新初始化。"""
 
@@ -1171,6 +1176,51 @@ class MemoryStore:
             self._load_error = error
             self._status = "failed"
             self._status_message = f"长期记忆系统暂时不可用：{error}"
+
+
+class ScopedMemoryStore(MemoryStore):
+    """复用同一个 mem0 运行时，但把业务 scope 固定在创建时的角色上。"""
+
+    def __init__(self, owner: MemoryStore, scope_id: str) -> None:
+        self._owner = owner
+        self.base_dir = owner.base_dir
+        self.api_settings = owner.api_settings
+        self.scope_id = _normalize_scope_id(scope_id)
+        self.memory_client = owner.memory_client
+        self.resource_registry = owner.resource_registry
+        self._loading_started_at = owner._loading_started_at
+
+    def set_scope(self, scope_id: str) -> None:
+        self.scope_id = _normalize_scope_id(scope_id)
+
+    def is_ready(self) -> bool:
+        return self._owner.is_ready()
+
+    def needs_embedding_model_download(self) -> bool:
+        return self._owner.needs_embedding_model_download()
+
+    def close(self) -> None:
+        """视图不拥有底层 mem0 运行时，关闭由 owner 负责。"""
+
+        return None
+
+    def _get_memory(self, *, wait: bool = True) -> Any | None:
+        return self._owner._get_memory(wait=wait)
+
+    def _load_core_profiles(self) -> dict[str, Any]:
+        return self._owner._load_core_profiles()
+
+    def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
+        self._owner._save_core_profiles(profiles)
+
+    def _loading_response(self) -> dict[str, Any]:
+        return self._owner._loading_response()
+
+    def _failed_response(self, error: str) -> dict[str, Any]:
+        return self._owner._failed_response(error)
+
+    def _mark_runtime_failed(self, error: str) -> None:
+        self._owner._mark_runtime_failed(error)
 
 
 def _resolve_base_dir(base_dir: Path | None) -> Path:
