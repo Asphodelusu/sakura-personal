@@ -252,13 +252,13 @@ class AgentRuntime:
         raw_content: str,
         *,
         cancel_checker: CancelChecker | None = None,
-    ) -> ChatReply:
+    ) -> ChatReplyParseResult:
         """最终回复结构不合格时，只重试一次格式修复，避免坏 JSON 进入 UI。"""
         check_cancelled(cancel_checker)
         parsed = parse_chat_reply_result(raw_content)
         retry_reason = parsed.reason if parsed.needs_retry else ""
         if not parsed.needs_retry and _reply_has_display_translation(parsed.reply):
-            return parsed.reply
+            return parsed
         if not retry_reason:
             retry_reason = "missing_translation"
 
@@ -295,7 +295,7 @@ class AgentRuntime:
             )
         except ApiRequestError as exc:
             debug_log("AgentRuntime", "最终回复修复请求失败，使用安全兜底", {"error": str(exc)})
-            return parsed.reply
+            return parsed
 
         check_cancelled(cancel_checker)
         repaired = parse_chat_reply_result(repaired_turn.content)
@@ -305,9 +305,9 @@ class AgentRuntime:
                 "最终回复修复后仍不合格，使用安全兜底",
                 {"reason": repaired.reason, "raw_content": repaired_turn.content},
             )
-            return parsed.reply
+            return parsed
         debug_log("AgentRuntime", "最终回复结构修复成功", {"repaired": repaired.repaired})
-        return repaired.reply
+        return repaired
 
     def handle_user_message(
         self,
@@ -489,14 +489,15 @@ class AgentRuntime:
                         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                     },
                 )
+                parsed = self._parse_final_reply_with_retry(
+                    prompt_build.system_prompt,
+                    working_messages,
+                    turn.content,
+                    cancel_checker=cancel_checker,
+                )
                 return AgentResult(
                     reply=sanitize_reply_tones(
-                        self._parse_final_reply_with_retry(
-                            prompt_build.system_prompt,
-                            working_messages,
-                            turn.content,
-                            cancel_checker=cancel_checker,
-                        ),
+                        parsed.reply,
                         self.reply_tones,
                     ),
                     _debug=_build_debug_meta(
@@ -505,6 +506,7 @@ class AgentRuntime:
                         self.get_last_prompt_inspection(),
                     ),
                     actions=emitted_actions,
+                    mood_update=parsed.mood,
                 )
 
             _emit_progress_from_content(
@@ -1292,9 +1294,12 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
 def _reply_has_display_translation(reply: ChatReply) -> bool:
     """最终回复需要中文显示文本，避免兼容模型的纯日语正文漏到中文字幕 UI。"""
 
-    return any(
-        segment.text.strip() and segment.translation.strip()
-        for segment in reply.segments
+    text_segments = [segment for segment in reply.segments if segment.text.strip()]
+    if not text_segments:
+        return True  # no text to display, nothing to translate
+    return all(
+        segment.translation.strip()
+        for segment in text_segments
     )
 
 

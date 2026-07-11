@@ -57,7 +57,7 @@ _REFLECTION_SYSTEM_PROMPT = (
     "用对方告诉你的名字称呼对方。如果还不知道名字，用「对方」或「他/她」。不要默认用「主人」——除非对方明确要求。\n"
     "不要用数字或等级评价关系。用你自己的感受和具体的观察来说——就像写日记一样。\n"
     "每一条应该是一句完整的、独立可读的自我认知。\n\n"
-    "必须只返回严格 JSON，格式如下：\n"
+    "必须只返回严格 JSON，不要有任何前言、解释或后缀。格式如下：\n"
     '{"reflections":[\n'
     '  {"content":"反思内容一","importance":0.7,"confidence":0.6},\n'
     '  {"content":"反思内容二","importance":0.6,"confidence":0.7}\n'
@@ -242,7 +242,7 @@ class MemoryReflector:
                 [{"role": "user", "content": user_prompt}],
                 temperature=0.7,
                 response_format={"type": "json_object"},
-                max_tokens=1000,
+                max_tokens=2000,
             )
         except Exception as exc:
             _logger.exception("Reflection: LLM call failed")

@@ -250,6 +250,21 @@ class SubtitleController(QObject):
         self.speech_label.setText(cleaned)
         self._log_stage("speech_text_shown_immediately", {"text": cleaned})
 
+    def show_proactive_segment(self, segment: ChatSegment) -> None:
+        """显示主动发言：字幕用 zh，同时播 ja 语音。"""
+        self.stop_waiting_indicator()
+        display = segment.display_text(self.subtitle_language)
+        self.set_speech(display, pulse=True)
+
+        # TTS: 用 ja 原文播放，不依赖 prepared audio
+        sequence_id = self.reply_sequence_id
+        self.voice_playback.speak_segment(
+            segment,
+            sequence_id,
+            on_started=lambda: None,
+            on_finished=lambda: None,
+        )
+
     def restart_current_segment_speech(self) -> None:
         if self.current_segment_sequence_id is None or self.current_segment is None:
             return

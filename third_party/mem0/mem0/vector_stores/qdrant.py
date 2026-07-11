@@ -162,15 +162,19 @@ class Qdrant(VectorStoreBase):
             logger.debug("Skipping payload index creation for local Qdrant (not supported)")
             return
 
+        import warnings
+
         common_fields = ["user_id", "agent_id", "run_id", "actor_id"]
 
         for field in common_fields:
             try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name=field,
-                    field_schema="keyword"
-                )
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Payload indexes have no effect in the local Qdrant")
+                    self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=field,
+                        field_schema="keyword"
+                    )
                 logger.info(f"Created index for {field} in collection {self.collection_name}")
             except Exception as e:
                 logger.debug(f"Index for {field} might already exist: {e}")

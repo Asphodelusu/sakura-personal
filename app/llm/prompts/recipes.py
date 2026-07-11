@@ -64,7 +64,7 @@ def build_agent_reply_protocol(
         format_text=segment_format_for_portraits(portraits),
         segment_rules=segment_rules,
         include_translation_rules=True,
-    )
+    ) + "\n" + _MOOD_UPDATE_RULE
 
 
 def build_event_reply_protocol(
@@ -85,7 +85,14 @@ def build_event_reply_protocol(
         format_text=format_text,
         segment_rules=segment_rules,
         include_translation_rules=True,
-    )
+    ) + "\n" + _MOOD_UPDATE_RULE
+
+
+_MOOD_UPDATE_RULE = (
+    "你可以在 JSON 回复中额外加入 \"mood\": \"一两句心情描述\"——"
+    "这是你自己的心情日记，写不写由你的主观意愿决定。"
+    "如果现在的心情和上次一样，不需要重复写。"
+)
 
 
 def build_proactive_check_reply_protocol(
