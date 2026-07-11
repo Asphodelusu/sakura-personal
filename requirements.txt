@@ -18,6 +18,6 @@ sentence-transformers>=5.0.0
 py7zz>=1.1.4
 py7zr
 pytest>=8.0.0
-# STT (voice input)
-sherpa-onnx>=1.13
-sounddevice>=0.5
+# STT (voice input) — Windows only
+sherpa-onnx>=1.13; sys_platform == "win32"
+sounddevice>=0.5; sys_platform == "win32"
