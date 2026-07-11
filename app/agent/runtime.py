@@ -42,7 +42,7 @@ from app.llm.api_client import (
     is_vision_unsupported_error,
     messages_contain_image,
 )
-from app.llm.chat_reply import ChatReply, parse_chat_reply, parse_chat_reply_result, sanitize_reply_tones
+from app.llm.chat_reply import ChatReply, ChatSegment, DEFAULT_TONE, parse_chat_reply, parse_chat_reply_result, sanitize_reply_tones
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_body_enabled, debug_log, summarize_messages
 from app.agent.runtime_limits import (
@@ -787,12 +787,23 @@ class AgentRuntime:
         try:
             check_cancelled(cancel_checker)
             final_started_at = time.perf_counter()
+            streamed_chunks: list[str] = []
+            def _on_stream_chunk(chunk: str) -> None:
+                streamed_chunks.append(chunk)
+                _emit_progress_from_content(
+                    progress_callback,
+                    "".join(streamed_chunks),
+                    stage="streaming",
+                    metadata={"partial": True},
+                    cancel_checker=cancel_checker,
+                )
             final_reply = self.api_client.chat(
                 self._build_final_reply_prompt(),
                 working_messages,
                 self.reply_tones,
                 self.reply_portraits,
                 cancel_checker=cancel_checker,
+                on_chunk=_on_stream_chunk,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -895,6 +906,16 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
+            streamed_chunks2: list[str] = []
+            def _on_stream_chunk2(chunk: str) -> None:
+                streamed_chunks2.append(chunk)
+                _emit_progress_from_content(
+                    progress_callback,
+                    "".join(streamed_chunks2),
+                    stage="streaming",
+                    metadata={"partial": True},
+                    cancel_checker=cancel_checker,
+                )
             reply = self.api_client.chat(
                 prompt_build.system_prompt,
                 final_messages,
@@ -902,6 +923,7 @@ class AgentRuntime:
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
+                on_chunk=_on_stream_chunk2,
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -956,7 +978,7 @@ class AgentRuntime:
         cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
         check_cancelled(cancel_checker)
-        if event.type not in {"reminder_due", "screen_awareness_check", "proactive_check"}:
+        if event.type not in {"reminder_due", "screen_awareness_check", "proactive_check", "user_interaction"}:
             return AgentResult(reply=parse_chat_reply("未対応のイベントだよ。"))
 
         debug_log("AgentRuntime", "处理主动事件", {"event": {"type": event.type, "payload": event.payload}})
@@ -999,6 +1021,16 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
+            streamed_chunks: list[str] = []
+            def _on_stream_chunk(chunk: str) -> None:
+                streamed_chunks.append(chunk)
+                _emit_progress_from_content(
+                    progress_callback,
+                    "".join(streamed_chunks),
+                    stage="streaming",
+                    metadata={"partial": True},
+                    cancel_checker=cancel_checker,
+                )
             reply = self.api_client.chat(
                 prompt_build.system_prompt,
                 event_messages,
@@ -1006,6 +1038,7 @@ class AgentRuntime:
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
+                on_chunk=_on_stream_chunk,
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -1100,24 +1133,15 @@ class AgentRuntime:
         )
         tool_rules = "\n".join(
             [
-                "- 只调用 API tools 列表中真实存在的工具；工具能帮助完成请求时优先发起原生 tool_calls。",
-                "- 可以在 assistant content 中写一句可直接说给用户听的短句；不要提前给最终结论。",
-                "- 不要臆造工具名；只能使用 API tools 列表中的工具。",
-                "- 高风险或 requires_confirmation 工具会在用户确认后执行；你可以发起 tool_call，但正文要简短说明为什么需要确认。",
-                "- 用户明确要求浏览器可见过程或网页操作时，用 playwright_*，不要用后台 web__ 替代。",
-                "- 浏览器外的桌面点击、输入、窗口操作才用 windows__*；操作前先用 windows__Snapshot / windows__Screenshot 获取真实状态。",
+                "- 只调用 API tools 列表中真实存在的工具，不臆造工具名。",
+                "- 可以在 assistant 内容中写一句可直接说给用户听的短句，但不要把工具计划或 tool_calls JSON 写进正文。",
                 screen_observation_rule,
                 browser_page_rule,
                 visible_browser_rule,
-                "- 如果 playwright_ 浏览器工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。",
-                "- 需要网页交互时，只能基于当前页面真实内容选择工具，不要臆造 selector、target 或页面内容。",
+                "- 高风险或需确认的工具会在用户确认后执行；发起时正文要简短说明原因。",
                 self._combine_extra_instructions(extra_instructions),
-                "- 用户说‘几分钟后/几秒后/一会儿后’等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。",
-                "- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。",
-                "- 需要跨会话信息、用户偏好或项目状态时，优先使用 memory_search。",
-                "- 只有用户明确要求记住，或信息明显长期有用且不包含敏感凭据时，才使用 memory_remember。",
-                "- 需要纠正、补充或合并已有长期记忆时，先用 memory_search 找到 id，再用 memory_update 写入更新后的完整记忆。",
-                "- 只有用户明确要求忘掉信息时，才使用 memory_forget。",
+                "- 用户说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
+                "- 跨会话信息优先用 memory_search；用户明确要求记住才用 memory_remember；纠正/补充先搜索再 update；用户明确要求忘掉才 forget。",
             ]
         )
         sections = [
@@ -2009,11 +2033,13 @@ def _normalize_image_detail(value: Any, *, default: str = "low") -> str:
 
 
 def _format_event_for_model(event: AgentEvent) -> str:
-    instruction = (
-        "主动屏幕感知事件如下，请基于屏幕内容找话题：可以评论变化、接续任务、询问卡点、轻量协助或保持安静感；不要把时间或停留时长自动泛化成休息建议。"
-        if event.type in {"screen_awareness_check", "proactive_check"}
-        else "主动事件如下，请生成要直接说给用户听的提醒："
-    )
+    if event.type in {"screen_awareness_check", "proactive_check"}:
+        instruction = "主动屏幕感知事件如下，请基于屏幕内容找话题：可以评论变化、接续任务、询问卡点、轻量协助或保持安静感；不要把时间或停留时长自动泛化成休息建议。"
+    elif event.type == "user_interaction":
+        action_text = event.payload.get("text", "对你做了一个动作")
+        return f"（{action_text}）[请用角色语气直接回应这个互动，一句话，不超过20字。]"
+    else:
+        instruction = "主动事件如下，请生成要直接说给用户听的提醒："
     return instruction + "\n" + json.dumps(
         _redact_event_for_model(event),
         ensure_ascii=False,

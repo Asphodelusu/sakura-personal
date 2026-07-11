@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-import http.client
 import json
-import ssl
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
+import httpx
+
 from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
 from app.core.debug_log import debug_log, summarize_messages
-from app.core.http_client import urlopen_direct_for_loopback
 from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
 
 MAX_API_RETRY_ATTEMPTS = 3
-API_RETRY_DELAY_SECONDS = 0.8
+API_RETRY_DELAY_SECONDS = 1.0
+API_RETRY_JITTER = 0.25
 STRUCTURED_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 ChatMessage = dict[str, Any]
 SUPPORTED_CHAT_COMPLETION_PARAMS = {
@@ -53,6 +51,8 @@ class ApiSettings:
     temperature: float | None = None  # None → 角色对话用内置默认 0.8
     top_p: float | None = None  # None → 不发送 top_p
     max_tokens: int | None = None  # None → 不发送 max_tokens（不截断输出）
+    frequency_penalty: float | None = None  # None → 不发送，建议 0.3-0.5 防复读
+    presence_penalty: float | None = None  # None → 不发送，建议 0.2-0.4 增加多样性
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,23 @@ class OpenAICompatibleClient:
         self._runtime_context_role = "system"
         # 可选事件发射器（由宿主注入），用于派发 llm.request.* 插件事件。
         self._event_emit: Callable[[str, dict[str, Any] | None], None] | None = None
+        self._http: httpx.Client | None = None
+
+    def _http_client(self) -> httpx.Client:
+        """获取或创建可复用的 httpx.Client，连接池复用 TCP 连接。"""
+        if self._http is None:
+            self._http = httpx.Client(
+                base_url=_normalize_openai_base_url(self.settings.base_url),
+                timeout=httpx.Timeout(self.settings.timeout_seconds),
+                headers={"Authorization": f"Bearer {self.settings.api_key}"},
+                limits=httpx.Limits(max_keepalive_connections=4, max_connections=20),
+            )
+        return self._http
+
+    def _close_http(self) -> None:
+        if self._http is not None:
+            self._http.close()
+            self._http = None
 
     def set_event_emitter(
         self,
@@ -105,6 +122,7 @@ class OpenAICompatibleClient:
         self.settings = settings
         self._unsupported_chat_params.clear()
         self._runtime_context_role = "system"
+        self._close_http()
     @property
     def runtime_context_role(self) -> str:
         return self._runtime_context_role
@@ -123,6 +141,10 @@ class OpenAICompatibleClient:
             extra["top_p"] = self.settings.top_p
         if self.settings.max_tokens is not None:
             extra["max_tokens"] = self.settings.max_tokens
+        if self.settings.frequency_penalty is not None:
+            extra["frequency_penalty"] = self.settings.frequency_penalty
+        if self.settings.presence_penalty is not None:
+            extra["presence_penalty"] = self.settings.presence_penalty
         return temperature, extra
 
     def test_connection(self) -> str:
@@ -153,25 +175,16 @@ class OpenAICompatibleClient:
     def list_models(self) -> list[str]:
         """读取 OpenAI 兼容 /models 接口，返回可选择的模型 id 列表。"""
         self._ensure_model_list_config()
-        base_url = _normalize_openai_base_url(self.settings.base_url)
-        url = f"{base_url}/models"
-        request = urllib.request.Request(
-            url=url,
-            method="GET",
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-            },
-        )
         debug_log(
             "API",
             "准备检测模型列表",
             {
-                "url": url,
+                "base_url": _normalize_openai_base_url(self.settings.base_url),
                 "configured_base_url": self.settings.base_url,
                 "timeout_seconds": self.settings.timeout_seconds,
             },
         )
-        response_body = self._send_with_retries(request)
+        response_body = self._send_http_with_retries("GET", "/models")
 
         try:
             data: dict[str, Any] = json.loads(response_body)
@@ -189,18 +202,32 @@ class OpenAICompatibleClient:
         *,
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
+        on_chunk: Callable[[str], None] | None = None,
     ) -> ChatReply:
+        """角色聊天回复，支持流式回调 on_chunk。"""
         segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones, reply_portraits)
         temperature, extra_params = self.resolve_dialogue_params()
-        content = self.complete_raw(
-            f"{system_prompt.strip()}\n\n{segmented_reply_instruction}",
-            messages,
-            temperature=temperature,
-            response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
-            cancel_checker=cancel_checker,
-            runtime_context=runtime_context,
-            **extra_params,
-        )
+        if on_chunk is not None:
+            content = self._stream_accumulate(
+                f"{system_prompt.strip()}\n\n{segmented_reply_instruction}",
+                messages,
+                temperature=temperature,
+                response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
+                cancel_checker=cancel_checker,
+                runtime_context=runtime_context,
+                on_chunk=on_chunk,
+                **extra_params,
+            )
+        else:
+            content = self.complete_raw(
+                f"{system_prompt.strip()}\n\n{segmented_reply_instruction}",
+                messages,
+                temperature=temperature,
+                response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
+                cancel_checker=cancel_checker,
+                runtime_context=runtime_context,
+                **extra_params,
+            )
         check_cancelled(cancel_checker)
 
         reply = sanitize_reply_tones(parse_chat_reply(content), reply_tones)
@@ -215,6 +242,31 @@ class OpenAICompatibleClient:
             },
         )
         return reply
+
+    def _stream_accumulate(
+        self,
+        system_prompt: str,
+        messages: list[ChatMessage],
+        temperature: float = 0.8,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        runtime_context: str = "",
+        on_chunk: Callable[[str], None],
+        **chat_params: Any,
+    ) -> str:
+        """流式获取并累积完整响应，同时通过 on_chunk 回调每个文本块。"""
+        chunks: list[str] = []
+        for chunk in self.stream_raw(
+            system_prompt,
+            messages,
+            temperature=temperature,
+            cancel_checker=cancel_checker,
+            runtime_context=runtime_context,
+            **chat_params,
+        ):
+            chunks.append(chunk)
+            on_chunk(chunk)
+        return "".join(chunks)
 
     def complete_raw(
         self,
@@ -295,6 +347,98 @@ class OpenAICompatibleClient:
         result = str(content).strip()
         debug_log("API", "模型原始文本返回", {"content": result})
         return result
+
+    def stream_raw(
+        self,
+        system_prompt: str,
+        messages: list[ChatMessage],
+        temperature: float = 0.8,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        runtime_context: str = "",
+        **chat_params: Any,
+    ):
+        """流式聊天补全，逐块 yield 文本内容。调用方累积后自行解析。"""
+        self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
+        check_cancelled(cancel_checker)
+        payload = _build_chat_completion_payload(
+            model=self.settings.model,
+            system_prompt=system_prompt,
+            messages=_messages_with_runtime_context(
+                messages, runtime_context, self._runtime_context_role
+            ),
+            temperature=temperature,
+            chat_params={**chat_params, "stream": True},
+        )
+        debug_log(
+            "API",
+            "准备发送流式聊天补全请求",
+            {
+                "base_url": _normalize_openai_base_url(self.settings.base_url),
+                "model": self.settings.model,
+                "temperature": temperature,
+                "message_count": len(payload["messages"]),
+            },
+        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        model_name = payload.get("model")
+        self._emit_llm_event("llm.request.started", {"model": model_name})
+        try:
+            client = self._http_client()
+            with client.stream(
+                "POST",
+                "/chat/completions",
+                content=body,
+                headers={"Content-Type": "application/json"},
+                timeout=httpx.Timeout(
+                    self.settings.timeout_seconds,
+                    read=self.settings.timeout_seconds,
+                ),
+            ) as response:
+                if response.status_code >= 400:
+                    error_body = response.read().decode("utf-8", errors="replace")
+                    raise ApiRequestError(
+                        _format_api_http_error(
+                            response.status_code, error_body, str(response.url)
+                        )
+                    )
+                for line in response.iter_lines():
+                    check_cancelled(cancel_checker)
+                    line = line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        delta = chunk["choices"][0]["delta"]
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                    delta_content = delta.get("content")
+                    if isinstance(delta_content, str) and delta_content:
+                        yield delta_content
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        yield reasoning
+        except (httpx.HTTPStatusError, httpx.ConnectError,
+                httpx.NetworkError, httpx.RemoteProtocolError,
+                httpx.ReadTimeout) as exc:
+            self._emit_llm_event(
+                "llm.request.failed",
+                {"model": model_name, "error": str(exc)},
+            )
+            raise ApiRequestError(f"API 流式请求失败：{exc}") from exc
+        except Exception:
+            self._emit_llm_event(
+                "llm.request.failed",
+                {"model": model_name, "error": "stream_error"},
+            )
+            raise
+        self._emit_llm_event("llm.request.finished", {"model": model_name})
 
     def complete_with_tools(
         self,
@@ -388,6 +532,9 @@ class OpenAICompatibleClient:
         tool_calls = _parse_native_tool_calls(raw_message.get("tool_calls"))
         if not tool_calls:
             tool_calls = _parse_pseudo_tool_calls_from_content(content)
+            # 如果从 content 中解析出了 XML 格式的 tool_call，从可见文本中移除
+            if tool_calls and isinstance(content, str):
+                content = _strip_xml_tool_calls(content)
         normalized_message = _normalize_assistant_message(raw_message, content, tool_calls)
         debug_log(
             "API",
@@ -467,23 +614,12 @@ class OpenAICompatibleClient:
         """调用 OpenAI 兼容的 chat/completions 接口并返回 JSON 数据。"""
         check_cancelled(cancel_checker)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        base_url = _normalize_openai_base_url(self.settings.base_url)
-        url = f"{base_url}/chat/completions"
-        request = urllib.request.Request(
-            url=url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-                "Content-Type": "application/json",
-            },
-        )
 
         debug_log(
             "API",
             "HTTP 请求体已构建",
             {
-                "url": url,
+                "base_url": _normalize_openai_base_url(self.settings.base_url),
                 "configured_base_url": self.settings.base_url,
                 "bytes": len(body),
                 "payload": payload,
@@ -492,7 +628,12 @@ class OpenAICompatibleClient:
         model_name = payload.get("model")
         self._emit_llm_event("llm.request.started", {"model": model_name})
         try:
-            response_body = self._send_with_retries(request, cancel_checker=cancel_checker)
+            response_body = self._send_http_with_retries(
+                "POST", "/chat/completions",
+                content=body,
+                headers={"Content-Type": "application/json"},
+                cancel_checker=cancel_checker,
+            )
             check_cancelled(cancel_checker)
             try:
                 data: dict[str, Any] = json.loads(response_body)
@@ -508,62 +649,73 @@ class OpenAICompatibleClient:
         self._emit_llm_event("llm.request.finished", {"model": model_name})
         return data
 
-    def _send_with_retries(
+    def _send_http_with_retries(
         self,
-        request: urllib.request.Request,
+        method: str,
+        path: str,
         *,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
         cancel_checker: CancelChecker | None = None,
     ) -> str:
+        """使用 httpx 连接池发送 HTTP 请求，支持自动重试。"""
         last_error: BaseException | None = None
         for attempt in range(1, MAX_API_RETRY_ATTEMPTS + 1):
             check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
-                with urlopen_direct_for_loopback(
-                    request,
-                    timeout=self.settings.timeout_seconds,
-                ) as response:
-                    response_body = response.read().decode("utf-8")
-                    debug_log(
-                        "API",
-                        "HTTP 请求成功",
-                        {
-                            "attempt": attempt,
-                            "status": getattr(response, "status", None),
-                            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                            "response_body": response_body,
-                        },
-                    )
-                    return response_body
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")
+                client = self._http_client()
+                request = client.build_request(
+                    method=method,
+                    url=path,
+                    content=content,
+                    headers=headers,
+                )
+                response = client.send(request)
+                response_body = response.text
+                debug_log(
+                    "API",
+                    "HTTP 请求成功",
+                    {
+                        "attempt": attempt,
+                        "status": response.status_code,
+                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                        "response_body": response_body,
+                    },
+                )
+                return response_body
+            except httpx.HTTPStatusError as exc:
+                error_body = exc.response.text
+                status_code = exc.response.status_code
+                url = str(exc.request.url) if exc.request is not None else path
                 debug_log(
                     "API",
                     "HTTP 请求失败",
                     {
                         "attempt": attempt,
-                        "status": exc.code,
+                        "status": status_code,
                         "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                         "error_body": error_body,
                     },
                 )
-                if exc.code not in {429, 500, 502, 503, 504} or attempt == MAX_API_RETRY_ATTEMPTS:
-                    raise ApiRequestError(_format_api_http_error(exc.code, error_body, request.full_url)) from exc
+                if status_code not in {429, 500, 502, 503, 504} or attempt == MAX_API_RETRY_ATTEMPTS:
+                    raise ApiRequestError(_format_api_http_error(status_code, error_body, url)) from exc
                 last_error = exc
-            except urllib.error.URLError as exc:
+            except (httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 debug_log(
                     "API",
-                    "URL 请求失败",
+                    "连接/网络错误",
                     {
                         "attempt": attempt,
                         "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                        "reason": str(exc.reason),
+                        "error": str(exc),
                     },
                 )
                 if attempt == MAX_API_RETRY_ATTEMPTS:
-                    raise ApiRequestError(f"API 请求失败：{exc.reason}") from exc
+                    raise ApiRequestError(f"API 请求失败：{exc}") from exc
                 last_error = exc
-            except TimeoutError as exc:
+                self._close_http()
+            except httpx.ReadTimeout as exc:
                 debug_log(
                     "API",
                     "请求超时",
@@ -574,19 +726,6 @@ class OpenAICompatibleClient:
                 )
                 if attempt == MAX_API_RETRY_ATTEMPTS:
                     raise ApiRequestError("API 请求超时。") from exc
-                last_error = exc
-            except (ssl.SSLError, ConnectionError, http.client.RemoteDisconnected) as exc:
-                debug_log(
-                    "API",
-                    "连接中断",
-                    {
-                        "attempt": attempt,
-                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                        "error": str(exc),
-                    },
-                )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
-                    raise ApiRequestError(f"API 连接中断：{exc}") from exc
                 last_error = exc
 
             debug_log(
@@ -599,7 +738,11 @@ class OpenAICompatibleClient:
                     "last_error": str(last_error),
                 },
             )
-            cancellable_sleep(API_RETRY_DELAY_SECONDS * attempt, cancel_checker)
+            import random
+            base_delay = API_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+            jitter = base_delay * API_RETRY_JITTER * (random.random() * 2 - 1)
+            delay = base_delay + jitter
+            cancellable_sleep(delay, cancel_checker)
 
         raise ApiRequestError("API 请求失败。")
 
@@ -849,16 +992,23 @@ def _parse_native_tool_calls(raw_tool_calls: Any) -> list[NativeToolCall]:
 
 
 def _parse_pseudo_tool_calls_from_content(content: Any) -> list[NativeToolCall]:
-    """Parse OpenAI-compatible providers that emit tool calls as JSON text.
+    """Parse providers that emit tool calls as text (JSON or XML) in message.content.
 
     Some providers combine poorly with response_format=json_object and return
     {"tool_call": "name", "parameters": {...}} in message.content instead of
-    native message.tool_calls. Keep this conservative: only accept top-level
-    JSON objects/lists that clearly describe tool calls.
+    native message.tool_calls. Others (e.g. reasoning models) emit XML-style
+    <tool_call> blocks. Keep the parser conservative.
     """
 
     if not isinstance(content, str) or not content.strip():
         return []
+
+    # Try XML-style tool calls first (glm-4.6v reasoning model fallback)
+    xml_calls = _parse_xml_tool_calls(content)
+    if xml_calls:
+        return xml_calls
+
+    # Then try JSON-style pseudo tool calls
     try:
         raw = json.loads(content)
     except json.JSONDecodeError:
@@ -884,6 +1034,59 @@ def _parse_pseudo_tool_calls_from_content(content: Any) -> list[NativeToolCall]:
         if call is not None:
             parsed.append(call)
     return parsed
+
+
+import re as _re
+
+_XML_TOOL_CALL_RE = _re.compile(
+    r"<tool_call>(.*?)</tool_call>",
+    _re.DOTALL,
+)
+_XML_ARG_RE = _re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    _re.DOTALL,
+)
+
+
+def _parse_xml_tool_calls(content: str) -> list[NativeToolCall]:
+    """解析 glm-4.6v 等推理模型输出的 XML 格式 tool_call 文本。"""
+    if "<tool_call>" not in content:
+        return []
+    parsed: list[NativeToolCall] = []
+    for index, match in enumerate(_XML_TOOL_CALL_RE.finditer(content)):
+        block = match.group(1).strip()
+        # First line is the tool name
+        lines = block.split("\n", 1)
+        name = lines[0].strip()
+        if not name:
+            continue
+        args_text = lines[1] if len(lines) > 1 else ""
+        arguments: dict[str, Any] = {}
+        for arg_match in _XML_ARG_RE.finditer(args_text):
+            key = arg_match.group(1).strip()
+            value = arg_match.group(2).strip()
+            # Try to parse JSON values (numbers, booleans, etc.)
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            arguments[key] = value
+        arguments_json = json.dumps(arguments, ensure_ascii=False)
+        call_id = f"xml_tool_call_{index}"
+        parsed.append(
+            NativeToolCall(
+                id=call_id,
+                name=name,
+                arguments=arguments,
+                arguments_json=arguments_json,
+            )
+        )
+    return parsed
+
+
+def _strip_xml_tool_calls(content: str) -> str:
+    """移除 content 中 XML 格式的 tool_call 块，保留用户可见文本。"""
+    return _XML_TOOL_CALL_RE.sub("", content).strip()
 
 
 def _parse_pseudo_tool_call(item: Any, index: int) -> NativeToolCall | None:

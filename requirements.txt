@@ -6,6 +6,7 @@ mcp>=1.9
 uv>=0.7.0
 PyYAML>=6.0
 playwright>=1.40
+mss>=9.0
 openai>=1.90.0
 pydantic>=2.7.3
 qdrant-client>=1.12.0
@@ -17,3 +18,6 @@ sentence-transformers>=5.0.0
 py7zz>=1.1.4
 py7zr
 pytest>=8.0.0
+# STT (voice input)
+sherpa-onnx>=1.13
+sounddevice>=0.5

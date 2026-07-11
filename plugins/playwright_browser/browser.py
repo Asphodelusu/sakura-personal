@@ -55,11 +55,31 @@ def search_web(query: str, limit: int = 5) -> str:
 
     def task() -> str:
         page = _ensure_browser()
-        page.goto(f"https://www.bing.com/search?q={quote_plus(query)}", wait_until="domcontentloaded")
+        # Visit homepage first for proper session cookies, then submit via
+        # search box.  This produces better results than URL params for mixed
+        # Latin/CJK queries and renders snippets more reliably.
+        page.goto("https://www.bing.com/", wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
+        search_box = page.query_selector("#sb_form_q")
+        if search_box:
+            search_box.click()
+            search_box.fill(query)
+            page.wait_for_timeout(300)
+            page.keyboard.press("Enter")
+        else:
+            page.goto(f"https://www.bing.com/search?q={quote_plus(query)}", wait_until="domcontentloaded")
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2000)
         results: list[str] = []
         for index, item in enumerate(page.query_selector_all("li.b_algo")[: max(1, limit)], start=1):
             title = _inner_text(item, "h2")
-            snippet = _inner_text(item, "p")
+            # Use .b_caption p for snippet (more specific than "p" which may
+            # match unrelated paragraphs).  Fall back to text_content() because
+            # inner_text() can be empty when CSS line-clamp hasn't finished
+            # layout computation (e.g.  b_lineclamp2).
+            snippet = _text_or_inner(item, ".b_caption p")
+            if not snippet:
+                snippet = _inner_text(item, ".b_caption")
             display_url = _inner_text(item, ".b_attribution cite")
             link = item.query_selector("h2 a")
             href = link.get_attribute("href") if link is not None else ""
@@ -230,6 +250,20 @@ def _inner_text(item: Any, selector: str) -> str:
     if element is None:
         return ""
     try:
+        return str(element.inner_text()).strip()
+    except Exception:
+        return ""
+
+
+def _text_or_inner(item: Any, selector: str) -> str:
+    """Try text_content() first (not CSS-layout-dependent), fall back to inner_text()."""
+    element = item.query_selector(selector)
+    if element is None:
+        return ""
+    try:
+        tc = element.text_content()
+        if tc:
+            return str(tc).strip()
         return str(element.inner_text()).strip()
     except Exception:
         return ""

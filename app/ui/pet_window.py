@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QPainter,
     QPixmap,
     QRegion,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -60,6 +61,12 @@ from app.agent.memory_curator import (
     MemoryCurationResult,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
+from app.agent.memory_reflector import (
+    MemoryReflector,
+    ReflectionStateStore,
+    mark_reflection_done,
+    reflection_should_run,
+)
 from app.agent.runtime_limits import RuntimeLoopSettings
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.core.app_context import AppContext
@@ -116,6 +123,8 @@ from app.plugins.events import (
     EVENT_CHAT_MESSAGE_SENT,
     EVENT_TTS_FINISHED,
     EVENT_TTS_STARTED,
+    EVENT_USER_IDLE,
+    EVENT_USER_RETURNED,
 )
 from app.ui.state import PetUiState, PetUiStateStore
 from app.ui.error_messages import format_failure_message
@@ -132,6 +141,7 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
 )
+from app.perception import ProactiveObserver, ProactiveConfig, PrivacyGuard
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -194,6 +204,7 @@ from app.ui.card_container import CardContainer
 from app.ui.window_backdrop import MacOSVisualEffectBackdrop, VisualEffectMode
 from app.ui.input_blur_background import InputBlurBackground, make_blurred_pixmap
 from app.ui.bubble_auto_hide import BubbleAutoHideController
+from app.ui.mic_level_button import MicLevelButton
 from app.ui import (
     ManualScreenshotOverlay,
     PortraitController,
@@ -224,6 +235,8 @@ MEMORY_STATUS_DISPLAY_MS = 7_000
 MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SPEAKING_STATE_TIMEOUT_MS = 45_000
 THREAD_SHUTDOWN_WAIT_MS = 1_000
+USER_IDLE_THRESHOLD_SECONDS = 30
+USER_IDLE_CHECK_INTERVAL_MS = 5_000
 TRANSIENT_PROGRESS_MESSAGE_KEY = "_sakura_transient_progress"
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
@@ -472,6 +485,8 @@ class PetWindow(QWidget):
     memory_status_changed = Signal(str, str)
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
+    # 主动模式评论信号（从后台线程 emit，queued connection 回 UI 线程）
+    proactive_comment_arrived = Signal(str)
 
     def __init__(
         self,
@@ -610,6 +625,11 @@ class PetWindow(QWidget):
         self.screen_awareness_context_batch_started_at: float | None = None
         self.screen_awareness_contexts: list[dict[str, Any]] = []
         self.screen_awareness_context_dropped_count = 0
+        # ---- proactive observer ----
+        self._proactive_observer: ProactiveObserver | None = None
+        self.proactive_comment_arrived.connect(self._show_proactive_comment)
+        self._init_proactive_observer()
+        # ----
         self.interaction_sequence = 0
         self.active_interaction_id = ""
         self.active_interaction_started_at: float | None = None
@@ -627,12 +647,24 @@ class PetWindow(QWidget):
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(REMINDER_CHECK_INTERVAL_MS)
         self.reminder_timer.timeout.connect(self._check_due_reminders)
+        self._user_was_idle = False
         self.screen_awareness_timer = QTimer(self)
         self.screen_awareness_timer.setInterval(SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS)
         self.screen_awareness_timer.timeout.connect(self._check_screen_awareness)
+        self.user_idle_timer = QTimer(self)
+        self.user_idle_timer.setInterval(USER_IDLE_CHECK_INTERVAL_MS)
+        self.user_idle_timer.timeout.connect(self._check_user_idle)
+        self.reflection_timer = QTimer(self)
+        self.reflection_timer.setInterval(60000)  # 每分钟检查一次
+        self.reflection_timer.timeout.connect(self._check_memory_reflection)
+        self.memory_reflector: MemoryReflector | None = None
+        self.reflection_state_store: ReflectionStateStore | None = None
+        self.reflection_worker: QThread | None = None
         if not self.startup_initializing:
             self.reminder_timer.start()
             self._sync_screen_awareness_timer()
+            self.user_idle_timer.start()
+            self.reflection_timer.start()
             QTimer.singleShot(0, self._maybe_start_memory_backfill)
         debug_log(
             "PetWindow",
@@ -851,7 +883,14 @@ class PetWindow(QWidget):
         input_layout.setSpacing(8)
         input_layout.addWidget(self.input_edit, 1)
         input_layout.addWidget(self.tool_confirmation_panel)
+        self.voice_button = MicLevelButton(self.input_bar)
+        self.voice_button.setObjectName("voiceButton")
+        self.voice_button.clicked.connect(self._handle_voice_button_clicked)
+        self._voice_listening = False
+        self._voice_finishing = False
+
         input_layout.addWidget(self.screenshot_button)
+        input_layout.addWidget(self.voice_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
         # 输入栏为「窗口内」卡片容器（单窗口重构）：Windows 亚克力不再暴露为可选项；
@@ -926,6 +965,7 @@ class PetWindow(QWidget):
         self.memory_status_changed.connect(self._handle_memory_status_changed)
         self._connect_memory_status_listener()
         self._move_to_default_position()
+        self._restore_window_position()  # 用边缘偏移反算，不受 DWM 边框影响
         if getattr(self, "startup_initializing", False):
             self._apply_startup_initializing_state()
             self.renderer_manager = None
@@ -938,6 +978,11 @@ class PetWindow(QWidget):
             application.aboutToQuit.connect(self.close_external_tools)
             if sys.platform == "darwin":
                 application.installEventFilter(self)
+
+        # 语音输入快捷键
+        self._voice_shortcut = QShortcut(self)
+        self._voice_shortcut.setKey("Alt+T")
+        self._voice_shortcut.activated.connect(self._handle_voice_button_clicked)
 
     @property
     def proactive_care_settings(self) -> Any:
@@ -1023,6 +1068,10 @@ class PetWindow(QWidget):
             QTimer.singleShot(100, self._raise_foreground_controls)
         self._refresh_tray_menu()
         self._schedule_native_topmost_sync()
+        if getattr(self, "_first_show_done", False):
+            self._emit_bus_event("pet.reopened", {})
+        else:
+            self._first_show_done = True
         if getattr(self, "memory_failure_dialog_pending_message", ""):
             QTimer.singleShot(0, self._show_pending_memory_failure_dialog)
 
@@ -1030,6 +1079,7 @@ class PetWindow(QWidget):
         super().hideEvent(event)
         # 子控件随主窗口隐藏，无需单独 hide。
         self._refresh_tray_menu()
+        self._emit_bus_event("pet.hidden", {})
 
     def changeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().changeEvent(event)
@@ -1089,6 +1139,7 @@ class PetWindow(QWidget):
         return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        super().mousePressEvent(event)
         self._handle_mouse_press(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -1277,6 +1328,7 @@ class PetWindow(QWidget):
         if getattr(self, "_shutdown_in_progress", False):
             return
         self._shutdown_in_progress = True
+        self._save_window_position()
         self._emit_app_closed_event()
         self._stop_speaking_state_watchdog()
         self.messages = _without_transient_progress_messages(self.messages)
@@ -1287,7 +1339,11 @@ class PetWindow(QWidget):
         cancel_backchannel = getattr(backchannel_controller, "cancel", None)
         if callable(cancel_backchannel):
             cancel_backchannel()
+        self._stop_proactive_observer()
         self.resource_manager.stop_all(THREAD_SHUTDOWN_WAIT_MS)
+        self.user_idle_timer.stop()
+        self.reminder_timer.stop()
+        self.screen_awareness_timer.stop()
 
     def _emit_app_started_event(self) -> None:
         """启动就绪后落盘 app.started；若存在上次关闭记录则附带跨会话信息并注入首条消息。"""
@@ -1521,6 +1577,9 @@ class PetWindow(QWidget):
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
             controller.handle_pet_clicked()
+        # 唤回后刷新字幕：防止残留旧分段的日文文本
+        if not self._refresh_reply_history_review_text():
+            self.subtitle_controller.restart_current_segment_speech()
         # 无副窗口/对话框占用且模型未在思考时，让输入栏现身并把焦点移入输入框。
         # 先 set_force_visible(True) 使 input_card 同步 show()（hidden widget 无法接收焦点），
         # 设完焦点后立即释放 force_visible——_input_bar_pinned 会通过焦点继续维持可见。
@@ -1610,6 +1669,10 @@ class PetWindow(QWidget):
         self._schedule_native_topmost_sync()
 
     def _apply_reply_segment(self, segment: ChatSegment) -> None:
+        # 新立绘注入：取消回退到默认的定时器。
+        timer = getattr(self, "_portrait_reset_timer", None)
+        if timer is not None:
+            timer.stop()
         # 正式回复开始:放弃尚未触发的接话(已显示的接话被正式字幕自然覆盖)。
         self._cancel_backchannel()
         # 同轮回复内各段高度延续：不在此重置，避免"段间先缩后扩"产生闪现。
@@ -2641,7 +2704,49 @@ class PetWindow(QWidget):
         y = geometry.bottom() - self.height() - 20
         self.move(max(geometry.left(), x), max(geometry.top(), y))
 
+    def _save_window_position(self) -> None:
+        p = self.pos()
+        w = self.width()
+        h = self.height()
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.geometry()
+        # 保存窗口右下角距屏幕右下角的偏移（相对定位，避免 DWM 边框偏移）
+        self._save_system_config_values("ui", {
+            "window_x": p.x(),
+            "window_y": p.y(),
+            "window_offset_right": geo.right() - (p.x() + w),
+            "window_offset_bottom": geo.bottom() - (p.y() + h),
+        })
+
+    def _restore_window_position(self) -> None:
+        """尝试恢复上次窗口位置（需在 show 后调用才能精确定位）。"""
+        values = self._load_system_config_values("ui")
+        offset_right = values.get("window_offset_right")
+        offset_bottom = values.get("window_offset_bottom")
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.geometry()
+        if offset_right is not None and offset_bottom is not None:
+            x = max(geo.left(), geo.right() - int(offset_right) - self.width())
+            y = max(geo.top(), geo.bottom() - int(offset_bottom) - self.height())
+        else:
+            # 兼容旧格式（仅存绝对坐标）
+            x = values.get("window_x")
+            y = values.get("window_y")
+            if x is None or y is None:
+                return
+            x = max(geo.left(), min(x, geo.right() - self.width()))
+            y = max(geo.top(), min(y, geo.bottom() - self.height()))
+        self.setGeometry(x, y, self.width(), self.height())
+
     def _begin_interaction(self, source: str) -> None:
+        # 新交互开始，取消立绘回退定时器
+        timer = getattr(self, "_portrait_reset_timer", None)
+        if timer is not None:
+            timer.stop()
         self.interaction_sequence += 1
         now = time.perf_counter()
         self.active_interaction_id = f"interaction-{self.interaction_sequence}"
@@ -2650,6 +2755,7 @@ class PetWindow(QWidget):
         # UI 线程后续的 debug_log 自动带上交互 ID；worker/TTS 线程由各自入口恢复
         set_interaction_id(self.active_interaction_id)
         self.ui_state.begin_thinking(source)
+        self._emit_bus_event("agent.thinking.started", {"source": source})
         debug_log(
             "Latency",
             "输入事件开始",
@@ -2701,6 +2807,7 @@ class PetWindow(QWidget):
         # 失败结局保持 ERROR 状态供动效展示，直到下一次交互进入 thinking
         if outcome != "error":
             self.ui_state.finish(outcome)
+            self._emit_bus_event("agent.thinking.finished", {"outcome": outcome})
         self._update_reply_history_buttons()
         # 每完成一轮对话（含完整回复）累计一次，驱动自动记忆整理触发
         if outcome == "reply_completed":
@@ -2709,14 +2816,109 @@ class PetWindow(QWidget):
             controller = getattr(self, "bubble_auto_hide", None)
             if controller is not None:
                 controller.notify_settled()
+            # 说完话：40 秒后若无新对话，立绘退回默认（中性）表情。
+            _PORTRAIT_IDLE_RESET_MS = 20_000
+            existing_timer = getattr(self, "_portrait_reset_timer", None)
+            if existing_timer is not None:
+                existing_timer.stop()
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.portrait_controller.reset_to_default)
+            timer.start(_PORTRAIT_IDLE_RESET_MS)
+            self._portrait_reset_timer = timer
             # 空闲时机:补合成本轮消耗/让位掉的接话音频(对话中绝不补,
             # 避免抢占回复分段的串行合成队列)。
             refill_backchannel_audio = getattr(self, "_prepare_backchannel_audio_cache", None)
             if callable(refill_backchannel_audio):
                 refill_backchannel_audio()
 
+    # ------------------------------------------------------------------
+    # Proactive screen observer (desktop-kanojo style)
+    # ------------------------------------------------------------------
+
+    def _init_proactive_observer(self) -> None:
+        """Initialize the desktop-kanojo style proactive screen observer."""
+        proactive_cfg = self.settings_service.load_proactive_config()
+        config = ProactiveConfig.from_dict(proactive_cfg)
+        if not config.enabled:
+            return
+        try:
+            api = self.api_client.settings
+            observer = ProactiveObserver(
+                api_base_url=api.base_url,
+                api_key=api.api_key,
+                api_model=api.model,
+                system_prompt=self.system_prompt,
+                config=config,
+                privacy=PrivacyGuard(),
+                on_speak=self._on_proactive_speak,
+                is_busy=lambda: self.worker_thread is not None,
+                on_memory_record=self._on_proactive_memory_record,
+            )
+            self._proactive_observer = observer
+            debug_log("PetWindow", "ProactiveObserver 初始化成功")
+        except Exception as exc:
+            debug_log("PetWindow", "ProactiveObserver 初始化失败", {"error": str(exc)})
+
+    def _start_proactive_observer(self) -> None:
+        observer = getattr(self, "_proactive_observer", None)
+        if observer is not None:
+            try:
+                observer.start()
+                debug_log("PetWindow", "ProactiveObserver 已启动")
+            except Exception as exc:
+                debug_log("PetWindow", "ProactiveObserver 启动失败", {"error": str(exc)})
+
+    def _stop_proactive_observer(self) -> None:
+        observer = getattr(self, "_proactive_observer", None)
+        if observer is not None:
+            try:
+                observer.stop()
+                debug_log("PetWindow", "ProactiveObserver 已停止")
+            except Exception:
+                pass
+
+    def _on_proactive_speak(self, comment: str) -> None:
+        """Callback: display proactive comment (thread-safe via Qt signal)."""
+        if not comment.strip():
+            return
+        debug_log("PetWindow", "主动发言", {"comment": comment[:60]})
+        # Emit signal for thread-safe main-thread dispatch
+        self.proactive_comment_arrived.emit(comment)
+
+    @Slot(str)
+    def _show_proactive_comment(self, comment: str) -> None:
+        """Display a proactive comment in the subtitle (always on main thread)."""
+        # Don't interrupt active reply / TTS playback
+        sc = getattr(self, "subtitle_controller", None)
+        if sc is not None and sc.is_reply_sequence_active():
+            return
+        if sc is not None:
+            sc.show_text_immediately(comment)
+
+    def _on_proactive_memory_record(self, text: str) -> None:
+        """Callback: persist proactive comment in chat history (thread-safe)."""
+        # Enqueue to main thread to avoid file I/O races
+        QTimer.singleShot(0, lambda t=text: self._do_proactive_memory_record(t))
+
+    def _do_proactive_memory_record(self, text: str) -> None:
+        store = getattr(self, "history_store", None)
+        if store is not None:
+            try:
+                store.append(role="assistant", content=text)
+            except Exception:
+                pass
+
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
+        observer = getattr(self, "_proactive_observer", None)
+        if observer is not None:
+            observer.notify_user_spoke()
+        if self._user_was_idle:
+            self._user_was_idle = False
+            self._emit_bus_event(EVENT_USER_RETURNED, {
+                "seconds_idle": int(time.perf_counter() - self._idle_started_at) if hasattr(self, "_idle_started_at") else 0,
+            })
 
     @Slot()
     def _handle_return_pressed(self) -> None:
@@ -2843,6 +3045,113 @@ class PetWindow(QWidget):
         self.screenshot_button.style().unpolish(self.screenshot_button)
         self.screenshot_button.style().polish(self.screenshot_button)
         self.screenshot_button.update()
+
+    # ── 语音输入 ──────────────────────────────────────────────
+
+    def _handle_voice_button_clicked(self) -> None:
+        self._mark_user_activity()
+        if getattr(self, "startup_initializing", False):
+            return
+        if self.worker_thread is not None:
+            return
+        if self._voice_finishing:
+            return  # 识别中，忽略
+
+        if self._voice_listening:
+            self._stop_and_send()
+        else:
+            self._start_voice_listening()
+
+    def _start_voice_listening(self) -> None:
+        from app.stt import STTManager
+        if not STTManager().available:
+            show_themed_warning(self, "语音不可用", "未找到语音识别模型。")
+            return
+
+        self._voice_listening = True
+        self.voice_button.set_active(True)
+        self._suppress_bubble_hide(True)
+
+        self._stt_manager = STTManager()
+        self._stt_manager.start_listening()
+
+        self._voice_timer = QTimer(self)
+        self._voice_timer.timeout.connect(self._poll_voice_state)
+        self._voice_timer.start(25)
+
+    def _poll_voice_state(self) -> None:
+        if not self._voice_listening:
+            return
+        manager = getattr(self, "_stt_manager", None)
+        if manager is None:
+            return
+
+        self.voice_button.set_mic_level(manager.latest_level)
+
+        if not manager.is_listening():
+            self._voice_timer.stop()
+            self._voice_timer = None
+            self._voice_listening = False
+            self._finish_and_send()
+
+    def _stop_and_send(self) -> None:
+        """手动停止：如果还在录音就中断，否则直接识别。"""
+        self._voice_listening = False
+        if hasattr(self, "_voice_timer") and self._voice_timer:
+            self._voice_timer.stop()
+            self._voice_timer = None
+
+        manager = getattr(self, "_stt_manager", None)
+        if manager is not None:
+            if manager.is_listening():
+                # 还在录音中，请求中断（短超时，不卡 UI）
+                manager.stop(timeout=1.0)
+            # 不管是否拿到音频，都走识别流程
+        self._finish_and_send()
+
+    def _finish_and_send(self) -> None:
+        manager = getattr(self, "_stt_manager", None)
+        if manager is None:
+            return
+        if self._voice_finishing:
+            return
+        self._voice_finishing = True
+
+        self.voice_button.set_processing()
+        self._pending_manager = manager
+        QTimer.singleShot(0, self._do_recognize)
+
+    def _do_recognize(self) -> None:
+        manager = getattr(self, "_pending_manager", None)
+        self._pending_manager = None
+        if manager is None:
+            self._voice_finishing = False
+            self.voice_button.set_idle()
+            return
+
+        text = manager.transcribe()
+        self._pending_voice_text = text
+        QTimer.singleShot(250, self._voice_send_result)
+
+    def _voice_send_result(self) -> None:
+        text = getattr(self, "_pending_voice_text", None)
+        self._pending_voice_text = None
+        self._voice_finishing = False
+        self.voice_button.set_idle()
+        self._suppress_bubble_hide(False)
+
+        if text:
+            self.input_edit.setText(text)
+            self.send_message("voice_input")
+
+    def _suppress_bubble_hide(self, suppress: bool) -> None:
+        controller = getattr(self, "bubble_auto_hide", None)
+        if controller is None:
+            return
+        if suppress:
+            controller.notify_speaking()
+        else:
+            controller.notify_settled()
 
     @Slot()
     def send_message(self, source: str = "direct_call") -> None:
@@ -3061,7 +3370,7 @@ class PetWindow(QWidget):
                 TRANSIENT_PROGRESS_MESSAGE_KEY: True,
             }
         )
-        self._record_assistant_reply_history(reply)
+        # 不回写历史记录：_handle_reply 收到最终回复后再统一写
 
     def _remove_transient_progress_messages(self) -> None:
         self.messages = _without_transient_progress_messages(self.messages)
@@ -3653,12 +3962,26 @@ class PetWindow(QWidget):
             >= check_interval_seconds
         )
 
+    def _detect_screen_change(self, data_url: str, screen_name: str) -> None:
+        """通过 hash 比较检测屏幕内容是否变化，发出 screen.changed 事件。"""
+        import hashlib
+        sample = data_url[:16384] if len(data_url) > 16384 else data_url
+        current_hash = hashlib.md5(sample.encode()).hexdigest()
+        last = getattr(self, "_last_screen_hash", None)
+        if last is not None and last != current_hash:
+            self._emit_bus_event("screen.changed", {
+                "screen_name": screen_name,
+                "hash": current_hash,
+            })
+        self._last_screen_hash = current_hash
+
     def _capture_screen_awareness_context(self, now: float) -> None:
         self.last_screen_awareness_context_at = now
         try:
             captured = capture_screen_image(self)
         except RuntimeError as exc:
             debug_log("ScreenAwareness", "主动屏幕上下文获取失败", {"error": str(exc)})
+            self._emit_bus_event("screen.error_detected", {"error": str(exc)})
             return
         if not self._start_screen_observation_encode(
             captured,
@@ -3687,6 +4010,12 @@ class PetWindow(QWidget):
             "screen_name": observation.screen_name,
             "detail": str(context_data.get("detail") or SCREEN_AWARENESS_IMAGE_DETAIL),
         }
+        self._emit_bus_event("screen.summary.updated", {
+            "screen_name": observation.screen_name,
+            "width": observation.width,
+            "height": observation.height,
+        })
+        self._detect_screen_change(observation.data_url, observation.screen_name)
         if not self.screen_awareness_contexts:
             self.screen_awareness_context_batch_started_at = float(captured_at_monotonic)
         self.screen_awareness_contexts.append(context)
@@ -4223,6 +4552,101 @@ class PetWindow(QWidget):
         if pending_turns >= self.memory_curation_settings.trigger_turns:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
+    def _check_memory_reflection(self) -> None:
+        """定时检查是否应该触发记忆反思。"""
+        if getattr(self, "startup_initializing", False):
+            return
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+
+        # 延迟初始化 reflector
+        if self.memory_reflector is None:
+            self.reflection_state_store = ReflectionStateStore(self.character_registry.base_dir)
+            self.memory_reflector = MemoryReflector(
+                self.api_client,
+                self.memory_store,
+                system_prompt=self.system_prompt,
+            )
+
+        if not reflection_should_run(
+            self.reflection_state_store,
+            is_busy=self.worker_thread is not None,
+        ):
+            return
+
+        # 确保不在对话中
+        if self.worker_thread is not None:
+            return
+
+        debug_log("Memory", "触发记忆反思")
+        self._run_memory_reflection()
+
+    def _run_memory_reflection(self) -> None:
+        """在后台线程中运行记忆反思。"""
+        from app.agent.memory_reflector import ReflectionResult
+
+        worker_curator = self.memory_reflector
+        state_store = self.reflection_state_store
+        memory_store = self.memory_store.scoped(self.character_profile.id)
+
+        class _ReflectionWorker(QObject):
+            finished = Signal(object)  # ReflectionResult
+            failed = Signal(str)
+
+            def __init__(self, reflector, store, state_s):
+                super().__init__()
+                self.reflector = reflector
+                self.store = store
+                self.state_store = state_s
+
+            def run(self) -> None:
+                try:
+                    result = self.reflector.reflect(memory_store=self.store)
+                    self.finished.emit(result)
+                except Exception as e:
+                    self.failed.emit(str(e))
+
+        worker = _ReflectionWorker(worker_curator, memory_store, state_store)
+
+        self.resource_manager.spawn_qt_worker(
+            worker,
+            parent=self,
+            owner=self,
+            thread_attr="reflection_worker",
+            worker_attr="reflection_worker",
+            signal_bindings=[
+                (worker.finished, self._handle_reflection_finished),
+                (worker.failed, self._handle_reflection_failed),
+            ],
+            quit_on=[worker.finished, worker.failed],
+        )
+
+    @Slot(object)
+    def _handle_reflection_finished(self, result: Any) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        from app.agent.memory_reflector import ReflectionResult
+
+        if isinstance(result, ReflectionResult):
+            m_created = result.memories_created
+            m_errors = len(result.errors)
+        else:
+            m_created = 0
+            m_errors = 0
+        debug_log(
+            "Memory",
+            "记忆反思完成",
+            {"memories_created": m_created, "errors": m_errors},
+        )
+        mark_reflection_done(self.reflection_state_store, m_created)
+
+    @Slot(str)
+    def _handle_reflection_failed(self, message: str) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        debug_log("Memory", "记忆反思失败", {"error": message})
+        mark_reflection_done(self.reflection_state_store, 0)
+
     def _maybe_start_auto_memory_curation(self) -> None:
         if getattr(self, "startup_initializing", False):
             return
@@ -4403,7 +4827,9 @@ class PetWindow(QWidget):
         self.renderer_manager = self._activate_renderer_manager()
 
         self.startup_initializing = False
+        self._start_proactive_observer()
         self._emit_app_started_event()
+        self.reflection_timer.start()
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text())
         self._collapse_auto_fit_bubble_height()
         self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
@@ -6268,6 +6694,28 @@ class PetWindow(QWidget):
         return create_visual_observation_store(self.base_dir, profile)
 
 
+    def _emit_bus_event(self, event_name: str, payload: dict[str, Any] | None = None) -> None:
+        """安全派发插件事件；插件未就绪或异常时静默跳过。"""
+        try:
+            emit = getattr(getattr(self, "plugin_manager", None), "emit_bus_event", None)
+            if callable(emit):
+                emit(event_name, payload)
+        except Exception:
+            pass
+
+    def _check_user_idle(self) -> None:
+        """定期检查用户空闲状态，触发 user.idle 事件。"""
+        if self._user_was_idle:
+            return
+        now = time.perf_counter()
+        if now - self.last_user_activity_at >= USER_IDLE_THRESHOLD_SECONDS:
+            self._user_was_idle = True
+            self._idle_started_at = now - USER_IDLE_THRESHOLD_SECONDS
+            self._emit_bus_event(EVENT_USER_IDLE, {
+                "seconds_idle": USER_IDLE_THRESHOLD_SECONDS,
+            })
+
+
 def _build_screen_observation_disabled_result() -> AgentResult:
     return AgentResult(
         reply=ChatReply(
@@ -6928,3 +7376,8 @@ def _set_macos_window_topmost(window_id: int, enabled: bool) -> None:
         ctypes.c_void_p(selector(b"setCollectionBehavior:")),
         collection_behavior,
     )
+
+
+
+
+

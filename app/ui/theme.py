@@ -286,7 +286,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
 #petInput:disabled {{
     color: {rgba(mix(theme.text_color, "#000000", 0.08), 150)};
 }}
-#sendButton, #screenshotButton {{
+#sendButton, #screenshotButton, #voiceButton {{
     background: {rgba(theme.primary_color, 232)};
     border: 1px solid rgba(255, 255, 255, 150);
     border-radius: 19px;
@@ -300,7 +300,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     min-width: 50px;
     padding: 4px 10px;
 }}
-#screenshotButton {{
+#screenshotButton, #voiceButton {{
     width: 36px;
     height: 36px;
     min-width: 36px;
@@ -309,7 +309,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     max-height: 36px;
     padding: 0;
 }}
-#sendButton:hover, #screenshotButton:hover {{
+#sendButton:hover, #screenshotButton:hover, #voiceButton:hover {{
     background: {rgba(theme.primary_hover_color, 242)};
     border: 1px solid {rgba(mix(theme.panel_background_color, "#ffffff", 0.35), 190)};
 }}
@@ -318,7 +318,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     border: 1px solid {rgba(mix(theme.panel_background_color, "#ffffff", 0.25), 220)};
     color: white;
 }}
-#sendButton:disabled, #screenshotButton:disabled {{
+#sendButton:disabled, #screenshotButton:disabled, #voiceButton:disabled {{
     background: {rgba(theme.primary_color, 118)};
     border: 1px solid {rgba(theme.border_color, 92)};
     color: rgba(255, 255, 255, 178);

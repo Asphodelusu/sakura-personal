@@ -236,3 +236,13 @@ class PortraitController(QObject):
         self.main_opacity_effect.setOpacity(1.0)
         self.transition_opacity_effect.setOpacity(0.0)
         self._relayout()
+
+    def reset_to_default(self) -> None:
+        """回复说完后 N 秒无操作，直接切回默认立绘。"""
+        default_path = self.profile.default_portrait_path
+        if default_path == self.current_path:
+            return
+        self.current_path = default_path
+        self.pixmap = self.load_portrait(default_path)
+        self.apply_current()
+        self._on_portrait_changed(self.pixmap)

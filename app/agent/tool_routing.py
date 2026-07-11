@@ -450,7 +450,11 @@ def _build_web_tool_capability_rule(visible_browser_mode: bool) -> str:
             "- 网页：本轮是显式可见浏览器任务，使用 playwright_*；"
             "后台 web__ 搜索/抓取只用于非可见浏览器的轻量公开资料。"
         )
-    return "- 网页：轻量公开资料用 web__web_search / web__fetch_url；可见浏览器操作用 playwright_*。"
+    return (
+        "- 网页搜索策略：web__web_search 支持百度/必应/DDG，可加 site: 限定来源（如 site:zhihu.com）。\n"
+        "- 复杂话题多搜几轮：先粗搜了解概况 → 读一篇关键页面(web__fetch_url) → 从内容中提取关键词 → 用关键词再搜一轮 → 综合回答。\n"
+        "- 社区/论坛类（攻略、评测、八卦）追加'知乎''NGA''贴吧''B站'等社区名重搜。"
+    )
 
 
 def _build_screen_and_desktop_routing_rule(allow_screen_observation: bool) -> str:

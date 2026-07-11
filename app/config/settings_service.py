@@ -163,6 +163,8 @@ class AppSettingsService:
             temperature=_optional_float(data.get("temperature"), minimum=0.0, maximum=2.0),
             top_p=_optional_float(data.get("top_p"), minimum=0.0, maximum=1.0),
             max_tokens=_optional_positive_int(data.get("max_tokens")),
+            frequency_penalty=_optional_float(data.get("frequency_penalty"), minimum=-2.0, maximum=2.0),
+            presence_penalty=_optional_float(data.get("presence_penalty"), minimum=-2.0, maximum=2.0),
         )
 
     def save_api_settings(self, settings: ApiSettings) -> None:
@@ -180,6 +182,10 @@ class AppSettingsService:
             llm_data["top_p"] = float(settings.top_p)
         if settings.max_tokens is not None:
             llm_data["max_tokens"] = int(settings.max_tokens)
+        if settings.frequency_penalty is not None:
+            llm_data["frequency_penalty"] = float(settings.frequency_penalty)
+        if settings.presence_penalty is not None:
+            llm_data["presence_penalty"] = float(settings.presence_penalty)
         data["llm"] = llm_data
         save_yaml_mapping(self.api_config_path, data)
 
@@ -444,6 +450,13 @@ class AppSettingsService:
     def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
         """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""
         return self.load_screen_awareness_settings()
+
+    def load_proactive_config(self) -> dict[str, Any]:
+        """加载主动屏幕感知 ProactiveObserver 的运行时配置。"""
+        proactive = self._system_section("proactive")
+        if not isinstance(proactive, dict):
+            return {}
+        return dict(proactive)
 
     def save_proactive_care_settings(self, settings: ScreenAwarenessSettings) -> None:
         """兼容旧调用点；新代码请使用 save_screen_awareness_settings。"""

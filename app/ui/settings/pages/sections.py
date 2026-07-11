@@ -40,7 +40,13 @@ from app.agent.runtime_limits import (
     MIN_TOOL_CALLS_PER_STEP,
     RuntimeLoopSettings,
 )
-from app.agent.memory import MEMORY_LAYER_LABELS, MEMORY_LAYERS, MemoryStore
+from app.agent.memory import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_MODEL_CACHE_NAME,
+    MEMORY_LAYER_LABELS,
+    MEMORY_LAYERS,
+    MemoryStore,
+)
 from app.backchannel.model_cache import (
     BACKCHANNEL_MODEL_CACHE_NAME,
     DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
@@ -1119,12 +1125,12 @@ class MemorySettingsPage:
         owner.memory_refresh_button.clicked.connect(owner._load_memory_entries)
         owner.memory_download_model_button = QPushButton("在线安装记忆模型", tab)
         owner.memory_download_model_button.setToolTip(
-            "从 Hugging Face 安装 sentence-transformers/all-MiniLM-L6-v2 到本地缓存。"
+            f"从 Hugging Face 安装 {DEFAULT_EMBEDDING_MODEL} 到本地缓存。"
         )
         owner.memory_download_model_button.clicked.connect(owner._download_memory_model)
         owner.memory_import_model_button = QPushButton("导入记忆模型", tab)
         owner.memory_import_model_button.setToolTip(
-            "导入 models--sentence-transformers--all-MiniLM-L6-v2.zip，供无法自动下载时使用。"
+            f"导入记忆模型离线包（{DEFAULT_EMBEDDING_MODEL_CACHE_NAME}.zip），供无法自动下载时使用。"
         )
         owner.memory_import_model_button.clicked.connect(owner._import_memory_model_archive)
         owner.memory_status_label = QLabel(MEMORY_READING_TEXT, tab)

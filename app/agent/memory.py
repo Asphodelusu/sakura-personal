@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 MEM0_VENDOR_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mem0"
 DEFAULT_MEMORY_SCOPE = "sakura"
 DEFAULT_COLLECTION_NAME = "sakura_memories"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_DIMS = 384
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
+DEFAULT_EMBEDDING_DIMS = 768
 DEFAULT_MEMORY_LIMIT = 20
 MEMORY_LAYER_CORE_PROFILE = "core_profile"
 MEMORY_LAYER_SEMANTIC = "semantic"
@@ -108,6 +108,155 @@ def install_mem0_vendor() -> Path:
 
 
 install_mem0_vendor()
+
+
+# ---------------------------------------------------------------------------
+# Qdrant 迁移：嵌入模型或维度变更时自动重建向量库
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_VERSION_FILE = "embedding_version.txt"
+
+
+def _migrate_qdrant_if_needed(qdrant_path: Path, memory_dir: Path, expected_dims: int) -> None:
+    """嵌入模型/维度变更时导出旧记忆、清理向量库，供后续重建。"""
+    version_file = memory_dir / _EMBEDDING_VERSION_FILE
+    current_version = f"{DEFAULT_EMBEDDING_MODEL}:{expected_dims}"
+
+    stored_version = ""
+    if version_file.exists():
+        try:
+            stored_version = version_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+    if stored_version == current_version:
+        return  # 无需迁移
+
+    # 尝试导出旧记忆（在删除 Qdrant 前）
+    backup_path = memory_dir / "memory_backup.json"
+    if qdrant_path.exists() and stored_version:
+        _export_memories_from_qdrant(qdrant_path, backup_path)
+
+    logger.info(
+        "Qdrant 迁移：嵌入模型已变更 (%s → %s)，清理旧向量库",
+        stored_version or "(无)",
+        current_version,
+    )
+    shutil.rmtree(qdrant_path, ignore_errors=True)
+    # 同时清理锁文件
+    for lock_name in (".lock", "qdrant.lock"):
+        lock_file = qdrant_path.parent / (qdrant_path.name + lock_name if lock_name.startswith(".") else lock_name)
+        lock_file.unlink(missing_ok=True)
+
+    # 清理旧嵌入模型缓存（可选，不影响功能）
+    old_cache_name = "models--sentence-transformers--all-MiniLM-L6-v2"
+    for candidate in (memory_dir / "embedding_cache", Path.home() / ".cache" / "huggingface" / "hub"):
+        old_cache = candidate / old_cache_name
+        if old_cache.exists():
+            shutil.rmtree(old_cache, ignore_errors=True)
+            logger.info("Qdrant 迁移：已清理旧模型缓存 %s", old_cache)
+
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+    version_file.write_text(current_version, encoding="utf-8")
+
+
+def _export_memories_from_qdrant(qdrant_path: Path, backup_path: Path) -> None:
+    """从旧 Qdrant 存储中导出全部记忆文本和元数据为 JSON。"""
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.http import models as qmodels
+
+        client = QdrantClient(path=str(qdrant_path))
+        collections = client.get_collections().collections
+        if not collections:
+            return
+
+        all_points: list[dict] = []
+        for col in collections:
+            # 分页拉取所有 point
+            offset = None
+            while True:
+                result = client.scroll(
+                    collection_name=col.name,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points, offset = result[0], result[1]
+                if not points:
+                    break
+                for p in points:
+                    payload = p.payload or {}
+                    content = payload.get("data") or payload.get("memory") or payload.get("text") or ""
+                    if not content and hasattr(p, "id"):
+                        content = str(p.id)
+                    all_points.append({
+                        "content": str(content).strip(),
+                        "layer": payload.get("layer", "semantic"),
+                        "category": payload.get("category", ""),
+                        "importance": float(payload.get("importance", 0.5)),
+                        "confidence": float(payload.get("confidence", 0.75)),
+                        "source": str(payload.get("source", "migrated")),
+                        "scope": str(payload.get("user_id") or payload.get("scope", DEFAULT_MEMORY_SCOPE)),
+                        "metadata": {k: v for k, v in payload.items()
+                                     if k not in ("data", "memory", "text", "layer", "category",
+                                                   "importance", "confidence", "source", "user_id", "scope")},
+                    })
+                if offset is None:
+                    break
+
+        if all_points:
+            backup_path.write_text(
+                json.dumps(all_points, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info("Qdrant 迁移：已导出 %d 条记忆到 %s", len(all_points), backup_path.name)
+    except Exception as exc:
+        logger.warning("Qdrant 迁移：导出旧记忆失败 (%s)，将继续清理", exc)
+
+
+def _import_backup_memories(mem: Any, base_dir: Path | None = None) -> None:
+    """迁移后从备份 JSON 重新导入记忆到新向量库。"""
+    memory_dir = StoragePaths(base_dir).memory_dir
+    backup_path = memory_dir / "memory_backup.json"
+    if not backup_path.exists():
+        return
+    try:
+        memories = json.loads(backup_path.read_text(encoding="utf-8"))
+        if not isinstance(memories, list) or not memories:
+            backup_path.unlink(missing_ok=True)
+            return
+    except (OSError, json.JSONDecodeError):
+        return
+
+    imported = 0
+    for item in memories:
+        if not isinstance(item, dict) or not item.get("content"):
+            continue
+        try:
+            mem.add(
+                item["content"],
+                user_id=item.get("scope", DEFAULT_MEMORY_SCOPE),
+                metadata={
+                    "layer": item.get("layer", "semantic"),
+                    "category": item.get("category", ""),
+                    "importance": item.get("importance", 0.5),
+                    "confidence": item.get("confidence", 0.75),
+                    "source": item.get("source", "migrated"),
+                    **(item.get("metadata") or {}),
+                },
+            )
+            imported += 1
+        except Exception:
+            continue
+
+    if imported > 0:
+        logger.info("Qdrant 迁移：已重新导入 %d 条记忆", imported)
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -495,6 +644,9 @@ class MemoryStore:
         qdrant_path = memory_dir / "qdrant"
         qdrant_path.mkdir(parents=True, exist_ok=True)
         settings = self.api_settings if api_settings is None else api_settings
+
+        # 嵌入模型变更时自动清理旧向量库
+        _migrate_qdrant_if_needed(qdrant_path, memory_dir, DEFAULT_EMBEDDING_DIMS)
 
         llm_config: dict[str, Any] = {
             "provider": "openai",
@@ -1082,7 +1234,9 @@ class MemoryStore:
             install_mem0_vendor()
             from mem0 import Memory
 
-            return Memory.from_config(self.build_mem0_config(api_settings))
+            mem = Memory.from_config(self.build_mem0_config(api_settings))
+            _import_backup_memories(mem, self.base_dir)
+            return mem
 
     def _supports_memory_llm_reload(self, memory: Any | None) -> bool:
         if memory is None:
@@ -1153,7 +1307,7 @@ class MemoryStore:
             "status": "loading",
             "message": (
                 f"记忆系统正在初始化（已等待 {elapsed} 秒）。"
-                "请告诉主人记忆系统稍后就绪，不要连续重复调用记忆工具。"
+                "请告诉对方记忆系统稍后就绪，不要连续重复调用记忆工具。"
             ),
             "memories": [],
         }
@@ -1162,7 +1316,7 @@ class MemoryStore:
         return {
             "status": "failed",
             "message": (
-                "长期记忆系统暂时不可用。请告诉主人普通聊天仍可继续，"
+                "长期记忆系统暂时不可用。请告诉对方普通聊天仍可继续，"
                 "不要重复调用记忆工具。"
             ),
             "error": error,
@@ -1309,7 +1463,7 @@ def _project_embedding_cache_folder(base_dir: Path | None = None) -> Path:
 
 
 def import_embedding_model_archive(path: Path, base_dir: Path | None = None) -> EmbeddingModelImportResult:
-    """导入 all-MiniLM-L6-v2 的 HuggingFace hub 缓存 ZIP。"""
+    """导入嵌入模型的 HuggingFace hub 缓存 ZIP。"""
 
     archive_path = Path(path)
     if not archive_path.exists():
@@ -1367,7 +1521,7 @@ def import_embedding_model_archive(path: Path, base_dir: Path | None = None) -> 
 
 
 def download_embedding_model(base_dir: Path | None = None) -> EmbeddingModelImportResult:
-    """下载 all-MiniLM-L6-v2 到 Sakura 管理的 HuggingFace hub 缓存。"""
+    """下载嵌入模型到 Sakura 管理的 HuggingFace hub 缓存。"""
 
     destination_root = _project_embedding_cache_folder(base_dir)
     destination_root.mkdir(parents=True, exist_ok=True)

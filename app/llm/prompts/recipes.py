@@ -1,19 +1,14 @@
 from __future__ import annotations
 
 from app.llm.prompts.blocks import (
-    AGENT_REPLY_FORMAT,
     DEFAULT_REPLY_PORTRAITS,
     DEFAULT_REPLY_TONES,
-    SEGMENTED_REPLY_FORMAT,
     build_proactive_check_segment_rules,
     build_segment_protocol,
     context_acquisition_strategy_block,
     labels_or_default,
-    proactive_reply_decision_flow_block,
-    proactive_reply_examples_block,
-    proactive_rules_block,
-    proactive_scene_strategy_block,
-    proactive_web_research_rules_block,
+    proactive_core_rules_block,
+    segment_format_for_portraits,
 )
 from app.llm.prompts.render import render_blocks
 from app.llm.prompts.types import PromptBlock
@@ -23,30 +18,27 @@ def build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
     *,
-    simple_segments: str = "2-3",
-    default_segments: str = "3-4",
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
     rules = [
-        f"- 尽量输出 {default_segments} 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。",
-        "- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。",
-        f"- 如果用户只问很简单的问题，可以只输出 {simple_segments} 段。",
-        "- 需要对每段文本的语气进行标注，语气标签放在 tone 字段中。优先选择中性，除非文本明显带有其他语气；如果文本中同时包含多种语气，请选择最突出的一种。",
+        "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
+        "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
+        "- 每段文本的语气标注在 tone 字段中。每句话的语气可能不同，请逐句判断，不要多句共用一个 tone。优先选择中性，除非文本明显带有其他语气。",
     ]
     if include_no_single_segment_rule:
         rules.extend(
             [
-                "- 用户问题包含多个要点、步骤、原因或较长说明时，优先输出 3-4 段，让桌宠可以逐段显示和朗读。",
+                "- 用户问题包含多个要点、步骤、原因或较长说明时，按句子分段，让桌宠可以逐句显示和朗读。",
                 "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
             ]
         )
     return build_segment_protocol(
         tones,
         portraits,
-        format_text=SEGMENTED_REPLY_FORMAT,
+        format_text=segment_format_for_portraits(portraits),
         segment_rules="\n".join(rules),
         include_translation_rules=include_translation_rules,
     )
@@ -60,17 +52,16 @@ def build_agent_reply_protocol(
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
     segment_rules = "\n".join(
         [
-            "- 尽量输出 2-4 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。",
-            "- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。",
-            "- 如果用户只问很简单的问题，可以只输出 1-2 段。",
-            "- 用户问题包含多个要点、步骤、原因或较长说明时，优先输出 3-4 段，让桌宠可以逐段显示和朗读。",
+            "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
+            "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
+            "- 每段文本的语气标注在 tone 字段中。每句话的语气可能不同，请逐句判断。",
             "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
         ]
     )
     return build_segment_protocol(
         tones,
         portraits,
-        format_text=AGENT_REPLY_FORMAT,
+        format_text=segment_format_for_portraits(portraits),
         segment_rules=segment_rules,
         include_translation_rules=True,
     )
@@ -187,11 +178,7 @@ def build_proactive_check_tool_system_prefix(
                     ]
                 ),
             ),
-            proactive_reply_decision_flow_block(),
-            proactive_scene_strategy_block(),
-            proactive_web_research_rules_block(),
-            proactive_rules_block(include_tool_rules=True),
-            proactive_reply_examples_block(),
+            proactive_core_rules_block(include_tool_rules=True),
             PromptBlock(None, reply_protocol),
             PromptBlock(None, extra_instructions.strip()),
             PromptBlock(
@@ -272,10 +259,7 @@ def build_event_system_prompt(
                     build_proactive_check_reply_protocol(reply_tones, reply_portraits),
                 ),
                 PromptBlock(None, "- 不要提及内部事件类型、JSON 或工具实现。"),
-                proactive_reply_decision_flow_block(),
-                proactive_scene_strategy_block(),
-                proactive_rules_block(),
-                proactive_reply_examples_block(),
+                proactive_core_rules_block(include_tool_rules=False),
             ]
         )
     else:
@@ -304,11 +288,7 @@ def build_proactive_tool_loop_rules() -> str:
         [
             PromptBlock(None, "- 这是主动屏幕感知事件，不是用户直接发来的请求；整体保持低打扰。"),
             PromptBlock(None, "- 请用角色语气基于屏幕内容找话题、接续任务、提问或轻量协助。"),
-            proactive_reply_decision_flow_block(),
-            proactive_scene_strategy_block(),
-            proactive_web_research_rules_block(),
-            proactive_rules_block(include_tool_rules=True),
-            proactive_reply_examples_block(),
+            proactive_core_rules_block(include_tool_rules=True),
         ]
     )
 

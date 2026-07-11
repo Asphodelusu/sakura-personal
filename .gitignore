@@ -63,3 +63,11 @@ plugins/playwright_browser/config.json
 
 # 备份文件
 *.bak
+
+# 角色包（可能含版权素材，不入库）
+Sakura.char
+*.char
+
+# 本地模型文件（大体积，不入库）
+data/models/
+data/hf-cache/

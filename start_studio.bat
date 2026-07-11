@@ -12,8 +12,10 @@ if errorlevel 1 (
 
 if exist "%PRJ_ROOT%runtime\python.exe" (
     set "PYTHON_EXE=%PRJ_ROOT%runtime\python.exe"
+) else if exist "%PRJ_ROOT%.venv\Scripts\python.exe" (
+    set "PYTHON_EXE=%PRJ_ROOT%.venv\Scripts\python.exe"
 ) else (
-    echo [ERROR] runtime\python.exe not found. Please prepare the runtime directory first.
+    echo [ERROR] python.exe not found in runtime\ or .venv\. Please set up a Python environment first.
     pause
     exit /b 1
 )
