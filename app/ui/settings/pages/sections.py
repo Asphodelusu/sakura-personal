@@ -1013,7 +1013,9 @@ class SystemSettingsPage:
         owner.backchannel_import_model_button.clicked.connect(owner._import_backchannel_model_archive)
         owner.backchannel_refresh_status_button = QPushButton("重新检测", tab)
         owner.backchannel_refresh_status_button.setToolTip("重新检测接话模型状态。")
-        owner.backchannel_refresh_status_button.clicked.connect(owner._refresh_backchannel_setup_status)
+        owner.backchannel_refresh_status_button.clicked.connect(
+            lambda: owner._refresh_backchannel_setup_status(force=True)
+        )
         owner.backchannel_enabled_check.toggled.connect(owner._sync_backchannel_controls)
         owner.backchannel_mode_combo.currentIndexChanged.connect(
             lambda _index: owner._refresh_backchannel_setup_status()

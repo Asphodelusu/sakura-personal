@@ -24,7 +24,16 @@ from app.perception.privacy import PrivacyGuard
 from app.perception.screen_capture import ScreenCapture
 from app.perception.win32 import get_active_window_title, get_idle_seconds
 
-OnSpeakFn = Callable[[str], "None"]
+@dataclass(frozen=True)
+class ProactiveSpeakPayload:
+    """主动发言内容；comment 为角色口吻台词，translation/tone 可选。"""
+
+    text: str
+    translation: str = ""
+    tone: str = "中性"
+
+
+OnSpeakFn = Callable[[ProactiveSpeakPayload], "None"]
 IsBusyFn = Callable[[], bool]
 OnMemoryRecordFn = Callable[[str], "None"]
 
@@ -44,9 +53,9 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚
 - 不确定：选 false，宁静默不烦人
 
 只输出 JSON，不要 markdown 不要解释：
-{"should_speak": true|false, "reason": "给我自己看的简短理由", "comment": "对用户说的一两句话，仅当 should_speak=true 时填"}
+{"should_speak": true|false, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
 
-comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定。
+comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
 """
 
 # ---------------------------------------------------------------------------
@@ -121,7 +130,7 @@ class ProactiveObserver:
         self.config = config or ProactiveConfig()
         self.privacy = privacy or PrivacyGuard()
 
-        self.on_speak = on_speak or (lambda _: None)
+        self.on_speak = on_speak or (lambda _payload: None)
         self._is_busy = is_busy or (lambda: False)
         self._on_memory_record = on_memory_record or (lambda _: None)
 
@@ -341,17 +350,17 @@ class ProactiveObserver:
         self._last_proactive_at = time.monotonic()
         self._idle_armed = True
 
-        # Deliver to UI
+        payload = ProactiveSpeakPayload(
+            text=comment,
+            translation=str(parsed.get("translation", "")).strip(),
+            tone=str(parsed.get("tone", "")).strip() or "中性",
+        )
+
+        # Deliver to UI（正式回复管线由 PetWindow 负责：字幕/TTS/历史/立绘）
         try:
-            self.on_speak(comment)
+            self.on_speak(payload)
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
-
-        # Save to memory
-        try:
-            self._on_memory_record(f"[主动] {comment}")
-        except Exception as e:
-            logger.warning("ProactiveObserver: memory record error: {}", e)
 
     def _build_full_system_prompt(self) -> str:
         parts = []

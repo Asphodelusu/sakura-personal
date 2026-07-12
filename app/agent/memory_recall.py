@@ -148,7 +148,9 @@ class MemoryRecallService:
             ContextFragment(
                 fragment_id=f"memory.{memory['id'] or index}",
                 source="memory",
-                content=f"与本轮相关的长期记忆：{memory['content']}",
+                # 不再逐条加「与本轮相关的长期记忆：」前缀——source=memory 属性已表明
+                # 来源，让每条都带同样的开场白只会显得像检索结果堆砌，也白费 token。
+                content=memory["content"],
                 trust="trusted" if memory["source"] == "explicit" else "untrusted",
                 priority=80 if memory["source"] == "explicit" else 70,
                 freshness=memory["updated_at"],

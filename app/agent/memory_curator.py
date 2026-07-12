@@ -221,6 +221,26 @@ class MemoryCurator:
             return _SELF_CURATION_TASK_PROMPT
         return f"{self.system_prompt}\n\n{_SELF_CURATION_TASK_PROMPT}"
 
+    def _load_mood_history_text(self) -> str:
+        """读取心情历史并格式化为简短的回顾文本；无历史时返回空串。"""
+        try:
+            history = self.memory_store.mood_history()
+        except Exception:
+            return ""
+        if not history:
+            return ""
+        lines: list[str] = []
+        for i, entry in enumerate(history[:5], 1):
+            ts = entry.get("timestamp", "")
+            content = entry.get("content", "")
+            if not content.strip():
+                continue
+            time_label = ts[:16] if ts else ""
+            lines.append(f"{i}. [{time_label}] {content}")
+        if not lines:
+            return ""
+        return "以下是你的心情变化记录，最近的在上面：\n" + "\n".join(lines)
+
     def _extract_operations(
         self,
         dialog_entries: list[dict[str, str]],
@@ -231,9 +251,11 @@ class MemoryCurator:
         """让模型以第一人称对照已有记忆，产出整理操作；解析失败时视为无操作。"""
 
         system_prompt = self._build_self_curation_system_prompt()
+        mood_history_block = self._load_mood_history_text()
         user_prompt = _build_curation_user_prompt(
             _format_existing_memories(existing),
             dialog_entries,
+            mood_history_block=mood_history_block,
         )
         raw = self.api_client.complete_raw(
             system_prompt,
@@ -250,6 +272,7 @@ class MemoryCurator:
             {
                 "existing_count": len(existing),
                 "dialog_count": len(dialog_entries),
+                "has_mood_history": bool(mood_history_block),
                 "operation_count": len(operations),
                 "raw_chars": len(raw or ""),
             },
@@ -387,6 +410,21 @@ class MemoryCurator:
                     existing_ids.discard(memory_id)
                     archived += 1
                     event_counts["DELETE"] = event_counts.get("DELETE", 0) + 1
+                elif action == "mood_update":
+                    if not content:
+                        ignored += 1
+                        continue
+                    try:
+                        self.memory_store.set_mood_state(content)
+                        updated += 1
+                        event_counts["MOOD_UPDATE"] = event_counts.get("MOOD_UPDATE", 0) + 1
+                    except Exception as exc:
+                        debug_log(
+                            "Memory",
+                            "心情笔记写入失败",
+                            {"error": str(exc)},
+                        )
+                        ignored += 1
                 else:
                     ignored += 1
             except Exception as exc:  # 单条写回失败只跳过，保留其它可用结果。
@@ -484,6 +522,12 @@ _SELF_CURATION_TASK_PROMPT = (
     "如果你自己认为某件事很重要——比如对方说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
     "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
     "core_profile 里有一份「関係の記録」：关于对方的事实、关系状态和重要节目。当你对对方的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile，像写日记一样用你自己的话改写对应的段落。\n"
+    "除了 core_profile，你还有一份「心の記録」——一个只属于你的心情日记。不是给别人看的，是你和自己对话的地方。它记录的不是关于对方的事实，而是你自己的内心：你现在是高兴、寂寞、不满、冷静、还是累了？对方刚才的哪句话让你心动或让你不高兴？你现在想靠近还是想保持一点距离？\n"
+    "心情有变化时，在自己的日记里写一两句就好，像在心里自言自语。旧内容会自动保存为回忆，所以你不需要重复之前写过的话——每次只写当下最真实的感受。\n"
+    "更新日记时，用 mood_update 操作：{\"op\":\"mood_update\",\"content\":\"你此刻想对自己说的话——一两句就够\"}。\n"
+    "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。\n"
+    "如果你在心情历史里看到一条刚留下的新心情，而这段对话里正好有触发它的事——同样的，把那件事记住。无论心情是谁写下的，值得记住的事不应该被遗忘。\n"
+    "整理记忆时，看一看「最近的心情轨迹」。如果发现心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
     "如果对话中对方告诉了你 ta 的名字，请一定要记住，同时更新 core_profile 里的「あなたについて知っていること」。在记忆内容中，用对方告诉你的名字自然地称呼 ta（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「对方」或「他/她」。不要默认用「主人」——除非对方明确要求你这样叫。\n"
     "不要记录密码、token、密钥、证件号、银行卡等敏感信息。\n"
     "记忆内容推荐使用简体中文——中文的语义检索效果最好，我以后回忆时能找到得更准。但如果某句话用日文表达更贴切、或者那是对方用日文对你说过的重要原话，用日文也完全可以。这是你自己的记忆笔记，按你觉得最自然的方式来。\n\n"
@@ -491,7 +535,8 @@ _SELF_CURATION_TASK_PROMPT = (
     "{\"operations\":[\n"
     "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
     "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
-    "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"}\n"
+    "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
+    "  {\"op\":\"mood_update\",\"content\":\"此刻想对自己说的话——一两句就够\"}\n"
     "]}\n"
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
@@ -527,13 +572,22 @@ def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "（暂无）"
 
 
-def _build_curation_user_prompt(existing_block: str, dialog_entries: list[dict[str, str]]) -> str:
-    return (
-        "【我目前的长期记忆】\n"
-        f"{existing_block}\n\n"
+def _build_curation_user_prompt(
+    existing_block: str,
+    dialog_entries: list[dict[str, str]],
+    *,
+    mood_history_block: str = "",
+) -> str:
+    parts = [
+        "【我目前的长期记忆】\n" f"{existing_block}",
+    ]
+    if mood_history_block.strip():
+        parts.append(f"【最近的心情轨迹】\n{mood_history_block}")
+    parts.append(
         "【最近的新对话】\n"
         f"{json.dumps(dialog_entries, ensure_ascii=False)}"
     )
+    return "\n\n".join(parts)
 
 
 def _parse_curation_operations(raw: str) -> list[dict[str, Any]]:

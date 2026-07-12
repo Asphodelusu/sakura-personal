@@ -140,8 +140,11 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS,
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
+    is_night_quiet_period,
+    night_quiet_interval_multiplier,
 )
 from app.perception import ProactiveObserver, ProactiveConfig, PrivacyGuard
+from app.perception.observer import ProactiveSpeakPayload
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -250,6 +253,14 @@ SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT = (
     "这些 recent_conversation 消息用于理解这段时间发生了什么、用户当前阶段和 Sakura "
     "刚刚说过什么；不要逐字复述，应结合屏幕变化找话题，并避免连续重复同一类话题或休息提醒。"
 )
+PROACTIVE_ASSISTANT_JUST_SPOKE_HINT = (
+    "Sakura 刚在 recent_conversation 里说过话；本轮主动搭话应换角度或换话题，"
+    "不要延续同一提醒、同一关心句式或同一屏幕评论。"
+)
+# 用户刚有过互动后的冷却：屏幕批次已凑齐也先不发，避免聊完立刻又主动搭话。
+PROACTIVE_POST_INTERACTION_GRACE_SECONDS = 180
+# 对话刚结束后的记忆整理缓冲：等字幕/朗读收尾后再启动，避免边说话边整理。
+MEMORY_CURATION_POST_TURN_GRACE_MS = 45_000
 SCREEN_AWARENESS_EVENT_TYPE = "screen_awareness_check"
 LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
@@ -486,7 +497,7 @@ class PetWindow(QWidget):
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
     # 主动模式评论信号（从后台线程 emit，queued connection 回 UI 线程）
-    proactive_comment_arrived = Signal(str)
+    proactive_comment_arrived = Signal(object)
 
     def __init__(
         self,
@@ -1292,6 +1303,10 @@ class PetWindow(QWidget):
             layout = self._compute_pet_layout()
         px, py, pw, ph = layout.portrait_rect
         top_left = self.mapToGlobal(QPoint(px, py))
+        geom_key = (top_left.x(), top_left.y(), pw, ph)
+        if geom_key == getattr(self, "_renderer_overlay_geom_key", None):
+            return
+        self._renderer_overlay_geom_key = geom_key
         try:
             manager.set_geometry(top_left.x(), top_left.y(), pw, ph)
             manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
@@ -2340,14 +2355,30 @@ class PetWindow(QWidget):
 
     def _compute_pet_layout(self) -> PetLayout:
         pw, ph = self._current_portrait_size()
-        return compute_pet_layout(
+        effective_bubble = self._effective_bubble_height()
+        cache_key = (
+            pw,
+            ph,
+            self.control_panel_width,
+            effective_bubble,
+            self.control_panel_vertical_offset,
+            self.input_bar_offset,
+        )
+        cached_key = getattr(self, "_pet_layout_cache_key", None)
+        cached_layout = getattr(self, "_pet_layout_cache", None)
+        if cached_key == cache_key and cached_layout is not None:
+            return cached_layout
+        layout = compute_pet_layout(
             portrait_width=pw,
             portrait_height=ph,
             control_panel_width=self.control_panel_width,
-            bubble_height=self._effective_bubble_height(),
+            bubble_height=effective_bubble,
             vertical_offset=self.control_panel_vertical_offset,
             input_bar_offset=self.input_bar_offset,
         )
+        self._pet_layout_cache_key = cache_key
+        self._pet_layout_cache = layout
+        return layout
 
     def _portrait_anchor_global(self) -> QPoint:
         """当前布局下立绘底边中心的屏幕坐标——参数变化时把它钉在原位即可让立绘位置不动。
@@ -2852,8 +2883,7 @@ class PetWindow(QWidget):
                 config=config,
                 privacy=PrivacyGuard(),
                 on_speak=self._on_proactive_speak,
-                is_busy=lambda: self.worker_thread is not None,
-                on_memory_record=self._on_proactive_memory_record,
+                is_busy=self._is_proactive_observer_busy,
             )
             self._proactive_observer = observer
             debug_log("PetWindow", "ProactiveObserver 初始化成功")
@@ -2878,36 +2908,65 @@ class PetWindow(QWidget):
             except Exception:
                 pass
 
-    def _on_proactive_speak(self, comment: str) -> None:
-        """Callback: display proactive comment (thread-safe via Qt signal)."""
-        if not comment.strip():
+    def _is_proactive_observer_busy(self) -> bool:
+        """ProactiveObserver 评估/发言前的忙碌门：避免打断正式对话或字幕播放。"""
+        if getattr(self, "startup_initializing", False):
+            return True
+        if (
+            self.worker_thread is not None
+            or self.active_reminder_id is not None
+            or self.active_event_type
+            or self.pending_tool_action is not None
+            or self.pending_screen_observation_messages is not None
+            or self.screen_observation_followup_in_progress
+            or self.screen_observation_encode_thread is not None
+            or self.active_interaction_id
+        ):
+            return True
+        if self.input_edit.text().strip() or self.speech_timer.isActive():
+            return True
+        if time.perf_counter() - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
+            return True
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if subtitle_controller is not None and (
+            subtitle_controller.current_segment_in_progress()
+            or subtitle_controller.is_reply_sequence_active()
+        ):
+            return True
+        if subtitle_controller is None and getattr(self, "current_segment_sequence_id", None) is not None and (
+            not getattr(self, "current_segment_speech_done", True)
+            or not getattr(self, "current_segment_tts_done", True)
+        ):
+            return True
+        return False
+
+    def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
+        """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
+        if not payload.text.strip():
             return
-        debug_log("PetWindow", "主动发言", {"comment": comment[:60]})
-        # Emit signal for thread-safe main-thread dispatch
-        self.proactive_comment_arrived.emit(comment)
+        debug_log(
+            "PetWindow",
+            "主动发言",
+            {"comment": payload.text[:60], "tone": payload.tone},
+        )
+        self.proactive_comment_arrived.emit(payload)
 
-    @Slot(str)
-    def _show_proactive_comment(self, comment: str) -> None:
-        """Display a proactive comment in the subtitle (always on main thread)."""
-        # Don't interrupt active reply / TTS playback
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is not None and sc.is_reply_sequence_active():
+    @Slot(object)
+    def _show_proactive_comment(self, payload: ProactiveSpeakPayload) -> None:
+        """将 ProactiveObserver 的 should_speak 评论接入 TTS/字幕/历史/立绘。"""
+        if not isinstance(payload, ProactiveSpeakPayload) or not payload.text.strip():
             return
-        if sc is not None:
-            sc.show_text_immediately(comment)
+        if self._is_proactive_observer_busy():
+            debug_log("PetWindow", "主动发言被跳过（UI 忙碌）", {"comment": payload.text[:40]})
+            return
 
-    def _on_proactive_memory_record(self, text: str) -> None:
-        """Callback: persist proactive comment in chat history (thread-safe)."""
-        # Enqueue to main thread to avoid file I/O races
-        QTimer.singleShot(0, lambda t=text: self._do_proactive_memory_record(t))
-
-    def _do_proactive_memory_record(self, text: str) -> None:
-        store = getattr(self, "history_store", None)
-        if store is not None:
-            try:
-                store.append(role="assistant", content=text)
-            except Exception:
-                pass
+        segment = ChatSegment(
+            text=payload.text,
+            translation=payload.translation,
+            tone=payload.tone or "中性",
+        )
+        result = AgentResult(reply=ChatReply(segments=[segment]))
+        self._consume_agent_result(result)
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
@@ -3895,6 +3954,8 @@ class PetWindow(QWidget):
     def _check_screen_awareness(self) -> None:
         if getattr(self, "startup_initializing", False):
             return
+        if not self._screen_awareness_context_allowed():
+            return
         if not self._can_run_screen_awareness():
             return
 
@@ -3948,7 +4009,9 @@ class PetWindow(QWidget):
 
     def _should_capture_screen_awareness_context(self, now: float) -> bool:
         settings = self._current_screen_awareness_settings()
-        check_interval_seconds = settings.check_interval_minutes * 60
+        check_interval_seconds = (
+            settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
+        )
         seconds_since_pet_interaction = now - self.last_user_activity_at
         if (
             seconds_since_pet_interaction + SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS
@@ -4042,10 +4105,11 @@ class PetWindow(QWidget):
             return False
         if self.screen_awareness_context_batch_started_at is None:
             return False
-        return (
-            now - self.screen_awareness_context_batch_started_at
-            >= self._current_screen_awareness_settings().cooldown_minutes * 60
+        settings = self._current_screen_awareness_settings()
+        cooldown_seconds = (
+            settings.cooldown_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
         )
+        return now - self.screen_awareness_context_batch_started_at >= cooldown_seconds
 
     def _build_screen_awareness_event(self, now: float | None = None) -> AgentEvent:
         now = time.perf_counter() if now is None else now
@@ -4058,6 +4122,7 @@ class PetWindow(QWidget):
             "screen_context_allowed": self._screen_awareness_context_allowed(),
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.screen_awareness_context_dropped_count,
+            **_build_proactive_event_time_context(),
         }
         recent_conversation = _build_screen_awareness_recent_conversation_for_window(self)
         if recent_conversation:
@@ -4065,6 +4130,9 @@ class PetWindow(QWidget):
             payload["recent_conversation_summary_hint"] = (
                 SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT
             )
+            reply_hint = _build_proactive_event_reply_hint(recent_conversation)
+            if reply_hint:
+                payload["reply_hint"] = reply_hint
         if screen_contexts:
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
@@ -4158,7 +4226,9 @@ class PetWindow(QWidget):
 
     def _should_capture_proactive_screen_context(self, now: float) -> bool:
         settings = PetWindow._current_screen_awareness_settings(self)
-        check_interval_seconds = settings.check_interval_minutes * 60
+        check_interval_seconds = (
+            settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
+        )
         seconds_since_pet_interaction = now - self.last_user_activity_at
         if (
             seconds_since_pet_interaction + SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS
@@ -4235,10 +4305,13 @@ class PetWindow(QWidget):
             return False
         if self.proactive_screen_context_batch_started_at is None:
             return False
-        return (
-            now - self.proactive_screen_context_batch_started_at
-            >= PetWindow._current_screen_awareness_settings(self).cooldown_minutes * 60
+        if now - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
+            return False
+        settings = PetWindow._current_screen_awareness_settings(self)
+        cooldown_seconds = (
+            settings.cooldown_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
         )
+        return now - self.proactive_screen_context_batch_started_at >= cooldown_seconds
 
     def _build_proactive_care_event(self, now: float | None = None) -> AgentEvent:
         now = time.perf_counter() if now is None else now
@@ -4252,6 +4325,7 @@ class PetWindow(QWidget):
             "screen_context_allowed": self._proactive_screen_context_allowed(),
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.proactive_screen_context_dropped_count,
+            **_build_proactive_event_time_context(),
         }
         recent_conversation = _build_screen_awareness_recent_conversation_for_window(self)
         if recent_conversation:
@@ -4259,6 +4333,9 @@ class PetWindow(QWidget):
             payload["recent_conversation_summary_hint"] = (
                 SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT
             )
+            reply_hint = _build_proactive_event_reply_hint(recent_conversation)
+            if reply_hint:
+                payload["reply_hint"] = reply_hint
         if screen_contexts:
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
@@ -4411,14 +4488,20 @@ class PetWindow(QWidget):
         return StoragePaths(Path(getattr(self, "base_dir", Path.cwd()))).screen_awareness_state()
 
     def _load_screen_awareness_state(self) -> dict[str, Any]:
+        cached = getattr(self, "_screen_awareness_state_cache", None)
+        if isinstance(cached, dict):
+            return dict(cached)
         path = self._screen_awareness_state_path()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            data = {}
+        state = data if isinstance(data, dict) else {}
+        self._screen_awareness_state_cache = dict(state)
+        return state
 
     def _save_screen_awareness_state(self, state: dict[str, Any]) -> None:
+        self._screen_awareness_state_cache = dict(state)
         try:
             atomic_write_text(
                 self._screen_awareness_state_path(),
@@ -4550,7 +4633,23 @@ class PetWindow(QWidget):
         pending_turns = self.memory_curation_state.increment_pending_turns()
         debug_log("Memory", "自动记忆轮次已累计", {"pending_turns": pending_turns})
         if pending_turns >= self.memory_curation_settings.trigger_turns:
-            QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+            self._schedule_auto_memory_curation()
+
+    def _schedule_auto_memory_curation(self) -> None:
+        """对话结束后再整理：等朗读/字幕收尾并留出短缓冲，避免边回复边提炼。"""
+        existing_timer = getattr(self, "_memory_curation_defer_timer", None)
+        if existing_timer is not None:
+            existing_timer.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def _deferred_start() -> None:
+            self._memory_curation_defer_timer = None
+            self._maybe_start_auto_memory_curation()
+
+        timer.timeout.connect(_deferred_start)
+        timer.start(MEMORY_CURATION_POST_TURN_GRACE_MS)
+        self._memory_curation_defer_timer = timer
 
     def _check_memory_reflection(self) -> None:
         """定时检查是否应该触发记忆反思。"""
@@ -4690,9 +4789,18 @@ class PetWindow(QWidget):
         )
 
     def _memory_curation_can_start(self) -> bool:
+        if self.worker_thread is not None:
+            return False
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if subtitle_controller is not None and subtitle_controller.current_segment_in_progress():
+            return False
+        if subtitle_controller is None and getattr(self, "current_segment_sequence_id", None) is not None and (
+            not getattr(self, "current_segment_speech_done", True)
+            or not getattr(self, "current_segment_tts_done", True)
+        ):
+            return False
         return (
-            self.worker_thread is None
-            and self.memory_curation_thread is None
+            self.memory_curation_thread is None
             and self.pending_tool_action is None
             and self.pending_screen_observation_messages is None
             and self.pending_screen_observation_event is None
@@ -6029,7 +6137,6 @@ class PetWindow(QWidget):
             due_reminders = self.reminder_store.due_reminders()
         except ValueError as exc:
             debug_log("Reminder", "读取失败", {"error": str(exc)})
-            debug_log("Reminder", "读取失败", {"error": str(exc)})
             return
         if not due_reminders:
             return
@@ -6948,6 +7055,28 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
             ],
         )
     ]
+
+
+def _build_proactive_event_time_context() -> dict[str, Any]:
+    """为主动关怀事件补充本地时间与深夜安静时段信号。"""
+    local_now = datetime.now().astimezone()
+    local_hour = local_now.hour
+    return {
+        "local_hour": local_hour,
+        "is_night_quiet_period": is_night_quiet_period(local_hour),
+        "night_quiet_interval_multiplier": night_quiet_interval_multiplier(local_hour),
+    }
+
+
+def _build_proactive_event_reply_hint(
+    recent_conversation: list[dict[str, str]],
+) -> str | None:
+    """若 Sakura 刚说过话，提示模型换角度搭话，避免重复同一话题。"""
+    if not recent_conversation:
+        return None
+    if str(recent_conversation[-1].get("role", "")).strip() != "assistant":
+        return None
+    return PROACTIVE_ASSISTANT_JUST_SPOKE_HINT
 
 
 def _build_screen_awareness_recent_conversation(

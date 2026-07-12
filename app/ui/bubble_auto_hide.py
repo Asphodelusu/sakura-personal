@@ -130,7 +130,11 @@ class BubbleAutoHideController(QObject):
         card = self._bubble_card
         if card is None or not card.isVisible():
             return
-        anim = self._make_fade(self._opacity_effect.opacity(), 0.0)
+        current = self._opacity_effect.opacity()
+        if current <= 0.02:
+            card.hide()
+            return
+        anim = self._make_fade(current, 0.0, easing=QEasingCurve.Type.InCubic)
         anim.finished.connect(self._on_fade_out_finished)
         anim.start()
         self._fade_anim = anim
@@ -144,21 +148,36 @@ class BubbleAutoHideController(QObject):
         card = self._bubble_card
         if card is None:
             return
+        current = self._opacity_effect.opacity()
+        if card.isVisible() and current >= 0.98:
+            self._opacity_effect.setOpacity(1.0)
+            return
         if not card.isVisible():
             self._opacity_effect.setOpacity(0.0)
             card.show()
-        anim = self._make_fade(self._opacity_effect.opacity(), 1.0)
+        anim = self._make_fade(self._opacity_effect.opacity(), 1.0, easing=QEasingCurve.Type.OutCubic)
         anim.start()
         self._fade_anim = anim
 
-    def _make_fade(self, start: float, end: float) -> QPropertyAnimation:
+    def _make_fade(
+        self,
+        start: float,
+        end: float,
+        *,
+        easing: QEasingCurve.Type = QEasingCurve.Type.InOutQuad,
+    ) -> QPropertyAnimation:
         if self._fade_anim is not None:
             self._fade_anim.stop()
             self._fade_anim.deleteLater()
             self._fade_anim = None
+        if abs(start - end) < 0.02:
+            self._opacity_effect.setOpacity(end)
+            anim = QPropertyAnimation(self._opacity_effect, b"opacity")
+            anim.setDuration(0)
+            return anim
         anim = QPropertyAnimation(self._opacity_effect, b"opacity")
         anim.setDuration(FADE_DURATION_MS)
         anim.setStartValue(start)
         anim.setEndValue(end)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setEasingCurve(easing)
         return anim

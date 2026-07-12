@@ -605,9 +605,9 @@ def _start_tts_migration_or_deferred(base_dir: Path, pet_window: PetWindow) -> N
 def _pending_startup_tts_migrations(base_dir: Path) -> list[TTSBundleMigration]:
     settings_service = AppSettingsService(base_dir=base_dir)
     settings = settings_service.load_tts_settings(validate_enabled=False)
-    provider_migrations = find_pending_bundle_migrations(base_dir, settings.provider)
-    all_migrations = find_pending_bundle_migrations(base_dir)
-    migrations = _dedupe_tts_migrations([*provider_migrations, *all_migrations])
+    # provider=None 时已覆盖全部按 archive 方式安装的整合包（含当前 provider 对应的条目），
+    # 按 settings.provider 再筛一遍纯属重复的目录探测，故只保留一次全量扫描。
+    migrations = _dedupe_tts_migrations(find_pending_bundle_migrations(base_dir))
     debug_log(
         "TTS",
         "启动检测 TTS 整合包迁移",

@@ -26,7 +26,9 @@ def build_segmented_reply_instruction(
     rules = [
         "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
         "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
-        "- 每段文本的语气标注在 tone 字段中。每句话的语气可能不同，请逐句判断，不要多句共用一个 tone。优先选择中性，除非文本明显带有其他语气。",
+        "- 每段文本的语气标注在 tone 字段中，按情绪的真实走向逐句判断：情绪没有转折时，相邻句可以延续同一个 tone，"
+        "不必每句都刻意换一个，那样反而显得情绪来回跳；只有当内容确实出现转折（比如从担心转到安心、从平静转到不满）时才换 tone。"
+        "优先选择中性，除非文本明显带有其他语气。",
     ]
     if include_no_single_segment_rule:
         rules.extend(
@@ -48,22 +50,12 @@ def build_agent_reply_protocol(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
 ) -> str:
-    tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
-    portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
-    segment_rules = "\n".join(
-        [
-            "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
-            "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
-            "- 每段文本的语气标注在 tone 字段中。每句话的语气可能不同，请逐句判断。",
-            "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
-        ]
-    )
-    return build_segment_protocol(
-        tones,
-        portraits,
-        format_text=segment_format_for_portraits(portraits),
-        segment_rules=segment_rules,
+    """与分段回复协议共用同一套分段规则，避免 agent 路径重复维护两套文案。"""
+    return build_segmented_reply_instruction(
+        reply_tones,
+        reply_portraits,
         include_translation_rules=True,
+        include_no_single_segment_rule=True,
     )
 
 
@@ -161,20 +153,8 @@ def build_proactive_check_tool_system_prefix(
                     [
                         "你现在正在处理【主动屏幕感知事件】。这不是用户直接发来的请求，而是系统定时截图后触发的低打扰找话题。",
                         "请用角色语气基于屏幕内容找话题：评论变化、接续任务、询问卡点、轻量协助或保持安静感。",
-                        "请把 screen_contexts/visual_contexts 当作当前画面，把 recent_conversation 当作最近完整对话历史；必须结合两者判断用户正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
-                    ]
-                ),
-            ),
-            PromptBlock(
-                "核心目标",
-                "\n".join(
-                    [
-                        "- 结合图片和最近对话历史理解用户这段时间在做什么，并基于屏幕内容寻找自然话题，而不是逐张描述截图。",
-                        "- recent_conversation 包含用户和 Sakura 的最近对话；它用于判断上下文、进展、已给建议和已重复话题，不只是用来避免 Sakura 自己复读。",
-                        "- 优先使用 visual_contexts 中的 summary、visible_texts、notable_elements。",
-                        "- 最终回复必须至少点到一个具体可见对象，除非视觉上下文为空或明确不可识别。",
-                        "- 如果只能部分识别，也要先说出能确认的部分，再轻轻询问。",
-                        "- 不要机械套用休息、喝水、深呼吸、累不累等通用提醒；深夜和停留时长只能作为弱信号。",
+                        "请把 screen_contexts/visual_contexts 当作当前画面，把 recent_conversation 当作最近完整对话历史；"
+                        "结合两者判断用户正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
                     ]
                 ),
             ),
@@ -188,10 +168,7 @@ def build_proactive_check_tool_system_prefix(
                         "当前 Agent 循环：",
                         "- 如果信息足够或已经完成，不要再发起 tool_calls。",
                         f"- 每步最多请求 {max_tool_calls_per_step} 个工具，整轮最多 {max_tool_calls_per_turn} 个工具。",
-                        "",
-                        "- 你可以使用只读或低风险工具补充上下文（后台 Web 搜索、当前时间、搜索记忆、列出待办和笔记、查看已有提醒）。",
-                        "- 如果事件已有 screen_contexts（多张截图），不要再请求 observe_screen。",
-                        "- 不要循环调用工具；工具结果足够后直接给最终回复。",
+                        "- 只读或低风险工具可补充上下文；改变外部状态先让主人决定。",
                         "- 最终回复只说给用户听的屏幕相关自然搭话、提问、评论或轻量协助，不要提及内部事件或工具协议。",
                     ]
                 ),
@@ -286,8 +263,10 @@ def build_proactive_rules(*, include_tool_rules: bool = False) -> str:
 def build_proactive_tool_loop_rules() -> str:
     return render_blocks(
         [
-            PromptBlock(None, "- 这是主动屏幕感知事件，不是用户直接发来的请求；整体保持低打扰。"),
-            PromptBlock(None, "- 请用角色语气基于屏幕内容找话题、接续任务、提问或轻量协助。"),
+            PromptBlock(
+                None,
+                "- 这是主动屏幕感知事件，不是用户直接发来的请求；整体保持低打扰，用角色语气基于屏幕找话题。",
+            ),
             proactive_core_rules_block(include_tool_rules=True),
         ]
     )

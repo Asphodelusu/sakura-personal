@@ -68,6 +68,7 @@ DEFAULT_MEMORY_IMPORTANCE = 0.5
 DEFAULT_MEMORY_CONFIDENCE = 0.75
 DEFAULT_MEMORY_SOURCE = "manual"
 CORE_PROFILE_CONTEXT_BUDGET = 1200
+MOOD_CONTEXT_BUDGET = 500
 SESSION_CONTEXT_BUDGET = 600
 MEMORY_SECTION_CHAR_BUDGET = 1600
 DEFAULT_HUGGINGFACE_ENDPOINT = "https://huggingface.co"
@@ -689,10 +690,12 @@ class MemoryStore:
     def summary(self, limit: int = 12) -> str:
         mem = self._get_memory(wait=False)
         core_profile = self.core_profile()
+        mood_state = self.mood_state()
         if mem is None:
-            if core_profile is not None:
+            if core_profile is not None or mood_state is not None:
                 return _format_memory_context(
                     core_profile=core_profile,
+                    mood_state=mood_state,
                     semantic=[],
                     episodic=[],
                     procedural=[],
@@ -704,7 +707,7 @@ class MemoryStore:
         memories = _normalize_memory_results(raw, default_scope=self.scope_id)
         if core_profile is not None:
             memories.insert(0, core_profile)
-        if not memories:
+        if not memories and mood_state is None:
             return "暂无长期记忆。"
         lines = ["长期记忆："]
         for memory in memories:
@@ -712,6 +715,16 @@ class MemoryStore:
             content = str(memory.get("content", ""))
             layer = str(memory.get("layer") or DEFAULT_MEMORY_LAYER)
             lines.append(f"- [{memory_id}] {_memory_layer_label(layer)}：{content}")
+        if mood_state is not None:
+            mood_content = str(mood_state.get("content", ""))
+            if mood_content.strip():
+                lines.insert(1, f"【心の記録 — 此刻心情】{mood_content}")
+                mood_history = mood_state.get("history")
+                if isinstance(mood_history, list) and mood_history:
+                    prev = mood_history[0]
+                    prev_content = str(prev.get("content", ""))
+                    if prev_content.strip():
+                        lines.insert(2, f"  → 之前：{_clip_text(prev_content, 80)}")
         return "\n".join(lines)
 
     def list_memories(self, *, limit: int | None = DEFAULT_MEMORY_LIMIT) -> list[dict[str, Any]]:
@@ -788,6 +801,77 @@ class MemoryStore:
             return None
         return _normalize_memory_record(previous, default_scope=self.scope_id)
 
+    # ---- Mood State (心の記録) ----
+
+    def mood_state(self) -> dict[str, Any] | None:
+        """读取当前角色的心情笔记；缺失时返回 None。"""
+        data = self._load_mood_state()
+        entry = data.get(self.scope_id) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        content = str(entry.get("content", "")).strip()
+        if not content:
+            return None
+        result: dict[str, Any] = {"id": f"mood:{self.scope_id}", "content": content, "metadata": {"layer": "mood"}}
+        history = entry.get("history", [])
+        if isinstance(history, list) and history:
+            result["history"] = [
+                {"content": str(h.get("content", "")).strip(), "timestamp": str(h.get("timestamp", ""))}
+                for h in history
+                if isinstance(h, dict) and str(h.get("content", "")).strip()
+            ]
+        return result
+
+    def mood_history(self) -> list[dict[str, str]]:
+        """读取心情历史（不含当前），最近在前；用于情绪回顾。"""
+        data = self._load_mood_state()
+        entry = data.get(self.scope_id) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return []
+        history = entry.get("history", [])
+        if not isinstance(history, list):
+            return []
+        return [
+            {"content": str(h.get("content", "")), "timestamp": str(h.get("timestamp", ""))}
+            for h in history
+            if isinstance(h, dict) and str(h.get("content", "")).strip()
+        ]
+
+    def set_mood_state(self, content: str) -> dict[str, Any]:
+        """写入当前角色的心情笔记，旧内容推入历史（保留最近 5 条）。"""
+        text = content.strip()
+        if not text:
+            raise ValueError("心情笔记内容不能为空。")
+        data = self._load_mood_state()
+        now = _now_iso()
+        previous_entry = None
+        existing = data.get(self.scope_id) if isinstance(data, dict) else None
+        if isinstance(existing, dict):
+            prev_content = str(existing.get("content", "")).strip()
+            if prev_content:
+                previous_entry = {"content": prev_content, "timestamp": existing.get("updated_at", "")}
+        history = existing.get("history", []) if isinstance(existing, dict) else []
+        if previous_entry:
+            history.insert(0, previous_entry)
+        history = history[:5]
+        data[self.scope_id] = {"content": text, "updated_at": now, "history": history}
+        self._save_mood_state(data)
+        return {"id": f"mood:{self.scope_id}", "content": text, "metadata": {"layer": "mood"}}
+
+    def _load_mood_state(self) -> dict[str, Any]:
+        path = StoragePaths(self.base_dir).memory_mood_state()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_mood_state(self, data: dict[str, Any]) -> None:
+        path = StoragePaths(self.base_dir).memory_mood_state()
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
     def build_memory_context(self, query: str = "", *, mode: str = "chat") -> str:
         """按当前对话场景构建分层记忆注入文本。"""
 
@@ -823,8 +907,10 @@ class MemoryStore:
 
         include_procedural = _query_needs_procedural_memory(query_text, mode)
         include_episodic = _query_needs_episodic_memory(query_text, mode)
+        mood_state = self.mood_state()
         return _format_memory_context(
             core_profile=core_profile,
+            mood_state=mood_state,
             semantic=grouped[MEMORY_LAYER_SEMANTIC][:8],
             episodic=grouped[MEMORY_LAYER_EPISODIC][:3] if include_episodic else [],
             procedural=grouped[MEMORY_LAYER_PROCEDURAL][:3] if include_procedural else [],
@@ -1366,6 +1452,12 @@ class ScopedMemoryStore(MemoryStore):
 
     def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
         self._owner._save_core_profiles(profiles)
+
+    def _load_mood_state(self) -> dict[str, Any]:
+        return self._owner._load_mood_state()
+
+    def _save_mood_state(self, data: dict[str, Any]) -> None:
+        self._owner._save_mood_state(data)
 
     def _loading_response(self) -> dict[str, Any]:
         return self._owner._loading_response()
@@ -1974,6 +2066,7 @@ def _parse_iso_timestamp(value: str) -> float:
 def _format_memory_context(
     *,
     core_profile: dict[str, Any] | None,
+    mood_state: dict[str, Any] | None = None,
     semantic: list[dict[str, Any]],
     episodic: list[dict[str, Any]],
     procedural: list[dict[str, Any]],
@@ -1987,6 +2080,26 @@ def _format_memory_context(
         content = _clip_text(str(core_profile.get("content") or ""), CORE_PROFILE_CONTEXT_BUDGET)
         if content:
             sections.append(f"【常驻档案】\n{content}")
+    if mood_state is not None:
+        mood_content = _clip_text(str(mood_state.get("content") or ""), MOOD_CONTEXT_BUDGET)
+        if mood_content:
+            parts = [f"【心の記録】\n你现在的心情：{mood_content}"]
+            # 附带心情历史，方便被问起时回顾
+            mood_history = mood_state.get("history")
+            if isinstance(mood_history, list) and mood_history:
+                history_lines: list[str] = []
+                for h in mood_history[:5]:
+                    ts = str(h.get("timestamp", ""))
+                    c = str(h.get("content", ""))
+                    if not c.strip():
+                        continue
+                    time_label = ts[:16] if ts else ""
+                    history_lines.append(f"· [{time_label}] {c}")
+                if history_lines:
+                    parts.append("之前的心情：\n" + "\n".join(history_lines))
+                    parts.append("回顾之前的心情，你能感受到自己的情绪是怎么走到现在的。")
+            parts.append("它会自然影响你的语气和节奏——高兴时轻快，不满时句子更短更直，害羞时停顿多。但这只是你此刻感受的一部分，不是全部。")
+            sections.append("\n".join(parts))
     sections.extend(
         _format_memory_section(
             title,

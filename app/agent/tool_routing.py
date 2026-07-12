@@ -343,11 +343,6 @@ def _should_prefer_browser_page_tools(messages: list[ChatMessage]) -> bool:
         "url",
         "http://",
         "https://",
-        "百科",
-        "必应",
-        "bing",
-        "百度",
-        "google",
     )
     return any(keyword in latest_text for keyword in browser_keywords)
 

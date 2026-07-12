@@ -23,6 +23,25 @@ SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS = 10_000
 SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS = 1.0
 SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER = "[已抓取屏幕上下文]"
 
+# 深夜/凌晨没有专门的“安静时段”配置项，这里用当前本地小时数这个已有信号做一个
+# 保守的默认收紧：这段时间用户大概率已经离开或在休息，继续按白天节奏截图搭话
+# 意义不大，还会白白消耗截图/编码/一次事件处理的开销。
+SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR = 1
+SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR = 6
+SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER = 1.8
+
+
+def is_night_quiet_period(hour: int) -> bool:
+    """当前本地小时是否处于深夜/凌晨安静时段（默认 01:00-06:00）。"""
+    return SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR <= hour < SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR
+
+
+def night_quiet_interval_multiplier(hour: int) -> float:
+    """深夜/凌晨时段（默认 01:00-06:00）返回 >1 的倍率以拉长检查/冷却间隔，其余时段返回 1.0。"""
+    if is_night_quiet_period(hour):
+        return SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER
+    return 1.0
+
 
 @dataclass(frozen=True)
 class ScreenAwarenessSettings:

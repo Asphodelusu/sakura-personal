@@ -12,6 +12,41 @@ from app.core.debug_log import debug_log
 # argmax 过阈值才输出;低于阈值由调用方(分类器)回退意图缺省映射。
 DEFAULT_EMOTION_THRESHOLD = 1.0
 
+# 否定前缀:词典本身只靠"更长命中词压制子串"处理否定(如显式收录的「不开心」),
+# 没被专门收录的否定表达(「不难过」「不用担心」「没有崩溃」……)会被裸词条误判。
+# 这里补一层轻量位置检测:命中词紧邻前方出现否定词时,视为被否定,不计分。
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "不用", "不必", "无需", "没有", "不会", "不再", "毫不", "并不",
+    "不", "没", "无", "别", "莫",
+)
+
+
+def _is_negated_occurrence(content: str, start: int, word: str) -> bool:
+    """判断 content[start:start+len(word)] 处的命中是否被紧邻前缀的否定词否定。
+
+    word 本身已经以否定词开头时(如词典显式收录的「不开心」)不再重复判定，
+    避免和"最长匹配压制"的逻辑重复处理。
+    """
+    if word.startswith(_NEGATION_MARKERS):
+        return False
+    for marker in _NEGATION_MARKERS:
+        marker_len = len(marker)
+        if start >= marker_len and content[start - marker_len : start] == marker:
+            return True
+    return False
+
+
+def _all_occurrences_negated(word: str, content: str) -> bool:
+    """word 在 content 中的每一次出现都被否定前缀覆盖时返回 True。"""
+    index = content.find(word)
+    if index == -1:
+        return False
+    while index != -1:
+        if not _is_negated_occurrence(content, index, word):
+            return False
+        index = content.find(word, index + 1)
+    return True
+
 _LEXICON_PATH = Path(__file__).resolve().parent / "data" / "emotion_lexicon.json"
 
 
@@ -74,7 +109,7 @@ class EmotionScorer:
             (word, emotion, weight)
             for emotion, words in self._lexicon.items()
             for word, weight in words.items()
-            if word in content
+            if word in content and not _all_occurrences_negated(word, content)
         ]
         if not matched:
             return {}

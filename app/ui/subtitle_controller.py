@@ -206,14 +206,27 @@ class SubtitleController(QObject):
         cleaned = " ".join(text.split())
         self.speech_timer.stop()
         self.speech_text = cleaned
-        self.speech_index = 0
         self._last_label_height = 0
-        self.speech_label.clear()
-        if self.speech_text:
-            self.speech_timer.start()
-            if pulse:
+        if not self.speech_text:
+            self.speech_index = 0
+            self.speech_label.clear()
+        else:
+            # 首字立即呈现，避免 clear 后等一拍定时器造成的空白闪烁。
+            self.speech_index = 1
+            self.speech_label.setText(self.speech_text[:1])
+            if len(self.speech_text) > 1:
+                self.speech_timer.start()
+            elif self.current_segment_sequence_id is not None:
+                self._mark_segment_speech_done(self.current_segment_sequence_id)
+            if pulse and self._should_pulse_bubble():
                 self._pulse_bubble()
         self._log_stage("speech_text_started", {"text": cleaned})
+
+    def _should_pulse_bubble(self) -> bool:
+        # 分段停顿极短时跳过脉冲，避免快速连段时气泡频闪。
+        if self.current_segment_sequence_id is not None and self.segment_pause_ms < 50:
+            return False
+        return True
 
     def _pulse_bubble(self) -> None:
         """每段台词开始时让气泡做一次轻微"暗-亮"脉冲，营造浮现感（克制、不闪黑）。"""
@@ -228,12 +241,12 @@ class SubtitleController(QObject):
         fade_out = QPropertyAnimation(effect, b"opacity")
         fade_out.setDuration(110)
         fade_out.setEndValue(0.5)
-        fade_out.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
         fade_in = QPropertyAnimation(effect, b"opacity")
         fade_in.setDuration(130)
         fade_in.setStartValue(0.5)
         fade_in.setEndValue(1.0)
-        fade_in.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
         group = QSequentialAnimationGroup(self)
         group.addAnimation(fade_out)
         group.addAnimation(fade_in)
@@ -250,6 +263,21 @@ class SubtitleController(QObject):
         self.speech_label.setText(cleaned)
         self._log_stage("speech_text_shown_immediately", {"text": cleaned})
 
+    def show_proactive_segment(self, segment: ChatSegment) -> None:
+        """显示主动发言：字幕用 zh，同时播 ja 语音。"""
+        self.stop_waiting_indicator()
+        display = segment.display_text(self.subtitle_language)
+        self.set_speech(display, pulse=True)
+
+        # TTS: 用 ja 原文播放，不依赖 prepared audio
+        sequence_id = self.reply_sequence_id
+        self.voice_playback.speak_segment(
+            segment,
+            sequence_id,
+            on_started=lambda: None,
+            on_finished=lambda: None,
+        )
+
     def restart_current_segment_speech(self) -> None:
         if self.current_segment_sequence_id is None or self.current_segment is None:
             return
@@ -257,7 +285,10 @@ class SubtitleController(QObject):
         self.reply_advance_token += 1
         self.current_segment_speech_done = False
         self.reply_advance_scheduled = False
-        self.set_speech(self.current_segment.display_text(self.subtitle_language), pulse=True)
+        self.set_speech(
+            self.current_segment.display_text(self.subtitle_language),
+            pulse=self._should_pulse_bubble(),
+        )
 
     def reset_current_segment_progress(self) -> None:
         self.voice_playback.discard_prepared()
@@ -338,7 +369,10 @@ class SubtitleController(QObject):
             },
         )
         self._apply_segment(self.current_segment)
-        self.set_speech(self.current_segment.display_text(self.subtitle_language), pulse=True)
+        self.set_speech(
+            self.current_segment.display_text(self.subtitle_language),
+            pulse=self._should_pulse_bubble(),
+        )
 
     def _mark_segment_speech_done(self, sequence_id: int) -> None:
         if sequence_id != self.reply_sequence_id or sequence_id != self.current_segment_sequence_id:
@@ -446,10 +480,9 @@ class SubtitleController(QObject):
         if not self.waiting_indicator_active:
             self.waiting_indicator_timer.stop()
             return
-        if self.waiting_indicator_index < len(WAITING_INDICATOR_FRAMES) - 1:
-            self.waiting_indicator_index += 1
-        else:
-            self.waiting_indicator_index = len(WAITING_INDICATOR_FRAMES) - 2
+        self.waiting_indicator_index = (
+            self.waiting_indicator_index + 1
+        ) % len(WAITING_INDICATOR_FRAMES)
         self._show_waiting_indicator_frame()
 
 

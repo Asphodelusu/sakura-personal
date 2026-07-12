@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.gui_log import record_debug_log_for_gui
+from app.core.interaction import get_interaction_id
 from app.storage.paths import StoragePaths
 
 
@@ -46,6 +47,13 @@ FILE_LOG_BACKUP_COUNT = 5
 _FILE_LOG_PATH = StoragePaths(Path(__file__).resolve().parents[2]).runtime_log_file()
 _FILE_LOGGER_NAME = "sakura.runtime_file_log"
 _file_logger_signature: tuple[str, int, int] | None = None
+
+# debug 开关缓存：debug_log 是全代码库最高频的调用点之一（几乎每个事件都会经过），
+# 若每次都同步读盘 + 解析 system_config.yaml 来判断"是否要打日志"，本身就会成为一个
+# 反复触发的 IO 热点。这里按文件 mtime 缓存解析结果：未变化时只有一次轻量 os.stat，
+# 设置对话框保存 debug 开关后 mtime 会变化，仍能立即生效。
+_debug_values_cache: dict[str, Any] = {}
+_debug_values_cache_mtime: float | None = None
 
 
 def debug_enabled() -> bool:
@@ -94,8 +102,6 @@ def debug_log(category: str, message: str, data: Any | None = None) -> None:
 def _attach_interaction_id(data: Any) -> Any:
     """data 为 dict 或 None 时附加当前 interaction_id；调用方已显式给出则不覆盖。"""
     try:
-        from app.core.interaction import get_interaction_id
-
         interaction_id = get_interaction_id()
     except Exception:
         return data
@@ -519,14 +525,29 @@ def _read_bool(key: str, default: bool) -> bool:
 
 
 def _load_debug_values() -> dict[str, Any]:
-    from app.config.yaml_config import load_yaml_mapping
+    global _debug_values_cache, _debug_values_cache_mtime
+
     config_path = StoragePaths(Path(__file__).resolve().parents[2]).system_config()
+    try:
+        mtime = config_path.stat().st_mtime
+    except OSError:
+        # 文件不存在等情况：清空缓存签名，避免文件出现后仍沿用旧的空结果。
+        _debug_values_cache_mtime = None
+        _debug_values_cache = {}
+        return _debug_values_cache
+    if mtime == _debug_values_cache_mtime:
+        return _debug_values_cache
+
+    from app.config.yaml_config import load_yaml_mapping
+
     try:
         system_config = load_yaml_mapping(config_path)
     except (OSError, ValueError):
-        return {}
+        return _debug_values_cache
     debug_config = system_config.get("debug")
-    return dict(debug_config) if isinstance(debug_config, dict) else {}
+    _debug_values_cache = dict(debug_config) if isinstance(debug_config, dict) else {}
+    _debug_values_cache_mtime = mtime
+    return _debug_values_cache
 
 
 def _write_file_log(

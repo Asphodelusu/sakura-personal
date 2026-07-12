@@ -293,7 +293,7 @@ def fetch_url(url: str, max_chars: int = 6000) -> dict[str, Any]:
 
     # --- Primary: Playwright for JS-heavy pages ---
     try:
-        return _fetch_url_playwright(normalized_url, max_chars)
+        return _run_in_thread(_fetch_url_playwright, normalized_url, max_chars)
     except Exception:
         pass
 
