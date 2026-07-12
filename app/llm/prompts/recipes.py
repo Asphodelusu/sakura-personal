@@ -29,7 +29,13 @@ def build_segmented_reply_instruction(
         "- 每段文本的语气标注在 tone 字段中，按情绪的真实走向逐句判断：情绪没有转折时，相邻句可以延续同一个 tone，"
         "不必每句都刻意换一个，那样反而显得情绪来回跳；只有当内容确实出现转折（比如从担心转到安心、从平静转到不满）时才换 tone。"
         "优先选择中性，除非文本明显带有其他语气。",
+        "- 无论你本轮是否调用工具，一旦决定直接回复用户，assistant 的 content 必须是合法 JSON segments，"
+        "禁止纯文本、Markdown 或代码块。",
     ]
+    if len(portraits) > 1:
+        rules.append(
+            "- 每段根据情绪填写 portrait，不要整轮都填「站立待机」；情绪平淡用站立待机，害羞/不满/惊讶等要换对应立绘。"
+        )
     if include_no_single_segment_rule:
         rules.extend(
             [

@@ -8,6 +8,7 @@ from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider
 from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
 from app.config.settings_service import AppSettingsService, DebugLogSettings, StartupSettings
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.local_client import LocalLlmSettings, RoutingLlmClient
 from app.config.character_loader import CharacterProfile, CharacterRegistry
 from app.storage.chat_history import ChatHistoryStore
 from app.agent.runtime_events import RuntimeEventLog
@@ -23,7 +24,7 @@ from app.core.resource_manager import ResourceRegistry
 class CoreServices:
     """聊天运行时和工具注册等核心服务。"""
 
-    api_client: OpenAICompatibleClient
+    api_client: OpenAICompatibleClient | RoutingLlmClient
     tool_registry: ToolRegistry
     agent_runtime: AgentRuntime
 
@@ -74,7 +75,7 @@ class AppContext:
     startup_initializing: bool = False
 
     @property
-    def api_client(self) -> OpenAICompatibleClient:
+    def api_client(self) -> OpenAICompatibleClient | RoutingLlmClient:
         return self.core.api_client
 
     @property

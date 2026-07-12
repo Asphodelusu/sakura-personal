@@ -540,6 +540,9 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         return None
 
     settings_service.save_api_settings(dialog.result_api_settings)
+    result_local_llm = getattr(dialog, "result_local_llm_settings", None)
+    if result_local_llm is not None:
+        settings_service.save_local_llm_settings(result_local_llm)
     settings_service.save_tts_settings(dialog.result_tts_settings)
     settings_service.save_current_character_id(
         dialog.character_registry,

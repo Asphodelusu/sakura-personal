@@ -33,6 +33,21 @@ class CharacterVoice:
     text_lang: str = "ja"
 
 
+# tone 与立绘标签是两套命名；模型常只填 tone 时按此表回退到表情立绘。
+_TONE_PORTRAIT_FALLBACKS: dict[str, str] = {
+    "中性": "站立待机",
+    "不满": "不满无语",
+    "害羞": "害羞脸红",
+    "请求": "伸手命令",
+    "惊讶": "张嘴疑问",
+    "困惑": "张嘴疑问",
+    "开心": "开心脸红",
+    "高兴": "高兴满足",
+    "难过": "难过沮丧",
+    "自信": "自信拍胸",
+}
+
+
 @dataclass(frozen=True)
 class CharacterProfile:
     id: str
@@ -64,6 +79,9 @@ class CharacterProfile:
         tone_key = (tone or "").strip()
         if tone_key and tone_key in self.expression_portraits:
             return self.expression_portraits[tone_key]
+        mapped = _TONE_PORTRAIT_FALLBACKS.get(tone_key)
+        if mapped and mapped in self.expression_portraits:
+            return self.expression_portraits[mapped]
         return self.default_portrait_path
 
     def portrait_for_segment(self, portrait: str | None, tone: str | None = None) -> Path:

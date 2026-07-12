@@ -27,6 +27,7 @@ from app.config.character_archive import (
 from app.config.character_loader import CharacterProfile
 from app.core.debug_log import debug_log
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.dual_provider_client import create_cloud_llm_client
 from app.llm.prompts.recipes import build_theme_color_system_prompt
 from app.ui.theme import parse_ai_theme_response
 from app.voice.factory import create_tts_provider
@@ -54,7 +55,7 @@ class ApiConnectionTestWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            message = OpenAICompatibleClient(self.settings).test_connection()
+            message = create_cloud_llm_client(self.settings).test_connection()
         except Exception as exc:  # UI 边界统一转成可读错误。
             self.failed.emit(str(exc))
         else:

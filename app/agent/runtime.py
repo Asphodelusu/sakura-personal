@@ -264,7 +264,7 @@ class AgentRuntime:
 
         debug_log(
             "AgentRuntime",
-            "最终回复结构异常，准备请求模型修复",
+            "最终回复格式不合规，准备修复",
             {"reason": retry_reason, "raw_content": raw_content},
         )
         repair_messages: list[ChatMessage] = [
@@ -272,15 +272,7 @@ class AgentRuntime:
             {"role": "assistant", "content": raw_content},
             {
                 "role": "user",
-                "content": (
-                    "上一条 assistant 输出不是合格的 Sakura 回复 JSON。"
-                    "请只把上一条内容修复为合法 JSON，不新增事实、不解释、不使用 Markdown。"
-                    "格式必须是 {\"segments\":[{\"ja\":\"自然日语\",\"zh\":\"中文译文\","
-                    "\"tone\":\"中性\",\"portrait\":\"站立待机\"}]}。"
-                    "ja 字段只能写自然日语，不能包含中文。"
-                    "如果 ja 中有中文，请把它的意思翻译成自然日语，不要用固定兜底句替代。"
-                    "zh 保留或补充与 ja 对应的中文译文。"
-                ),
+                "content": self._build_final_reply_repair_instruction(),
             },
         ]
         try:
@@ -308,6 +300,31 @@ class AgentRuntime:
             return parsed
         debug_log("AgentRuntime", "最终回复结构修复成功", {"repaired": repaired.repaired})
         return repaired
+
+    def _build_final_reply_repair_instruction(self) -> str:
+        portraits = [name.strip() for name in self.reply_portraits if str(name).strip()]
+        example_portrait = portraits[0] if portraits else "站立待机"
+        portrait_rule = (
+            f"- portrait 只能从以下选择：{'、'.join(portraits)}。"
+            if len(portraits) > 1
+            else ""
+        )
+        tone_rule = (
+            f"- tone 只能从以下选择：{'、'.join(self.reply_tones)}。"
+            if self.reply_tones
+            else ""
+        )
+        return (
+            "上一条 assistant 输出不是合格的 Sakura 回复 JSON。"
+            "请只把上一条内容修复为合法 JSON，不新增事实、不解释、不使用 Markdown。"
+            f"格式必须是 {{\"segments\":[{{\"ja\":\"自然日语\",\"zh\":\"中文译文\","
+            f"\"tone\":\"中性\",\"portrait\":\"{example_portrait}\"}}]}}。"
+            "ja 字段只能写自然日语，不能包含中文。"
+            "如果 ja 中有中文，请把它的意思翻译成自然日语，不要用固定兜底句替代。"
+            "zh 保留或补充与 ja 对应的中文译文。"
+            "保留原文的情绪与分段意图；不要把所有 portrait 都改成站立待机。"
+            f"{portrait_rule}{tone_rule}"
+        )
 
     def handle_user_message(
         self,
@@ -446,10 +463,9 @@ class AgentRuntime:
                     tool_choice="auto",
                     temperature=dialogue_temperature,
                     runtime_context=prompt_build.runtime_context,
-                    # Some OpenAI-compatible providers return pseudo tool-call JSON
-                    # in message.content instead of native tool_calls when
-                    # response_format=json_object is combined with tools.
-                    structured_response=not bool(tool_defs),
+                    # 无图（文本端点如 DeepSeek）时始终请求 JSON，减少纯文本回复触发的格式修复。
+                    # 含图（视觉端点）且带工具时仍关闭 structured，避免部分接口把工具调用写进 content。
+                    structured_response=not messages_contain_image(working_messages),
                     cancel_checker=cancel_checker,
                     **dialogue_extra_params,
                 )

@@ -59,6 +59,9 @@ from app.agent import (
 )
 from app.agent.memory_curator import (
     MemoryCurationResult,
+    MemoryCurationSettings,
+    evaluate_idle_curation_trigger,
+    seconds_since_iso_timestamp,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
 from app.agent.memory_reflector import (
@@ -145,6 +148,7 @@ from app.agent.screen_awareness import (
 )
 from app.perception import ProactiveObserver, ProactiveConfig, PrivacyGuard
 from app.perception.observer import ProactiveSpeakPayload
+from app.llm.local_client import is_routing_llm_client
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -668,6 +672,9 @@ class PetWindow(QWidget):
         self.reflection_timer = QTimer(self)
         self.reflection_timer.setInterval(60000)  # 每分钟检查一次
         self.reflection_timer.timeout.connect(self._check_memory_reflection)
+        self.memory_curation_idle_timer = QTimer(self)
+        self.memory_curation_idle_timer.setInterval(60_000)
+        self.memory_curation_idle_timer.timeout.connect(self._check_idle_memory_curation)
         self.memory_reflector: MemoryReflector | None = None
         self.reflection_state_store: ReflectionStateStore | None = None
         self.reflection_worker: QThread | None = None
@@ -676,6 +683,7 @@ class PetWindow(QWidget):
             self._sync_screen_awareness_timer()
             self.user_idle_timer.start()
             self.reflection_timer.start()
+            self.memory_curation_idle_timer.start()
             QTimer.singleShot(0, self._maybe_start_memory_backfill)
         debug_log(
             "PetWindow",
@@ -2874,7 +2882,12 @@ class PetWindow(QWidget):
         if not config.enabled:
             return
         try:
-            api = self.api_client.settings
+            if is_routing_llm_client(self.api_client):
+                # 未测试阶段 resolve 默认回云端；仅用户显式 route=local 时用本地 VLM。
+                vision_api = self.api_client.resolve_vision_api_settings()
+            else:
+                vision_api = self.api_client.settings
+            api = vision_api
             observer = ProactiveObserver(
                 api_base_url=api.base_url,
                 api_key=api.api_key,
@@ -2967,6 +2980,12 @@ class PetWindow(QWidget):
         )
         result = AgentResult(reply=ChatReply(segments=[segment]))
         self._consume_agent_result(result)
+
+    def _restart_proactive_observer(self) -> None:
+        self._stop_proactive_observer()
+        self._proactive_observer = None
+        self._init_proactive_observer()
+        self._start_proactive_observer()
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
@@ -4632,24 +4651,29 @@ class PetWindow(QWidget):
             return
         pending_turns = self.memory_curation_state.increment_pending_turns()
         debug_log("Memory", "自动记忆轮次已累计", {"pending_turns": pending_turns})
-        if pending_turns >= self.memory_curation_settings.trigger_turns:
-            self._schedule_auto_memory_curation()
 
-    def _schedule_auto_memory_curation(self) -> None:
-        """对话结束后再整理：等朗读/字幕收尾并留出短缓冲，避免边回复边提炼。"""
-        existing_timer = getattr(self, "_memory_curation_defer_timer", None)
-        if existing_timer is not None:
-            existing_timer.stop()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
+    @Slot()
+    def _check_idle_memory_curation(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        self._maybe_start_auto_memory_curation()
 
-        def _deferred_start() -> None:
-            self._memory_curation_defer_timer = None
-            self._maybe_start_auto_memory_curation()
-
-        timer.timeout.connect(_deferred_start)
-        timer.start(MEMORY_CURATION_POST_TURN_GRACE_MS)
-        self._memory_curation_defer_timer = timer
+    def _idle_memory_curation_ready(self) -> bool:
+        settings = self.memory_curation_settings.normalized()
+        silence_seconds = max(0.0, time.perf_counter() - self.last_user_activity_at)
+        pending_turns = self.memory_curation_state.pending_turns()
+        entries = self.memory_curation_state.unprocessed_entries(self.history_store.load())
+        return evaluate_idle_curation_trigger(
+            settings,
+            silence_seconds=silence_seconds,
+            pending_turns=pending_turns,
+            seconds_since_last_curation=seconds_since_iso_timestamp(
+                self.memory_curation_state.last_curation_at()
+            ),
+            has_unprocessed_entries=bool(entries),
+        )
 
     def _check_memory_reflection(self) -> None:
         """定时检查是否应该触发记忆反思。"""
@@ -4751,7 +4775,7 @@ class PetWindow(QWidget):
             return
         if not self.memory_curation_settings.enabled:
             return
-        if self.memory_curation_state.pending_turns() < self.memory_curation_settings.trigger_turns:
+        if not self._idle_memory_curation_ready():
             return
         if not self._memory_curation_can_start():
             return
@@ -4825,6 +4849,8 @@ class PetWindow(QWidget):
                 "entry_count": len(entries),
                 "target_history_count": target_history_count,
                 "consumed_turns": consumed_turns,
+                "silence_seconds": int(max(0.0, time.perf_counter() - self.last_user_activity_at)),
+                "idle_minutes": self.memory_curation_settings.normalized().idle_minutes,
             },
         )
         self.memory_curation_mode = mode
@@ -4938,6 +4964,7 @@ class PetWindow(QWidget):
         self._start_proactive_observer()
         self._emit_app_started_event()
         self.reflection_timer.start()
+        self.memory_curation_idle_timer.start()
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text())
         self._collapse_auto_fit_bubble_height()
         self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
@@ -5488,6 +5515,7 @@ class PetWindow(QWidget):
             ),
             on_layout_preview=self._preview_layout,
             memory_curation_settings=getattr(self, "memory_curation_settings", None),
+            local_llm_settings=self.settings_service.load_local_llm_settings(),
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
@@ -5652,12 +5680,21 @@ class PetWindow(QWidget):
             return
 
         api_changed = dialog.result_api_settings != self.api_client.settings
+        local_llm_changed = (
+            dialog.result_local_llm_settings is not None
+            and (
+                not is_routing_llm_client(self.api_client)
+                or dialog.result_local_llm_settings != self.api_client.local_settings
+            )
+        )
         startup_settings_changed = result_startup_settings != current_startup_settings
         theme_write_mode = getattr(dialog, "result_theme_write_mode", "unchanged")
         should_write_character_theme = _should_write_character_theme(theme_write_mode, selected_profile)
         try:
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
+            if local_llm_changed and dialog.result_local_llm_settings is not None:
+                self.settings_service.save_local_llm_settings(dialog.result_local_llm_settings)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
             if should_write_character_theme:
                 save_character_theme(
@@ -5732,6 +5769,10 @@ class PetWindow(QWidget):
         if api_changed:
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
+        if local_llm_changed and dialog.result_local_llm_settings is not None:
+            if is_routing_llm_client(self.api_client):
+                self.api_client.update_local_settings(dialog.result_local_llm_settings)
+                self._restart_proactive_observer()
         self.agent_runtime.set_runtime_loop_settings(result_runtime_loop_settings)
         self._apply_layout_settings(
             portrait_scale_percent=dialog.result_portrait_scale_percent,

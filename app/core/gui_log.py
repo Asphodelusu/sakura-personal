@@ -63,7 +63,81 @@ _PROGRAM_MESSAGE_LABELS = {
     ("API", "准备发送原生工具聊天补全请求"): "发送请求（带工具）",
     ("API", "模型原始文本返回"): "收到回复：文本",
     ("API", "原生工具模型返回"): "收到回复：工具调用",
+    ("ScreenAwareness", "主动屏幕上下文批次已附加"): "屏幕批次已就绪",
+    ("ScreenAwareness", "主动屏幕上下文批次已清空"): "屏幕批次已清空",
+    ("ScreenAwareness", "主动屏幕上下文获取失败"): "截图失败",
+    ("ScreenAwareness", "主动屏幕上下文编码失败"): "截图编码失败",
+    ("Memory", "触发记忆反思"): "触发记忆整理",
+    ("Memory", "记忆反思失败"): "记忆整理失败",
+    ("Memory", "第一人称记忆整理抽取完成"): "记忆整理抽取完成",
+    ("Memory", "长期记忆状态变化"): "记忆系统状态变化",
+    ("ProactiveObserver", "主动观察已启动"): "主动观察已启动",
+    ("ProactiveObserver", "主动观察已停止"): "主动观察已停止",
+    ("ProactiveObserver", "正在评估是否发言"): "正在评估是否发言",
+    ("ProactiveObserver", "隐私拦截"): "隐私拦截",
+    ("ProactiveObserver", "截图失败"): "截图失败",
+    ("ProactiveObserver", "VLM 调用失败"): "VLM 调用失败",
+    ("ProactiveObserver", "主动观察线程异常退出"): "主动观察线程异常退出",
+    ("AgentRuntime", "处理主动事件"): "处理主动事件",
+    ("PetWindow", "主动发言被跳过（UI 忙碌）"): "主动发言跳过（忙碌）",
+    ("PetWindow", "主动事件屏幕观察失败"): "主动事件屏幕观察失败",
+    ("Event", "主动事件生成失败"): "主动事件生成失败",
 }
+# 这些分类下的 info 级日志默认进入 GUI（错误/警告始终收录）。
+_PROGRAM_GUI_CATEGORIES = frozenset({
+    "Startup",
+    "Plugin",
+    "LocalLLM",
+    "ProactiveObserver",
+})
+_CATEGORY_MESSAGE_ALLOWLIST: dict[str, frozenset[str]] = {
+    "ScreenAwareness": frozenset({
+        "主动屏幕上下文批次已附加",
+        "主动屏幕上下文批次已清空",
+        "主动屏幕上下文获取失败",
+        "主动屏幕上下文编码失败",
+        "主动屏幕感知状态保存失败",
+        "读取近期聊天历史失败",
+    }),
+    "Memory": frozenset({
+        "触发记忆反思",
+        "记忆反思失败",
+        "第一人称记忆整理抽取完成",
+        "长期记忆状态变化",
+        "记忆整理读取现有记忆失败",
+        "记忆整理写回失败",
+        "心情笔记写入失败",
+        "连接长期记忆状态监听失败",
+    }),
+    "AgentRuntime": frozenset({
+        "处理主动事件",
+        "主动事件视觉输入不受支持，返回兜底回复",
+        "最终回复格式不合规，准备修复",
+        "最终回复结构修复成功",
+        "最终回复修复请求失败，使用安全兜底",
+        "最终回复修复后仍不合格，使用安全兜底",
+    }),
+    "PetWindow": frozenset({
+        "主动发言被跳过（UI 忙碌）",
+        "主动事件屏幕观察失败",
+    }),
+    "Event": frozenset({
+        "主动事件生成失败",
+    }),
+}
+# 高频、低价值的 info 日志不进入 GUI，避免挤掉环形缓冲里的关键记录。
+_NOISY_PROGRAM_MESSAGES = frozenset({
+    "主动屏幕上下文已缓存",
+    "主动屏幕上下文编码忙，跳过本次截图",
+    "自动记忆轮次已累计",
+    "准备检测模型列表",
+    "HTTP 请求体已构建",
+    "聊天回复解析完成",
+    "跳过疑似敏感记忆候选",
+    "跳过超出单层写入上限的记忆候选",
+    "跳过无效的记忆删除操作",
+    "现有记忆超出注入预算已截断",
+})
 _PROGRAM_TTS_MESSAGE_LABELS = {
     "发送 GPT-SoVITS 请求": "送入 TTS：GPT-SoVITS",
     "发送 Genie TTS 请求": "送入 TTS：Genie",
@@ -320,6 +394,13 @@ def _should_record(scope: str, category: str, message: str, level: str) -> bool:
     if category.lower() == "tts":
         return message in _PROGRAM_TTS_MESSAGE_LABELS
     if level == GUI_LOG_LEVEL_WARNING:
+        return True
+    if message in _NOISY_PROGRAM_MESSAGES:
+        return False
+    allowed_messages = _CATEGORY_MESSAGE_ALLOWLIST.get(category)
+    if allowed_messages is not None:
+        return message in allowed_messages
+    if category in _PROGRAM_GUI_CATEGORIES:
         return True
     return message in _PROGRAM_INFO_MESSAGES or (category, message) in _PROGRAM_MESSAGE_LABELS
 

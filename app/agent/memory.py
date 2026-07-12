@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+from app.agent.persona_state import normalize_emotion
 from app.core.resource_manager import (
     DEFAULT_THREAD_SHUTDOWN_WAIT_MS,
     ResourceRegistry,
@@ -975,7 +976,8 @@ class MemoryStore:
         memories = [
             memory
             for memory in memories
-            if _memory_matches_filters(
+            if not memory_record_is_expired(memory)
+            and _memory_matches_filters(
                 memory,
                 layer=layer_filter,
                 category=category_filter,
@@ -1099,6 +1101,66 @@ class MemoryStore:
         }
         memory = _normalize_memory_record(memory, default_scope=self.scope_id) or memory
         return {"memory": memory, "ok": True}
+
+    def expire_memory(
+        self,
+        memory_id: str,
+        *,
+        valid_until: str | None = None,
+        wait: bool = True,
+    ) -> bool:
+        """将可变近况标记为过去（写 valid_until，不删正文）。"""
+        memory_id = str(memory_id).strip()
+        if not memory_id or _is_core_profile_id(memory_id):
+            return False
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError:
+            if wait:
+                raise
+            return False
+        if mem is None:
+            return False
+        previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
+        if not previous:
+            return False
+        content = str(previous.get("content") or previous.get("memory") or "").strip()
+        if not content:
+            return False
+        metadata = _memory_metadata(
+            {
+                "valid_until": valid_until or _now_iso(),
+                "volatile": True,
+                "layer": previous.get("layer"),
+                "category": previous.get("category"),
+                "importance": previous.get("importance"),
+                "confidence": previous.get("confidence"),
+                "source": previous.get("source"),
+            },
+            scope_id=self.scope_id,
+            existing=previous,
+            updated_at=_now_iso(),
+        )
+        mem.update(memory_id, content, metadata=metadata)
+        return True
+
+    def list_scope_memories(self, *, limit: int = 200, wait: bool = False) -> list[dict[str, Any]]:
+        """列出当前角色记忆（供整理/到点召回等后台逻辑使用）。"""
+        capped = max(1, min(500, int(limit)))
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError:
+            if wait:
+                raise
+            return []
+        if mem is None:
+            return []
+        try:
+            raw = mem.get_all(filters={"user_id": self.scope_id}, top_k=capped)
+        except Exception:
+            return []
+        memories = _normalize_memory_results(raw, default_scope=self.scope_id)
+        return [memory for memory in memories if not memory_record_is_expired(memory)]
 
     def delete_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
@@ -1928,6 +1990,17 @@ def _memory_metadata(
             ),
         }
     )
+    for key in ("memory_kind", "valid_until", "event_time"):
+        value = _optional_text(arguments, key) or str(metadata.get(key) or "").strip()
+        if value:
+            metadata[key] = value
+    emotion_value = _optional_text(arguments, "emotion") or str(metadata.get("emotion") or "").strip()
+    if emotion_value:
+        metadata["emotion"] = normalize_emotion(emotion_value)
+    if arguments.get("volatile") is True:
+        metadata["volatile"] = True
+    elif str(arguments.get("volatile", "")).strip().lower() == "false":
+        metadata["volatile"] = False
     return metadata
 
 
@@ -2036,6 +2109,25 @@ def _memory_matches_filters(
         return False
     memory_scope = _normalize_scope_id(str(memory.get("scope") or scope))
     return memory_scope == scope
+
+
+def memory_record_is_expired(record: dict[str, Any], *, now: datetime | None = None) -> bool:
+    """记忆是否因 expires_at / valid_until 已失效。"""
+    now = now or datetime.now().astimezone()
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    for key in ("expires_at", "valid_until"):
+        value = record.get(key) or metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            expires_at = datetime.fromisoformat(value.strip())
+        except ValueError:
+            continue
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=now.tzinfo)
+        if expires_at <= now:
+            return True
+    return False
 
 
 def _rank_memories(memories: list[dict[str, Any]], *, query: str) -> list[dict[str, Any]]:

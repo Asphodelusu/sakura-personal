@@ -63,7 +63,9 @@ from app.config.settings_service import (
     StartupSettings,
 )
 from app.platforms.launch_at_login import is_launch_at_login_supported
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, api_settings_for_text, normalize_provider_base_url
+from app.llm.local_client import LocalLlmSettings
+from app.llm.local_client import LocalLlmSettings
 from app.plugins.discovery import PluginDiscovery, save_plugin_enabled_overrides
 from app.plugins.models import PluginSpec
 from app.config.character_loader import (
@@ -171,6 +173,7 @@ class SettingsDialog(QDialog):
         on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
         proactive_care_settings: ScreenAwarenessSettings | None = None,
         memory_curation_settings=None,
+        local_llm_settings: LocalLlmSettings | None = None,
     ) -> None:
         super().__init__(parent)
         if screen_awareness_settings is None:
@@ -186,6 +189,7 @@ class SettingsDialog(QDialog):
 
         self.memory_curation_settings = memory_curation_settings or _MemoryCurationSettings()
         self._initial_api_settings = api_settings
+        self._initial_local_llm_settings = (local_llm_settings or LocalLlmSettings()).normalized()
         self._initial_tts_settings = tts_settings
         self._initial_character_id = current_character.id if current_character is not None else None
         self.theme_settings = merge_theme_with_character(
@@ -224,6 +228,7 @@ class SettingsDialog(QDialog):
         self._editing_memory_id: str | None = None
         self._active_memory_id: str | None = None
         self.result_api_settings: ApiSettings | None = None
+        self.result_local_llm_settings: LocalLlmSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
         self.result_portrait_scale_percent: int | None = None
@@ -249,6 +254,12 @@ class SettingsDialog(QDialog):
         self._api_test_worker: settings_workers.ApiConnectionTestWorker | None = None
         self._api_model_probe_thread: QThread | None = None
         self._api_model_probe_worker: settings_workers.ApiModelListProbeWorker | None = None
+        self._text_api_model_probe_thread: QThread | None = None
+        self._text_api_model_probe_worker: settings_workers.ApiModelListProbeWorker | None = None
+        self._local_llm_test_thread: QThread | None = None
+        self._local_llm_test_worker: settings_workers.ApiConnectionTestWorker | None = None
+        self._local_llm_probe_thread: QThread | None = None
+        self._local_llm_probe_worker: settings_workers.ApiModelListProbeWorker | None = None
         self._tts_test_thread: QThread | None = None
         self._tts_test_worker: settings_workers.TTSTestWorker | None = None
         self._pending_api_accept_values: dict[str, object] | None = None
@@ -297,7 +308,9 @@ class SettingsDialog(QDialog):
                 ),
             ),
             ("外观", self._build_scrollable_tab(ThemeSettingsPage(self).build())),
-            ("模型", self._build_scrollable_tab(ApiSettingsPage(self).build(api_settings))),
+            ("模型", self._build_scrollable_tab(
+                ApiSettingsPage(self).build(api_settings, self._initial_local_llm_settings)
+            )),
             ("语音", self._build_scrollable_tab(TtsSettingsPage(self).build(tts_settings))),
             (
                 "隐私",
@@ -334,8 +347,12 @@ class SettingsDialog(QDialog):
             ),
         ]
         if memory_store is not None:
-            # 记忆页自带列表滚动，沿用原行为不再额外包滚动区，避免双重滚动条。
-            nav_items.append(("记忆", MemorySettingsPage(self).build(memory_store)))
+            nav_items.append(
+                (
+                    "记忆",
+                    self._build_scrollable_tab(MemorySettingsPage(self).build(memory_store)),
+                )
+            )
 
         navigation = self._build_navigation(nav_items)
 
@@ -1992,6 +2009,12 @@ class SettingsDialog(QDialog):
         if self._api_model_probe_thread is not None:
             QMessageBox.information(self, "检测中", "模型列表仍在检测，请等待完成后再保存设置。")
             return
+        if self._local_llm_test_thread is not None:
+            QMessageBox.information(self, "测试中", "本地端点测试仍在进行，请等待完成后再保存设置。")
+            return
+        if self._local_llm_probe_thread is not None:
+            QMessageBox.information(self, "检测中", "本地模型列表仍在检测，请等待完成后再保存设置。")
+            return
         if self._tts_test_thread is not None:
             QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再保存设置。")
             return
@@ -2052,20 +2075,25 @@ class SettingsDialog(QDialog):
     def _collect_memory_curation_settings(self):
         from dataclasses import replace
 
-        spin = getattr(self, "memory_trigger_turns_spin", None)
-        if spin is None:
-            # 记忆页未构建时回退到初始值，保留 backfill_limit 等未暴露字段。
+        idle_spin = getattr(self, "memory_idle_minutes_spin", None)
+        if idle_spin is None:
             return self.memory_curation_settings
-        # 自动整理始终开启，设置页只调整触发轮数。
         return replace(
             self.memory_curation_settings,
             enabled=True,
-            trigger_turns=int(spin.value()),
-        )
+            idle_minutes=int(idle_spin.value()),
+            min_turns=int(self.memory_min_turns_spin.value()),
+            cooldown_minutes=int(self.memory_cooldown_minutes_spin.value()),
+            long_idle_minutes=int(self.memory_long_idle_minutes_spin.value()),
+            catch_up_turns=int(self.memory_catch_up_turns_spin.value()),
+        ).normalized()
 
     def _collect_accept_values(self) -> dict[str, object] | None:
         api_settings = self._validated_api_settings()
         if api_settings is None:
+            return None
+        local_llm_settings = self._validated_local_llm_settings()
+        if local_llm_settings is None:
             return None
         tts_settings = self._validated_tts_settings()
         if tts_settings is None:
@@ -2085,6 +2113,7 @@ class SettingsDialog(QDialog):
         launch_at_login_supported = is_launch_at_login_supported()
         return {
             "api_settings": api_settings,
+            "local_llm_settings": local_llm_settings,
             "tts_settings": tts_settings,
             "character_id": character_id,
             "portrait_scale_percent": self._selected_portrait_scale_percent(),
@@ -2145,6 +2174,7 @@ class SettingsDialog(QDialog):
 
     def _complete_accept(self, values: dict[str, object]) -> None:
         api_settings = values["api_settings"]
+        local_llm_settings = values["local_llm_settings"]
         tts_settings = values["tts_settings"]
         character_id = values["character_id"]
         portrait_scale_percent = values["portrait_scale_percent"]
@@ -2165,6 +2195,8 @@ class SettingsDialog(QDialog):
         memory_curation_settings = values["memory_curation_settings"]
 
         if not isinstance(api_settings, ApiSettings):
+            return
+        if not isinstance(local_llm_settings, LocalLlmSettings):
             return
         if not isinstance(tts_settings, GPTSoVITSTTSSettings):
             return
@@ -2211,6 +2243,7 @@ class SettingsDialog(QDialog):
             return
 
         self.result_api_settings = api_settings
+        self.result_local_llm_settings = local_llm_settings
         self.result_tts_settings = tts_settings
         self.result_character_id = character_id
         self.result_portrait_scale_percent = portrait_scale_percent
@@ -2454,6 +2487,8 @@ class SettingsDialog(QDialog):
             )
             return
         self.model_edit.set_model_names(model_names)
+        if hasattr(self, "text_model_edit"):
+            self.text_model_edit.set_model_names(model_names)
         QMessageBox.information(self, "探测成功", f"已发现 {len(model_names)} 个模型。")
 
     @Slot(str)
@@ -2473,6 +2508,80 @@ class SettingsDialog(QDialog):
         self._api_model_probe_thread = None
         self._api_model_probe_worker = None
         self._set_api_model_probe_busy(False)
+
+    def _probe_text_api_models(self) -> None:
+        settings = self._validated_text_api_model_probe_settings()
+        if (
+            settings is None
+            or self._text_api_model_probe_thread is not None
+            or self._api_model_probe_thread is not None
+            or self._api_test_thread is not None
+            or self._tts_test_thread is not None
+        ):
+            return
+        self._set_text_api_model_probe_busy(True)
+        thread = QThread()
+        worker = settings_workers.ApiModelListProbeWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_text_api_model_probe_success)
+        worker.failed.connect(self._handle_text_api_model_probe_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_text_api_model_probe_state)
+
+        self._text_api_model_probe_thread = thread
+        self._text_api_model_probe_worker = worker
+        thread.start()
+
+    @Slot(list)
+    def _handle_text_api_model_probe_success(self, model_names: list[str]) -> None:
+        if not model_names:
+            QMessageBox.warning(
+                self,
+                "探测失败",
+                format_failure_message(
+                    "文本端点返回了空的模型列表。",
+                    "请确认 DeepSeek 等服务提供 /models 接口，并检查文本 API Key。",
+                    "模型列表为空。",
+                ),
+            )
+            return
+        if hasattr(self, "text_model_edit"):
+            self.text_model_edit.set_model_names(model_names)
+        hint = ""
+        if any(name.startswith("deepseek-") for name in model_names):
+            hint = "\n（DeepSeek 可能未提供 /models 列表，已使用内置候选。）"
+        QMessageBox.information(
+            self,
+            "探测成功",
+            f"文本端点已发现 {len(model_names)} 个模型。{hint}",
+        )
+
+    @Slot(str)
+    def _handle_text_api_model_probe_failed(self, message: str) -> None:
+        QMessageBox.warning(
+            self,
+            "探测失败",
+            format_failure_message(
+                "无法从文本端点读取模型列表。",
+                "请检查文本 Base URL、API Key 与网络连接。",
+                message,
+            ),
+        )
+
+    @Slot()
+    def _reset_text_api_model_probe_state(self) -> None:
+        self._text_api_model_probe_thread = None
+        self._text_api_model_probe_worker = None
+        self._set_text_api_model_probe_busy(False)
+
+    def _set_text_api_model_probe_busy(self, busy: bool) -> None:
+        button = getattr(self, "text_api_model_probe_button", None)
+        if button is not None:
+            button.setEnabled(not busy)
+            button.setText("检测中..." if busy else "检测文本模型")
 
     def _set_api_model_probe_busy(self, busy: bool) -> None:
         self.api_model_probe_button.setEnabled(not busy)
@@ -2875,12 +2984,45 @@ class SettingsDialog(QDialog):
         if not model:
             QMessageBox.warning(self, "配置无效", "模型不能为空。")
             return None
+        split_enabled = self.model_split_enabled_check.isChecked()
+        text_model = self.text_model_edit.text().strip()
+        dual_enabled = self.dual_endpoint_enabled_check.isChecked()
+        text_base_url = normalize_provider_base_url(
+            self.text_base_url_edit.text().strip().rstrip("/")
+        )
+        text_api_key = self.text_api_key_edit.text().strip()
+        if split_enabled and not dual_enabled and not text_model:
+            QMessageBox.warning(
+                self,
+                "配置无效",
+                "启用图文分流（同端点）时，文本模型不能为空。",
+            )
+            return None
+        if split_enabled and dual_enabled:
+            if not _is_http_url(text_base_url):
+                QMessageBox.warning(self, "配置无效", "文本 Base URL 必须是有效的 http 或 https 地址。")
+                return None
+            if not text_api_key:
+                QMessageBox.warning(self, "配置无效", "启用双端点模式时，文本 API Key 不能为空。")
+                return None
+            if not text_model:
+                QMessageBox.warning(
+                    self,
+                    "配置无效",
+                    "保存前请填写文本模型（可先点「检测文本模型」或手填 deepseek-v4-flash）。",
+                )
+                return None
 
         return ApiSettings(
             base_url=base_url,
             api_key=api_key,
             model=model,
             timeout_seconds=self.api_timeout_spin.value(),
+            text_model=text_model,
+            model_split_enabled=split_enabled,
+            dual_endpoint_enabled=dual_enabled,
+            text_base_url=text_base_url,
+            text_api_key=text_api_key,
             temperature=temperature,
             top_p=(
                 self.llm_top_p_spin.value()
@@ -2911,6 +3053,196 @@ class SettingsDialog(QDialog):
             model=self.model_edit.text().strip(),
             timeout_seconds=self.api_timeout_spin.value(),
         )
+
+    def _validated_text_api_model_probe_settings(self) -> ApiSettings | None:
+        if not self.model_split_enabled_check.isChecked():
+            QMessageBox.warning(self, "配置无效", "请先启用「图文分流」。")
+            return None
+        if not self.dual_endpoint_enabled_check.isChecked():
+            QMessageBox.warning(self, "配置无效", "请先启用「文本与视觉使用不同 API 端点」。")
+            return None
+
+        text_base_url = normalize_provider_base_url(
+            self.text_base_url_edit.text().strip().rstrip("/")
+        )
+        text_api_key = self.text_api_key_edit.text().strip()
+        if not _is_http_url(text_base_url):
+            QMessageBox.warning(self, "配置无效", "文本 Base URL 必须是有效的 http 或 https 地址。")
+            return None
+        if not text_api_key:
+            QMessageBox.warning(self, "配置无效", "探测文本模型前请先填写文本 API Key。")
+            return None
+
+        vision_base_url = self.base_url_edit.text().strip().rstrip("/")
+        vision_api_key = self.api_key_edit.text().strip()
+        vision_model = self.model_edit.text().strip() or "glm-5v-turbo"
+        text_model = self.text_model_edit.text().strip() or "deepseek-v4-flash"
+        return api_settings_for_text(
+            ApiSettings(
+                base_url=vision_base_url,
+                api_key=vision_api_key,
+                model=vision_model,
+                timeout_seconds=self.api_timeout_spin.value(),
+                text_model=text_model,
+                model_split_enabled=True,
+                dual_endpoint_enabled=True,
+                text_base_url=text_base_url,
+                text_api_key=text_api_key,
+            )
+        )
+
+    def _validated_local_llm_settings(self) -> LocalLlmSettings | None:
+        if not hasattr(self, "local_llm_enabled_check"):
+            return self._initial_local_llm_settings
+        enabled = self.local_llm_enabled_check.isChecked()
+        base_url = self.local_base_url_edit.text().strip().rstrip("/")
+        api_key = self.local_api_key_edit.text().strip()
+        text_model = self.local_text_model_edit.text().strip()
+        vision_model = self.local_vision_model_edit.text().strip()
+        vision_route = str(self.local_vision_route_combo.currentData() or "cloud")
+
+        if enabled:
+            if not _is_http_url(base_url):
+                QMessageBox.warning(self, "配置无效", "本地 Base URL 必须是有效的 http 或 https 地址。")
+                return None
+            if not text_model and not vision_model:
+                QMessageBox.warning(
+                    self,
+                    "配置无效",
+                    "启用本地模型时，请至少填写文本模型或视觉模型。",
+                )
+                return None
+
+        return LocalLlmSettings(
+            enabled=enabled,
+            base_url=base_url,
+            api_key=api_key,
+            text_model=text_model,
+            vision_model=vision_model,
+            timeout_seconds=self.local_timeout_spin.value(),
+            vision_route=vision_route if vision_route in {"cloud", "local", "auto"} else "cloud",
+            background_route=self._initial_local_llm_settings.background_route,
+        ).normalized()
+
+    def _validated_local_llm_probe_settings(self) -> ApiSettings | None:
+        local_settings = self._validated_local_llm_settings()
+        if local_settings is None:
+            return None
+        if not local_settings.enabled:
+            QMessageBox.warning(self, "配置无效", "请先启用本地模型。")
+            return None
+        if not _is_http_url(local_settings.base_url):
+            QMessageBox.warning(self, "配置无效", "本地 Base URL 必须是有效的 http 或 https 地址。")
+            return None
+        try:
+            return local_settings.to_api_settings(vision=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "配置无效", str(exc))
+            return None
+
+    def _test_local_llm_settings(self) -> None:
+        settings = self._validated_local_llm_probe_settings()
+        if settings is None or self._local_llm_test_thread is not None:
+            return
+        self._start_local_llm_settings_test(settings)
+
+    def _probe_local_llm_models(self) -> None:
+        settings = self._validated_local_llm_probe_settings()
+        if settings is None or self._local_llm_probe_thread is not None:
+            return
+        self._start_local_llm_model_probe(settings)
+
+    def _start_local_llm_settings_test(self, settings: ApiSettings) -> None:
+        self._set_local_llm_test_busy(True)
+        thread = QThread()
+        worker = settings_workers.ApiConnectionTestWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_local_llm_test_success)
+        worker.failed.connect(self._handle_local_llm_test_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_local_llm_test_state)
+        self._local_llm_test_thread = thread
+        self._local_llm_test_worker = worker
+        thread.start()
+
+    def _start_local_llm_model_probe(self, settings: ApiSettings) -> None:
+        self._set_local_llm_probe_busy(True)
+        thread = QThread()
+        worker = settings_workers.ApiModelListProbeWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_local_llm_probe_success)
+        worker.failed.connect(self._handle_local_llm_probe_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_local_llm_probe_state)
+        self._local_llm_probe_thread = thread
+        self._local_llm_probe_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _handle_local_llm_test_success(self, message: str) -> None:
+        QMessageBox.information(self, "测试成功", f"本地端点连接成功，模型返回：{message}")
+
+    @Slot(str)
+    def _handle_local_llm_test_failed(self, message: str) -> None:
+        QMessageBox.warning(
+            self,
+            "测试失败",
+            format_failure_message(
+                "本地端点连接测试没有成功。",
+                "请确认 Ollama 已启动，并检查 Base URL 与模型名称。",
+                message,
+            ),
+        )
+
+    @Slot(list)
+    def _handle_local_llm_probe_success(self, models: list) -> None:
+        if not models:
+            QMessageBox.information(self, "检测完成", "本地端点可用，但未返回模型列表。")
+            return
+        preview = "\n".join(str(model) for model in models[:20])
+        if len(models) > 20:
+            preview += f"\n... 共 {len(models)} 个模型"
+        QMessageBox.information(self, "检测完成", f"已获取本地模型列表：\n{preview}")
+
+    @Slot(str)
+    def _handle_local_llm_probe_failed(self, message: str) -> None:
+        QMessageBox.warning(
+            self,
+            "检测失败",
+            format_failure_message(
+                "本地模型列表检测没有成功。",
+                "请确认 Ollama 已启动，并检查 Base URL。",
+                message,
+            ),
+        )
+
+    @Slot()
+    def _reset_local_llm_test_state(self) -> None:
+        self._local_llm_test_thread = None
+        self._local_llm_test_worker = None
+        self._set_local_llm_test_busy(False)
+
+    @Slot()
+    def _reset_local_llm_probe_state(self) -> None:
+        self._local_llm_probe_thread = None
+        self._local_llm_probe_worker = None
+        self._set_local_llm_probe_busy(False)
+
+    def _set_local_llm_test_busy(self, busy: bool) -> None:
+        if hasattr(self, "local_llm_test_button"):
+            self.local_llm_test_button.setEnabled(not busy)
+            self.local_llm_test_button.setText("测试中..." if busy else "测试本地端点")
+
+    def _set_local_llm_probe_busy(self, busy: bool) -> None:
+        if hasattr(self, "local_llm_probe_button"):
+            self.local_llm_probe_button.setEnabled(not busy)
+            self.local_llm_probe_button.setText("检测中..." if busy else "检测本地模型")
 
     def _validated_tts_settings(
         self,

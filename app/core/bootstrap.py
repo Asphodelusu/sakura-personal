@@ -8,7 +8,8 @@ from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
 from app.agent.mcp.settings import MCPRuntimeSettings
 from app.agent.memory_curator import MemoryCurator, MemoryCurationState
 from app.config.settings_service import AppSettingsService
-from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.api_client import ApiSettings
+from app.llm.local_client import LocalLlmSettings, create_routing_llm_client
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.extensions import ExtensionRegistry
@@ -69,6 +70,7 @@ def load_startup_state(base_dir: Path) -> StartupState:
 
     settings_service = AppSettingsService(base_dir=base_dir)
     settings = settings_service.load_api_settings()
+    local_llm_settings = settings_service.load_local_llm_settings()
     debug_log(
         "Startup",
         "API 配置已加载",
@@ -77,6 +79,8 @@ def load_startup_state(base_dir: Path) -> StartupState:
             "model": settings.model,
             "timeout_seconds": settings.timeout_seconds,
             "api_key": settings.api_key,
+            "local_llm_enabled": local_llm_settings.enabled,
+            "local_vision_model": local_llm_settings.vision_model,
         },
     )
 
@@ -121,7 +125,8 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     character_registry = startup_state.character_registry
     character_profile = startup_state.character_profile
     system_prompt = startup_state.system_prompt
-    api_client = OpenAICompatibleClient(settings)
+    local_llm_settings = settings_service.load_local_llm_settings()
+    api_client = create_routing_llm_client(settings, local_llm_settings)
     resource_registry = ResourceRegistry()
     memory_store = MemoryStore(
         base_dir=base_dir,

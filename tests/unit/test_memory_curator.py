@@ -11,9 +11,11 @@ import pytest
 from app.agent.memory import MemoryStore
 from app.agent.memory_curator import (
     DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
+    MemoryCurationSettings,
     MemoryCurationState,
     MemoryCurator,
     _entries_for_model,
+    evaluate_idle_curation_trigger,
 )
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.storage.chat_history import ChatHistoryEntry
@@ -308,6 +310,43 @@ def test_memory_curation_state_waits_until_trigger_turns() -> None:
     state.increment_pending_turns()
 
     assert state.pending_turns() == DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
+
+
+def test_evaluate_idle_curation_trigger_hybrid_rules() -> None:
+    settings = MemoryCurationSettings().normalized()
+    base_kwargs = {
+        "settings": settings,
+        "seconds_since_last_curation": None,
+        "has_unprocessed_entries": True,
+    }
+    assert not evaluate_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=60,
+        pending_turns=2,
+    )
+    assert evaluate_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=12 * 60,
+        pending_turns=2,
+    )
+    assert not evaluate_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=12 * 60,
+        pending_turns=1,
+        seconds_since_last_curation=5 * 60,
+    )
+    assert evaluate_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=30 * 60,
+        pending_turns=1,
+        seconds_since_last_curation=5 * 60,
+    )
+    assert evaluate_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=12 * 60,
+        pending_turns=12,
+        seconds_since_last_curation=5 * 60,
+    )
 
 
 def test_memory_entries_ignore_tone_and_portrait_metadata() -> None:

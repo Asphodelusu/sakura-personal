@@ -4,11 +4,16 @@ import json
 import math
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.agent.memory import MemoryStore
+from app.agent.persona_state import (
+    PersonaState,
+    emotion_congruence_factor,
+    resolve_persona_state,
+)
 from app.llm.prompts.types import ContextFragment, ContextRequest
 
 
@@ -28,6 +33,14 @@ _ACCESS_TRACKER_LOCK = threading.Lock()
 _ACCESS_TRACKER_PATH: Path | None = None
 _ACCESS_TRACKER_CACHE: dict[str, str] = {}
 _ACCESS_TRACKER_DIRTY: bool = False
+# 约定/纪念日：event_time 落在今天或明天时主动浮现（不占满检索名额）
+MAX_DUE_COMMITMENT_RECALLS = 2
+DUE_COMMITMENT_DECAY_BOOST = 1.28
+# 冷归档：久未激活且低重要性的琐碎记忆缓慢降权（豁免约定/情感转折）
+COLD_ARCHIVE_IDLE_DAYS = 45
+COLD_ARCHIVE_IMPORTANCE_MAX = 0.38
+COLD_ARCHIVE_DECAY_FLOOR = 0.52
+EXEMPT_COLD_ARCHIVE_KINDS = frozenset({"commitment", "emotional_turn", "core_profile"})
 
 
 def _set_access_tracker_path(path: Path) -> None:
@@ -137,7 +150,17 @@ class MemoryRecallService:
         if not isinstance(memories, list):
             return MemoryRecallResult(status="failed", query=query)
 
-        selected = _select_memories(memories, self.threshold, self.limit)
+        now = datetime.now().astimezone()
+        persona = _resolve_recall_persona(self.memory, query)
+        due_commitments = _select_due_commitment_memories(self.memory, now=now)
+        selected = _select_memories(
+            memories,
+            self.threshold,
+            self.limit,
+            now=now,
+            persona=persona,
+        )
+        selected = _merge_due_commitments(selected, due_commitments, self.limit)
 
         # 回忆强化：记录被选中的记忆（被检索到即算访问）
         hit_ids = [m["id"] for m in selected if m.get("id")]
@@ -179,14 +202,28 @@ def _build_memory_query(request: ContextRequest) -> str:
     return query[:MAX_MEMORY_QUERY_CHARS].rstrip()
 
 
+def _resolve_recall_persona(memory_store: MemoryStore, query: str) -> PersonaState:
+    mood_content = ""
+    try:
+        mood_state = memory_store.mood_state()
+        if isinstance(mood_state, dict):
+            mood_content = str(mood_state.get("content") or "").strip()
+    except Exception:  # noqa: BLE001
+        mood_content = ""
+    return resolve_persona_state(dialogue_text=query, mood_content=mood_content)
+
+
 def _select_memories(
     memories: list[Any],
     threshold: float,
     limit: int,
+    *,
+    now: datetime | None = None,
+    persona: PersonaState | None = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
-    now = datetime.now().astimezone()
+    now = now or datetime.now().astimezone()
     for raw in memories:
         if not isinstance(raw, dict):
             continue
@@ -194,24 +231,38 @@ def _select_memories(
         if not content:
             continue
         dedupe_key = " ".join(content.lower().split())
-        if dedupe_key in seen or _is_expired(raw.get("expires_at"), now):
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        if dedupe_key in seen or _is_memory_expired(raw, metadata, now):
             continue
         score = _optional_score(raw.get("score"))
         if score is not None and score < threshold:
             continue
-        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         source = str(raw.get("source") or metadata.get("source") or "inferred").strip().lower()
         updated_at = str(raw.get("updated_at") or metadata.get("updated_at") or "").strip()
         created_at = str(raw.get("created_at") or metadata.get("created_at") or "").strip()
         importance = _extract_importance(metadata, source)
+        memory_kind = str(metadata.get("memory_kind") or "").strip().lower()
         # 回忆强化：最近被 search 过的记忆，用访问时间代替更新时间算衰减
-        last_accessed = _get_last_accessed(str(raw.get("id") or raw.get("memory_id") or ""))
+        memory_id = str(raw.get("id") or raw.get("memory_id") or "").strip()
+        last_accessed = _get_last_accessed(memory_id)
         effective_ts = last_accessed or updated_at or created_at
         days = _days_since(effective_ts, now)
         decay_weight = _compute_decay_weight(importance, days)
+        if metadata.get("volatile") is True:
+            decay_weight = min(1.0, decay_weight * 1.12)
+        decay_weight = min(
+            1.0,
+            decay_weight * _compute_cold_archive_factor(importance, days, memory_kind),
+        )
+        memory_emotion = str(metadata.get("emotion") or "").strip()
+        if persona is not None and memory_emotion:
+            decay_weight = min(
+                1.0,
+                decay_weight * emotion_congruence_factor(persona.active_emotion(), memory_emotion),
+            )
         normalized.append(
             {
-                "id": str(raw.get("id") or raw.get("memory_id") or "").strip(),
+                "id": memory_id,
                 "content": content,
                 "score": score,
                 "source": source,
@@ -271,6 +322,118 @@ def _compute_decay_weight(importance: float, days: float, lmbda: float = DEFAULT
     """重要性加权时间衰减：importance=1.0 永不衰减，importance=0.2 快速衰减。"""
     decay = math.exp(-lmbda * days)
     return importance + (1.0 - importance) * decay
+
+
+def _compute_cold_archive_factor(importance: float, idle_days: float, memory_kind: str) -> float:
+    """琐碎共同经历久未激活时额外降权；约定/情感转折豁免。"""
+    if memory_kind in EXEMPT_COLD_ARCHIVE_KINDS:
+        return 1.0
+    if idle_days < COLD_ARCHIVE_IDLE_DAYS or importance >= COLD_ARCHIVE_IMPORTANCE_MAX:
+        return 1.0
+    excess_days = idle_days - COLD_ARCHIVE_IDLE_DAYS
+    fade = min(1.0, excess_days / 120.0) * (COLD_ARCHIVE_IMPORTANCE_MAX - importance)
+    return max(COLD_ARCHIVE_DECAY_FLOOR, 1.0 - fade)
+
+
+def _select_due_commitment_memories(
+    memory_store: MemoryStore,
+    *,
+    now: datetime,
+    limit: int = MAX_DUE_COMMITMENT_RECALLS,
+) -> list[dict[str, Any]]:
+    """扫描约定/纪念日，今天或明天到点的条目主动浮现。"""
+    try:
+        scope_memories = memory_store.list_scope_memories(limit=200, wait=False)
+    except Exception:  # noqa: BLE001
+        return []
+    due: list[dict[str, Any]] = []
+    for raw in scope_memories:
+        if not isinstance(raw, dict):
+            continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        memory_kind = str(metadata.get("memory_kind") or "").strip().lower()
+        if memory_kind != "commitment":
+            continue
+        event_time = str(metadata.get("event_time") or raw.get("event_time") or "").strip()
+        if not event_time or not _commitment_is_due(event_time, now):
+            continue
+        content = str(raw.get("content") or raw.get("memory") or "").strip()
+        if not content:
+            continue
+        source = str(raw.get("source") or metadata.get("source") or "inferred").strip().lower()
+        updated_at = str(raw.get("updated_at") or metadata.get("updated_at") or "").strip()
+        due.append(
+            {
+                "id": str(raw.get("id") or raw.get("memory_id") or "").strip(),
+                "content": content,
+                "score": 0.72,
+                "source": source,
+                "updated_at": updated_at,
+                "importance": _extract_importance(metadata, source),
+                "decay_weight": DUE_COMMITMENT_DECAY_BOOST,
+            }
+        )
+    due.sort(key=lambda item: (item["updated_at"], item["content"]))
+    return due[: max(0, limit)]
+
+
+def _merge_due_commitments(
+    selected: list[dict[str, Any]],
+    due_commitments: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not due_commitments:
+        return selected
+    seen_ids = {item["id"] for item in selected if item.get("id")}
+    seen_content = {" ".join(item["content"].lower().split()) for item in selected}
+    merged = list(selected)
+    for commitment in due_commitments:
+        memory_id = commitment.get("id") or ""
+        dedupe_key = " ".join(commitment["content"].lower().split())
+        if memory_id and memory_id in seen_ids:
+            continue
+        if dedupe_key in seen_content:
+            continue
+        merged.insert(0, commitment)
+        if memory_id:
+            seen_ids.add(memory_id)
+        seen_content.add(dedupe_key)
+        if len(merged) > limit:
+            merged.pop()
+    return merged[:limit]
+
+
+def _commitment_is_due(event_time: str, now: datetime) -> bool:
+    event_date = _parse_event_date(event_time, now)
+    if event_date is None:
+        return False
+    today = now.date()
+    return event_date == today or event_date == today + timedelta(days=1)
+
+
+def _parse_event_date(event_time: str, now: datetime) -> date | None:
+    text = event_time.strip()
+    if not text:
+        return None
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=now.tzinfo)
+            return parsed.date()
+        except ValueError:
+            pass
+        try:
+            return date.fromisoformat(candidate[:10])
+        except ValueError:
+            continue
+    return None
+
+
+def _is_memory_expired(raw: dict[str, Any], metadata: dict[str, Any], now: datetime) -> bool:
+    if _is_expired(raw.get("expires_at"), now):
+        return True
+    return _is_expired(metadata.get("valid_until"), now)
 
 
 def _is_expired(value: Any, now: datetime) -> bool:
