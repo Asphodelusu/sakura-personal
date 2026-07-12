@@ -13,6 +13,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
@@ -72,7 +73,8 @@ from app.config.settings_service import (
     DebugLogSettings,
     StartupSettings,
 )
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, DEFAULT_TEXT_PROVIDER_BASE_URL
+from app.llm.local_client import LocalLlmSettings
 from app.platforms.launch_at_login import (
     is_launch_at_login_supported,
     launch_at_login_platform_text,
@@ -417,18 +419,48 @@ class ApiSettingsPage:
     def __init__(self, dialog: Any) -> None:
         self.dialog = dialog
 
-    def build(self, settings: ApiSettings) -> QWidget:
+    def build(self, settings: ApiSettings, local_settings: LocalLlmSettings | None = None) -> QWidget:
         owner = self.dialog
         tab = QWidget(owner)
+        local_settings = (local_settings or LocalLlmSettings()).normalized()
         owner.base_url_edit = QLineEdit(settings.base_url, tab)
-        owner.base_url_edit.setPlaceholderText("https://api.openai.com/v1")
+        owner.base_url_edit.setPlaceholderText("https://open.bigmodel.cn/api/paas/v4")
         owner.api_key_edit = QLineEdit(settings.api_key, tab)
         owner.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         owner.api_key_edit.setPlaceholderText("请输入 API Key")
 
+        owner.vision_base_url_label = QLabel("Base URL", tab)
+        owner.vision_api_key_label = QLabel("API Key", tab)
+
         owner.model_edit = ModelComboBox(tab)
         owner.model_edit.setText(settings.model)
-        owner.model_edit.setPlaceholderText("gpt-4.1-mini")
+        owner.model_edit.setPlaceholderText("glm-5v-turbo")
+
+        owner.model_split_enabled_check = QCheckBox("启用图文分流（无图用文本模型，更省 token）", tab)
+        owner.model_split_enabled_check.setChecked(settings.model_split_enabled)
+
+        owner.dual_endpoint_enabled_check = QCheckBox(
+            "文本与视觉使用不同 API 端点（如 DeepSeek 文本 + 智谱视觉）",
+            tab,
+        )
+        owner.dual_endpoint_enabled_check.setChecked(settings.dual_endpoint_enabled)
+
+        owner.text_base_url_edit = QLineEdit(settings.text_base_url, tab)
+        owner.text_base_url_edit.setPlaceholderText(DEFAULT_TEXT_PROVIDER_BASE_URL)
+        owner.text_api_key_edit = QLineEdit(settings.text_api_key, tab)
+        owner.text_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        owner.text_api_key_edit.setPlaceholderText("DeepSeek API Key")
+
+        owner.text_model_edit = ModelComboBox(tab)
+        owner.text_model_edit.setText(settings.text_model)
+        owner.text_model_edit.setPlaceholderText("deepseek-v4-flash 或 deepseek-v4-pro")
+
+        owner.model_field_label = QLabel("模型", tab)
+        owner.text_model_label = QLabel("文本模型", tab)
+        owner.text_endpoint_label = QLabel("文本端点", tab)
+
+        owner.text_api_model_probe_button = QPushButton("检测文本模型", tab)
+        owner.text_api_model_probe_button.clicked.connect(owner._probe_text_api_models)
 
         owner.api_timeout_spin = _NoWheelSpinBox(tab)
         owner.api_timeout_spin.setRange(1, 600)
@@ -450,22 +482,167 @@ class ApiSettingsPage:
         form_layout = QFormLayout()
         form_layout.setContentsMargins(0, 0, 0, 0)
         form_layout.setSpacing(12)
-        form_layout.addRow("Base URL", owner.base_url_edit)
-        form_layout.addRow("API Key", owner.api_key_edit)
-        form_layout.addRow("模型", owner.model_edit)
+        form_layout.addRow(owner.vision_base_url_label, owner.base_url_edit)
+        form_layout.addRow(owner.vision_api_key_label, owner.api_key_edit)
+        form_layout.addRow(owner.model_field_label, owner.model_edit)
+        form_layout.addRow("", owner.model_split_enabled_check)
+        form_layout.addRow("", owner.dual_endpoint_enabled_check)
+        form_layout.addRow(owner.text_endpoint_label, owner.text_base_url_edit)
+        form_layout.addRow("文本 API Key", owner.text_api_key_edit)
+        text_model_row = QWidget(tab)
+        text_model_layout = QHBoxLayout(text_model_row)
+        text_model_layout.setContentsMargins(0, 0, 0, 0)
+        text_model_layout.setSpacing(8)
+        text_model_layout.addWidget(owner.text_model_edit, 1)
+        text_model_layout.addWidget(owner.text_api_model_probe_button)
+        form_layout.addRow(owner.text_model_label, text_model_row)
         form_layout.addRow("超时", owner.api_timeout_spin)
         form_layout.addRow("", api_actions)
         form_container = QWidget(tab)
         form_container.setLayout(form_layout)
 
+        split_hint = QLabel(
+            "视觉端点（智谱）：open.bigmodel.cn；文本端点（DeepSeek）必须填 "
+            "https://api.deepseek.com ，不要填 platform.deepseek.com 网页地址。"
+            "DeepSeek 若无模型列表接口，检测文本模型会提供内置候选。",
+            tab,
+        )
+        split_hint.setWordWrap(True)
+        split_hint.setObjectName("mutedHint")
+
+        def _sync_model_split_fields(enabled: bool | None = None) -> None:
+            split_on = (
+                bool(enabled)
+                if enabled is not None
+                else owner.model_split_enabled_check.isChecked()
+            )
+            dual_on = split_on and owner.dual_endpoint_enabled_check.isChecked()
+            owner.model_field_label.setText("视觉模型" if split_on else "模型")
+            owner.vision_base_url_label.setText("视觉 Base URL" if dual_on else "Base URL")
+            owner.vision_api_key_label.setText("视觉 API Key" if dual_on else "API Key")
+            owner.dual_endpoint_enabled_check.setVisible(split_on)
+            owner.text_model_label.setVisible(split_on)
+            owner.text_model_edit.setVisible(split_on)
+            owner.text_api_model_probe_button.setVisible(split_on and dual_on)
+            owner.text_endpoint_label.setVisible(dual_on)
+            owner.text_base_url_edit.setVisible(dual_on)
+            owner.text_api_key_edit.setVisible(dual_on)
+            split_hint.setVisible(split_on)
+
+        owner._sync_model_split_fields = _sync_model_split_fields
+        owner.model_split_enabled_check.toggled.connect(_sync_model_split_fields)
+        owner.dual_endpoint_enabled_check.toggled.connect(_sync_model_split_fields)
+        _sync_model_split_fields(settings.model_split_enabled)
+
         outer_layout = QVBoxLayout()
         outer_layout.setContentsMargins(16, 18, 16, 16)
         outer_layout.setSpacing(12)
         outer_layout.addWidget(form_container)
+        outer_layout.addWidget(split_hint)
         outer_layout.addWidget(self._build_advanced_llm_params_group(settings, tab))
+        outer_layout.addWidget(self._build_local_llm_group(local_settings, tab))
         outer_layout.addStretch(1)
         tab.setLayout(outer_layout)
         return tab
+
+    def _build_local_llm_group(self, settings: LocalLlmSettings, parent: QWidget) -> QGroupBox:
+        owner = self.dialog
+        group = QGroupBox("本地模型（Ollama · 实验性 / 未测试）", parent)
+        group.setObjectName("localLlmGroup")
+
+        owner.local_llm_enabled_check = QCheckBox("启用本地 OpenAI 兼容端点", group)
+        owner.local_llm_enabled_check.setChecked(settings.enabled)
+
+        owner.local_base_url_edit = QLineEdit(settings.base_url, group)
+        owner.local_base_url_edit.setPlaceholderText("http://127.0.0.1:11434/v1")
+
+        owner.local_api_key_edit = QLineEdit(settings.api_key, group)
+        owner.local_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        owner.local_api_key_edit.setPlaceholderText("Ollama 可填 ollama")
+
+        owner.local_text_model_edit = ModelComboBox(group)
+        owner.local_text_model_edit.setText(settings.text_model)
+        owner.local_text_model_edit.setPlaceholderText("qwen3:4b")
+
+        owner.local_vision_model_edit = ModelComboBox(group)
+        owner.local_vision_model_edit.setText(settings.vision_model)
+        owner.local_vision_model_edit.setPlaceholderText("qwen2.5vl:7b")
+
+        owner.local_timeout_spin = _NoWheelSpinBox(group)
+        owner.local_timeout_spin.setRange(5, 600)
+        owner.local_timeout_spin.setSuffix(" 秒")
+        owner.local_timeout_spin.setValue(settings.timeout_seconds)
+
+        owner.local_vision_route_combo = QComboBox(group)
+        for label, value in (
+            ("始终云端（推荐，默认）", "cloud"),
+            ("自动（当前未测试，等同云端）", "auto"),
+            ("始终本地（需自行验证显存）", "local"),
+        ):
+            owner.local_vision_route_combo.addItem(label, value)
+        route_index = owner.local_vision_route_combo.findData(settings.vision_route)
+        owner.local_vision_route_combo.setCurrentIndex(
+            route_index if route_index >= 0 else owner.local_vision_route_combo.findData("cloud")
+        )
+
+        owner.local_llm_test_button = QPushButton("测试本地端点", group)
+        owner.local_llm_test_button.clicked.connect(owner._test_local_llm_settings)
+        owner.local_llm_probe_button = QPushButton("检测本地模型", group)
+        owner.local_llm_probe_button.clicked.connect(owner._probe_local_llm_models)
+
+        local_actions = QWidget(group)
+        local_actions_layout = QHBoxLayout(local_actions)
+        local_actions_layout.setContentsMargins(0, 0, 0, 0)
+        local_actions_layout.setSpacing(8)
+        local_actions_layout.addWidget(owner.local_llm_probe_button)
+        local_actions_layout.addWidget(owner.local_llm_test_button)
+
+        local_hint = QLabel(
+            "预留接口：8G 显存等环境尚未验证，默认不启用、视觉任务走云端。"
+            "用户可见对话始终用上方云端模型；仅显式选「始终本地」才会尝试 Ollama。",
+            group,
+        )
+        local_hint.setWordWrap(True)
+        local_hint.setObjectName("localLlmHint")
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(12)
+        form.addRow(owner.local_llm_enabled_check)
+        form.addRow("本地 Base URL", owner.local_base_url_edit)
+        form.addRow("本地 API Key", owner.local_api_key_edit)
+        form.addRow("文本模型", owner.local_text_model_edit)
+        form.addRow("视觉模型", owner.local_vision_model_edit)
+        form.addRow("超时", owner.local_timeout_spin)
+        form.addRow("视觉任务路由", owner.local_vision_route_combo)
+        form.addRow("", local_actions)
+
+        body = QWidget(group)
+        body.setLayout(form)
+
+        group_layout = QVBoxLayout()
+        group_layout.setContentsMargins(12, 12, 12, 12)
+        group_layout.setSpacing(8)
+        group_layout.addWidget(local_hint)
+        group_layout.addWidget(body)
+        group.setLayout(group_layout)
+
+        def _sync_local_fields(enabled: bool) -> None:
+            for widget in (
+                owner.local_base_url_edit,
+                owner.local_api_key_edit,
+                owner.local_text_model_edit,
+                owner.local_vision_model_edit,
+                owner.local_timeout_spin,
+                owner.local_vision_route_combo,
+                owner.local_llm_test_button,
+                owner.local_llm_probe_button,
+            ):
+                widget.setEnabled(enabled)
+
+        _sync_local_fields(settings.enabled)
+        owner.local_llm_enabled_check.toggled.connect(_sync_local_fields)
+        return group
 
     def _build_advanced_llm_params_group(self, settings: ApiSettings, parent: QWidget) -> QGroupBox:
         owner = self.dialog
@@ -1098,22 +1275,59 @@ class MemorySettingsPage:
         tab.setObjectName("settingsNavPage")
         _ = memory_store
 
-        # 自动整理设置（需求3）：自动整理始终开启，这里只暴露触发频率（轮数）。
+        # 自动整理：静默触发 + 轮数护栏（聊完一段再整理，避免高频小碎调用）。
         from app.agent.memory_curator import MemoryCurationSettings
 
         curation_settings = (
             getattr(owner, "memory_curation_settings", None) or MemoryCurationSettings()
+        ).normalized()
+        owner.memory_idle_minutes_spin = _NoWheelSpinBox(tab)
+        owner.memory_idle_minutes_spin.setRange(3, 120)
+        owner.memory_idle_minutes_spin.setSuffix(" 分钟")
+        owner.memory_idle_minutes_spin.setValue(int(curation_settings.idle_minutes))
+        owner.memory_min_turns_spin = _NoWheelSpinBox(tab)
+        owner.memory_min_turns_spin.setRange(1, 20)
+        owner.memory_min_turns_spin.setSuffix(" 轮")
+        owner.memory_min_turns_spin.setValue(int(curation_settings.min_turns))
+        owner.memory_cooldown_minutes_spin = _NoWheelSpinBox(tab)
+        owner.memory_cooldown_minutes_spin.setRange(5, 240)
+        owner.memory_cooldown_minutes_spin.setSuffix(" 分钟")
+        owner.memory_cooldown_minutes_spin.setValue(int(curation_settings.cooldown_minutes))
+        owner.memory_long_idle_minutes_spin = _NoWheelSpinBox(tab)
+        owner.memory_long_idle_minutes_spin.setRange(5, 240)
+        owner.memory_long_idle_minutes_spin.setSuffix(" 分钟")
+        owner.memory_long_idle_minutes_spin.setValue(int(curation_settings.long_idle_minutes))
+        owner.memory_catch_up_turns_spin = _NoWheelSpinBox(tab)
+        owner.memory_catch_up_turns_spin.setRange(2, 50)
+        owner.memory_catch_up_turns_spin.setSuffix(" 轮")
+        owner.memory_catch_up_turns_spin.setValue(int(curation_settings.catch_up_turns))
+        curation_hint = QLabel(
+            "聊完静默一段时间后整理；至少攒够最少轮数，或长空闲/大量积压时才触发。"
+            "整理有冷却，避免每隔十几分钟发一条就反复调用。",
+            tab,
         )
-        owner.memory_trigger_turns_spin = _NoWheelSpinBox(tab)
-        owner.memory_trigger_turns_spin.setRange(1, 50)
-        owner.memory_trigger_turns_spin.setSuffix(" 轮对话")
-        owner.memory_trigger_turns_spin.setValue(int(curation_settings.trigger_turns))
+        curation_hint.setWordWrap(True)
         curation_form = QFormLayout()
         curation_form.setContentsMargins(16, 12, 16, 12)
         curation_form.setSpacing(12)
-        curation_form.addRow("自动整理频率", owner.memory_trigger_turns_spin)
-        owner.memory_curation_group = QGroupBox("自动整理", tab)
-        owner.memory_curation_group.setLayout(curation_form)
+        curation_form.addRow("静默触发", owner.memory_idle_minutes_spin)
+        curation_form.addRow("最少轮数", owner.memory_min_turns_spin)
+        curation_form.addRow("整理冷却", owner.memory_cooldown_minutes_spin)
+        curation_form.addRow("长空闲兜底", owner.memory_long_idle_minutes_spin)
+        curation_form.addRow("积压追赶", owner.memory_catch_up_turns_spin)
+        owner.memory_curation_group = QGroupBox("自动整理（展开后配置）", tab)
+        owner.memory_curation_group.setCheckable(True)
+        owner.memory_curation_group.setChecked(False)
+        group_layout = QVBoxLayout(owner.memory_curation_group)
+        owner.memory_curation_body = QWidget(owner.memory_curation_group)
+        curation_body_layout = QVBoxLayout(owner.memory_curation_body)
+        curation_body_layout.setContentsMargins(0, 0, 0, 0)
+        curation_body_layout.setSpacing(8)
+        curation_body_layout.addWidget(curation_hint)
+        curation_body_layout.addLayout(curation_form)
+        group_layout.addWidget(owner.memory_curation_body)
+        owner.memory_curation_body.setVisible(False)
+        owner.memory_curation_group.toggled.connect(owner.memory_curation_body.setVisible)
 
         owner.memory_search_edit = QLineEdit(tab)
         owner.memory_search_edit.setPlaceholderText("搜索记忆内容或 ID")
@@ -1155,6 +1369,7 @@ class MemorySettingsPage:
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         owner.memory_table.setColumnWidth(0, 56)
+        owner.memory_table.setMinimumHeight(200)
         owner.memory_select_all_check = QCheckBox(header)
         owner.memory_select_all_check.setToolTip("全选当前结果")
         owner.memory_select_all_check.stateChanged.connect(
@@ -1279,6 +1494,7 @@ class MemorySettingsPage:
         owner.memory_list_splitter.addWidget(owner.memory_editor_pane)
         owner.memory_list_splitter.setStretchFactor(0, 1)
         owner.memory_list_splitter.setStretchFactor(1, 0)
+        owner.memory_list_splitter.setMinimumHeight(280)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(16, 18, 16, 16)
@@ -1288,6 +1504,7 @@ class MemorySettingsPage:
         layout.addLayout(status_layout)
         layout.addWidget(owner.memory_list_splitter, 1)
         tab.setLayout(layout)
+        tab.setMinimumHeight(520)
 
         owner.memory_status_label.setText("打开记忆页时读取长期记忆。")
         owner._show_memory_placeholder("切换到记忆页后读取长期记忆。")

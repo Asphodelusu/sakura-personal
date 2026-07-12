@@ -23,6 +23,14 @@ from loguru import logger
 from app.perception.privacy import PrivacyGuard
 from app.perception.screen_capture import ScreenCapture
 from app.perception.win32 import get_active_window_title, get_idle_seconds
+from app.core.debug_log import debug_log
+
+
+def _observer_gui_log(message: str, data: Any | None = None) -> None:
+    try:
+        debug_log("ProactiveObserver", message, data)
+    except Exception:
+        pass
 
 @dataclass(frozen=True)
 class ProactiveSpeakPayload:
@@ -180,6 +188,14 @@ class ProactiveObserver:
             self.config.cooldown_seconds,
             self.config.idle_threshold_seconds,
         )
+        _observer_gui_log(
+            "主动观察已启动",
+            {
+                "timer_seconds": self.config.timer_seconds,
+                "cooldown_seconds": self.config.cooldown_seconds,
+                "idle_threshold_seconds": self.config.idle_threshold_seconds,
+            },
+        )
 
     def stop(self) -> None:
         self._running = False
@@ -194,6 +210,7 @@ class ProactiveObserver:
             self._http = None
         self._loop = None
         logger.info("ProactiveObserver: stopped")
+        _observer_gui_log("主动观察已停止")
 
     def _thread_main(self) -> None:
         """Run the asyncio loop in a dedicated daemon thread."""
@@ -203,6 +220,7 @@ class ProactiveObserver:
             self._loop.run_until_complete(self._run())
         except Exception:
             logger.exception("ProactiveObserver: thread crashed")
+            _observer_gui_log("主动观察线程异常退出")
         finally:
             self._loop.close()
             self._loop = None
@@ -230,9 +248,11 @@ class ProactiveObserver:
                         logger.debug("ProactiveObserver: UI busy, skipping")
                         continue
                     logger.info("ProactiveObserver: evaluating, triggers={}", triggers)
+                    _observer_gui_log("正在评估是否发言", {"triggers": triggers})
                     await self._do_evaluation(triggers)
                 except Exception as e:
                     logger.warning("ProactiveObserver loop error: {}", e)
+                    _observer_gui_log("主动观察循环异常", {"error": str(e)})
         finally:
             if self._http:
                 await self._http.aclose()
@@ -278,6 +298,7 @@ class ProactiveObserver:
         blocked, matched = self.privacy.check_active_window()
         if blocked:
             logger.info("ProactiveObserver: privacy block ({})", matched)
+            _observer_gui_log("隐私拦截", {"matched": matched})
             return
 
         # Capture screen
@@ -285,6 +306,7 @@ class ProactiveObserver:
             obs = self.capture.grab()
         except Exception as e:
             logger.warning("ProactiveObserver: screen capture failed: {}", e)
+            _observer_gui_log("截图失败", {"error": str(e)})
             return
 
         # Build context
@@ -324,6 +346,7 @@ class ProactiveObserver:
             response = await self._chat_completion(messages)
         except Exception as e:
             logger.warning("ProactiveObserver: VLM call failed: {}", e)
+            _observer_gui_log("VLM 调用失败", {"error": str(e)})
             # 代理切换等会破坏 httpcore 连接池，重建一次
             try:
                 old = self._http
@@ -361,6 +384,7 @@ class ProactiveObserver:
             self.on_speak(payload)
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
+            _observer_gui_log("主动发言回调失败", {"error": str(e)})
 
     def _build_full_system_prompt(self) -> str:
         parts = []

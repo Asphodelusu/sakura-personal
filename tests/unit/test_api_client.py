@@ -12,6 +12,11 @@ from app.llm.api_client import (
     _build_chat_completion_payload,
     _filter_supported_chat_params,
     _is_temperature_unsupported_error,
+    resolve_chat_model,
+    api_settings_for_text,
+    api_settings_for_vision,
+    api_settings_uses_dual_endpoint,
+    normalize_provider_base_url,
 )
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply, sanitize_reply_tones
 
@@ -835,6 +840,64 @@ def test_parse_chat_reply_replaces_chinese_ja_with_safe_japanese() -> None:
     assert "原因是" not in reply.segments[0].text
     assert reply.segments[0].translation == "原因是 Mermaid 语法。"
     assert reply.segments[0].suppress_tts is True
+
+
+def test_resolve_chat_model_uses_text_model_when_split_enabled_without_images() -> None:
+    settings = ApiSettings(
+        base_url="https://api.example.com/v1",
+        api_key="key",
+        model="glm-5v-turbo",
+        text_model="glm-4.6",
+        model_split_enabled=True,
+    )
+    messages = [{"role": "user", "content": "你好"}]
+
+    assert resolve_chat_model(settings, messages) == "glm-4.6"
+
+
+def test_resolve_chat_model_uses_vision_model_when_messages_contain_image() -> None:
+    settings = ApiSettings(
+        base_url="https://api.example.com/v1",
+        api_key="key",
+        model="glm-5v-turbo",
+        text_model="glm-4.6",
+        model_split_enabled=True,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看看屏幕"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+
+    assert resolve_chat_model(settings, messages) == "glm-5v-turbo"
+
+
+def test_normalize_provider_base_url_fixes_deepseek_platform() -> None:
+    assert normalize_provider_base_url("https://platform.deepseek.com") == "https://api.deepseek.com"
+
+
+def test_api_settings_uses_dual_endpoint_requires_text_credentials() -> None:
+    base = ApiSettings(
+        base_url="https://open.bigmodel.cn/api/paas/v4",
+        api_key="zhipu-key",
+        model="glm-5v-turbo",
+        text_model="deepseek-v4-flash",
+        model_split_enabled=True,
+        dual_endpoint_enabled=True,
+        text_base_url="https://api.deepseek.com",
+        text_api_key="ds-key",
+    )
+    assert api_settings_uses_dual_endpoint(base) is True
+    text_settings = api_settings_for_text(base)
+    assert text_settings.base_url == "https://api.deepseek.com"
+    assert text_settings.model == "deepseek-v4-flash"
+    vision_settings = api_settings_for_vision(base)
+    assert vision_settings.model == "glm-5v-turbo"
+    assert vision_settings.base_url == base.base_url
 
 
 def test_parse_chat_reply_suppresses_tts_for_safe_parse_failure() -> None:

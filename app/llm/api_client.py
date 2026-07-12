@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
@@ -47,12 +47,115 @@ class ApiSettings:
     api_key: str
     model: str
     timeout_seconds: int = 60
+    # 图文分流：model 为视觉/默认模型；启用且填写 text_model 时，无图请求走 text_model。
+    text_model: str = ""
+    model_split_enabled: bool = False
+    # 双端点：文本与视觉使用不同的 base_url / api_key（如 DeepSeek 文本 + 智谱视觉）。
+    dual_endpoint_enabled: bool = False
+    text_base_url: str = ""
+    text_api_key: str = ""
     # 角色对话生成参数；None 表示沿用内置默认/不发送该参数，保持历史行为。
     temperature: float | None = None  # None → 角色对话用内置默认 0.8
     top_p: float | None = None  # None → 不发送 top_p
     max_tokens: int | None = None  # None → 不发送 max_tokens（不截断输出）
     frequency_penalty: float | None = None  # None → 不发送，建议 0.3-0.5 防复读
     presence_penalty: float | None = None  # None → 不发送，建议 0.2-0.4 增加多样性
+
+
+DEFAULT_TEXT_PROVIDER_BASE_URL = "https://api.deepseek.com"
+
+
+def normalize_provider_base_url(base_url: str) -> str:
+    """修正常见填错的提供商地址（如 DeepSeek 开放平台网页）。"""
+    normalized = base_url.strip().rstrip("/")
+    lowered = normalized.lower()
+    if "platform.deepseek.com" in lowered or lowered in {
+        "https://www.deepseek.com",
+        "http://www.deepseek.com",
+        "https://deepseek.com",
+        "http://deepseek.com",
+    }:
+        return DEFAULT_TEXT_PROVIDER_BASE_URL
+    return normalized
+
+
+def _looks_like_html_response(body: str) -> bool:
+    stripped = body.lstrip()
+    return stripped.startswith("<!") or stripped.lower().startswith("<html")
+
+
+def _truncate_diagnostic(body: str, limit: int = 280) -> str:
+    text = " ".join(body.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _friendly_non_json_api_error(base_url: str, body: str) -> str:
+    if _looks_like_html_response(body):
+        if "platform.deepseek.com" in body.lower() or "platform.deepseek.com" in base_url.lower():
+            return (
+                "文本 Base URL 填成了 DeepSeek 开放平台网页地址。"
+                "请改为 https://api.deepseek.com（不是 platform.deepseek.com）。"
+            )
+        if "request blocked" in body.lower():
+            return (
+                "请求被拦截（Request Blocked）。请确认 Base URL 为 API 地址"
+                "（DeepSeek：https://api.deepseek.com），并检查代理/防火墙。"
+            )
+        return (
+            "API 返回了网页 HTML 而非 JSON，请确认 Base URL 指向 API 端点。"
+            "DeepSeek 应填 https://api.deepseek.com 。"
+        )
+    return f"API 返回格式无法解析：{_truncate_diagnostic(body)}"
+
+
+def api_settings_uses_dual_endpoint(settings: ApiSettings) -> bool:
+    return (
+        settings.model_split_enabled
+        and settings.dual_endpoint_enabled
+        and bool(settings.text_model.strip())
+        and bool(settings.text_base_url.strip())
+        and bool(settings.text_api_key.strip())
+    )
+
+
+def api_settings_for_vision(settings: ApiSettings) -> ApiSettings:
+    """单端点分流或双端点模式下的视觉侧配置。"""
+    return replace(
+        settings,
+        model=settings.model.strip(),
+        text_model="",
+        model_split_enabled=False,
+        dual_endpoint_enabled=False,
+        text_base_url="",
+        text_api_key="",
+    )
+
+
+def api_settings_for_text(settings: ApiSettings) -> ApiSettings:
+    """单端点分流或双端点模式下的文本侧配置。"""
+    if api_settings_uses_dual_endpoint(settings):
+        return replace(
+            settings,
+            base_url=normalize_provider_base_url(settings.text_base_url).strip().rstrip("/"),
+            api_key=settings.text_api_key.strip(),
+            model=settings.text_model.strip(),
+            text_model="",
+            model_split_enabled=False,
+            dual_endpoint_enabled=False,
+            text_base_url="",
+            text_api_key="",
+        )
+    return replace(
+        settings,
+        model=settings.text_model.strip() or settings.model.strip(),
+        text_model="",
+        model_split_enabled=False,
+        dual_endpoint_enabled=False,
+        text_base_url="",
+        text_api_key="",
+    )
 
 
 @dataclass(frozen=True)
@@ -147,14 +250,26 @@ class OpenAICompatibleClient:
             extra["presence_penalty"] = self.settings.presence_penalty
         return temperature, extra
 
+    def resolve_vision_api_settings(self) -> ApiSettings:
+        """返回视觉任务用的 API 配置（图文分流时 model 即为视觉模型）。"""
+        return replace(self.settings, model=self.settings.model.strip())
+
+    def _resolve_request_model(self, messages: list[ChatMessage]) -> str:
+        return resolve_chat_model(self.settings, messages)
+
     def test_connection(self) -> str:
         """发送一次最小聊天请求，验证 Base URL、API Key 和模型是否可用。"""
         self._ensure_chat_config("缺少 API_KEY。请在设置中填写 API Key。")
 
         # 连通性检测只需验证 Base URL / API Key / 模型可用，不发送 temperature：
         # 部分模型（如 o1/o3/gpt-5 等推理模型）只接受默认温度，显式传值会直接报错。
+        probe_model = (
+            self.settings.text_model.strip()
+            if self.settings.model_split_enabled and self.settings.text_model.strip()
+            else self.settings.model
+        )
         payload = {
-            "model": self.settings.model,
+            "model": probe_model,
             "messages": [
                 {
                     "role": "user",
@@ -168,28 +283,32 @@ class OpenAICompatibleClient:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
+            raise ApiRequestError(
+                f"API 返回格式无法解析：{_truncate_diagnostic(json.dumps(data, ensure_ascii=False))}"
+            ) from exc
 
         return str(content).strip() or "OK"
 
     def list_models(self) -> list[str]:
         """读取 OpenAI 兼容 /models 接口，返回可选择的模型 id 列表。"""
         self._ensure_model_list_config()
+        base_url = normalize_provider_base_url(self.settings.base_url)
         debug_log(
             "API",
             "准备检测模型列表",
             {
-                "base_url": _normalize_openai_base_url(self.settings.base_url),
+                "base_url": _normalize_openai_base_url(base_url),
                 "configured_base_url": self.settings.base_url,
                 "timeout_seconds": self.settings.timeout_seconds,
             },
         )
         response_body = self._send_http_with_retries("GET", "/models")
-
+        if _looks_like_html_response(response_body):
+            raise ApiRequestError(_friendly_non_json_api_error(base_url, response_body))
         try:
             data: dict[str, Any] = json.loads(response_body)
         except json.JSONDecodeError as exc:
-            raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
+            raise ApiRequestError(_friendly_non_json_api_error(base_url, response_body)) from exc
 
         return _parse_model_ids(data)
 
@@ -282,8 +401,9 @@ class OpenAICompatibleClient:
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
         runtime_context_role = self._runtime_context_role
+        request_model = self._resolve_request_model(messages)
         payload = _build_chat_completion_payload(
-            model=self.settings.model,
+            model=request_model,
             system_prompt=system_prompt,
             messages=_messages_with_runtime_context(
                 messages, runtime_context, runtime_context_role
@@ -297,7 +417,8 @@ class OpenAICompatibleClient:
             {
                 "base_url": _normalize_openai_base_url(self.settings.base_url),
                 "configured_base_url": self.settings.base_url,
-                "model": self.settings.model,
+                "model": request_model,
+                "model_split_enabled": self.settings.model_split_enabled,
                 "timeout_seconds": self.settings.timeout_seconds,
                 "temperature": temperature,
                 "message_count": len(payload["messages"]),
@@ -319,7 +440,7 @@ class OpenAICompatibleClient:
             ):
                 self._runtime_context_role = "user"
                 payload = _build_chat_completion_payload(
-                    model=self.settings.model,
+                    model=request_model,
                     system_prompt=system_prompt,
                     messages=_messages_with_runtime_context(messages, runtime_context, "user"),
                     temperature=temperature,
@@ -361,8 +482,9 @@ class OpenAICompatibleClient:
         """流式聊天补全，逐块 yield 文本内容。调用方累积后自行解析。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
+        request_model = self._resolve_request_model(messages)
         payload = _build_chat_completion_payload(
-            model=self.settings.model,
+            model=request_model,
             system_prompt=system_prompt,
             messages=_messages_with_runtime_context(
                 messages, runtime_context, self._runtime_context_role
@@ -375,7 +497,8 @@ class OpenAICompatibleClient:
             "准备发送流式聊天补全请求",
             {
                 "base_url": _normalize_openai_base_url(self.settings.base_url),
-                "model": self.settings.model,
+                "model": request_model,
+                "model_split_enabled": self.settings.model_split_enabled,
                 "temperature": temperature,
                 "message_count": len(payload["messages"]),
             },
@@ -466,8 +589,9 @@ class OpenAICompatibleClient:
         request_messages = _messages_with_runtime_context(
             messages, runtime_context, runtime_context_role
         )
+        request_model = self._resolve_request_model(request_messages)
         payload = _build_chat_completion_payload(
-            model=self.settings.model,
+            model=request_model,
             system_prompt=system_prompt,
             messages=request_messages,
             temperature=temperature,
@@ -479,7 +603,8 @@ class OpenAICompatibleClient:
             {
                 "base_url": _normalize_openai_base_url(self.settings.base_url),
                 "configured_base_url": self.settings.base_url,
-                "model": self.settings.model,
+                "model": request_model,
+                "model_split_enabled": self.settings.model_split_enabled,
                 "timeout_seconds": self.settings.timeout_seconds,
                 "temperature": temperature,
                 "message_count": len(payload["messages"]),
@@ -503,7 +628,7 @@ class OpenAICompatibleClient:
                 self._runtime_context_role = "user"
                 runtime_context_role = "user"
                 payload = _build_chat_completion_payload(
-                    model=self.settings.model,
+                    model=request_model,
                     system_prompt=system_prompt,
                     messages=_messages_with_runtime_context(messages, runtime_context, "user"),
                     temperature=temperature,
@@ -638,7 +763,9 @@ class OpenAICompatibleClient:
             try:
                 data: dict[str, Any] = json.loads(response_body)
             except json.JSONDecodeError as exc:
-                raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
+                raise ApiRequestError(
+                    _friendly_non_json_api_error(self.settings.base_url, response_body)
+                ) from exc
         except Exception as exc:  # noqa: BLE001 — 仅用于派发失败事件，随后原样抛出
             self._emit_llm_event(
                 "llm.request.failed",
@@ -1146,6 +1273,19 @@ def _normalize_assistant_message(
                 for call in tool_calls
             ]
     return message
+
+
+def resolve_chat_model(settings: ApiSettings, messages: list[ChatMessage]) -> str:
+    """按消息是否含图选择模型；未启用分流时始终用 settings.model。"""
+    primary = settings.model.strip()
+    if not settings.model_split_enabled:
+        return primary
+    text_model = settings.text_model.strip()
+    if not text_model:
+        return primary
+    if messages_contain_image(messages):
+        return primary
+    return text_model
 
 
 def messages_contain_image(messages: list[ChatMessage]) -> bool:

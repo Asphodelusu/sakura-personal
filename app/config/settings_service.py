@@ -8,7 +8,8 @@ from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_set
 from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, normalize_provider_base_url
+from app.llm.local_client import LocalLlmSettings
 from app.storage.paths import StoragePaths
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
 from app.agent.screen_awareness import (
@@ -160,6 +161,11 @@ class AppSettingsService:
             api_key=str(data.get("api_key", "")).strip(),
             model=str(data.get("model", "gpt-4.1-mini")).strip(),
             timeout_seconds=timeout_seconds,
+            text_model=str(data.get("text_model", "")).strip(),
+            model_split_enabled=_bool_value(data.get("model_split_enabled"), False),
+            dual_endpoint_enabled=_bool_value(data.get("dual_endpoint_enabled"), False),
+            text_base_url=normalize_provider_base_url(str(data.get("text_base_url", "")).strip()),
+            text_api_key=str(data.get("text_api_key", "")).strip(),
             temperature=_optional_float(data.get("temperature"), minimum=0.0, maximum=2.0),
             top_p=_optional_float(data.get("top_p"), minimum=0.0, maximum=1.0),
             max_tokens=_optional_positive_int(data.get("max_tokens")),
@@ -175,6 +181,16 @@ class AppSettingsService:
             "model": settings.model.strip(),
             "timeout_seconds": int(settings.timeout_seconds),
         }
+        if settings.model_split_enabled:
+            llm_data["model_split_enabled"] = True
+        if settings.dual_endpoint_enabled:
+            llm_data["dual_endpoint_enabled"] = True
+        if settings.text_model.strip():
+            llm_data["text_model"] = settings.text_model.strip()
+        if settings.text_base_url.strip():
+            llm_data["text_base_url"] = settings.text_base_url.strip()
+        if settings.text_api_key.strip():
+            llm_data["text_api_key"] = settings.text_api_key.strip()
         # 仅写入用户显式配置的高级参数，避免给老配置塞入空键、改变默认行为。
         if settings.temperature is not None:
             llm_data["temperature"] = float(settings.temperature)
@@ -187,6 +203,37 @@ class AppSettingsService:
         if settings.presence_penalty is not None:
             llm_data["presence_penalty"] = float(settings.presence_penalty)
         data["llm"] = llm_data
+        save_yaml_mapping(self.api_config_path, data)
+
+    def load_local_llm_settings(self) -> LocalLlmSettings:
+        data = self._api_section("local_llm")
+        vision_route = str(data.get("vision_route", "cloud")).strip().lower()
+        background_route = str(data.get("background_route", "cloud")).strip().lower()
+        return LocalLlmSettings(
+            enabled=_bool_value(data.get("enabled"), False),
+            base_url=str(data.get("base_url", "")).strip(),
+            api_key=str(data.get("api_key", "")).strip(),
+            text_model=str(data.get("text_model", "")).strip(),
+            vision_model=str(data.get("vision_model", "")).strip(),
+            timeout_seconds=_int_value(data.get("timeout_seconds"), 120),
+            vision_route=vision_route if vision_route in {"cloud", "local", "auto"} else "cloud",
+            background_route=background_route if background_route in {"cloud", "local", "auto"} else "cloud",
+        ).normalized()
+
+    def save_local_llm_settings(self, settings: LocalLlmSettings) -> None:
+        normalized = settings.normalized()
+        data = load_yaml_mapping(self.api_config_path)
+        local_data: dict[str, Any] = {
+            "enabled": normalized.enabled,
+            "base_url": normalized.base_url,
+            "api_key": normalized.api_key,
+            "text_model": normalized.text_model,
+            "vision_model": normalized.vision_model,
+            "timeout_seconds": normalized.timeout_seconds,
+            "vision_route": normalized.vision_route,
+            "background_route": normalized.background_route,
+        }
+        data["local_llm"] = local_data
         save_yaml_mapping(self.api_config_path, data)
 
     def load_tts_settings(
@@ -508,23 +555,49 @@ class AppSettingsService:
 
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
-
-        memory = self._system_section("memory_curation")
-        return MemoryCurationSettings(
-            enabled=_bool_value(memory.get("enabled"), True),
-            trigger_turns=_int_value(memory.get("trigger_turns"), 8),
-            backfill_limit=_int_value(memory.get("backfill_limit"), 200),
+        from app.config.defaults import (
+            DEFAULT_MEMORY_CURATION_CATCH_UP_TURNS,
+            DEFAULT_MEMORY_CURATION_COOLDOWN_MINUTES,
+            DEFAULT_MEMORY_CURATION_IDLE_MINUTES,
+            DEFAULT_MEMORY_CURATION_LONG_IDLE_MINUTES,
+            DEFAULT_MEMORY_CURATION_MIN_TURNS,
+            DEFAULT_MEMORY_CURATION_TRIGGER_TURNS,
         )
 
+        memory = self._system_section("memory_curation")
+        legacy_trigger = _int_value(memory.get("trigger_turns"), DEFAULT_MEMORY_CURATION_TRIGGER_TURNS)
+        catch_up_turns = memory.get("catch_up_turns")
+        if catch_up_turns is None:
+            catch_up_turns = legacy_trigger
+        return MemoryCurationSettings(
+            enabled=_bool_value(memory.get("enabled"), True),
+            backfill_limit=_int_value(memory.get("backfill_limit"), 200),
+            idle_minutes=_int_value(memory.get("idle_minutes"), DEFAULT_MEMORY_CURATION_IDLE_MINUTES),
+            min_turns=_int_value(memory.get("min_turns"), DEFAULT_MEMORY_CURATION_MIN_TURNS),
+            cooldown_minutes=_int_value(
+                memory.get("cooldown_minutes"),
+                DEFAULT_MEMORY_CURATION_COOLDOWN_MINUTES,
+            ),
+            long_idle_minutes=_int_value(
+                memory.get("long_idle_minutes"),
+                DEFAULT_MEMORY_CURATION_LONG_IDLE_MINUTES,
+            ),
+            catch_up_turns=_int_value(catch_up_turns, DEFAULT_MEMORY_CURATION_CATCH_UP_TURNS),
+            trigger_turns=legacy_trigger,
+        ).normalized()
+
     def save_memory_curation_settings(self, settings) -> None:
-        # 仅写入 memory_curation section 的三个字段；backfill_limit 不在 UI 暴露，
-        # 但持久化时一并保留，避免被默认值覆盖。
+        normalized = settings.normalized()
         self.save_system_values(
             "memory_curation",
             {
-                "enabled": bool(settings.enabled),
-                "trigger_turns": int(settings.trigger_turns),
-                "backfill_limit": int(settings.backfill_limit),
+                "enabled": bool(normalized.enabled),
+                "backfill_limit": int(normalized.backfill_limit),
+                "idle_minutes": int(normalized.idle_minutes),
+                "min_turns": int(normalized.min_turns),
+                "cooldown_minutes": int(normalized.cooldown_minutes),
+                "long_idle_minutes": int(normalized.long_idle_minutes),
+                "catch_up_turns": int(normalized.catch_up_turns),
             },
         )
 

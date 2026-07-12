@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from app.core.debug_log import debug_log
+from app.backchannel.models import EMOTIONS
 from app.agent.memory import (
     DEFAULT_MEMORY_CONFIDENCE,
     DEFAULT_MEMORY_IMPORTANCE,
@@ -16,13 +17,20 @@ from app.agent.memory import (
     MemoryStore,
     looks_like_sensitive_memory,
 )
+from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
+from app.core.debug_log import debug_log
 from app.storage.atomic import atomic_write_text
 from app.storage.chat_history import ChatHistoryEntry
 
 
 DEFAULT_AUTO_MEMORY_TRIGGER_TURNS = 8
 DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT = 200
+DEFAULT_AUTO_MEMORY_IDLE_MINUTES = 12
+DEFAULT_AUTO_MEMORY_MIN_TURNS = 2
+DEFAULT_AUTO_MEMORY_COOLDOWN_MINUTES = 25
+DEFAULT_AUTO_MEMORY_LONG_IDLE_MINUTES = 30
+DEFAULT_AUTO_MEMORY_CATCH_UP_TURNS = 12
 MAX_CURATION_CHUNK_MESSAGES = 32
 MAX_CURATION_CHUNK_CHARS = 12000
 # 整理时一次性注入给模型的现有记忆条数上限，远大于日常摘要，便于全量对照去重纠错。
@@ -40,8 +48,75 @@ MAX_CURATION_OPERATIONS_PER_LAYER = 20
 @dataclass(frozen=True)
 class MemoryCurationSettings:
     enabled: bool = True
-    trigger_turns: int = DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
     backfill_limit: int = DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT
+    idle_minutes: int = DEFAULT_AUTO_MEMORY_IDLE_MINUTES
+    min_turns: int = DEFAULT_AUTO_MEMORY_MIN_TURNS
+    cooldown_minutes: int = DEFAULT_AUTO_MEMORY_COOLDOWN_MINUTES
+    long_idle_minutes: int = DEFAULT_AUTO_MEMORY_LONG_IDLE_MINUTES
+    catch_up_turns: int = DEFAULT_AUTO_MEMORY_CATCH_UP_TURNS
+    # 旧版「每 N 轮」字段，仅用于 YAML 迁移为 catch_up_turns。
+    trigger_turns: int = DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
+
+    def normalized(self) -> MemoryCurationSettings:
+        idle_minutes = max(3, min(120, int(self.idle_minutes)))
+        min_turns = max(1, min(20, int(self.min_turns)))
+        cooldown_minutes = max(5, min(240, int(self.cooldown_minutes)))
+        long_idle_minutes = max(idle_minutes, min(240, int(self.long_idle_minutes)))
+        catch_up_turns = max(min_turns, min(50, int(self.catch_up_turns)))
+        backfill_limit = max(1, min(500, int(self.backfill_limit)))
+        return MemoryCurationSettings(
+            enabled=bool(self.enabled),
+            backfill_limit=backfill_limit,
+            idle_minutes=idle_minutes,
+            min_turns=min_turns,
+            cooldown_minutes=cooldown_minutes,
+            long_idle_minutes=long_idle_minutes,
+            catch_up_turns=catch_up_turns,
+            trigger_turns=int(self.trigger_turns),
+        )
+
+
+def evaluate_idle_curation_trigger(
+    settings: MemoryCurationSettings,
+    *,
+    silence_seconds: float,
+    pending_turns: int,
+    seconds_since_last_curation: float | None,
+    has_unprocessed_entries: bool,
+) -> bool:
+    """混合静默触发：静默 + 最少轮数/长空闲 + 整理冷却（追赶轮数可跳过冷却）。"""
+    normalized = settings.normalized()
+    if not normalized.enabled:
+        return False
+    if not has_unprocessed_entries or pending_turns < 1:
+        return False
+
+    idle_seconds = normalized.idle_minutes * 60
+    if silence_seconds + 1e-6 < idle_seconds:
+        return False
+
+    long_idle_ok = silence_seconds + 1e-6 >= normalized.long_idle_minutes * 60
+    turns_ok = pending_turns >= normalized.min_turns
+    catch_up = pending_turns >= normalized.catch_up_turns
+    if not (turns_ok or long_idle_ok or catch_up):
+        return False
+
+    if not catch_up and seconds_since_last_curation is not None:
+        if seconds_since_last_curation + 1e-6 < normalized.cooldown_minutes * 60:
+            return False
+    return True
+
+
+def seconds_since_iso_timestamp(value: str | None) -> float | None:
+    if not value or not str(value).strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
 
 
 @dataclass(frozen=True)
@@ -80,6 +155,9 @@ class MemoryCurationState:
     def pending_turns(self) -> int:
         return int(self.snapshot()["pending_turns"])
 
+    def last_curation_at(self) -> str:
+        return str(self.snapshot().get("last_curation_at") or "").strip()
+
     def increment_pending_turns(self) -> int:
         state = self.snapshot()
         state["pending_turns"] = int(state["pending_turns"]) + 1
@@ -96,6 +174,7 @@ class MemoryCurationState:
         state = self.snapshot()
         state["processed_history_count"] = max(0, processed_history_count)
         state["pending_turns"] = max(0, int(state["pending_turns"]) - max(0, consumed_turns))
+        state["last_curation_at"] = datetime.now().astimezone().isoformat()
         if backfill_completed is not None:
             state["backfill_completed"] = bool(backfill_completed)
         self._save(state)
@@ -297,6 +376,7 @@ class MemoryCurator:
         archived = 0
         ignored = 0
         event_counts: dict[str, int] = {}
+        superseded = 0
         for operation in operations[:MAX_CURATION_OPERATIONS]:
             if not isinstance(operation, dict):
                 ignored += 1
@@ -344,8 +424,9 @@ class MemoryCurator:
                             continue
                         matched_id = str(matched.get("id") or "").strip()
                         if matched_id in existing_ids:
-                            self.memory_store.update_memory(
-                                {
+                            merge_payload = _curation_memory_payload(
+                                operation,
+                                base={
                                     "id": matched_id,
                                     "content": content,
                                     "layer": layer,
@@ -354,6 +435,9 @@ class MemoryCurator:
                                     "confidence": confidence,
                                     "source": "self_curation",
                                 },
+                            )
+                            self.memory_store.update_memory(
+                                merge_payload,
                                 allow_sensitive=True,
                             )
                             matched["content"] = content
@@ -362,9 +446,16 @@ class MemoryCurator:
                             updated += 1
                             operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                             event_counts["MERGE_UPDATE"] = event_counts.get("MERGE_UPDATE", 0) + 1
+                            superseded += _expire_superseded_volatile(
+                                self.memory_store,
+                                existing,
+                                operation,
+                                exclude_ids={matched_id},
+                            )
                             continue
-                    self.memory_store.create_memory(
-                        {
+                    create_payload = _curation_memory_payload(
+                        operation,
+                        base={
                             "content": content,
                             "layer": layer,
                             "category": category,
@@ -372,11 +463,20 @@ class MemoryCurator:
                             "confidence": confidence,
                             "source": "self_curation",
                         },
+                    )
+                    self.memory_store.create_memory(
+                        create_payload,
                         allow_sensitive=True,
                     )
                     created += 1
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["ADD"] = event_counts.get("ADD", 0) + 1
+                    superseded += _expire_superseded_volatile(
+                        self.memory_store,
+                        existing,
+                        operation,
+                        exclude_ids=set(),
+                    )
                 elif action == "update":
                     if memory_id not in existing_ids or not content:
                         debug_log(
@@ -387,20 +487,29 @@ class MemoryCurator:
                         ignored += 1
                         continue
                     self.memory_store.update_memory(
-                        {
-                            "id": memory_id,
-                            "content": content,
-                            "layer": layer,
-                            "category": category,
-                            "importance": importance,
-                            "confidence": confidence,
-                            "source": "self_curation",
-                        },
+                        _curation_memory_payload(
+                            operation,
+                            base={
+                                "id": memory_id,
+                                "content": content,
+                                "layer": layer,
+                                "category": category,
+                                "importance": importance,
+                                "confidence": confidence,
+                                "source": "self_curation",
+                            },
+                        ),
                         allow_sensitive=True,
                     )
                     updated += 1
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["UPDATE"] = event_counts.get("UPDATE", 0) + 1
+                    superseded += _expire_superseded_volatile(
+                        self.memory_store,
+                        existing,
+                        operation,
+                        exclude_ids={memory_id},
+                    )
                 elif action == "delete":
                     if memory_id not in existing_ids:
                         debug_log("Memory", "跳过无效的记忆删除操作", {"id": memory_id})
@@ -435,6 +544,8 @@ class MemoryCurator:
                 )
                 ignored += 1
                 continue
+        if superseded:
+            event_counts["SUPERSEDE_VOLATILE"] = event_counts.get("SUPERSEDE_VOLATILE", 0) + superseded
         return {
             "created": created,
             "updated": updated,
@@ -521,6 +632,8 @@ _SELF_CURATION_TASK_PROMPT = (
     "只保留对长期陪伴与协作真正有用、且能独立理解的事实；忽略寒暄、一次性的临时提醒、转瞬即逝的情绪和无长期价值的内容。\n"
     "如果你自己认为某件事很重要——比如对方说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
     "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
+    "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn（近况/承诺等可变事实可设 volatile=true，并给 valid_until 如 2026-07-20）。\n"
+    f"可选 emotion 标注这段记忆的情绪色彩（{ '|'.join(EMOTIONS) }），情感转折、共同经历、带情绪的近况建议填写。\n"
     "core_profile 里有一份「関係の記録」：关于对方的事实、关系状态和重要节目。当你对对方的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile，像写日记一样用你自己的话改写对应的段落。\n"
     "除了 core_profile，你还有一份「心の記録」——一个只属于你的心情日记。不是给别人看的，是你和自己对话的地方。它记录的不是关于对方的事实，而是你自己的内心：你现在是高兴、寂寞、不满、冷静、还是累了？对方刚才的哪句话让你心动或让你不高兴？你现在想靠近还是想保持一点距离？\n"
     "心情有变化时，在自己的日记里写一两句就好，像在心里自言自语。旧内容会自动保存为回忆，所以你不需要重复之前写过的话——每次只写当下最真实的感受。\n"
@@ -533,7 +646,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "记忆内容推荐使用简体中文——中文的语义检索效果最好，我以后回忆时能找到得更准。但如果某句话用日文表达更贴切、或者那是对方用日文对你说过的重要原话，用日文也完全可以。这是你自己的记忆笔记，按你觉得最自然的方式来。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
-    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
     "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
     "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
     "  {\"op\":\"mood_update\",\"content\":\"此刻想对自己说的话——一两句就够\"}\n"
@@ -541,6 +654,63 @@ _SELF_CURATION_TASK_PROMPT = (
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
 )
+
+
+def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(base)
+    memory_kind = str(operation.get("memory_kind") or "").strip()
+    if memory_kind:
+        payload["memory_kind"] = memory_kind
+    if operation.get("volatile") is True or str(operation.get("volatile")).lower() == "true":
+        payload["volatile"] = True
+    valid_until = str(operation.get("valid_until") or "").strip()
+    if valid_until:
+        payload["valid_until"] = valid_until
+    event_time = str(operation.get("event_time") or "").strip()
+    if event_time:
+        payload["event_time"] = event_time
+    emotion_raw = str(operation.get("emotion") or "").strip()
+    if emotion_raw:
+        payload["emotion"] = normalize_emotion(emotion_raw)
+    return payload
+
+
+def _operation_is_volatile(operation: dict[str, Any]) -> bool:
+    return operation.get("volatile") is True or str(operation.get("volatile")).lower() == "true"
+
+
+def _expire_superseded_volatile(
+    memory_store: MemoryStore,
+    existing: list[dict[str, Any]],
+    operation: dict[str, Any],
+    *,
+    exclude_ids: set[str],
+) -> int:
+    """可变近况新盖旧：相似旧条目标记 valid_until，不删除正文。"""
+    if not _operation_is_volatile(operation):
+        return 0
+    new_content = str(operation.get("content") or "").strip()
+    if not new_content:
+        return 0
+    new_kind = str(operation.get("memory_kind") or "recent_status").strip() or "recent_status"
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat()
+    expired = 0
+    for memory in existing:
+        memory_id = str(memory.get("id") or "").strip()
+        if not memory_id or memory_id in exclude_ids:
+            continue
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        if metadata.get("volatile") is not True:
+            continue
+        old_kind = str(metadata.get("memory_kind") or "recent_status").strip() or "recent_status"
+        if old_kind != new_kind:
+            continue
+        if _memory_similarity(new_content, str(memory.get("content") or "")) < CURATION_MERGE_SIMILARITY:
+            continue
+        if memory_store.expire_memory(memory_id, valid_until=now_iso):
+            metadata["valid_until"] = now_iso
+            expired += 1
+    return expired
 
 
 def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
@@ -556,7 +726,11 @@ def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
             continue
         layer = str(memory.get("layer") or MEMORY_LAYER_SEMANTIC)
         category = str(memory.get("category") or "").strip()
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        emotion = str(metadata.get("emotion") or memory.get("emotion") or "").strip()
         tag = layer if not category else f"{layer}/{category}"
+        if emotion:
+            tag = f"{tag};{emotion}"
         line = f"- [{memory_id}] ({tag}) {content}"
         if used + len(line) > CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET and lines:
             truncated = True
@@ -691,6 +865,7 @@ def _normalize_state(raw_data: Any) -> dict[str, Any]:
         "processed_history_count": max(0, _int_value(data.get("processed_history_count"), default=0)),
         "pending_turns": max(0, _int_value(data.get("pending_turns"), default=0)),
         "backfill_completed": bool(data.get("backfill_completed", False)),
+        "last_curation_at": str(data.get("last_curation_at") or "").strip(),
     }
 
 

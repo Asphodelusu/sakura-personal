@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
@@ -9,11 +10,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QStyle,
     QStyledItemDelegate,
@@ -79,6 +82,8 @@ _DETAIL_PRIORITY_KEYS = (
     "provider",
     "voice",
     "character",
+    "source",
+    "reason",
     "status",
     "status_code",
     "elapsed_ms",
@@ -89,6 +94,26 @@ _DETAIL_PRIORITY_KEYS = (
 )
 _MAX_DETAIL_SUMMARY_ITEMS = 3
 _MAX_DETAIL_SUMMARY_VALUE_CHARS = 36
+_CATEGORY_DISPLAY_LABELS = {
+    "ScreenAwareness": "屏幕感知",
+    "ProactiveObserver": "主动观察",
+    "Memory": "记忆",
+    "AgentRuntime": "Agent",
+    "PetWindow": "桌宠",
+    "API": "API",
+    "TTS": "TTS",
+    "Startup": "启动",
+    "Plugin": "插件",
+    "LocalLLM": "本地模型",
+    "Event": "事件",
+}
+
+
+def _category_display_label(category: str) -> str:
+    text = str(category).strip()
+    if not text:
+        return "Runtime"
+    return _CATEGORY_DISPLAY_LABELS.get(text, text)
 
 
 def _with_alpha(color_text: str, alpha: int) -> QColor:
@@ -270,7 +295,16 @@ class RuntimeLogWindow(QDialog):
         refresh_button.clicked.connect(lambda: self.refresh(reset=True))
 
         copy_button = QPushButton("复制选中", self)
+        copy_button.setToolTip("复制当前选中的一条或多条日志（Ctrl+C）")
         copy_button.clicked.connect(self._copy_selected)
+
+        copy_page_button = QPushButton("复制本页", self)
+        copy_page_button.setToolTip("复制当前标签页的全部日志")
+        copy_page_button.clicked.connect(self._copy_current_page)
+
+        export_button = QPushButton("导出本页", self)
+        export_button.setToolTip("将当前标签页日志保存为文本文件")
+        export_button.clicked.connect(self._export_current_page)
 
         clear_button = QPushButton("清空", self)
         clear_button.setObjectName("dangerButton")
@@ -284,6 +318,8 @@ class RuntimeLogWindow(QDialog):
         button_layout.addStretch(1)
         button_layout.addWidget(refresh_button)
         button_layout.addWidget(copy_button)
+        button_layout.addWidget(copy_page_button)
+        button_layout.addWidget(export_button)
         button_layout.addWidget(clear_button)
         button_layout.addWidget(close_button)
 
@@ -352,7 +388,8 @@ class RuntimeLogWindow(QDialog):
 
         log_list = QListWidget(page)
         log_list.setObjectName("runtimeLogList")
-        log_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        log_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        log_list.setToolTip("可多选：Ctrl+点击 / Shift+点击；双击单条复制")
         log_list.setItemDelegate(self._item_delegate)
         log_list.itemDoubleClicked.connect(lambda _item: self._copy_selected())
         log_list.itemSelectionChanged.connect(
@@ -452,12 +489,70 @@ class RuntimeLogWindow(QDialog):
             other_list.blockSignals(False)
 
     def _copy_selected(self) -> None:
-        active_list = self._last_selected_list or self.program_list
-        item = active_list.currentItem()
-        if item is None:
+        active_list = self._active_log_list()
+        if active_list is None:
             return
+        items = active_list.selectedItems()
+        if not items:
+            item = active_list.currentItem()
+            if item is None:
+                return
+            items = [item]
         clipboard = QApplication.clipboard()
-        clipboard.setText(str(item.data(_COPY_TEXT_ROLE) or item.text()))
+        clipboard.setText(self._items_copy_text(items))
+
+    def _copy_current_page(self) -> None:
+        active_list = self._active_log_list()
+        if active_list is None or active_list.count() == 0:
+            return
+        items = [active_list.item(index) for index in range(active_list.count())]
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self._items_copy_text(items))
+
+    def _export_current_page(self) -> None:
+        active_list = self._active_log_list()
+        if active_list is None or active_list.count() == 0:
+            QMessageBox.information(self, "导出日志", "当前页没有可导出的日志。")
+            return
+        tab_title = self.tabs.tabText(self.tabs.currentIndex())
+        default_name = f"sakura-runtime-log-{tab_title}.txt"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "导出运行日志",
+            default_name,
+            "文本文件 (*.txt);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        items = [active_list.item(index) for index in range(active_list.count())]
+        try:
+            Path(path).write_text(self._items_copy_text(items) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件：{exc}")
+            return
+        QMessageBox.information(self, "导出完成", f"已导出 {len(items)} 条日志到：\n{path}")
+
+    def _active_log_list(self) -> QListWidget | None:
+        scope = self._scope_for_tab_index(self.tabs.currentIndex())
+        if scope is None:
+            return self._last_selected_list or self.program_list
+        return self._lists_by_scope.get(scope)
+
+    def _scope_for_tab_index(self, index: int) -> str | None:
+        if index == 0:
+            return GUI_LOG_SCOPE_PROGRAM
+        if index == 1:
+            return GUI_LOG_SCOPE_TTS
+        return None
+
+    @staticmethod
+    def _items_copy_text(items: list[QListWidgetItem]) -> str:
+        lines = [
+            str(item.data(_COPY_TEXT_ROLE) or item.text())
+            for item in items
+            if item is not None
+        ]
+        return "\n".join(lines)
 
     def _clear_logs(self) -> None:
         self.log_buffer.clear()
@@ -508,7 +603,7 @@ def _record_segments(record: GuiLogRecord) -> list[tuple[str, str]]:
     """把日志记录拆为带类型的行内分段，供 delegate 分层着色绘制。"""
     segments: list[tuple[str, str]] = [
         (_SEG_TIME, _format_time(record.timestamp)),
-        (_SEG_CATEGORY, record.category),
+        (_SEG_CATEGORY, _category_display_label(record.category)),
     ]
     if record.level != GUI_LOG_LEVEL_INFO:
         segments.append((_SEG_LEVEL, _LEVEL_LABELS.get(record.level, "信息")))

@@ -174,25 +174,35 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     root = _runtime_root("yaml_memory_curation")
     service = AppSettingsService(root)
 
-    # 默认：启用、每 8 轮触发、回填上限 200。
-    assert service.load_memory_curation_settings() == MemoryCurationSettings(
-        enabled=True,
-        trigger_turns=8,
-        backfill_limit=200,
-    )
+    # 默认：启用、静默触发参数、回填上限 200。
+    defaults = service.load_memory_curation_settings()
+    assert defaults.enabled is True
+    assert defaults.idle_minutes == 12
+    assert defaults.min_turns == 2
+    assert defaults.backfill_limit == 200
 
-    # 仅改 UI 暴露的 enabled/trigger_turns，backfill_limit 用非默认值确认会被一并持久化。
     service.save_memory_curation_settings(
-        MemoryCurationSettings(enabled=False, trigger_turns=20, backfill_limit=150)
+        MemoryCurationSettings(
+            enabled=False,
+            idle_minutes=20,
+            min_turns=3,
+            cooldown_minutes=40,
+            long_idle_minutes=45,
+            catch_up_turns=15,
+            backfill_limit=150,
+        )
     )
 
     loaded = service.load_memory_curation_settings()
     assert loaded.enabled is False
-    assert loaded.trigger_turns == 20
+    assert loaded.idle_minutes == 20
+    assert loaded.min_turns == 3
+    assert loaded.catch_up_turns == 15
     assert loaded.backfill_limit == 150
     system = load_yaml_mapping(service.system_config_path)
     assert system["memory_curation"]["enabled"] is False
-    assert system["memory_curation"]["trigger_turns"] == 20
+    assert system["memory_curation"]["idle_minutes"] == 20
+    assert system["memory_curation"]["catch_up_turns"] == 15
     assert system["memory_curation"]["backfill_limit"] == 150
 
 
