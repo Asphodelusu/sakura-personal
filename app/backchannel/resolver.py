@@ -14,6 +14,8 @@ from app.backchannel.models import (
 # 防重复记忆窗口:最近 N 个变体不再被选中。
 # 依据:filler 的缓和效果随重复使用衰减,所以短期内轮换变体。
 DEFAULT_RECENT_LIMIT = 3
+# 同一意图/相位下最近使用过的模板 id 短期内不再选中,减轻罐头感。
+DEFAULT_TEMPLATE_COOLDOWN_LIMIT = 2
 MIN_DIRECT_CONFIDENCE = 0.55
 SYSTEM_FALLBACK_TEMPLATE_ID = "__system_fallback__"
 SYSTEM_FALLBACK_TEMPLATE = BackchannelTemplate(
@@ -59,11 +61,15 @@ class TemplateResolver:
         *,
         rng: random.Random | None = None,
         recent_limit: int = DEFAULT_RECENT_LIMIT,
+        template_cooldown_limit: int = DEFAULT_TEMPLATE_COOLDOWN_LIMIT,
         min_direct_confidence: float = MIN_DIRECT_CONFIDENCE,
     ) -> None:
         self._templates = self._templates_with_system_fallback(manifest)
         self._rng = rng if rng is not None else random.Random()
         self._recent: deque[tuple[str, int]] = deque(maxlen=max(1, recent_limit))
+        self._recent_templates: deque[tuple[str, str]] = deque(
+            maxlen=max(1, template_cooldown_limit)
+        )
         self._min_direct_confidence = max(0.0, min(1.0, min_direct_confidence))
 
     def _templates_with_system_fallback(
@@ -81,10 +87,21 @@ class TemplateResolver:
         *,
         phase: str | None = None,
     ) -> BackchannelChoice | None:
+        intent_key = self._intent_key(label, phase)
         for tier in self._match_tiers(label, phase):
             if tier:
-                return self._pick(tier)
+                choice = self._pick(tier, intent_key=intent_key)
+                if choice is not None:
+                    return choice
         return None
+
+    @staticmethod
+    def _intent_key(label: BackchannelLabel | None, phase: str | None) -> str:
+        if phase:
+            return f"phase:{phase}"
+        if label is not None:
+            return f"intent:{label.intent}"
+        return "fallback"
 
     def _match_tiers(
         self,
@@ -108,10 +125,23 @@ class TemplateResolver:
         tiers.append([t for t in self._templates if t.is_fallback and t.phase is None])
         return tiers
 
-    def _pick(self, templates: list[BackchannelTemplate]) -> BackchannelChoice | None:
+    def _pick(
+        self,
+        templates: list[BackchannelTemplate],
+        *,
+        intent_key: str,
+    ) -> BackchannelChoice | None:
+        cooled_template_ids = {
+            template_id
+            for key, template_id in self._recent_templates
+            if key == intent_key
+        }
+        active_templates = [
+            template for template in templates if template.id not in cooled_template_ids
+        ] or templates
         pool = [
             (template, variant, (template.id, index))
-            for template in templates
+            for template in active_templates
             for index, variant in enumerate(template.variants)
         ]
         if not pool:
@@ -121,4 +151,5 @@ class TemplateResolver:
         candidates = fresh or pool
         template, variant, key = self._rng.choice(candidates)
         self._recent.append(key)
+        self._recent_templates.append((intent_key, template.id))
         return BackchannelChoice(template=template, variant=variant)

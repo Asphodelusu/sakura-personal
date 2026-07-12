@@ -789,23 +789,13 @@ class AgentRuntime:
         try:
             check_cancelled(cancel_checker)
             final_started_at = time.perf_counter()
-            streamed_chunks: list[str] = []
-            def _on_stream_chunk(chunk: str) -> None:
-                streamed_chunks.append(chunk)
-                _emit_progress_from_content(
-                    progress_callback,
-                    "".join(streamed_chunks),
-                    stage="streaming",
-                    metadata={"partial": True},
-                    cancel_checker=cancel_checker,
-                )
             final_reply = self.api_client.chat(
                 self._build_final_reply_prompt(),
                 working_messages,
                 self.reply_tones,
                 self.reply_portraits,
                 cancel_checker=cancel_checker,
-                on_chunk=_on_stream_chunk,
+                on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -908,16 +898,6 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
-            streamed_chunks2: list[str] = []
-            def _on_stream_chunk2(chunk: str) -> None:
-                streamed_chunks2.append(chunk)
-                _emit_progress_from_content(
-                    progress_callback,
-                    "".join(streamed_chunks2),
-                    stage="streaming",
-                    metadata={"partial": True},
-                    cancel_checker=cancel_checker,
-                )
             reply = self.api_client.chat(
                 prompt_build.system_prompt,
                 final_messages,
@@ -925,7 +905,7 @@ class AgentRuntime:
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
-                on_chunk=_on_stream_chunk2,
+                on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -1023,16 +1003,6 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
-            streamed_chunks: list[str] = []
-            def _on_stream_chunk(chunk: str) -> None:
-                streamed_chunks.append(chunk)
-                _emit_progress_from_content(
-                    progress_callback,
-                    "".join(streamed_chunks),
-                    stage="streaming",
-                    metadata={"partial": True},
-                    cancel_checker=cancel_checker,
-                )
             reply = self.api_client.chat(
                 prompt_build.system_prompt,
                 event_messages,
@@ -1040,7 +1010,7 @@ class AgentRuntime:
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
-                on_chunk=_on_stream_chunk,
+                on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -1144,13 +1114,18 @@ class AgentRuntime:
                 self._combine_extra_instructions(extra_instructions),
                 "- 用户说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
                 "- 跨会话信息优先用 memory_search；用户明确要求记住才用 memory_remember；纠正/补充先搜索再 update；用户明确要求忘掉才 forget。",
+                "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
+                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
             ]
         )
         sections = [
             *self._persona_sections(),
             PromptSection(
                 "agent.identity",
-                "你现在是 Sakura 的桌面陪伴型 Agent。上下文不足、需要核实或工具能明显提升帮助质量时，可以主动发起 tool_calls；信息足够时直接按回复协议回答。\n不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文。",
+                "她手边有一些可以实际使用的工具（如查看屏幕、搜索网页、设置提醒、记住事情）。"
+                "遇到信息不足、需要核实、或工具能明显帮到对方时，她会自然地先用一下再回应，而不是凭空猜测或用套话敷衍；"
+                "信息已经够用时就直接按下面的回复协议正常回答。\n"
+                "不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文——那些是她动作背后的机制，不是她会说出口的话。",
             ),
             PromptSection(
                 "agent.loop_limits",
@@ -1248,6 +1223,38 @@ class AgentRuntime:
             return self.memory.summary()
         except Exception as exc:
             return f"长期记忆读取失败：{exc}"
+
+
+# 结构化 JSON 回复在括号闭合前几乎总是解析失败：如果每个 delta chunk 都重新对
+# 累积文本做一次完整解析尝试，长回复下等于对已积累文本反复全量重扫，是无谓的
+# O(n²) CPU 开销。按最小时间间隔节流即可保留“早期有反馈”的体验。
+STREAM_PROGRESS_MIN_INTERVAL_SECONDS = 0.2
+
+
+def _build_stream_progress_emitter(
+    progress_callback: ProgressCallback | None,
+    cancel_checker: CancelChecker | None,
+) -> Callable[[str], None]:
+    """构建限频的流式进度回调：累积 chunk，但不超过节流间隔不重新解析。"""
+    streamed_chunks: list[str] = []
+    last_emit_at = 0.0
+
+    def on_chunk(chunk: str) -> None:
+        nonlocal last_emit_at
+        streamed_chunks.append(chunk)
+        now = time.perf_counter()
+        if now - last_emit_at < STREAM_PROGRESS_MIN_INTERVAL_SECONDS:
+            return
+        last_emit_at = now
+        _emit_progress_from_content(
+            progress_callback,
+            "".join(streamed_chunks),
+            stage="streaming",
+            metadata={"partial": True},
+            cancel_checker=cancel_checker,
+        )
+
+    return on_chunk
 
 
 def _emit_progress_from_content(

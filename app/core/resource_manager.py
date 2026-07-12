@@ -807,6 +807,8 @@ class ResourceRegistry:
                 )
             finally:
                 self._unregister(entry.resource)
+        with self._lock:
+            self._lingering_threads = [item for item in self._lingering_threads if item.is_alive()]
 
     def track_service(
         self,
@@ -914,6 +916,8 @@ class ResourceRegistry:
 
     def _keep_lingering_thread(self, thread: threading.Thread, label: str) -> None:
         with self._lock:
+            # 清理已自然结束的 lingering 线程，避免列表无限增长。
+            self._lingering_threads = [item for item in self._lingering_threads if item.is_alive()]
             if thread in self._lingering_threads:
                 return
             self._lingering_threads.append(thread)
@@ -1167,6 +1171,13 @@ class ResourceManager(QObject):
         return True
 
     def _keep_lingering(self, thread: QThread, worker: QObject | None) -> None:
+        try:
+            if not thread.isRunning():
+                _delete_later_quietly(worker)
+                _delete_later_quietly(thread)
+                return
+        except RuntimeError:
+            return
         if any(item_thread is thread for item_thread, _worker in self._lingering):
             return
         self._lingering.append((thread, worker))

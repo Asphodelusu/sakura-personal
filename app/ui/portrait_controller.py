@@ -79,6 +79,10 @@ class PortraitController(QObject):
         self.pixmap = self.load_portrait()
         self.transition_animation: QAbstractAnimation | None = None
         self.transition_id = 0
+        self._crossfade_target_path: Path | None = None
+        # 记录各标签上次贴图键，避免同路径/同缩放重复 setPixmap 引发闪烁。
+        self._label_apply_keys: dict[int, tuple[Path | None, int, float]] = {}
+        self._scaled_pixmap_cache: dict[tuple[Path, int, float], QPixmap] = {}
 
     def apply_current(self) -> None:
         # 主窗口几何统一由 PetWindow 的统一布局模型管理（见 _apply_pet_layout）。
@@ -88,14 +92,19 @@ class PortraitController(QObject):
         if self.pixmap.isNull():
             return
 
-        self._apply_pixmap_to_label(self.main_label, self.pixmap)
+        self._apply_pixmap_to_label(self.main_label, self.pixmap, source_path=self.current_path)
         self._relayout()
 
     def set_stage_size(self, stage_size: tuple[int, int]) -> None:
         self.stage_size = stage_size
 
     def set_portrait_scale_percent(self, portrait_scale_percent: int) -> None:
-        self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
+        next_scale = normalize_portrait_scale_percent(portrait_scale_percent)
+        if next_scale == self.portrait_scale_percent:
+            return
+        self.portrait_scale_percent = next_scale
+        self._label_apply_keys.clear()
+        self._scaled_pixmap_cache.clear()
 
     def set_profile(self, profile: CharacterProfile) -> QPixmap:
         self.profile = profile
@@ -114,12 +123,18 @@ class PortraitController(QObject):
         next_portrait_path = self.profile.portrait_for_segment(segment.portrait, segment.tone)
         if next_portrait_path == self.current_path:
             return
+        # 交叉淡入进行中且目标相同：跳过重复切换，避免动画被打断后闪跳。
+        if (
+            self.transition_animation is not None
+            and self._crossfade_target_path == next_portrait_path
+        ):
+            return
 
         should_crossfade = should_crossfade_portrait(self.current_path, next_portrait_path)
         next_pixmap = self.load_portrait(next_portrait_path)
         self.current_path = next_portrait_path
         if should_crossfade:
-            self._crossfade(next_pixmap)
+            self._crossfade(next_pixmap, next_portrait_path)
         else:
             self.pixmap = next_pixmap
             self.apply_current()
@@ -145,31 +160,63 @@ class PortraitController(QObject):
         self.pixmap_cache[target_path] = pixmap
         return pixmap
 
-    def _apply_pixmap_to_label(self, label: QLabel, pixmap: QPixmap) -> None:
+    def _apply_pixmap_to_label(
+        self,
+        label: QLabel,
+        pixmap: QPixmap,
+        *,
+        source_path: Path | None = None,
+    ) -> None:
         scale = self.portrait_scale_percent / 100
         target_width = round(PORTRAIT_BASE_MAX_WIDTH * scale)
         target_height = round(PORTRAIT_BASE_MAX_HEIGHT * scale)
-        # HiDPI:按物理像素(逻辑尺寸 × dpr)缩放并标记 dpr,否则 retina 上立绘被拉伸成半分辨率(糊)。
-        # 逻辑尺寸(deviceIndependentSize)不变,故不影响舞台布局,只提升清晰度。
         dpr = label.devicePixelRatioF() or 1.0
-        scaled = pixmap.scaled(
-            round(target_width * dpr),
-            round(target_height * dpr),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        scaled.setDevicePixelRatio(dpr)
+        apply_key = (source_path, self.portrait_scale_percent, dpr)
+        if self._label_apply_keys.get(id(label)) == apply_key and not pixmap.isNull():
+            return
+
+        cache_key: tuple[Path, int, float] | None = None
+        scaled: QPixmap
+        if source_path is not None:
+            cache_key = (source_path, self.portrait_scale_percent, dpr)
+            cached_scaled = self._scaled_pixmap_cache.get(cache_key)
+            if cached_scaled is not None and not cached_scaled.isNull():
+                scaled = cached_scaled
+            else:
+                scaled = pixmap.scaled(
+                    round(target_width * dpr),
+                    round(target_height * dpr),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                scaled.setDevicePixelRatio(dpr)
+                self._scaled_pixmap_cache[cache_key] = scaled
+        else:
+            scaled = pixmap.scaled(
+                round(target_width * dpr),
+                round(target_height * dpr),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            scaled.setDevicePixelRatio(dpr)
+
         label.setPixmap(scaled)
         label.resize(scaled.deviceIndependentSize().toSize())
+        self._label_apply_keys[id(label)] = apply_key
 
-    def _crossfade(self, next_pixmap: QPixmap) -> None:
+    def _crossfade(self, next_pixmap: QPixmap, target_path: Path) -> None:
         self._stop_transition(finish_current=True)
         self.pixmap = next_pixmap
+        self._crossfade_target_path = target_path
         if self.pixmap.isNull():
             self.apply_current()
             return
 
-        self._apply_pixmap_to_label(self.transition_label, self.pixmap)
+        self._apply_pixmap_to_label(
+            self.transition_label,
+            self.pixmap,
+            source_path=target_path,
+        )
         # 不再 resize 主窗口：交叉淡入期间舞台尺寸不变，几何由 PetWindow 收口。
         self._relayout()
         self.main_opacity_effect.setOpacity(1.0)
@@ -191,13 +238,13 @@ class PortraitController(QObject):
         fade_out.setDuration(fade_duration)
         fade_out.setStartValue(1.0)
         fade_out.setEndValue(0.0)
-        fade_out.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
 
         fade_in = QPropertyAnimation(self.transition_opacity_effect, b"opacity")
         fade_in.setDuration(fade_duration)
         fade_in.setStartValue(0.0)
         fade_in.setEndValue(1.0)
-        fade_in.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         fade_in_sequence = QSequentialAnimationGroup()
         if fade_in_delay > 0:
@@ -218,10 +265,11 @@ class PortraitController(QObject):
             self.transition_id += 1
         self.transition_label.hide()
         self.transition_label.clear()
+        self._crossfade_target_path = None
         self.main_opacity_effect.setOpacity(1.0)
         self.transition_opacity_effect.setOpacity(0.0)
         if finish_current and not self.pixmap.isNull():
-            self._apply_pixmap_to_label(self.main_label, self.pixmap)
+            self._apply_pixmap_to_label(self.main_label, self.pixmap, source_path=self.current_path)
             self._relayout()
 
     def _finish_transition(self, transition_id: int) -> None:
@@ -230,9 +278,10 @@ class PortraitController(QObject):
         if self.transition_animation is not None:
             self.transition_animation.deleteLater()
             self.transition_animation = None
-        self._apply_pixmap_to_label(self.main_label, self.pixmap)
+        self._apply_pixmap_to_label(self.main_label, self.pixmap, source_path=self.current_path)
         self.transition_label.hide()
         self.transition_label.clear()
+        self._crossfade_target_path = None
         self.main_opacity_effect.setOpacity(1.0)
         self.transition_opacity_effect.setOpacity(0.0)
         self._relayout()

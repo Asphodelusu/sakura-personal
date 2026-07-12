@@ -281,6 +281,8 @@ class SettingsDialog(QDialog):
         self._memory_reload_pending = False
         self._syncing_memory_selection = False
         self._memory_entries_loaded_once = False
+        # 接话模型就绪状态缓存，避免切换控件时反复扫描 HuggingFace 缓存目录。
+        self._backchannel_model_ready_cached: bool | None = None
 
         self.setWindowTitle("设置")
         self.setMinimumSize(680, 500)
@@ -394,6 +396,8 @@ class SettingsDialog(QDialog):
             return
         if titles[row] == "记忆":
             self._ensure_memory_entries_loaded()
+        elif titles[row] == "系统":
+            self._refresh_backchannel_setup_status()
 
     def _ensure_memory_entries_loaded(self) -> None:
         if self._memory_entries_loaded_once:
@@ -716,6 +720,18 @@ class SettingsDialog(QDialog):
         )
         self._refresh_backchannel_setup_status()
 
+    def _invalidate_backchannel_model_cache(self) -> None:
+        self._backchannel_model_ready_cached = None
+
+    def _is_backchannel_model_ready(self, *, force: bool = False) -> bool:
+        if force:
+            self._invalidate_backchannel_model_cache()
+        if self._backchannel_model_ready_cached is not None:
+            return self._backchannel_model_ready_cached
+        ready = backchannel_model_cached(self.base_dir)
+        self._backchannel_model_ready_cached = ready
+        return ready
+
     def _sync_tts_enabled_controls(self, enabled: bool) -> None:
         """同步 TTS 总开关和整合包模式下的从属控件可交互状态。"""
         provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
@@ -852,7 +868,9 @@ class SettingsDialog(QDialog):
             return
         self._start_backchannel_model_download()
 
-    def _refresh_backchannel_setup_status(self) -> None:
+    def _refresh_backchannel_setup_status(self, *, force: bool = False) -> None:
+        if force:
+            self._invalidate_backchannel_model_cache()
         if hasattr(self, "backchannel_setup_hint_label"):
             self.backchannel_setup_hint_label.setText(self._backchannel_setup_hint_text())
         if hasattr(self, "backchannel_model_status_label"):
@@ -1005,7 +1023,7 @@ class SettingsDialog(QDialog):
 
     @Slot(object)
     def _handle_backchannel_model_import_success(self, result: BackchannelModelImportResult) -> None:
-        self._refresh_backchannel_setup_status()
+        self._refresh_backchannel_setup_status(force=True)
         QMessageBox.information(
             self,
             "导入成功",
@@ -1032,7 +1050,7 @@ class SettingsDialog(QDialog):
 
     @Slot(object)
     def _handle_backchannel_model_download_success(self, result: BackchannelModelImportResult) -> None:
-        self._refresh_backchannel_setup_status()
+        self._refresh_backchannel_setup_status(force=True)
         QMessageBox.information(
             self,
             "安装成功",
@@ -1074,14 +1092,14 @@ class SettingsDialog(QDialog):
         self._backchannel_model_import_thread = None
         self._backchannel_model_import_worker = None
         self._set_backchannel_model_import_busy(False)
-        self._refresh_backchannel_setup_status()
+        self._refresh_backchannel_setup_status(force=True)
 
     @Slot()
     def _reset_backchannel_model_download_worker(self) -> None:
         self._backchannel_model_download_thread = None
         self._backchannel_model_download_worker = None
         self._set_backchannel_model_download_busy(False)
-        self._refresh_backchannel_setup_status()
+        self._refresh_backchannel_setup_status(force=True)
 
     def _set_memory_model_import_busy(self, busy: bool) -> None:
         if hasattr(self, "memory_import_model_button"):
@@ -1132,7 +1150,7 @@ class SettingsDialog(QDialog):
             )
 
     def _backchannel_model_status_text(self) -> str:
-        if backchannel_model_cached(self.base_dir):
+        if self._is_backchannel_model_ready():
             if self._selected_backchannel_mode() == "hybrid":
                 return f"已导入 {DEFAULT_BACKCHANNEL_EMBEDDING_MODEL}，模型增强可用。"
             return f"已导入 {DEFAULT_BACKCHANNEL_EMBEDDING_MODEL}；切换到模型增强后启用。"
@@ -1141,7 +1159,7 @@ class SettingsDialog(QDialog):
     def _backchannel_setup_hint_text(self) -> str:
         enabled = self._selected_backchannel_enabled()
         mode = self._selected_backchannel_mode()
-        model_ready = backchannel_model_cached(self.base_dir)
+        model_ready = self._is_backchannel_model_ready()
 
         if not enabled:
             return "接话当前关闭；仍可先导入句向量模型备用。"

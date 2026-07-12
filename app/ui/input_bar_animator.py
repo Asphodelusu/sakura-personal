@@ -194,6 +194,20 @@ class InputBarAnimator(QObject):
             self._send_anim.stop()
             self._send_anim.deleteLater()
             self._send_anim = None
+        target_opacity = 1.0 if show else 0.0
+        current_opacity = self._card_effect.opacity()
+        # 已处于目标透明度时跳过动画，减少 hover 轮询触发的无谓重绘。
+        if abs(current_opacity - target_opacity) < 0.02:
+            if show:
+                self._maybe_before_show()
+                self._card_effect.setOpacity(1.0)
+                self._input_card.show()
+                self._maybe_after_show()
+            else:
+                self._maybe_before_hide()
+                self._card_effect.setOpacity(0.0)
+                self._input_card.hide()
+            return
         if show:
             self._maybe_before_show()
             self._input_card.show()
@@ -202,8 +216,9 @@ class InputBarAnimator(QObject):
             self._maybe_before_hide()
         anim = QPropertyAnimation(self._card_effect, b"opacity")
         anim.setDuration(HOVER_ANIM_DURATION_MS)
-        anim.setEndValue(1.0 if show else 0.0)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setStartValue(current_opacity)
+        anim.setEndValue(target_opacity)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic if show else QEasingCurve.Type.InCubic)
         if not show:
             anim.finished.connect(self._on_hide_finished)
         anim.start()

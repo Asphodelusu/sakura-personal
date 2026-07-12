@@ -24,7 +24,16 @@ from app.perception.privacy import PrivacyGuard
 from app.perception.screen_capture import ScreenCapture
 from app.perception.win32 import get_active_window_title, get_idle_seconds
 
-OnSpeakFn = Callable[[str, str], "None"]  # (ja_text, zh_text)
+@dataclass(frozen=True)
+class ProactiveSpeakPayload:
+    """主动发言内容；comment 为角色口吻台词，translation/tone 可选。"""
+
+    text: str
+    translation: str = ""
+    tone: str = "中性"
+
+
+OnSpeakFn = Callable[[ProactiveSpeakPayload], "None"]
 IsBusyFn = Callable[[], bool]
 OnMemoryRecordFn = Callable[[str], "None"]
 
@@ -44,9 +53,9 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚
 - 不确定：选 false，宁静默不烦人
 
 只输出 JSON，不要 markdown 不要解释：
-{"should_speak": true|false, "reason": "给我自己看的简短理由", "ja": "日文台词（TTS用，自然口语）", "zh": "中文译文（气泡显示用）"}
+{"should_speak": true|false, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
 
-ja 是你心里想说的话（日语），zh 是给用户看的中文翻译。两者一一对应，保持角色风格。
+comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
 """
 
 # ---------------------------------------------------------------------------
@@ -121,7 +130,7 @@ class ProactiveObserver:
         self.config = config or ProactiveConfig()
         self.privacy = privacy or PrivacyGuard()
 
-        self.on_speak = on_speak or (lambda _ja, _zh: None)
+        self.on_speak = on_speak or (lambda _payload: None)
         self._is_busy = is_busy or (lambda: False)
         self._on_memory_record = on_memory_record or (lambda _: None)
 
@@ -135,7 +144,6 @@ class ProactiveObserver:
         self._last_eval_at = 0.0
         self._last_window_trigger_at = 0.0
         self._idle_armed = True
-        self._input_focused = False
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -157,13 +165,6 @@ class ProactiveObserver:
     def notify_user_spoke(self) -> None:
         self._last_user_at = time.monotonic()
         self._idle_armed = True
-
-    def notify_input_focused(self) -> None:
-        self._input_focused = True
-
-    def notify_input_blurred(self) -> None:
-        self._input_focused = False
-        self._last_user_at = time.monotonic()
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -241,8 +242,6 @@ class ProactiveObserver:
         now = time.monotonic()
 
         # Absolute filters — silence required
-        if self._input_focused:
-            return []
         if now - self._last_user_at < self.config.min_silence_after_user:
             return []
         if self._last_proactive_at and now - self._last_proactive_at < self.config.cooldown_seconds:
@@ -321,21 +320,8 @@ class ProactiveObserver:
         ]
 
         # Call VLM
-        vlm_start = time.monotonic()
-        logger.debug("ProactiveObserver: VLM call start (timeout={}s, triggers={})",
-                     self.config.request_timeout, triggers)
         try:
-            response = await asyncio.wait_for(
-                self._chat_completion(messages),
-                timeout=self.config.request_timeout + 15,
-            )
-            vlm_elapsed = time.monotonic() - vlm_start
-            logger.debug("ProactiveObserver: VLM call done ({:.1f}s, {} chars)",
-                         vlm_elapsed, len(response or ""))
-        except asyncio.TimeoutError:
-            logger.warning("ProactiveObserver: VLM call timed out after {:.0f}s",
-                           time.monotonic() - vlm_start)
-            return
+            response = await self._chat_completion(messages)
         except Exception as e:
             logger.warning("ProactiveObserver: VLM call failed: {}", e)
             # 代理切换等会破坏 httpcore 连接池，重建一次
@@ -357,28 +343,24 @@ class ProactiveObserver:
             logger.debug("ProactiveObserver: silent (reason: {})", parsed.get("reason", ""))
             return
 
-        # Support old "comment" field as fallback
-        ja_text = str(parsed.get("ja", "") or parsed.get("comment", "")).strip()
-        zh_text = str(parsed.get("zh", "")).strip()
-        if not ja_text:
+        comment = str(parsed.get("comment", "")).strip()
+        if not comment:
             return
-        if not zh_text:
-            zh_text = ja_text  # 模型没给 zh 时用 ja 兜底
 
         self._last_proactive_at = time.monotonic()
         self._idle_armed = True
 
-        # Deliver to UI (ja for TTS, zh for subtitle)
+        payload = ProactiveSpeakPayload(
+            text=comment,
+            translation=str(parsed.get("translation", "")).strip(),
+            tone=str(parsed.get("tone", "")).strip() or "中性",
+        )
+
+        # Deliver to UI（正式回复管线由 PetWindow 负责：字幕/TTS/历史/立绘）
         try:
-            self.on_speak(ja_text, zh_text)
+            self.on_speak(payload)
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
-
-        # Save to memory (bilingual)
-        try:
-            self._on_memory_record(f"[主动] {ja_text} | {zh_text}")
-        except Exception as e:
-            logger.warning("ProactiveObserver: memory record error: {}", e)
 
     def _build_full_system_prompt(self) -> str:
         parts = []

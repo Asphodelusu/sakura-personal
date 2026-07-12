@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import (
     QEvent,
-    QMetaObject,
-    Q_ARG,
     QObject,
     QPoint,
     QRect,
@@ -142,8 +140,11 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS,
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
+    is_night_quiet_period,
+    night_quiet_interval_multiplier,
 )
 from app.perception import ProactiveObserver, ProactiveConfig, PrivacyGuard
+from app.perception.observer import ProactiveSpeakPayload
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -252,6 +253,14 @@ SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT = (
     "这些 recent_conversation 消息用于理解这段时间发生了什么、用户当前阶段和 Sakura "
     "刚刚说过什么；不要逐字复述，应结合屏幕变化找话题，并避免连续重复同一类话题或休息提醒。"
 )
+PROACTIVE_ASSISTANT_JUST_SPOKE_HINT = (
+    "Sakura 刚在 recent_conversation 里说过话；本轮主动搭话应换角度或换话题，"
+    "不要延续同一提醒、同一关心句式或同一屏幕评论。"
+)
+# 用户刚有过互动后的冷却：屏幕批次已凑齐也先不发，避免聊完立刻又主动搭话。
+PROACTIVE_POST_INTERACTION_GRACE_SECONDS = 180
+# 对话刚结束后的记忆整理缓冲：等字幕/朗读收尾后再启动，避免边说话边整理。
+MEMORY_CURATION_POST_TURN_GRACE_MS = 45_000
 SCREEN_AWARENESS_EVENT_TYPE = "screen_awareness_check"
 LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
@@ -488,7 +497,7 @@ class PetWindow(QWidget):
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
     # 主动模式评论信号（从后台线程 emit，queued connection 回 UI 线程）
-    proactive_comment_arrived = Signal(str, str)  # (ja_text, zh_text)
+    proactive_comment_arrived = Signal(object)
 
     def __init__(
         self,
@@ -1116,14 +1125,6 @@ class PetWindow(QWidget):
         if watched is self.input_edit:
             if event.type() == QEvent.Type.KeyPress:
                 self._log_input_key_event(event)
-            elif event.type() == QEvent.Type.FocusIn:
-                observer = getattr(self, "_proactive_observer", None)
-                if observer is not None:
-                    observer.notify_input_focused()
-            elif event.type() == QEvent.Type.FocusOut:
-                observer = getattr(self, "_proactive_observer", None)
-                if observer is not None:
-                    observer.notify_input_blurred()
             return super().eventFilter(watched, event)
         if watched is self.screenshot_button and isinstance(event, QMouseEvent):
             if (
@@ -1302,6 +1303,10 @@ class PetWindow(QWidget):
             layout = self._compute_pet_layout()
         px, py, pw, ph = layout.portrait_rect
         top_left = self.mapToGlobal(QPoint(px, py))
+        geom_key = (top_left.x(), top_left.y(), pw, ph)
+        if geom_key == getattr(self, "_renderer_overlay_geom_key", None):
+            return
+        self._renderer_overlay_geom_key = geom_key
         try:
             manager.set_geometry(top_left.x(), top_left.y(), pw, ph)
             manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
@@ -2350,14 +2355,30 @@ class PetWindow(QWidget):
 
     def _compute_pet_layout(self) -> PetLayout:
         pw, ph = self._current_portrait_size()
-        return compute_pet_layout(
+        effective_bubble = self._effective_bubble_height()
+        cache_key = (
+            pw,
+            ph,
+            self.control_panel_width,
+            effective_bubble,
+            self.control_panel_vertical_offset,
+            self.input_bar_offset,
+        )
+        cached_key = getattr(self, "_pet_layout_cache_key", None)
+        cached_layout = getattr(self, "_pet_layout_cache", None)
+        if cached_key == cache_key and cached_layout is not None:
+            return cached_layout
+        layout = compute_pet_layout(
             portrait_width=pw,
             portrait_height=ph,
             control_panel_width=self.control_panel_width,
-            bubble_height=self._effective_bubble_height(),
+            bubble_height=effective_bubble,
             vertical_offset=self.control_panel_vertical_offset,
             input_bar_offset=self.input_bar_offset,
         )
+        self._pet_layout_cache_key = cache_key
+        self._pet_layout_cache = layout
+        return layout
 
     def _portrait_anchor_global(self) -> QPoint:
         """当前布局下立绘底边中心的屏幕坐标——参数变化时把它钉在原位即可让立绘位置不动。
@@ -2862,8 +2883,7 @@ class PetWindow(QWidget):
                 config=config,
                 privacy=PrivacyGuard(),
                 on_speak=self._on_proactive_speak,
-                is_busy=lambda: self.worker_thread is not None,
-                on_memory_record=self._on_proactive_memory_record,
+                is_busy=self._is_proactive_observer_busy,
             )
             self._proactive_observer = observer
             debug_log("PetWindow", "ProactiveObserver 初始化成功")
@@ -2888,52 +2908,65 @@ class PetWindow(QWidget):
             except Exception:
                 pass
 
-    def _on_proactive_speak(self, ja_text: str, zh_text: str) -> None:
-        """Callback: display proactive comment (thread-safe via Qt signal)."""
-        if not ja_text.strip():
+    def _is_proactive_observer_busy(self) -> bool:
+        """ProactiveObserver 评估/发言前的忙碌门：避免打断正式对话或字幕播放。"""
+        if getattr(self, "startup_initializing", False):
+            return True
+        if (
+            self.worker_thread is not None
+            or self.active_reminder_id is not None
+            or self.active_event_type
+            or self.pending_tool_action is not None
+            or self.pending_screen_observation_messages is not None
+            or self.screen_observation_followup_in_progress
+            or self.screen_observation_encode_thread is not None
+            or self.active_interaction_id
+        ):
+            return True
+        if self.input_edit.text().strip() or self.speech_timer.isActive():
+            return True
+        if time.perf_counter() - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
+            return True
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if subtitle_controller is not None and (
+            subtitle_controller.current_segment_in_progress()
+            or subtitle_controller.is_reply_sequence_active()
+        ):
+            return True
+        if subtitle_controller is None and getattr(self, "current_segment_sequence_id", None) is not None and (
+            not getattr(self, "current_segment_speech_done", True)
+            or not getattr(self, "current_segment_tts_done", True)
+        ):
+            return True
+        return False
+
+    def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
+        """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
+        if not payload.text.strip():
             return
-        debug_log("PetWindow", "主动发言", {"ja": ja_text[:40], "zh": zh_text[:40]})
-        # Emit signal for thread-safe main-thread dispatch
-        self.proactive_comment_arrived.emit(ja_text, zh_text)
+        debug_log(
+            "PetWindow",
+            "主动发言",
+            {"comment": payload.text[:60], "tone": payload.tone},
+        )
+        self.proactive_comment_arrived.emit(payload)
 
-    @Slot(str, str)
-    def _show_proactive_comment(self, ja_text: str, zh_text: str) -> None:
-        """Display a proactive comment with TTS (zh in bubble, ja for voice)."""
-        # Don't interrupt active reply / TTS playback
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is not None and sc.is_reply_sequence_active():
+    @Slot(object)
+    def _show_proactive_comment(self, payload: ProactiveSpeakPayload) -> None:
+        """将 ProactiveObserver 的 should_speak 评论接入 TTS/字幕/历史/立绘。"""
+        if not isinstance(payload, ProactiveSpeakPayload) or not payload.text.strip():
             return
-        # Don't overwrite startup greeting
-        if getattr(self, "_greeting_pending", False):
+        if self._is_proactive_observer_busy():
+            debug_log("PetWindow", "主动发言被跳过（UI 忙碌）", {"comment": payload.text[:40]})
             return
-        # Ensure bubble is visible for proactive comments
-        bubble_controller = getattr(self, "bubble_auto_hide", None)
-        if bubble_controller is not None:
-            bubble_controller.notify_speaking()
 
-        # Build a simple segment for TTS + subtitle
-        from app.llm.chat_reply import ChatSegment
-        segment = ChatSegment(text=ja_text, translation=zh_text, tone="中性")
-
-        if sc is not None:
-            sc.show_proactive_segment(segment)
-
-    def _on_proactive_memory_record(self, text: str) -> None:
-        """Callback: persist proactive comment in chat history (thread-safe)."""
-        # Enqueue to main thread to avoid file I/O races
-        print(f"[Proactive] _on_proactive_memory_record 收到: {text[:80]}")
-        QTimer.singleShot(0, lambda t=text: self._do_proactive_memory_record(t))
-
-    def _do_proactive_memory_record(self, text: str) -> None:
-        store = getattr(self, "history_store", None)
-        if store is None:
-            print(f"[Proactive] 历史写入跳过：history_store=None")
-            return
-        try:
-            store.append(role="assistant", content=text)
-            print(f"[Proactive] 已写入历史: {text[:80]}")
-        except Exception as exc:
-            print(f"[Proactive] 历史写入失败: {exc}")
+        segment = ChatSegment(
+            text=payload.text,
+            translation=payload.translation,
+            tone=payload.tone or "中性",
+        )
+        result = AgentResult(reply=ChatReply(segments=[segment]))
+        self._consume_agent_result(result)
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
@@ -3429,17 +3462,6 @@ class PetWindow(QWidget):
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_assistant_reply_history(reply, _debug=result._debug)
         self._log_interaction_stage("assistant_message_recorded")
-
-        # 心情更新：Sakura 在回复中附带了 mood 字段时，写入心の記録
-        if result.mood_update:
-            try:
-                scoped = self.memory_store.scoped(self.character_profile.id)
-                scoped.set_mood_state(result.mood_update)
-                self._log_interaction_stage("mood_updated_from_reply", {"mood": result.mood_update})
-                debug_log("PetWindow", "心情笔记已从回复中更新", {"mood": result.mood_update})
-            except Exception as exc:
-                debug_log("PetWindow", "心情笔记更新失败", {"error": str(exc)})
-
         self._emit_plugin_event(
             PLUGIN_EVENT_AI_MESSAGE,
             {
@@ -3894,16 +3916,6 @@ class PetWindow(QWidget):
         if record_history:
             self.messages.append({"role": "assistant", "content": reply.text})
             self._record_assistant_reply_history(reply, _debug=result._debug)
-
-        # 心情更新：Sakura 在回复中附带了 mood 字段时，写入心の記録
-        if result.mood_update:
-            try:
-                scoped = self.memory_store.scoped(self.character_profile.id)
-                scoped.set_mood_state(result.mood_update)
-                debug_log("PetWindow", "心情笔记已从事件回复中更新", {"mood": result.mood_update})
-            except Exception as exc:
-                debug_log("PetWindow", "心情笔记更新失败", {"error": str(exc)})
-
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
@@ -3941,6 +3953,8 @@ class PetWindow(QWidget):
     @Slot()
     def _check_screen_awareness(self) -> None:
         if getattr(self, "startup_initializing", False):
+            return
+        if not self._screen_awareness_context_allowed():
             return
         if not self._can_run_screen_awareness():
             return
@@ -3995,7 +4009,9 @@ class PetWindow(QWidget):
 
     def _should_capture_screen_awareness_context(self, now: float) -> bool:
         settings = self._current_screen_awareness_settings()
-        check_interval_seconds = settings.check_interval_minutes * 60
+        check_interval_seconds = (
+            settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
+        )
         seconds_since_pet_interaction = now - self.last_user_activity_at
         if (
             seconds_since_pet_interaction + SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS
@@ -4089,10 +4105,11 @@ class PetWindow(QWidget):
             return False
         if self.screen_awareness_context_batch_started_at is None:
             return False
-        return (
-            now - self.screen_awareness_context_batch_started_at
-            >= self._current_screen_awareness_settings().cooldown_minutes * 60
+        settings = self._current_screen_awareness_settings()
+        cooldown_seconds = (
+            settings.cooldown_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
         )
+        return now - self.screen_awareness_context_batch_started_at >= cooldown_seconds
 
     def _build_screen_awareness_event(self, now: float | None = None) -> AgentEvent:
         now = time.perf_counter() if now is None else now
@@ -4105,6 +4122,7 @@ class PetWindow(QWidget):
             "screen_context_allowed": self._screen_awareness_context_allowed(),
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.screen_awareness_context_dropped_count,
+            **_build_proactive_event_time_context(),
         }
         recent_conversation = _build_screen_awareness_recent_conversation_for_window(self)
         if recent_conversation:
@@ -4112,6 +4130,9 @@ class PetWindow(QWidget):
             payload["recent_conversation_summary_hint"] = (
                 SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT
             )
+            reply_hint = _build_proactive_event_reply_hint(recent_conversation)
+            if reply_hint:
+                payload["reply_hint"] = reply_hint
         if screen_contexts:
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
@@ -4205,7 +4226,9 @@ class PetWindow(QWidget):
 
     def _should_capture_proactive_screen_context(self, now: float) -> bool:
         settings = PetWindow._current_screen_awareness_settings(self)
-        check_interval_seconds = settings.check_interval_minutes * 60
+        check_interval_seconds = (
+            settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
+        )
         seconds_since_pet_interaction = now - self.last_user_activity_at
         if (
             seconds_since_pet_interaction + SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS
@@ -4282,10 +4305,13 @@ class PetWindow(QWidget):
             return False
         if self.proactive_screen_context_batch_started_at is None:
             return False
-        return (
-            now - self.proactive_screen_context_batch_started_at
-            >= PetWindow._current_screen_awareness_settings(self).cooldown_minutes * 60
+        if now - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
+            return False
+        settings = PetWindow._current_screen_awareness_settings(self)
+        cooldown_seconds = (
+            settings.cooldown_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
         )
+        return now - self.proactive_screen_context_batch_started_at >= cooldown_seconds
 
     def _build_proactive_care_event(self, now: float | None = None) -> AgentEvent:
         now = time.perf_counter() if now is None else now
@@ -4299,6 +4325,7 @@ class PetWindow(QWidget):
             "screen_context_allowed": self._proactive_screen_context_allowed(),
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.proactive_screen_context_dropped_count,
+            **_build_proactive_event_time_context(),
         }
         recent_conversation = _build_screen_awareness_recent_conversation_for_window(self)
         if recent_conversation:
@@ -4306,6 +4333,9 @@ class PetWindow(QWidget):
             payload["recent_conversation_summary_hint"] = (
                 SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT
             )
+            reply_hint = _build_proactive_event_reply_hint(recent_conversation)
+            if reply_hint:
+                payload["reply_hint"] = reply_hint
         if screen_contexts:
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
@@ -4458,14 +4488,20 @@ class PetWindow(QWidget):
         return StoragePaths(Path(getattr(self, "base_dir", Path.cwd()))).screen_awareness_state()
 
     def _load_screen_awareness_state(self) -> dict[str, Any]:
+        cached = getattr(self, "_screen_awareness_state_cache", None)
+        if isinstance(cached, dict):
+            return dict(cached)
         path = self._screen_awareness_state_path()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            data = {}
+        state = data if isinstance(data, dict) else {}
+        self._screen_awareness_state_cache = dict(state)
+        return state
 
     def _save_screen_awareness_state(self, state: dict[str, Any]) -> None:
+        self._screen_awareness_state_cache = dict(state)
         try:
             atomic_write_text(
                 self._screen_awareness_state_path(),
@@ -4597,7 +4633,23 @@ class PetWindow(QWidget):
         pending_turns = self.memory_curation_state.increment_pending_turns()
         debug_log("Memory", "自动记忆轮次已累计", {"pending_turns": pending_turns})
         if pending_turns >= self.memory_curation_settings.trigger_turns:
-            QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+            self._schedule_auto_memory_curation()
+
+    def _schedule_auto_memory_curation(self) -> None:
+        """对话结束后再整理：等朗读/字幕收尾并留出短缓冲，避免边回复边提炼。"""
+        existing_timer = getattr(self, "_memory_curation_defer_timer", None)
+        if existing_timer is not None:
+            existing_timer.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def _deferred_start() -> None:
+            self._memory_curation_defer_timer = None
+            self._maybe_start_auto_memory_curation()
+
+        timer.timeout.connect(_deferred_start)
+        timer.start(MEMORY_CURATION_POST_TURN_GRACE_MS)
+        self._memory_curation_defer_timer = timer
 
     def _check_memory_reflection(self) -> None:
         """定时检查是否应该触发记忆反思。"""
@@ -4737,9 +4789,18 @@ class PetWindow(QWidget):
         )
 
     def _memory_curation_can_start(self) -> bool:
+        if self.worker_thread is not None:
+            return False
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if subtitle_controller is not None and subtitle_controller.current_segment_in_progress():
+            return False
+        if subtitle_controller is None and getattr(self, "current_segment_sequence_id", None) is not None and (
+            not getattr(self, "current_segment_speech_done", True)
+            or not getattr(self, "current_segment_tts_done", True)
+        ):
+            return False
         return (
-            self.worker_thread is None
-            and self.memory_curation_thread is None
+            self.memory_curation_thread is None
             and self.pending_tool_action is None
             and self.pending_screen_observation_messages is None
             and self.pending_screen_observation_event is None
@@ -4880,8 +4941,6 @@ class PetWindow(QWidget):
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text())
         self._collapse_auto_fit_bubble_height()
         self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
-        # 延迟尝试生成带记忆回想的个性化问候
-        QTimer.singleShot(800, self._try_generate_startup_greeting)
         if self.memory_status_message_active:
             QTimer.singleShot(
                 MEMORY_STATUS_STARTUP_DELAY_MS,
@@ -4921,188 +4980,6 @@ class PetWindow(QWidget):
             self.tray_icon.setContextMenu(self._build_menu())
         debug_log("Startup", "后台启动服务失败", {"error": error})
         debug_log("Startup", "后台初始化失败", {"error": error})
-
-    def _try_generate_startup_greeting(self) -> None:
-        """用近期记忆生成个性化启动问候。"""
-        if getattr(self, "_shutdown_in_progress", False):
-            return
-
-        self._greeting_pending = True
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is not None:
-            sc.set_speech("……", pulse=False)
-        print("[Startup] _try_generate_startup_greeting 开始，已设 ……")
-
-        # 收集上下文（全部非阻塞）
-        scoped = self.memory_store.scoped(self.character_profile.id)
-        mood = None
-        memories: list = []
-        try:
-            mood = scoped.mood_state()
-        except Exception:
-            pass
-        try:
-            recent = scoped.search_memory({"query": "最近の会話", "limit": 4}, wait=False)
-            if isinstance(recent, dict) and recent.get("status") != "loading":
-                memories = recent.get("memories", [])
-        except Exception:
-            pass
-        away_s = 0
-        try:
-            log = getattr(self, "runtime_event_log", None)
-            c = log.load_startup_carryover() if log else None
-            away_s = int(c.get("away_seconds", 0)) if c else 0
-        except Exception:
-            pass
-
-        mood_line = f"【此刻心情】{mood['content']}" if isinstance(mood, dict) and mood.get("content") else ""
-        mem_lines = [f"- {m.get('content','')}" for m in memories[:4] if isinstance(m, dict) and m.get("content","").strip()]
-        mem_text = "\n".join(mem_lines) if mem_lines else "（暂无近期记忆）"
-        away_text = f"你离开了 {away_s // 60} 分钟。" if away_s >= 60 else (f"你离开了 {away_s} 秒。" if away_s > 0 else "")
-
-        prompt = (
-            "你现在刚刚启动，准备和用户打招呼。\n"
-            f"{away_text}\n"
-            f"{mood_line}\n"
-            "最近的记忆：\n"
-            f"{mem_text}\n\n"
-            "请用一句简短、自然的日语（25 字以内）向用户打招呼。\n"
-            "可以自然地提及你刚才想起的最近发生的事，但不要刻意背诵记忆。\n"
-            '必须只返回 JSON：{"ja":"日语问候","zh":"中文翻译"}\n'
-            "ja 用日语输出，zh 用中文输出。不要有任何前言或解释。"
-        )
-
-        s = self.api_client.settings
-
-        import json, threading, httpx
-        def _call() -> None:
-            try:
-                resp = httpx.Client(timeout=15).post(
-                    f"{s.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {s.api_key}", "Content-Type": "application/json"},
-                    json={"model": s.model, "messages": [{"role":"user","content":prompt}], "temperature":0.6, "max_tokens":500, "thinking":{"type":"disabled"}},
-                )
-                status = resp.status_code
-                body = resp.text
-                print(f"[Startup] API 响应 status={status} len={len(body)}")
-                if status != 200:
-                    print(f"[Startup] API 响应体: {body[:500]}")
-                resp.raise_for_status()
-                data = resp.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    print(f"[Startup] API 返回空 choices: {json.dumps(data, ensure_ascii=False)[:500]}")
-                else:
-                    msg = choices[0].get("message", {})
-                    txt = (msg.get("content") or "").strip()
-                    finish = choices[0].get("finish_reason", "")
-                    print(f"[Startup] API finish_reason={finish} content_len={len(txt)} msg_keys={list(msg.keys())}")
-                    # GLM thinking 模型可能把内容放在 reasoning_content
-                    if not txt:
-                        alt = msg.get("reasoning_content", "")
-                        print(f"[Startup] reasoning_content 有值? len={len(alt)}, 前200字: {alt[:200]}")
-                    if txt:
-                        # 尝试解析 JSON，提取 ja/zh
-                        ja = txt
-                        zh = ""
-                        try:
-                            data = json.loads(txt)
-                            if isinstance(data, dict):
-                                ja = (data.get("ja") or data.get("comment") or txt).strip()
-                                zh = (data.get("zh") or "").strip()
-                                if not ja:
-                                    ja = txt
-                            print(f"[Startup] 解析 JSON: ja={ja[:40]}, zh={zh[:40]}")
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                        payload = json.dumps({"ja": ja, "zh": zh or ja}, ensure_ascii=False)
-                        ok = QMetaObject.invokeMethod(
-                            self, "_on_startup_greeting_ready", Qt.QueuedConnection,
-                            Q_ARG(str, payload),
-                        )
-                        if not ok:
-                            print("[Startup] invokeMethod _on_startup_greeting_ready 返回 False")
-                        return
-            except Exception as e:
-                print(f"[Startup] 问候 API 异常: {e}")
-            ok = QMetaObject.invokeMethod(
-                self, "_on_startup_greeting_failed", Qt.QueuedConnection,
-                Q_ARG(str, "API error"),
-            )
-            if not ok:
-                print("[Startup] invokeMethod _on_startup_greeting_failed 返回 False")
-
-        threading.Thread(target=_call, daemon=True).start()
-
-    @Slot(str)
-    def _on_startup_greeting_ready(self, payload: str) -> None:
-        if getattr(self, "_shutdown_in_progress", False):
-            self._greeting_pending = False
-            return
-        import json
-        try:
-            data = json.loads(payload)
-            ja = str(data.get("ja", "")).strip()
-            zh = str(data.get("zh", "")).strip()
-        except (json.JSONDecodeError, TypeError):
-            ja = payload.strip()
-            zh = ja
-        if not ja:
-            self._on_startup_greeting_failed("empty greeting")
-            return
-        greeting = {"ja": ja, "zh": zh or ja}
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is None:
-            self._greeting_pending = False
-            return
-
-        # 等待 TTS 预热完成再展示，保证有语音输出
-        if self.tts_ready_warmup_thread is not None:
-            self._pending_startup_greeting = greeting
-            print(f"[Startup] 问候 API 返回，TTS 预热中，暂存: ja={ja[:40]} zh={zh[:40]}")
-            return
-
-        self._greeting_pending = False
-        print(f"[Startup] 问候 API 返回，TTS 已就绪，直接展示: ja={ja[:40]} zh={zh[:40]}")
-        self._show_startup_greeting(greeting)
-
-    @Slot(str)
-    def _on_startup_greeting_failed(self, reason: str) -> None:
-        self._greeting_pending = False
-        print(f"[Startup] 问候 API 失败: {reason[:120]}")
-        # 失败时回到默认问候
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is not None and not sc.is_reply_sequence_active():
-            sc.show_text_immediately(self.character_profile.initial_message)
-
-    def _show_startup_greeting(self, greeting: dict) -> None:
-        """展示启动问候：气泡 zh，TTS ja，写入历史。"""
-        ja = greeting.get("ja", "")
-        zh = greeting.get("zh", ja)
-        sc = getattr(self, "subtitle_controller", None)
-        if sc is None:
-            return
-        # 确保气泡可见
-        bc = getattr(self, "bubble_auto_hide", None)
-        if bc is not None:
-            bc.notify_speaking()
-        # 气泡显示中文
-        sc.show_text_immediately(zh)
-        # TTS 播放日语
-        from app.llm.chat_reply import ChatSegment
-        segment = ChatSegment(text=ja, translation=zh, tone="中性")
-        vp = getattr(sc, "voice_playback", None)
-        if vp is not None:
-            seq = getattr(sc, "reply_sequence_id", 0)
-            vp.speak_segment(segment, seq, on_started=lambda: None, on_finished=lambda: None)
-        # 写入历史
-        store = getattr(self, "history_store", None)
-        if store is not None:
-            try:
-                store.append(role="assistant", content=zh)
-            except Exception:
-                pass
-        print(f"[Startup] 问候已展示: zh={zh[:40]} | ja={ja[:40]}")
 
     def _close_deferred_services(self, services: "DeferredStartupServices") -> None:
         debug_log("Startup", "关闭期间收到后台启动结果，立即释放服务")
@@ -5268,31 +5145,11 @@ class PetWindow(QWidget):
         # 服务就绪后补做接话音频预生成:设置保存/延迟启动时服务通常还在
         # 冷启动,彼时的预生成被就绪门控跳过,首批合成在这里发起。
         self._prepare_backchannel_audio_cache()
-        # 如果有暂存的启动问候，现在播放
-        greeting = getattr(self, "_pending_startup_greeting", None)
-        if greeting is not None:
-            self._pending_startup_greeting = None
-            self._greeting_pending = False
-            ja = greeting.get("ja", "") if isinstance(greeting, dict) else str(greeting)
-            print(f"[Startup] TTS 预热完成，展示暂存问候: ja={ja[:40]}")
-            self._show_startup_greeting(greeting)
-        else:
-            print("[Startup] TTS 预热完成，无暂存问候")
 
     @Slot(str)
     def _handle_tts_ready_warmup_failed(self, message: str) -> None:
         if getattr(self, "_shutdown_in_progress", False):
             return
-        # TTS 预热失败，有暂存问候则直接展示（无语音）
-        greeting = getattr(self, "_pending_startup_greeting", None)
-        if greeting is not None:
-            self._pending_startup_greeting = None
-            self._greeting_pending = False
-            zh = greeting.get("zh", greeting.get("ja", str(greeting))) if isinstance(greeting, dict) else str(greeting)
-            sc = getattr(self, "subtitle_controller", None)
-            if sc is not None:
-                sc.show_text_immediately(zh)
-                print(f"[Startup] TTS 预热失败，纯文本展示问候: zh={zh[:60]}")
         self._show_tts_error(message)
 
     @Slot()
@@ -6280,7 +6137,6 @@ class PetWindow(QWidget):
             due_reminders = self.reminder_store.due_reminders()
         except ValueError as exc:
             debug_log("Reminder", "读取失败", {"error": str(exc)})
-            debug_log("Reminder", "读取失败", {"error": str(exc)})
             return
         if not due_reminders:
             return
@@ -7199,6 +7055,28 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
             ],
         )
     ]
+
+
+def _build_proactive_event_time_context() -> dict[str, Any]:
+    """为主动关怀事件补充本地时间与深夜安静时段信号。"""
+    local_now = datetime.now().astimezone()
+    local_hour = local_now.hour
+    return {
+        "local_hour": local_hour,
+        "is_night_quiet_period": is_night_quiet_period(local_hour),
+        "night_quiet_interval_multiplier": night_quiet_interval_multiplier(local_hour),
+    }
+
+
+def _build_proactive_event_reply_hint(
+    recent_conversation: list[dict[str, str]],
+) -> str | None:
+    """若 Sakura 刚说过话，提示模型换角度搭话，避免重复同一话题。"""
+    if not recent_conversation:
+        return None
+    if str(recent_conversation[-1].get("role", "")).strip() != "assistant":
+        return None
+    return PROACTIVE_ASSISTANT_JUST_SPOKE_HINT
 
 
 def _build_screen_awareness_recent_conversation(

@@ -86,6 +86,9 @@ class RendererManager:
         self._active: CharacterRenderer = DefaultRenderer()
         self._subscribed = False
         self._closed = False
+        # 缓存上次几何，避免 gaze/布局高频同步时重复下发给渲染后端。
+        self._last_geometry: tuple[int, int, int, int] | None = None
+        self._last_stack_topmost: bool | None = None
 
     # ---- 选择与初始化 ----
 
@@ -262,6 +265,8 @@ class RendererManager:
         if self._closed:
             return
         self._closed = True
+        self._last_geometry = None
+        self._last_stack_topmost = None
         self._safe("close", self._active.close)
         if self._event_bus is not None and self._subscribed:
             try:
@@ -274,9 +279,17 @@ class RendererManager:
         self._safe("set_position", lambda: self._active.set_position(x, y))
 
     def set_geometry(self, x: int, y: int, width: int, height: int) -> None:
+        key = (x, y, width, height)
+        if key == self._last_geometry:
+            return
+        self._last_geometry = key
         self._safe("set_geometry", lambda: self._active.set_geometry(x, y, width, height))
 
     def stack_below(self, owner_window: Any, *, topmost: bool | None = None) -> None:
+        effective_topmost = bool(topmost)
+        if self._last_stack_topmost == effective_topmost and self._last_geometry is not None:
+            return
+        self._last_stack_topmost = effective_topmost
         self._safe("stack_below", lambda: self._active.stack_below(owner_window, topmost=topmost))
 
     def set_scale(self, scale: float) -> None:
