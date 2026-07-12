@@ -7,22 +7,66 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
-> ⚠️ 本仓库为个人自用修改版，不提供 Release，不保证与上游兼容。
-> 如需正式版本，请访问 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)。
-
-[安装教程](docs/SETUP.md) [API配置教程](docs/API_CONFIG.md)
-
 </div>
+
+## ⚠️ 免责声明
+
+本项目基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)（MIT License），为个人自用修改版。**不提供 Release，不保证通用性，不承诺跟进上游更新。** 如需稳定版本请访问原项目。
+
+---
+
+## 启动步骤参考
+
+以下步骤基于我当前的运行环境，仅供参考。
+
+### 运行环境
+
+- Windows 10/11，Python 3.11
+- LLM：智谱 GLM-5V-Turbo（视觉）+ DeepSeek V4 Pro（文本），双端点分流
+- TTS：GPT-SoVITS（本地服务）
+
+### 启动
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/Asphodelusu/sakura-personal.git
+cd sakura-personal
+
+# 2. 创建虚拟环境并安装依赖
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+# 3. 配置文件（不会被 git 跟踪，需自行创建）
+#    data/config/api.yaml       — API Key / Base URL / 模型 / 双端点
+#    data/config/characters.yaml — 角色配置
+#    参考 docs/API_CONFIG.md 了解配置格式
+
+# 4. 启动
+run.bat
+```
+
+> 上游项目使用 `start.bat` + 内置 `runtime/` Python，本 fork 改为 `run.bat` + 自建 `.venv`。`install.bat` 依赖上游 Release 包，不可用。
+
+### 已知局限
+
+- 仅 Windows 测试过，macOS/Linux 理论上不可用
+- PySide6 要求纯英文路径（`D:\sakura` 可，`D:\桌宠\sakura` 不可）
+- 双端点（DeepSeek 文本 + 智谱视觉）下偶有 tool 链兼容问题，重启即可恢复
+- 主动屏幕感知在部分全屏应用下截图可能失败
+- 网络环境需能直连 `open.bigmodel.cn` 和 `api.deepseek.com`（或通过系统代理）
+
+---
 
 ## 修改内容
 
-基于原版 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)（MIT License），本 fork 主要改动：
+相较于原始项目 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)，本 fork 的主要改动：
 
-- **主动屏幕感知增强** — 重构 ProactiveObserver，调整触发策略（定时器 8 分钟、窗口切换冷却 2 分钟、静默门 10 秒），更积极的屏幕观察行为
-- **语音输入（STT）** — 集成 SenseVoice 模型，支持 Alt+T 快捷键语音输入，带 VAD 能量检测和手动停止
-- **记忆系统改进** — 记忆反思（memory reflection）功能、embedding 模型升级到 bge-base-zh-v1.5、时间衰减召回、定性关系笔记替代数值好感度
-- **中文使用优化** — 默认简体中文对话、提示词本地化、记忆 curator 语言偏好调整
-- **UI 细节** — 麦克风按钮、点击桌宠唤回时字幕刷新、气泡自动隐藏逻辑
+- **双端点 LLM** — 视觉（智谱 GLM-5V-Turbo）与文本（DeepSeek V4 Pro）走不同 API，消息自动消毒与去图，工具链兼容修复
+- **Agent 工具循环** — 工具组按需激活（避免每轮全量 schema）、网页搜索成功后自动收束、同轮去重
+- **记忆系统** — embedding 升级至 bge-base-zh-v1.5、时间衰减召回、定性关系笔记、memory reflection 自动整理
+- **主动屏幕感知** — 重构触发策略（定时器 8 分钟、窗口切换冷却 2 分钟）
+- **立绘映射** — tone→portrait 自动回退，模型不填立绘时从语气推断表情
+- **工程** — 懒加载避免 PySide6 强依赖、pytest 可控测试、独立于上游 Release 包运行
 
 ---
 
