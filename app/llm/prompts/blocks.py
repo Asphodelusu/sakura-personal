@@ -51,17 +51,20 @@ def segment_rules_block(segment_rules: str) -> PromptBlock:
     return PromptBlock(None, f"分段规则：\n{segment_rules}")
 
 
-def reply_label_constraints_block(tones: list[str], portraits: list[str]) -> PromptBlock:
-    return PromptBlock(
-        None,
-        "\n".join(
-            [
-                "要求：",
-                f"- tone 只能从这些类别中选择：{'、'.join(tones)}。",
-                f"- portrait 只能从这些类别中选择：{'、'.join(portraits)}。",
-            ]
-        ),
-    )
+def reply_label_constraints_block(
+    tones: list[str],
+    portraits: list[str],
+    *,
+    portrait_hints: str | None = None,
+) -> PromptBlock:
+    lines = [
+        "要求：",
+        f"- tone 只能从这些类别中选择：{'、'.join(tones)}。",
+        f"- portrait 只能从这些类别中选择：{'、'.join(portraits)}。",
+    ]
+    if portrait_hints:
+        lines.extend(["- 立绘按情绪选择：", portrait_hints])
+    return PromptBlock(None, "\n".join(lines))
 
 
 def translation_rules_block() -> PromptBlock:
@@ -85,6 +88,7 @@ def build_segment_protocol(
     format_text: str,
     segment_rules: str,
     include_translation_rules: bool,
+    portrait_hints: str | None = None,
 ) -> str:
     blocks = [
         json_only_block(),
@@ -94,7 +98,7 @@ def build_segment_protocol(
         blocks.append(segment_rules_block(segment_rules))
     # 只有一个立绘时省略 portrait 约束
     if len(portraits) > 1:
-        blocks.append(reply_label_constraints_block(tones, portraits))
+        blocks.append(reply_label_constraints_block(tones, portraits, portrait_hints=portrait_hints))
     else:
         blocks.append(PromptBlock(None, f"tone 只能从：{'、'.join(tones)}。"))
     if include_translation_rules:

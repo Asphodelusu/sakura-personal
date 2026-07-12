@@ -17,6 +17,224 @@ from app.agent.tools import ToolExecutionResult, ToolRegistry
 from app.core.debug_log import debug_log
 from app.llm.api_client import ChatMessage, NativeToolCall
 
+DEFAULT_ACTIVE_TOOL_GROUPS: frozenset[str] = frozenset({"core"})
+
+_KEYWORD_TOOL_GROUP_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "productivity",
+        (
+            "待办",
+            "todo",
+            "任务清单",
+            "提醒",
+            "reminder",
+            "闹钟",
+            "笔记",
+            "note",
+            "备忘",
+        ),
+    ),
+    (
+        "desktop",
+        (
+            "打开文件夹",
+            "打开目录",
+            "本地文件夹",
+            "open folder",
+            "打开网页",
+            "打开链接",
+            "open url",
+            "http://",
+            "https://",
+        ),
+    ),
+    (
+        "memory-write",
+        (
+            "记住",
+            "记下",
+            "别忘了",
+            "忘记",
+            "忘掉",
+            "remember",
+            "forget",
+            "更新记忆",
+        ),
+    ),
+    (
+        "mcp",
+        (
+            "搜索",
+            "搜一下",
+            "查一下",
+            "再查",
+            "再搜",
+            "查一遍",
+            "再查一遍",
+            "再搜一遍",
+            "重新查",
+            "重新搜",
+            "联网",
+            "网页",
+            "百度",
+            "谷歌",
+            "google",
+            "fetch",
+            "新闻",
+            "web search",
+        ),
+    ),
+)
+
+_MCP_FOLLOWUP_MARKERS: tuple[str, ...] = (
+    "再查",
+    "再搜",
+    "查一遍",
+    "查一次",
+    "再查一遍",
+    "再搜一遍",
+    "还是",
+    "同样",
+    "又来",
+    "重新查",
+    "重新搜",
+    "再帮我查",
+    "再帮我搜",
+)
+
+_MEMORY_REMEMBER_MARKERS: tuple[str, ...] = (
+    "记住",
+    "记下",
+    "别忘了",
+    "remember",
+)
+
+_MEMORY_FORGET_MARKERS: tuple[str, ...] = (
+    "忘记",
+    "忘掉",
+    "forget",
+    "别记住",
+)
+
+_MEMORY_RECALL_MARKERS: tuple[str, ...] = (
+    "刚才让记住",
+    "刚才说",
+    "让你记住",
+    "还记得",
+    "记不记得",
+    "记得吗",
+    "想起来",
+    "刚才记",
+    "之前说",
+    "之前让",
+)
+
+_MEMORY_REMEMBER_CONTENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"记住[：:，,\s]+(.+)", re.IGNORECASE),
+    re.compile(r"记下[：:，,\s]+(.+)", re.IGNORECASE),
+    re.compile(r"别忘了[：:，,\s]+(.+)", re.IGNORECASE),
+    re.compile(r"remember\s+(.+)", re.IGNORECASE),
+)
+
+
+def infer_active_tool_groups_from_messages(messages: list[ChatMessage]) -> set[str]:
+    """根据用户话术预激活工具组，避免闲聊每轮携带全套工具 schema。"""
+    groups = set(DEFAULT_ACTIVE_TOOL_GROUPS)
+    text = (_latest_user_text(messages) or "").lower()
+    if not text:
+        return groups
+    for group, keywords in _KEYWORD_TOOL_GROUP_RULES:
+        if any(keyword.lower() in text for keyword in keywords):
+            groups.add(group)
+    if messages_contain_recent_web_search(messages) and user_requests_mcp_followup(text):
+        groups.add("mcp")
+    return groups
+
+
+def messages_contain_recent_web_search(messages: list[ChatMessage]) -> bool:
+    """对话里是否已出现过网页搜索/抓取工具调用。"""
+    web_tools = frozenset({"web__web_search", "web__fetch_url", "web_search", "fetch_url"})
+    for message in messages:
+        if message.get("role") == "tool" and str(message.get("name", "")) in web_tools:
+            return True
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            name = ""
+            if isinstance(function, dict):
+                name = str(function.get("name", ""))
+            if not name:
+                name = str(call.get("name", ""))
+            if name in web_tools:
+                return True
+    return False
+
+
+def user_requests_mcp_followup(text: str) -> bool:
+    """用户是否在要求重复/延续上一轮联网查询。"""
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    if any(marker.lower() in normalized for marker in _MCP_FOLLOWUP_MARKERS):
+        return True
+    return bool(re.search(r"[再又还].{0,6}[查搜]", normalized))
+
+
+def user_requests_memory_remember(messages: list[ChatMessage]) -> bool:
+    """用户是否明确要求写入长期记忆。"""
+    if user_requests_memory_recall(messages):
+        return False
+    text = (_latest_user_text(messages) or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _MEMORY_FORGET_MARKERS):
+        return False
+    return any(marker in text for marker in _MEMORY_REMEMBER_MARKERS)
+
+
+def user_requests_memory_recall(messages: list[ChatMessage]) -> bool:
+    """用户是否在追问已写入或应写入的长期记忆。"""
+    text = (_latest_user_text(messages) or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _MEMORY_RECALL_MARKERS):
+        return True
+    if re.search(r"(刚才|之前).{0,8}(记住|说|告诉)", text):
+        return True
+    if re.search(r"(记得|想起来).{0,4}(吗|么|不)", text):
+        return True
+    if "让你记住" in text and any(token in text for token in ("什么", "啥", "吗", "?", "？")):
+        return True
+    return False
+
+
+def extract_memory_remember_content(messages: list[ChatMessage]) -> str | None:
+    """从用户话术提取应写入长期记忆的正文。"""
+    text = (_latest_user_text(messages) or "").strip()
+    if not text:
+        return None
+    for pattern in _MEMORY_REMEMBER_CONTENT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            content = match.group(1).strip()
+            if content:
+                return content
+    if user_requests_memory_remember(messages):
+        return text
+    return None
+
+
+def extract_memory_recall_query(messages: list[ChatMessage]) -> str:
+    """为 memory_search 生成查询文本。"""
+    text = (_latest_user_text(messages) or "").strip()
+    return text or "用户偏好"
+
 
 def _filter_tools_for_browser_routing(
     tools: list[dict[str, Any]],
@@ -173,6 +391,29 @@ def _latest_user_is_browser_lookup_request(messages: list[ChatMessage]) -> bool:
         "summarize",
     )
     return any(keyword in text for keyword in lookup_keywords)
+
+
+_WEB_SEARCH_TOOL_NAMES = frozenset(
+    {"web__web_search", "web_search", "web__fetch_url", "fetch_url"}
+)
+
+
+def _should_fast_forward_after_web_search(
+    messages: list[ChatMessage],
+    execution_results: list[ToolExecutionResult],
+) -> bool:
+    """信息查询在已有网页搜索/抓取结果后应收束工具循环，进入最终总结。
+
+    避免模型因「不确定首轮结果是否够用」在同一轮里换关键词反复搜索。
+    """
+    if not _latest_user_is_browser_lookup_request(messages):
+        return False
+    if _latest_user_is_browser_interaction_request(messages):
+        return False
+    return any(
+        result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success
+        for result in execution_results
+    )
 
 
 def _latest_user_is_browser_interaction_request(messages: list[ChatMessage]) -> bool:

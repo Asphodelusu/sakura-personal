@@ -282,6 +282,7 @@ def test_search_tools_activates_browser_tool_group() -> None:
                 "required": ["keyword"],
             },
             handler=registry.search_tools,
+            group="core",
         )
     )
     client = NativeFakeClient(

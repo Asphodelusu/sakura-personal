@@ -157,6 +157,12 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         history_store=history_store,
         runtime_loop_settings=runtime_loop_settings,
     )
+    agent_runtime.update_character(
+        system_prompt,
+        character_profile.reply_tones,
+        character_profile.portrait_choices,
+        character_profile=character_profile,
+    )
     runtime_event_log = create_runtime_event_log(base_dir, character_profile)
     visual_observation_store = create_visual_observation_store(base_dir, character_profile)
     debug_log_settings = settings_service.load_debug_log_settings()

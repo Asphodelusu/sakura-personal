@@ -579,6 +579,7 @@ class OpenAICompatibleClient:
         """调用 OpenAI 原生 tools/tool_calls 协议并返回 assistant 消息。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
+        messages = sanitize_tool_conversation_messages(messages)
 
         if tools:
             chat_params["tools"] = tools
@@ -646,6 +647,7 @@ class OpenAICompatibleClient:
                 raise
         check_cancelled(cancel_checker)
 
+        choice_diagnostics = _extract_choice_diagnostics(data)
         try:
             raw_message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -661,17 +663,25 @@ class OpenAICompatibleClient:
             if tool_calls and isinstance(content, str):
                 content = _strip_xml_tool_calls(content)
         normalized_message = _normalize_assistant_message(raw_message, content, tool_calls)
-        debug_log(
-            "API",
-            "原生工具模型返回",
-            {
-                "content": str(content or "").strip(),
-                "tool_calls": [
-                    {"id": call.id, "name": call.name, "arguments": call.arguments}
-                    for call in tool_calls
-                ],
-            },
-        )
+        response_log: dict[str, Any] = {
+            "content": str(content or "").strip(),
+            "tool_calls": [
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in tool_calls
+            ],
+            **choice_diagnostics,
+        }
+        debug_log("API", "原生工具模型返回", response_log)
+        if not str(content or "").strip() and not tool_calls:
+            debug_log(
+                "API",
+                "空 content 且无 tool_calls",
+                {
+                    **choice_diagnostics,
+                    "tool_count": len(tools or []),
+                    "structured_response": structured_response,
+                },
+            )
         return ChatCompletionTurn(
             content=str(content or "").strip(),
             tool_calls=tool_calls,
@@ -872,6 +882,35 @@ class OpenAICompatibleClient:
             cancellable_sleep(delay, cancel_checker)
 
         raise ApiRequestError("API 请求失败。")
+
+
+def _extract_choice_diagnostics(data: dict[str, Any]) -> dict[str, Any]:
+    """从 chat/completions 响应提取 finish_reason 与 token usage，供空回复排查。"""
+    diagnostics: dict[str, Any] = {}
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return diagnostics
+    if not isinstance(choice, dict):
+        return diagnostics
+    finish_reason = choice.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason.strip():
+        diagnostics["finish_reason"] = finish_reason.strip()
+    message = choice.get("message")
+    if isinstance(message, dict):
+        refusal = message.get("refusal")
+        if refusal:
+            diagnostics["refusal"] = str(refusal)
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        usage_summary = {
+            key: usage[key]
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if key in usage
+        }
+        if usage_summary:
+            diagnostics["usage"] = usage_summary
+    return diagnostics
 
 
 def _build_segmented_reply_instruction(
@@ -1298,6 +1337,87 @@ def messages_contain_image(messages: list[ChatMessage]) -> bool:
             if isinstance(part, dict) and part.get("type") == "image_url":
                 return True
     return False
+
+
+_IMAGE_OMITTED_PLACEHOLDER = "[image omitted for text model]"
+
+
+def _assistant_tool_call_ids(message: ChatMessage) -> set[str]:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return set()
+    ids: set[str] = set()
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id")
+        if isinstance(call_id, str) and call_id.strip():
+            ids.add(call_id.strip())
+    return ids
+
+
+def sanitize_tool_conversation_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """移除没有对应 assistant tool_calls 的孤立 tool 消息，避免跨端点请求失败。"""
+    sanitized: list[ChatMessage] = []
+    pending_tool_ids: set[str] = set()
+    for message in messages:
+        role = str(message.get("role", "")).strip()
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            call_id_text = call_id.strip() if isinstance(call_id, str) else ""
+            if not call_id_text or call_id_text not in pending_tool_ids:
+                continue
+            pending_tool_ids.discard(call_id_text)
+            sanitized.append(message)
+            continue
+        if role == "assistant":
+            pending_tool_ids = _assistant_tool_call_ids(message)
+        else:
+            pending_tool_ids = set()
+        sanitized.append(message)
+    return sanitized
+
+
+def strip_image_parts_from_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """把多模态消息压成纯文本，供文本端点复用同一段对话历史。"""
+    stripped: list[ChatMessage] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            stripped.append(message)
+            continue
+        text_parts: list[str] = []
+        image_count = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                image_count += 1
+                continue
+            if part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+        combined = "\n".join(text_parts).strip()
+        if image_count:
+            note = f"[{image_count} image(s) omitted for text model]"
+            combined = f"{combined}\n{note}".strip() if combined else note
+        new_message = dict(message)
+        new_message["content"] = combined or _IMAGE_OMITTED_PLACEHOLDER
+        stripped.append(new_message)
+    return stripped
+
+
+def prepare_messages_for_chat_api(
+    messages: list[ChatMessage],
+    *,
+    text_only: bool = False,
+) -> list[ChatMessage]:
+    """入模前统一清理 tool 链；文本端点场景额外去掉图片块。"""
+    prepared = sanitize_tool_conversation_messages(messages)
+    if text_only:
+        prepared = strip_image_parts_from_messages(prepared)
+    return prepared
 
 
 def is_vision_unsupported_error(error: BaseException | str) -> bool:

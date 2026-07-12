@@ -16,7 +16,8 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QMessageBox, QWidget
 
-from app.config.character_loader import CharacterProfile
+from app.config.character_loader import CharacterProfile, resolve_reply_segment
+from app.core.debug_log import debug_log
 from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import should_crossfade_portrait
 from app.ui.error_messages import format_failure_message
@@ -115,12 +116,25 @@ class PortraitController(QObject):
         return self.pixmap
 
     def preload_for_segment(self, segment: ChatSegment) -> None:
+        segment = resolve_reply_segment(segment, self.profile)
         next_portrait_path = self.profile.portrait_for_segment(segment.portrait, segment.tone)
         if next_portrait_path not in self.pixmap_cache:
             self.load_portrait(next_portrait_path)
 
     def apply_for_segment(self, segment: ChatSegment) -> None:
+        segment = resolve_reply_segment(segment, self.profile)
+        resolved_label = segment.portrait or self.profile.resolve_portrait_label(segment.portrait, segment.tone)
         next_portrait_path = self.profile.portrait_for_segment(segment.portrait, segment.tone)
+        debug_log(
+            "Portrait",
+            "分段立绘切换",
+            {
+                "tone": segment.tone,
+                "portrait_resolved": resolved_label,
+                "path": str(next_portrait_path),
+                "current_path": str(self.current_path),
+            },
+        )
         if next_portrait_path == self.current_path:
             return
         # 交叉淡入进行中且目标相同：跳过重复切换，避免动画被打断后闪跳。

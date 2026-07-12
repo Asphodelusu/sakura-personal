@@ -949,6 +949,16 @@ class MemoryStore:
                 "query": query,
                 "count": len(memories),
                 "memories": memories,
+                **(
+                    {
+                        "agent_hint": (
+                            "未找到相关长期记忆。请直接告诉用户你目前没有这条记忆，"
+                            "不要在本轮再次调用 memory_search。"
+                        ),
+                    }
+                    if not memories
+                    else {}
+                ),
             }
         try:
             mem = self._get_memory(wait=wait)
@@ -990,6 +1000,16 @@ class MemoryStore:
             "query": query,
             "count": len(memories),
             "memories": memories,
+            **(
+                {
+                    "agent_hint": (
+                        "未找到相关长期记忆。请直接告诉用户你目前没有这条记忆，"
+                        "不要在本轮再次调用 memory_search。"
+                    ),
+                }
+                if not memories
+                else {}
+            ),
         }
 
     def create_memory(

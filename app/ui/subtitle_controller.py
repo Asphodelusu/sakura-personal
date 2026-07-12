@@ -343,6 +343,8 @@ class SubtitleController(QObject):
         self.reply_advance_scheduled = False
         if self._preload_segment is not None:
             self._preload_segment(segment)
+        # 立绘应在分段开始时立刻切换，不等待 TTS 合成/开播回调。
+        self._apply_segment(segment)
         self.voice_playback.speak_segment(
             segment,
             sequence_id,
@@ -368,7 +370,6 @@ class SubtitleController(QObject):
                 "portrait": self.current_segment.portrait,
             },
         )
-        self._apply_segment(self.current_segment)
         self.set_speech(
             self.current_segment.display_text(self.subtitle_language),
             pulse=self._should_pulse_bubble(),

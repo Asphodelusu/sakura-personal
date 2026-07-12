@@ -79,6 +79,7 @@ from app.config.character_loader import (
     CharacterProfile,
     CharacterRegistry,
     load_character_system_prompt,
+    resolve_reply_segment,
     save_character_theme,
 )
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
@@ -1698,9 +1699,11 @@ class PetWindow(QWidget):
             timer.stop()
         # 正式回复开始:放弃尚未触发的接话(已显示的接话被正式字幕自然覆盖)。
         self._cancel_backchannel()
+        segment = resolve_reply_segment(segment, self.character_profile)
         # 同轮回复内各段高度延续：不在此重置，避免"段间先缩后扩"产生闪现。
         # 高度重置由 _collapse_auto_fit_bubble_height 在 cancel_reply_flow 前统一处理。
         self.portrait_controller.apply_for_segment(segment)
+        self._sync_renderer_portrait(segment)
         maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
         if callable(maybe_resuppress):
             maybe_resuppress()
@@ -1711,6 +1714,21 @@ class PetWindow(QWidget):
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
             controller.notify_speaking()
+
+    def _sync_renderer_portrait(self, segment: ChatSegment) -> None:
+        """独立渲染器接管显示时，把立绘标签同步到渲染后端。"""
+        manager = getattr(self, "renderer_manager", None)
+        if manager is None or not getattr(manager, "is_overlay_active", False):
+            return
+        label = self.character_profile.resolve_portrait_label(segment.portrait, segment.tone)
+        set_expression = getattr(manager, "set_expression", None)
+        if callable(set_expression):
+            set_expression(label)
+        debug_log(
+            "Portrait",
+            "渲染器表情同步",
+            {"portrait": label, "renderer": getattr(manager, "active_renderer_name", "")},
+        )
 
     def _cancel_backchannel(self) -> None:
         controller = getattr(self, "backchannel_controller", None)
@@ -6221,6 +6239,10 @@ class PetWindow(QWidget):
         if callable(cancel_backchannel):
             cancel_backchannel()
         self._exit_reply_history_review(update_buttons=False)
+        segments = [
+            resolve_reply_segment(segment, self.character_profile)
+            for segment in segments
+        ]
         self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)
 
@@ -6778,7 +6800,12 @@ class PetWindow(QWidget):
         self.system_prompt = load_character_system_prompt(profile)
         self.memory_curator.set_system_prompt(self.system_prompt)
         self.memory_store.set_scope(profile.id)
-        self.agent_runtime.update_character(self.system_prompt, profile.reply_tones, profile.portrait_choices)
+        self.agent_runtime.update_character(
+            self.system_prompt,
+            profile.reply_tones,
+            profile.portrait_choices,
+            character_profile=profile,
+        )
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text(profile))
