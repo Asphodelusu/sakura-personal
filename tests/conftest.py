@@ -5,6 +5,10 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
+from tests.support.pyside6_stub import install_pyside6_stub_if_missing, is_pyside6_stub_active
+
+install_pyside6_stub_if_missing()
+
 import pytest
 
 
@@ -97,6 +101,8 @@ def block_memory_store_background_load(
 
 
 def _cleanup_qt_objects() -> None:
+    if is_pyside6_stub_active():
+        return
     if importlib.util.find_spec("PySide6") is None:
         return
     try:

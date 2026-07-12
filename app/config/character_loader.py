@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from app.backchannel.models import EMOTIONS
 from app.llm.prompt_templates import with_desktop_pet_context
 
 if TYPE_CHECKING:
@@ -47,6 +48,18 @@ _TONE_PORTRAIT_FALLBACKS: dict[str, str] = {
     "自信": "自信拍胸",
 }
 
+_EMOTION_HINT_LABELS: dict[str, str] = {
+    "neutral": "平淡",
+    "confused": "困惑",
+    "anxious": "担心",
+    "frustrated": "烦躁",
+    "sad": "难过",
+    "angry": "生气/吃醋",
+    "happy": "开心",
+    "playful": "兴奋/调皮",
+    "embarrassed": "害羞",
+}
+
 
 @dataclass(frozen=True)
 class CharacterProfile:
@@ -57,6 +70,8 @@ class CharacterProfile:
     initial_message: str
     default_portrait_path: Path
     expression_portraits: dict[str, Path] = field(default_factory=dict)
+    tone_portrait_map: dict[str, str] = field(default_factory=dict)
+    emotion_portrait_map: dict[str, str] = field(default_factory=dict)
     voice: CharacterVoice | None = None
     # 接话模板清单路径(可选,缺省即该角色 opt-out)。此处只解析路径不校验存在,
     # 文件缺失/非法由 manifest 加载方降级处理,不应让整个角色包加载失败。
@@ -75,20 +90,110 @@ class CharacterProfile:
     def portrait_choices(self) -> list[str]:
         return list(self.expression_portraits)
 
-    def portrait_for_tone(self, tone: str | None) -> Path:
+    @property
+    def portrait_selection_hints(self) -> str:
+        """供提示词使用的情绪→立绘分组说明。"""
+        if len(self.expression_portraits) <= 1:
+            return ""
+        lines: list[str] = []
+        covered: set[str] = set()
+        for tone, label in self.tone_portrait_map.items():
+            if label in self.expression_portraits and label not in covered:
+                lines.append(f"- tone「{tone}」→ portrait「{label}」")
+                covered.add(label)
+        for emotion, label in self.emotion_portrait_map.items():
+            if label in self.expression_portraits and label not in covered:
+                hint = _EMOTION_HINT_LABELS.get(emotion, emotion)
+                lines.append(f"- {hint} → portrait「{label}」")
+                covered.add(label)
+        default_label = self.default_portrait_label()
+        for label in self.expression_portraits:
+            if label not in covered and label != default_label:
+                lines.append(f"- 语境合适时可用 portrait「{label}」")
+        return "\n".join(lines)
+
+    def default_portrait_label(self) -> str:
+        for label, path in self.expression_portraits.items():
+            if path == self.default_portrait_path:
+                return label
+        if self.expression_portraits:
+            return next(iter(self.expression_portraits))
+        return "站立待机"
+
+    def portrait_label_for_tone(self, tone: str | None) -> str | None:
         tone_key = (tone or "").strip()
-        if tone_key and tone_key in self.expression_portraits:
-            return self.expression_portraits[tone_key]
-        mapped = _TONE_PORTRAIT_FALLBACKS.get(tone_key)
+        if not tone_key:
+            return None
+        mapped = self.tone_portrait_map.get(tone_key)
         if mapped and mapped in self.expression_portraits:
-            return self.expression_portraits[mapped]
+            return mapped
+        if tone_key in self.expression_portraits:
+            return tone_key
+        fallback = _TONE_PORTRAIT_FALLBACKS.get(tone_key)
+        if fallback and fallback in self.expression_portraits:
+            return fallback
+        return None
+
+    def portrait_label_for_emotion(self, emotion: str | None) -> str | None:
+        emotion_key = str(emotion or "").strip().lower()
+        if not emotion_key:
+            return None
+        mapped = self.emotion_portrait_map.get(emotion_key)
+        if mapped and mapped in self.expression_portraits:
+            return mapped
+        return None
+
+    def resolve_portrait_label(
+        self,
+        portrait: str | None,
+        tone: str | None = None,
+        *,
+        emotion: str | None = None,
+    ) -> str:
+        """把模型输出的 portrait/tone 规整为角色包内的立绘标签。"""
+        portrait_key = (portrait or "").strip()
+        default_label = self.default_portrait_label()
+        tone_label = self.portrait_label_for_tone(tone)
+        emotion_label = self.portrait_label_for_emotion(emotion)
+
+        if portrait_key and portrait_key in self.expression_portraits:
+            if portrait_key != default_label:
+                return portrait_key
+            if tone_label and tone_label != default_label:
+                return tone_label
+            if emotion_label and emotion_label != default_label:
+                return emotion_label
+            return portrait_key
+
+        alias = _match_portrait_alias(portrait_key, self.expression_portraits)
+        if alias:
+            return alias
+
+        if tone_label and tone_label != default_label:
+            return tone_label
+        if emotion_label and emotion_label != default_label:
+            return emotion_label
+        if tone_label:
+            return tone_label
+        if emotion_label:
+            return emotion_label
+        return default_label
+
+    def portrait_for_tone(self, tone: str | None) -> Path:
+        label = self.portrait_label_for_tone(tone)
+        if label:
+            return self.expression_portraits[label]
         return self.default_portrait_path
 
-    def portrait_for_segment(self, portrait: str | None, tone: str | None = None) -> Path:
-        portrait_key = (portrait or "").strip()
-        if portrait_key and portrait_key in self.expression_portraits:
-            return self.expression_portraits[portrait_key]
-        return self.portrait_for_tone(tone)
+    def portrait_for_segment(
+        self,
+        portrait: str | None,
+        tone: str | None = None,
+        *,
+        emotion: str | None = None,
+    ) -> Path:
+        label = self.resolve_portrait_label(portrait, tone, emotion=emotion)
+        return self.expression_portraits.get(label, self.default_portrait_path)
 
 
 class CharacterRegistry:
@@ -164,9 +269,18 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         "默认立绘",
     )
     expression_portraits = _load_expression_portraits(package_dir, portrait_data)
-
+    expression_labels = set(expression_portraits)
     reply_data = raw_data.get("reply")
     reply_tones = _load_reply_tones(reply_data)
+    tone_portrait_map = _load_tone_portrait_map(
+        portrait_data,
+        reply_tones=reply_tones,
+        expression_labels=expression_labels,
+    )
+    emotion_portrait_map = _load_emotion_portrait_map(
+        portrait_data,
+        expression_labels=expression_labels,
+    )
     voice = _load_voice(package_dir, raw_data.get("voice"), manifest_path)
     backchannel_text = _optional_text(raw_data, "backchannel", "")
     backchannel_manifest_path = (
@@ -182,6 +296,8 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         initial_message=initial_message,
         default_portrait_path=default_portrait,
         expression_portraits=expression_portraits,
+        tone_portrait_map=tone_portrait_map,
+        emotion_portrait_map=emotion_portrait_map,
         voice=voice,
         backchannel_manifest_path=backchannel_manifest_path,
         reply_tones=reply_tones,
@@ -228,6 +344,118 @@ def save_character_theme(
     if not isinstance(raw_data, dict):
         raise CharacterConfigError(f"角色清单必须是 JSON 对象：{manifest_path}")
     _write_character_theme_manifest(manifest_path, raw_data, settings, source=source)
+
+
+def resolve_reply_segment(segment: "ChatSegment", profile: CharacterProfile | None) -> "ChatSegment":
+    """把单段回复的 portrait 规整到角色包词表（展示/TTS 前调用）。"""
+    from app.backchannel.emotion import EmotionScorer
+    from app.llm.chat_reply import ChatSegment
+
+    if profile is None:
+        return segment
+    emotion: str | None = None
+    portrait_key = (segment.portrait or "").strip()
+    default_label = profile.default_portrait_label()
+    if (not portrait_key or portrait_key == default_label) and segment.text.strip():
+        emotion = EmotionScorer().best(f"{segment.translation}\n{segment.text}") or None
+    resolved = profile.resolve_portrait_label(
+        segment.portrait,
+        segment.tone,
+        emotion=emotion,
+    )
+    if resolved == segment.portrait:
+        return segment
+    return ChatSegment(
+        segment.text,
+        segment.tone,
+        segment.translation,
+        resolved,
+        suppress_tts=segment.suppress_tts,
+    )
+
+
+def normalize_reply_portraits(reply: "ChatReply", profile: CharacterProfile | None) -> "ChatReply":
+    """把分段回复里的 portrait 标签规整到角色包词表。"""
+    from app.llm.chat_reply import ChatReply, ChatSegment
+
+    if profile is None or not reply.segments:
+        return reply
+    segments: list[ChatSegment] = []
+    changed = False
+    for segment in reply.segments:
+        resolved_segment = resolve_reply_segment(segment, profile)
+        if resolved_segment is not segment:
+            changed = True
+        segments.append(resolved_segment)
+    return ChatReply(segments) if changed else reply
+
+
+def _match_portrait_alias(portrait_key: str, expression_portraits: dict[str, Path]) -> str | None:
+    if not portrait_key:
+        return None
+    if portrait_key in expression_portraits:
+        return portrait_key
+    for label in expression_portraits:
+        if portrait_key in label or label in portrait_key:
+            return label
+    return None
+
+
+def _load_tone_portrait_map(
+    portrait_data: dict[str, Any],
+    *,
+    reply_tones: list[str],
+    expression_labels: set[str],
+) -> dict[str, str]:
+    raw_map = portrait_data.get("tone_map")
+    result: dict[str, str] = {}
+    if isinstance(raw_map, dict):
+        for tone, label in raw_map.items():
+            if not isinstance(tone, str) or not isinstance(label, str):
+                raise CharacterConfigError("portrait.tone_map 的键和值都必须是字符串。")
+            tone_key = tone.strip()
+            label_key = label.strip()
+            if not tone_key or not label_key:
+                continue
+            if label_key not in expression_labels:
+                raise CharacterConfigError(f"portrait.tone_map 引用了未知立绘标签：{label_key}")
+            result[tone_key] = label_key
+    if result:
+        return result
+    for tone in reply_tones:
+        if tone in expression_labels:
+            result[tone] = tone
+            continue
+        fallback = _TONE_PORTRAIT_FALLBACKS.get(tone)
+        if fallback and fallback in expression_labels:
+            result[tone] = fallback
+    return result
+
+
+def _load_emotion_portrait_map(
+    portrait_data: dict[str, Any],
+    *,
+    expression_labels: set[str],
+) -> dict[str, str]:
+    raw_map = portrait_data.get("emotion_map")
+    if raw_map is None:
+        return {}
+    if not isinstance(raw_map, dict):
+        raise CharacterConfigError("portrait.emotion_map 必须是对象。")
+    result: dict[str, str] = {}
+    for emotion, label in raw_map.items():
+        if not isinstance(emotion, str) or not isinstance(label, str):
+            raise CharacterConfigError("portrait.emotion_map 的键和值都必须是字符串。")
+        emotion_key = emotion.strip().lower()
+        label_key = label.strip()
+        if not emotion_key or not label_key:
+            continue
+        if emotion_key not in EMOTIONS:
+            raise CharacterConfigError(f"portrait.emotion_map 使用了未知 emotion：{emotion_key}")
+        if label_key not in expression_labels:
+            raise CharacterConfigError(f"portrait.emotion_map 引用了未知立绘标签：{label_key}")
+        result[emotion_key] = label_key
+    return result
 
 
 def _load_expression_portraits(package_dir: Path, portrait_data: dict[str, Any]) -> dict[str, Path]:

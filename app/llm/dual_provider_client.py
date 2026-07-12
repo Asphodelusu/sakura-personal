@@ -12,6 +12,7 @@ from app.llm.api_client import (
     api_settings_for_vision,
     api_settings_uses_dual_endpoint,
     messages_contain_image,
+    prepare_messages_for_chat_api,
 )
 from app.llm.chat_reply import ChatReply
 
@@ -78,9 +79,13 @@ class DualProviderLlmClient:
         on_chunk: Callable[[str], None] | None = None,
     ) -> ChatReply:
         client = self._pick_client(messages)
+        prepared_messages = prepare_messages_for_chat_api(
+            messages,
+            text_only=client is self._text,
+        )
         reply = client.chat(
             system_prompt,
-            messages,
+            prepared_messages,
             reply_tones,
             reply_portraits,
             cancel_checker=cancel_checker,
@@ -101,9 +106,13 @@ class DualProviderLlmClient:
         **chat_params: Any,
     ) -> str:
         client = self._pick_client(messages)
+        prepared_messages = prepare_messages_for_chat_api(
+            messages,
+            text_only=client is self._text,
+        )
         result = client.complete_raw(
             system_prompt,
-            messages,
+            prepared_messages,
             temperature,
             cancel_checker=cancel_checker,
             runtime_context=runtime_context,
@@ -123,9 +132,13 @@ class DualProviderLlmClient:
         **chat_params: Any,
     ):
         client = self._pick_client(messages)
+        prepared_messages = prepare_messages_for_chat_api(
+            messages,
+            text_only=client is self._text,
+        )
         for chunk in client.stream_raw(
             system_prompt,
-            messages,
+            prepared_messages,
             temperature,
             cancel_checker=cancel_checker,
             runtime_context=runtime_context,
@@ -148,9 +161,13 @@ class DualProviderLlmClient:
         **chat_params: Any,
     ) -> ChatCompletionTurn:
         client = self._pick_client(messages)
+        prepared_messages = prepare_messages_for_chat_api(
+            messages,
+            text_only=client is self._text,
+        )
         turn = client.complete_with_tools(
             system_prompt,
-            messages,
+            prepared_messages,
             tools=tools,
             tool_choice=tool_choice,
             temperature=temperature,

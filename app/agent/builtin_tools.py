@@ -35,6 +35,7 @@ def create_builtin_tool_registry(
                 description="获取当前本机时间和时区。",
                 parameters={},
                 handler=lambda _arguments: get_current_time(),
+                group="core",
             ),
             Tool(
                 name="add_todo",
@@ -47,12 +48,14 @@ def create_builtin_tool_registry(
                     "required": ["text"],
                 },
                 handler=store.add_todo,
+                group="productivity",
             ),
             Tool(
                 name="list_todos",
                 description="列出所有未完成待办事项。",
                 parameters={},
                 handler=store.list_todos,
+                group="productivity",
             ),
             Tool(
                 name="complete_todo",
@@ -65,6 +68,7 @@ def create_builtin_tool_registry(
                     "required": ["id"],
                 },
                 handler=store.complete_todo,
+                group="productivity",
             ),
             Tool(
                 name="add_reminder",
@@ -93,12 +97,14 @@ def create_builtin_tool_registry(
                     "required": ["text"],
                 },
                 handler=reminders.add_reminder,
+                group="productivity",
             ),
             Tool(
                 name="list_reminders",
                 description="列出未完成且未取消的一次性提醒。",
                 parameters={},
                 handler=reminders.list_reminders,
+                group="productivity",
             ),
             Tool(
                 name="cancel_reminder",
@@ -111,6 +117,7 @@ def create_builtin_tool_registry(
                     "required": ["id"],
                 },
                 handler=reminders.cancel_reminder,
+                group="productivity",
             ),
             Tool(
                 name="read_note",
@@ -123,6 +130,7 @@ def create_builtin_tool_registry(
                     "required": ["name"],
                 },
                 handler=notes.read_note,
+                group="productivity",
             ),
             Tool(
                 name="write_note",
@@ -136,6 +144,7 @@ def create_builtin_tool_registry(
                     "required": ["name", "content"],
                 },
                 handler=notes.write_note,
+                group="productivity",
             ),
             Tool(
                 name="open_url",
@@ -149,6 +158,7 @@ def create_builtin_tool_registry(
                 },
                 handler=open_url,
                 requires_confirmation=True,
+                group="desktop",
             ),
             Tool(
                 name="open_local_folder",
@@ -162,6 +172,7 @@ def create_builtin_tool_registry(
                 },
                 handler=open_local_folder,
                 requires_confirmation=True,
+                group="desktop",
             ),
             Tool(
                 name="memory_search",
@@ -183,7 +194,7 @@ def create_builtin_tool_registry(
                     },
                 },
                 handler=lambda arguments: memory.search_memory(arguments, wait=False),
-                group="memory",
+                group="core",
             ),
             Tool(
                 name="memory_remember",
@@ -206,7 +217,7 @@ def create_builtin_tool_registry(
                     "required": ["content"],
                 },
                 handler=lambda arguments: memory.remember_memory(arguments, wait=False),
-                group="memory",
+                group="memory-write",
             ),
             Tool(
                 name="memory_update",
@@ -230,7 +241,7 @@ def create_builtin_tool_registry(
                 handler=lambda arguments: memory.update_memory(
                     _memory_update_arguments(arguments), wait=False
                 ),
-                group="memory",
+                group="memory-write",
             ),
             Tool(
                 name="memory_forget",
@@ -243,7 +254,7 @@ def create_builtin_tool_registry(
                     "required": ["memory_id"],
                 },
                 handler=lambda arguments: memory.forget_memory(_memory_forget_arguments(arguments), wait=False),
-                group="memory",
+                group="memory-write",
             ),
         ]
     )
@@ -252,7 +263,8 @@ def create_builtin_tool_registry(
             name="search_tools",
             description=(
                 "搜索 Sakura 当前已安装但可能尚未暴露的工具。"
-                "当你需要浏览器、桌面、网页、文件等能力但当前工具列表不足时使用。"
+                "当你需要 productivity（待办/提醒/笔记）、desktop（打开链接/文件夹）、"
+                "mcp（联网搜索）、browser（网页操作）等能力但当前工具列表不足时使用。"
             ),
             parameters={
                 "type": "object",
@@ -262,7 +274,7 @@ def create_builtin_tool_registry(
                 "required": ["keyword"],
             },
             handler=registry.search_tools,
-            group="default",
+            group="core",
             risk="low",
         )
     )
@@ -272,7 +284,7 @@ def create_builtin_tool_registry(
             description="列出 Sakura 当前可用工具组及数量，用于决定是否需要搜索并激活更多工具。",
             parameters={"type": "object", "properties": {}, "required": []},
             handler=registry.list_tool_groups,
-            group="default",
+            group="core",
             risk="low",
         )
     )
@@ -294,7 +306,8 @@ def _memory_forget_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _memory_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     memory_id = arguments.get("memory_id") or arguments.get("id")
-    mapped = {"id": memory_id, "content": arguments.get("content")}
+    content = arguments.get("content") or arguments.get("new_content")
+    mapped = {"id": memory_id, "content": content}
     for key in ("layer", "category", "importance", "confidence"):
         if key in arguments:
             mapped[key] = arguments.get(key)

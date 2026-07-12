@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from app.backchannel.models import EMOTIONS
 from app.config.character_loader import (
     CharacterConfigError,
     CharacterProfile,
@@ -243,15 +244,20 @@ def export_character_archive(profile: CharacterProfile, output_path: Path, *, in
         label: archive_path_for_resource(path, "portrait")
         for label, path in profile.expression_portraits.items()
     }
+    portrait_section: dict[str, Any] = {
+            "default": default_portrait_archive_path,
+            "expressions": expression_archive_paths,
+        }
+    if profile.tone_portrait_map:
+        portrait_section["tone_map"] = dict(profile.tone_portrait_map)
+    if profile.emotion_portrait_map:
+        portrait_section["emotion_map"] = dict(profile.emotion_portrait_map)
     character_manifest: dict[str, Any] = {
         "id": profile.id,
         "display_name": profile.display_name,
         "initial_message": profile.initial_message,
         "card": card_archive_path,
-        "portrait": {
-            "default": default_portrait_archive_path,
-            "expressions": expression_archive_paths,
-        },
+        "portrait": portrait_section,
         "reply": {"tones": [*profile.reply_tones]},
         "theme": character_theme_to_mapping(
             profile.theme_settings,
@@ -453,16 +459,32 @@ def _normalized_import_character_data(
         _required_archive_resource(portrait_data, "default", "character.portrait.default")
     )
     expressions = _normalized_expressions(portrait_data.get("expressions", {}))
+    expression_labels = set(expressions)
+
+    portrait_section: dict[str, Any] = {
+        "default": default_portrait,
+        "expressions": expressions,
+    }
+    tone_map = _normalized_portrait_label_map(
+        portrait_data.get("tone_map"),
+        expression_labels=expression_labels,
+        field_name="character.portrait.tone_map",
+    )
+    emotion_map = _normalized_emotion_portrait_map(
+        portrait_data.get("emotion_map"),
+        expression_labels=expression_labels,
+    )
+    if tone_map:
+        portrait_section["tone_map"] = tone_map
+    if emotion_map:
+        portrait_section["emotion_map"] = emotion_map
 
     normalized: dict[str, Any] = {
         "id": character_id,
         "display_name": display_name,
         "initial_message": _optional_text(character_data, "initial_message", "……起動した。用事があるなら、呼んで。"),
         "card": card,
-        "portrait": {
-            "default": default_portrait,
-            "expressions": expressions,
-        },
+        "portrait": portrait_section,
         "theme": _normalized_theme(character_data.get("theme")),
     }
 
@@ -492,6 +514,55 @@ def _normalized_expressions(raw_expressions: Any) -> dict[str, str]:
             _archive_resource_path(path_text, f"character.portrait.expressions.{label}")
         )
     return expressions
+
+
+def _normalized_portrait_label_map(
+    raw_map: Any,
+    *,
+    expression_labels: set[str],
+    field_name: str,
+) -> dict[str, str]:
+    if raw_map is None:
+        return {}
+    if not isinstance(raw_map, dict):
+        raise CharacterArchiveError(f"{field_name} 必须是对象。")
+    result: dict[str, str] = {}
+    for key, value in raw_map.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise CharacterArchiveError(f"{field_name} 的键和值都必须是字符串。")
+        tone_key = key.strip()
+        label_key = value.strip()
+        if not tone_key or not label_key:
+            continue
+        if label_key not in expression_labels:
+            raise CharacterArchiveError(f"{field_name} 引用了未知立绘标签：{label_key}")
+        result[tone_key] = label_key
+    return result
+
+
+def _normalized_emotion_portrait_map(
+    raw_map: Any,
+    *,
+    expression_labels: set[str],
+) -> dict[str, str]:
+    if raw_map is None:
+        return {}
+    if not isinstance(raw_map, dict):
+        raise CharacterArchiveError("character.portrait.emotion_map 必须是对象。")
+    result: dict[str, str] = {}
+    for emotion, label in raw_map.items():
+        if not isinstance(emotion, str) or not isinstance(label, str):
+            raise CharacterArchiveError("character.portrait.emotion_map 的键和值都必须是字符串。")
+        emotion_key = emotion.strip().lower()
+        label_key = label.strip()
+        if not emotion_key or not label_key:
+            continue
+        if emotion_key not in EMOTIONS:
+            raise CharacterArchiveError(f"character.portrait.emotion_map 使用了未知 emotion：{emotion_key}")
+        if label_key not in expression_labels:
+            raise CharacterArchiveError(f"character.portrait.emotion_map 引用了未知立绘标签：{label_key}")
+        result[emotion_key] = label_key
+    return result
 
 
 def _normalized_reply_tones(reply_data: Any) -> list[str]:
@@ -593,12 +664,7 @@ def _write_character_voice_manifest(package_dir: Path, voice_data: dict[str, str
 
 def _package_character_data(character_manifest: dict[str, Any]) -> dict[str, Any]:
     portrait = _required_mapping(character_manifest, "portrait", "character.portrait")
-    package_data: dict[str, Any] = {
-        "id": _required_text(character_manifest, "id", "character.id"),
-        "display_name": _required_text(character_manifest, "display_name", "character.display_name"),
-        "initial_message": _optional_text(character_manifest, "initial_message", ""),
-        "card": _package_path_text(_archive_resource_path(character_manifest.get("card"), "character.card")),
-        "portrait": {
+    portrait_package: dict[str, Any] = {
             "default": _package_path_text(
                 _archive_resource_path(portrait.get("default"), "character.portrait.default")
             ),
@@ -606,7 +672,27 @@ def _package_character_data(character_manifest: dict[str, Any]) -> dict[str, Any
                 label: _package_path_text(_archive_resource_path(path_text, f"character.portrait.expressions.{label}"))
                 for label, path_text in portrait.get("expressions", {}).items()
             },
-        },
+        }
+    tone_map = portrait.get("tone_map")
+    if isinstance(tone_map, dict) and tone_map:
+        portrait_package["tone_map"] = {
+            str(key).strip(): str(value).strip()
+            for key, value in tone_map.items()
+            if str(key).strip() and str(value).strip()
+        }
+    emotion_map = portrait.get("emotion_map")
+    if isinstance(emotion_map, dict) and emotion_map:
+        portrait_package["emotion_map"] = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in emotion_map.items()
+            if str(key).strip() and str(value).strip()
+        }
+    package_data: dict[str, Any] = {
+        "id": _required_text(character_manifest, "id", "character.id"),
+        "display_name": _required_text(character_manifest, "display_name", "character.display_name"),
+        "initial_message": _optional_text(character_manifest, "initial_message", ""),
+        "card": _package_path_text(_archive_resource_path(character_manifest.get("card"), "character.card")),
+        "portrait": portrait_package,
         "reply": character_manifest.get("reply", {}),
         "theme": character_manifest.get("theme", {}),
     }

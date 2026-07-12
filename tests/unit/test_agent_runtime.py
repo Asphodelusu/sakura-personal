@@ -20,7 +20,10 @@ from app.agent.actions import AgentAction, AgentEvent, AgentResult, PendingToolA
 from app.agent.runtime import (
     AgentRuntime,
     _build_vision_unsupported_reply,
+    _is_duplicate_tool_call,
+    _try_supplement_missed_memory_tools,
 )
+from app.llm.api_client import ChatCompletionTurn, NativeToolCall
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.agent.tool_routing import (
     _filter_openai_tools_for_browser_routing,
@@ -384,11 +387,10 @@ class TestAgentRuntimeBasics:
 
     def test_final_reply_retries_once_when_json_invalid(self) -> None:
         client = _dummy_api_client()
+        bad_content = '{"segments":[{"ja":"原因是 Mermaid 语法。","zh":"原因是 Mermaid 语法。"}]}'
         client.complete_with_tools.side_effect = [
-            MagicMock(
-                content='{"segments":[{"ja":"原因是 Mermaid 语法。","zh":"原因是 Mermaid 语法。"}]}',
-                tool_calls=[],
-            ),
+            MagicMock(content=bad_content, tool_calls=[]),
+            MagicMock(content=bad_content, tool_calls=[]),
             MagicMock(
                 content=json.dumps(
                     {"segments": [{"ja": "直したよ。", "zh": "修好了。", "tone": "中性"}]},
@@ -401,9 +403,9 @@ class TestAgentRuntimeBasics:
 
         result = runtime.handle_user_message([ChatMessage(role="user", content="hello")])
 
-        assert client.complete_with_tools.call_count == 2
+        assert client.complete_with_tools.call_count == 3
         assert result.reply.segments[0].text == "直したよ。"
-        repair_messages = client.complete_with_tools.call_args_list[1].args[1]
+        repair_messages = client.complete_with_tools.call_args_list[2].args[1]
         assert "不要用固定兜底句替代" in repair_messages[-1]["content"]
 
     def test_final_reply_retries_when_plain_japanese_lacks_translation(self) -> None:
@@ -443,12 +445,13 @@ class TestAgentRuntimeBasics:
         client.complete_with_tools.side_effect = [
             MagicMock(content=bad_content, tool_calls=[]),
             MagicMock(content=bad_content, tool_calls=[]),
+            MagicMock(content=bad_content, tool_calls=[]),
         ]
         runtime = AgentRuntime(client, _dummy_system_prompt())
 
         result = runtime.handle_user_message([ChatMessage(role="user", content="hello")])
 
-        assert client.complete_with_tools.call_count == 2
+        assert client.complete_with_tools.call_count == 3
         assert result.reply.segments[0].text != bad_content
         assert "segments" not in result.reply.segments[0].text
         assert result.reply.segments[0].suppress_tts is True
@@ -499,3 +502,107 @@ class TestAgentRuntimeBasics:
             )
 
         assert executed == []
+
+
+class TestLazyToolGroups:
+    """按需工具组与结构化最终回复。"""
+
+    def test_casual_chat_exposes_core_tools_only(self) -> None:
+        registry = ToolRegistry(
+            [
+                _dummy_tool("get_current_time", group="core"),
+                _dummy_tool("add_todo", group="productivity"),
+                _dummy_tool("web__web_search", group="mcp"),
+            ]
+        )
+        client = _dummy_api_client()
+        runtime = AgentRuntime(client, _dummy_system_prompt(), tools=registry)
+
+        runtime.handle_user_message([ChatMessage(role="user", content="今天心情不错")])
+
+        first_tools = client.complete_with_tools.call_args.kwargs["tools"]
+        names = {item["function"]["name"] for item in first_tools}
+        assert names == {"get_current_time"}
+
+    def test_empty_final_content_triggers_structured_compose(self) -> None:
+        good = json.dumps(
+            {
+                "segments": [
+                    {"ja": "できたよ。", "zh": "好了。", "tone": "中性", "portrait": "站立待机"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        client = MagicMock(spec=OpenAICompatibleClient)
+        client.resolve_dialogue_params.return_value = (0.8, {})
+        client.complete_with_tools.side_effect = [
+            MagicMock(content="", tool_calls=[]),
+            MagicMock(content=good, tool_calls=[]),
+        ]
+        runtime = AgentRuntime(
+            client,
+            _dummy_system_prompt(),
+            tools=ToolRegistry([_dummy_tool("get_current_time", group="core")]),
+        )
+
+        result = runtime.handle_user_message([ChatMessage(role="user", content="你好")])
+
+        assert len(result.reply.segments) > 0
+        assert client.complete_with_tools.call_count == 2
+        second_kwargs = client.complete_with_tools.call_args_list[1].kwargs
+        assert second_kwargs.get("tools") == []
+        assert second_kwargs.get("structured_response") is True
+
+    def test_duplicate_web_search_is_detected(self) -> None:
+        from app.agent.tools import ToolExecutionResult
+
+        call = NativeToolCall(
+            id="c1",
+            name="web__web_search",
+            arguments={"query": "tokyo weather"},
+            arguments_json='{"query":"tokyo weather"}',
+        )
+        assert _is_duplicate_tool_call(
+            call,
+            [
+                ToolExecutionResult(
+                    tool_name="web__web_search",
+                    success=True,
+                    content={"results": []},
+                    error="",
+                )
+            ],
+        )
+
+
+class TestMissedMemoryToolSupplement:
+    def test_supplement_memory_remember_when_model_returns_text_only(self) -> None:
+        registry = ToolRegistry(
+            [
+                _dummy_tool(
+                    "memory_remember",
+                    group="memory-write",
+                    handler=lambda arguments: {
+                        "ok": True,
+                        "memory": {"content": arguments.get("content", "")},
+                    },
+                )
+            ]
+        )
+        turn = ChatCompletionTurn(
+            content="覚えた。",
+            tool_calls=[],
+            message={"role": "assistant", "content": "覚えた。"},
+        )
+        supplement = _try_supplement_missed_memory_tools(
+            tools=registry,
+            working_messages=[ChatMessage(role="user", content="记住我喜欢喝乌龙茶")],
+            turn=turn,
+            execution_results=[],
+            step_index=0,
+            model_vision_enabled=False,
+        )
+        assert supplement is not None
+        assert supplement.continue_loop is False
+        assert supplement.results[0].tool_name == "memory_remember"
+        assert supplement.results[0].success is True

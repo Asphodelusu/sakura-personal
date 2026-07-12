@@ -82,6 +82,8 @@ _PROGRAM_MESSAGE_LABELS = {
     ("PetWindow", "主动发言被跳过（UI 忙碌）"): "主动发言跳过（忙碌）",
     ("PetWindow", "主动事件屏幕观察失败"): "主动事件屏幕观察失败",
     ("Event", "主动事件生成失败"): "主动事件生成失败",
+    ("Portrait", "分段立绘切换"): "立绘切换",
+    ("Portrait", "渲染器表情同步"): "渲染器表情同步",
 }
 # 这些分类下的 info 级日志默认进入 GUI（错误/警告始终收录）。
 _PROGRAM_GUI_CATEGORIES = frozenset({
@@ -120,6 +122,10 @@ _CATEGORY_MESSAGE_ALLOWLIST: dict[str, frozenset[str]] = {
     "PetWindow": frozenset({
         "主动发言被跳过（UI 忙碌）",
         "主动事件屏幕观察失败",
+    }),
+    "Portrait": frozenset({
+        "分段立绘切换",
+        "渲染器表情同步",
     }),
     "Event": frozenset({
         "主动事件生成失败",

@@ -20,6 +20,7 @@ def build_segmented_reply_instruction(
     *,
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
+    portrait_hints: str | None = None,
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
@@ -31,11 +32,15 @@ def build_segmented_reply_instruction(
         "优先选择中性，除非文本明显带有其他语气。",
         "- 无论你本轮是否调用工具，一旦决定直接回复用户，assistant 的 content 必须是合法 JSON segments，"
         "禁止纯文本、Markdown 或代码块。",
+        "- 日常闲聊默认不超过 4 个 segment；只有用户明确要求分点、多情绪或长说明时才可更长。",
     ]
     if len(portraits) > 1:
-        rules.append(
-            "- 每段根据情绪填写 portrait，不要整轮都填「站立待机」；情绪平淡用站立待机，害羞/不满/惊讶等要换对应立绘。"
-        )
+        if portrait_hints:
+            rules.append("- 每段根据情绪填写 portrait；不要整轮都填默认立绘。")
+        else:
+            rules.append(
+                "- 每段根据情绪填写 portrait，不要整轮都填「站立待机」；情绪平淡用站立待机，害羞/不满/惊讶等要换对应立绘。"
+            )
     if include_no_single_segment_rule:
         rules.extend(
             [
@@ -49,12 +54,15 @@ def build_segmented_reply_instruction(
         format_text=segment_format_for_portraits(portraits),
         segment_rules="\n".join(rules),
         include_translation_rules=include_translation_rules,
+        portrait_hints=portrait_hints,
     )
 
 
 def build_agent_reply_protocol(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
+    *,
+    portrait_hints: str | None = None,
 ) -> str:
     """与分段回复协议共用同一套分段规则，避免 agent 路径重复维护两套文案。"""
     return build_segmented_reply_instruction(
@@ -62,6 +70,7 @@ def build_agent_reply_protocol(
         reply_portraits,
         include_translation_rules=True,
         include_no_single_segment_rule=True,
+        portrait_hints=portrait_hints,
     )
 
 

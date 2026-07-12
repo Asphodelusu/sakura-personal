@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.llm.api_client import sanitize_tool_conversation_messages
 from app.llm.prompts.runtime import estimate_prompt_tokens
 
 
@@ -13,6 +14,8 @@ MAX_MODEL_CONTEXT_MESSAGES = 24
 MAX_MODEL_CONTEXT_TOKENS = 40_000
 # 向后兼容旧常量名，避免外部/测试引用报错。
 MAX_MODEL_CONTEXT_CHARS = MAX_MODEL_CONTEXT_TOKENS
+# 多模态截图在入模裁剪时按固定 token 粗估，避免低估后把 assistant+tool 链裁断。
+ESTIMATED_IMAGE_PART_TOKENS = 1200
 
 
 def trim_messages_for_model(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -20,8 +23,33 @@ def trim_messages_for_model(messages: list[dict[str, Any]]) -> list[dict[str, An
     recent = list(messages[-MAX_MODEL_CONTEXT_MESSAGES:])
     while len(recent) > 1 and _estimate_messages_tokens(recent) > MAX_MODEL_CONTEXT_TOKENS:
         recent.pop(0)
-    return recent
+    return _normalize_trimmed_message_window(recent)
+
+
+def _normalize_trimmed_message_window(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized = sanitize_tool_conversation_messages(messages)
+    while sanitized and str(sanitized[0].get("role", "")).strip() == "tool":
+        sanitized.pop(0)
+    return sanitized
 
 
 def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
-    return sum(estimate_prompt_tokens(str(message.get("content", ""))) for message in messages)
+    return sum(_estimate_message_tokens(message) for message in messages)
+
+
+def _estimate_message_tokens(message: dict[str, Any]) -> int:
+    content = message.get("content")
+    if isinstance(content, list):
+        tokens = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                tokens += ESTIMATED_IMAGE_PART_TOKENS
+                continue
+            if part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    tokens += estimate_prompt_tokens(text)
+        return tokens
+    return estimate_prompt_tokens(str(content or ""))

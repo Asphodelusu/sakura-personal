@@ -8,7 +8,7 @@ Ollama 等本地服务提供 OpenAI 兼容 API，本地端复用 OpenAICompatibl
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from app.config.defaults import (
     DEFAULT_LOCAL_LLM_API_KEY,
@@ -16,6 +16,7 @@ from app.config.defaults import (
     DEFAULT_LOCAL_LLM_TIMEOUT_SECONDS,
     DEFAULT_LOCAL_LLM_VISION_ROUTE,
 )
+from app.core.cancellation import CancelChecker
 from app.core.debug_log import debug_log
 from app.llm.dual_provider_client import create_cloud_llm_client
 from app.llm.api_client import (
@@ -179,16 +180,22 @@ class RoutingLlmClient:
         self,
         system_prompt: str,
         messages: list[ChatMessage],
+        reply_tones: list[str] | None = None,
+        reply_portraits: list[str] | None = None,
         *,
-        cancel_checker=None,
+        cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
+        on_chunk: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> ChatReply:
         return self._cloud.chat(
             system_prompt,
             messages,
+            reply_tones,
+            reply_portraits,
             cancel_checker=cancel_checker,
             runtime_context=runtime_context,
+            on_chunk=on_chunk,
             **kwargs,
         )
 

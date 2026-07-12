@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Any, Callable
 
@@ -36,13 +36,17 @@ from app.agent.tools import ToolExecutionResult, ToolRegistry
 from app.storage.chat_history import ChatHistoryStore
 from app.llm.api_client import (
     ApiRequestError,
+    ChatCompletionTurn,
     ChatMessage,
     NativeToolCall,
     OpenAICompatibleClient,
     is_vision_unsupported_error,
     messages_contain_image,
+    strip_image_parts_from_messages,
 )
-from app.llm.chat_reply import ChatReply, ChatSegment, DEFAULT_TONE, parse_chat_reply, parse_chat_reply_result, sanitize_reply_tones
+from app.llm.context_trimming import trim_messages_for_model
+from app.llm.chat_reply import ChatReply, ChatReplyParseResult, ChatSegment, DEFAULT_TONE, parse_chat_reply, parse_chat_reply_result, sanitize_reply_tones
+from app.config.character_loader import CharacterProfile, normalize_reply_portraits
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_body_enabled, debug_log, summarize_messages
 from app.agent.runtime_limits import (
@@ -73,6 +77,13 @@ from app.llm.prompts.types import (
     PromptSection,
 )
 
+_STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
+    "missing_translation",
+    "missing_segments",
+    "invalid_json",
+    "empty",
+})
+
 
 class AgentRuntime:
     """封装聊天决策链路，为后续工具调用和长期记忆留下扩展点。"""
@@ -94,6 +105,7 @@ class AgentRuntime:
         self.system_prompt = system_prompt
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
+        self.character_profile: CharacterProfile | None = None
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
         self.history_store = history_store
@@ -115,11 +127,14 @@ class AgentRuntime:
         system_prompt: str,
         reply_tones: list[str] | None = None,
         reply_portraits: list[str] | None = None,
+        *,
+        character_profile: CharacterProfile | None = None,
     ) -> None:
-        """角色切换后同步系统提示词、可用语气和可用立绘列表。"""
+        """角色切换后同步系统提示词、可用语气、可用立绘与情绪映射。"""
         self.system_prompt = system_prompt
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
+        self.character_profile = character_profile
 
     def set_prompt_patches(self, prompt_patches: list[PromptPatchContribution] | None) -> None:
         """同步插件提示词补丁。"""
@@ -245,22 +260,153 @@ class AgentRuntime:
             return resolver()
         return 0.8, {}
 
+    def _compose_structured_final_reply(
+        self,
+        system_prompt: str,
+        working_messages: list[ChatMessage],
+        *,
+        runtime_context: str,
+        cancel_checker: CancelChecker | None = None,
+    ) -> str:
+        """工具规划轮结束后，用不含 tools 的请求专门合成 JSON segments。"""
+        check_cancelled(cancel_checker)
+        text_messages = strip_image_parts_from_messages(working_messages)
+        compose_messages: list[ChatMessage] = [
+            *text_messages,
+            {
+                "role": "user",
+                "content": (
+                    "请根据以上对话与工具执行结果（如有），输出本轮给用户的最终 Sakura 回复。"
+                    "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
+                    "不要调用工具，不要解释，不要使用 Markdown。"
+                ),
+            },
+        ]
+        dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
+        turn = self.api_client.complete_with_tools(
+            system_prompt,
+            compose_messages,
+            tools=[],
+            tool_choice="none",
+            temperature=dialogue_temperature,
+            runtime_context=runtime_context,
+            structured_response=True,
+            cancel_checker=cancel_checker,
+            **dialogue_extra_params,
+        )
+        debug_log(
+            "AgentRuntime",
+            "结构化最终回复合成完成",
+            {"content_chars": len(turn.content or "")},
+        )
+        return turn.content
+
+    def _resolve_final_reply_content(
+        self,
+        raw_content: str,
+        *,
+        system_prompt: str,
+        working_messages: list[ChatMessage],
+        runtime_context: str,
+        cancel_checker: CancelChecker | None = None,
+    ) -> str:
+        """首轮直接回复不合格时，走不含 tools 的结构化合成。"""
+        reason = self._structured_compose_reason(raw_content)
+        if not reason:
+            return raw_content
+        debug_log(
+            "AgentRuntime",
+            "首轮最终回复不合格，启动结构化合成",
+            {
+                "reason": reason,
+                "content_chars": len(raw_content or ""),
+            },
+        )
+        return self._compose_structured_final_reply(
+            system_prompt,
+            working_messages,
+            runtime_context=runtime_context,
+            cancel_checker=cancel_checker,
+        )
+
+    def _structured_compose_reason(self, raw_content: str) -> str:
+        parsed = self._normalize_parsed_reply(parse_chat_reply_result(raw_content))
+        if parsed.needs_retry:
+            return parsed.reason
+        if not _reply_has_display_translation(parsed.reply):
+            return "missing_translation"
+        return ""
+
+    def _finalize_tool_loop_reply(
+        self,
+        working_messages: list[ChatMessage],
+        *,
+        context_source: str,
+        cancel_checker: CancelChecker | None = None,
+    ) -> ChatReply:
+        """工具循环结束后，用单次结构化请求合成最终 segments。"""
+        snapshot = self._build_single_context_snapshot(
+            working_messages,
+            source=context_source,
+        )
+        prompt_build = self._build_final_reply_result(snapshot)
+        self._record_prompt_inspection(prompt_build.inspection)
+        raw_content = self._compose_structured_final_reply(
+            prompt_build.system_prompt,
+            working_messages,
+            runtime_context=prompt_build.runtime_context,
+            cancel_checker=cancel_checker,
+        )
+        parsed = self._parse_final_reply_with_retry(
+            prompt_build.system_prompt,
+            working_messages,
+            raw_content,
+            runtime_context=prompt_build.runtime_context,
+            cancel_checker=cancel_checker,
+        )
+        return self._normalize_reply(
+            sanitize_reply_tones(parsed.reply, self.reply_tones)
+        )
+
     def _parse_final_reply_with_retry(
         self,
         system_prompt: str,
         working_messages: list[ChatMessage],
         raw_content: str,
         *,
+        runtime_context: str = "",
         cancel_checker: CancelChecker | None = None,
     ) -> ChatReplyParseResult:
         """最终回复结构不合格时，只重试一次格式修复，避免坏 JSON 进入 UI。"""
         check_cancelled(cancel_checker)
         parsed = parse_chat_reply_result(raw_content)
+        parsed = self._normalize_parsed_reply(parsed)
         retry_reason = parsed.reason if parsed.needs_retry else ""
         if not parsed.needs_retry and _reply_has_display_translation(parsed.reply):
             return parsed
         if not retry_reason:
             retry_reason = "missing_translation"
+
+        if retry_reason in _STRUCTURED_COMPOSE_RETRY_REASONS:
+            debug_log(
+                "AgentRuntime",
+                "最终回复不合格，改用结构化合成",
+                {"reason": retry_reason, "raw_content_chars": len(raw_content or "")},
+            )
+            try:
+                composed_content = self._compose_structured_final_reply(
+                    system_prompt,
+                    working_messages,
+                    runtime_context=runtime_context,
+                    cancel_checker=cancel_checker,
+                )
+            except ApiRequestError as exc:
+                debug_log("AgentRuntime", "结构化合成失败，回退格式修复", {"error": str(exc)})
+            else:
+                composed = self._normalize_parsed_reply(parse_chat_reply_result(composed_content))
+                if not composed.needs_retry and _reply_has_display_translation(composed.reply):
+                    debug_log("AgentRuntime", "结构化合成成功", {"reason": retry_reason})
+                    return composed
 
         debug_log(
             "AgentRuntime",
@@ -268,7 +414,7 @@ class AgentRuntime:
             {"reason": retry_reason, "raw_content": raw_content},
         )
         repair_messages: list[ChatMessage] = [
-            *working_messages,
+            *strip_image_parts_from_messages(working_messages),
             {"role": "assistant", "content": raw_content},
             {
                 "role": "user",
@@ -291,6 +437,7 @@ class AgentRuntime:
 
         check_cancelled(cancel_checker)
         repaired = parse_chat_reply_result(repaired_turn.content)
+        repaired = self._normalize_parsed_reply(repaired)
         if repaired.needs_retry:
             debug_log(
                 "AgentRuntime",
@@ -301,6 +448,34 @@ class AgentRuntime:
         debug_log("AgentRuntime", "最终回复结构修复成功", {"repaired": repaired.repaired})
         return repaired
 
+    def _portrait_hints(self) -> str:
+        profile = self.character_profile
+        if profile is None:
+            return ""
+        return profile.portrait_selection_hints
+
+    def _normalize_parsed_reply(self, parsed: ChatReplyParseResult) -> ChatReplyParseResult:
+        profile = self.character_profile
+        if profile is None:
+            return parsed
+        normalized = normalize_reply_portraits(parsed.reply, profile)
+        if normalized is parsed.reply:
+            return parsed
+        return ChatReplyParseResult(
+            normalized,
+            parsed.ok,
+            parsed.needs_retry,
+            parsed.repaired,
+            parsed.reason,
+            parsed.mood,
+        )
+
+    def _normalize_reply(self, reply: ChatReply) -> ChatReply:
+        profile = self.character_profile
+        if profile is None:
+            return reply
+        return normalize_reply_portraits(reply, profile)
+
     def _build_final_reply_repair_instruction(self) -> str:
         portraits = [name.strip() for name in self.reply_portraits if str(name).strip()]
         example_portrait = portraits[0] if portraits else "站立待机"
@@ -309,6 +484,9 @@ class AgentRuntime:
             if len(portraits) > 1
             else ""
         )
+        portrait_hints = self._portrait_hints()
+        if portrait_hints:
+            portrait_rule = f"{portrait_rule}\n- 立绘按情绪选择：\n{portrait_hints}"
         tone_rule = (
             f"- tone 只能从以下选择：{'、'.join(self.reply_tones)}。"
             if self.reply_tones
@@ -381,13 +559,19 @@ class AgentRuntime:
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
-        active_groups: set[str] = {"default", "mcp", "memory"}
+        active_groups: set[str] = tool_routing.infer_active_tool_groups_from_messages(working_messages)
+        debug_log(
+            "AgentRuntime",
+            "本轮初始可见工具组",
+            {"active_groups": sorted(active_groups)},
+        )
         turn_memory_fragments = ()
         memory_status = "unknown"
         memory_needs_refresh = True
         loop_settings = self.runtime_loop_settings
         for step_index in range(loop_settings.max_agent_steps_per_turn):
             check_cancelled(cancel_checker)
+            _trim_working_messages_for_model(working_messages)
             browser_page_mode = tool_routing._should_prefer_browser_page_tools(working_messages)
             browser_page_guard_active = (
                 browser_page_mode
@@ -456,6 +640,7 @@ class AgentRuntime:
                 )
                 self._record_prompt_inspection(prompt_build.inspection)
                 dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
+                has_tool_defs = bool(tool_defs)
                 turn = self.api_client.complete_with_tools(
                     prompt_build.system_prompt,
                     working_messages,
@@ -463,9 +648,10 @@ class AgentRuntime:
                     tool_choice="auto",
                     temperature=dialogue_temperature,
                     runtime_context=prompt_build.runtime_context,
-                    # 无图（文本端点如 DeepSeek）时始终请求 JSON，减少纯文本回复触发的格式修复。
-                    # 含图（视觉端点）且带工具时仍关闭 structured，避免部分接口把工具调用写进 content。
-                    structured_response=not messages_contain_image(working_messages),
+                    structured_response=(
+                        not has_tool_defs
+                        and not messages_contain_image(working_messages)
+                    ),
                     cancel_checker=cancel_checker,
                     **dialogue_extra_params,
                 )
@@ -496,6 +682,32 @@ class AgentRuntime:
                 },
             )
             if not turn.tool_calls:
+                supplement = _try_supplement_missed_memory_tools(
+                    tools=self.tools,
+                    working_messages=working_messages,
+                    turn=turn,
+                    execution_results=execution_results,
+                    step_index=step_index,
+                    model_vision_enabled=self.model_vision_enabled,
+                )
+                if supplement is not None:
+                    execution_results.extend(supplement.results)
+                    total_tool_calls += len(supplement.results)
+                    emitted_actions.extend(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(result),
+                        )
+                        for result in supplement.results
+                    )
+                    if any(
+                        result.tool_name in {"memory_remember", "memory_forget"}
+                        for result in supplement.results
+                    ):
+                        memory_needs_refresh = True
+                    if supplement.continue_loop:
+                        working_messages.extend(supplement.appended_messages)
+                        continue
                 debug_log(
                     "AgentRuntime",
                     "多步循环完成，返回模型回复",
@@ -508,13 +720,22 @@ class AgentRuntime:
                 parsed = self._parse_final_reply_with_retry(
                     prompt_build.system_prompt,
                     working_messages,
-                    turn.content,
+                    self._resolve_final_reply_content(
+                        turn.content,
+                        system_prompt=prompt_build.system_prompt,
+                        working_messages=working_messages,
+                        runtime_context=prompt_build.runtime_context,
+                        cancel_checker=cancel_checker,
+                    ),
+                    runtime_context=prompt_build.runtime_context,
                     cancel_checker=cancel_checker,
                 )
                 return AgentResult(
-                    reply=sanitize_reply_tones(
-                        parsed.reply,
-                        self.reply_tones,
+                    reply=self._normalize_reply(
+                        sanitize_reply_tones(
+                            parsed.reply,
+                            self.reply_tones,
+                        )
                     ),
                     _debug=_build_debug_meta(
                         self.api_client, execution_results,
@@ -548,10 +769,29 @@ class AgentRuntime:
             )
             for call in turn.tool_calls[:allowed_calls]:
                 check_cancelled(cancel_checker)
-                total_tool_calls += 1
                 execution_arguments = _tool_arguments_for_execution(call, self.tools)
                 call_data = _native_tool_call_to_policy_call(call, execution_arguments)
                 debug_log("AgentRuntime", "准备工具调用", {"step_index": step_index, **call_data})
+                if _is_duplicate_tool_call(call, execution_results):
+                    duplicate_result = _build_duplicate_tool_call_result(call)
+                    debug_log("AgentRuntime", "跳过重复工具调用", duplicate_result.to_dict())
+                    step_results.append(duplicate_result)
+                    execution_results.append(duplicate_result)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            call,
+                            duplicate_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(duplicate_result),
+                        )
+                    )
+                    continue
+                total_tool_calls += 1
                 if tool_routing._should_block_windows_tool_for_browser_page(call_data, browser_page_guard_active):
                     blocked_result = tool_routing._build_browser_page_windows_tool_block_result(call_data)
                     debug_log("AgentRuntime", "浏览器页面模式拦截 Windows 工具", blocked_result.to_dict())
@@ -747,6 +987,20 @@ class AgentRuntime:
                     snapshot_result,
                 )
 
+            if not should_fast_forward_final_reply and tool_routing._should_fast_forward_after_web_search(
+                working_messages,
+                execution_results,
+            ):
+                should_fast_forward_final_reply = True
+                debug_log(
+                    "AgentRuntime",
+                    "网页搜索已取得结果，进入最终总结",
+                    {
+                        "step_index": step_index,
+                        "tool_result_count": len(execution_results),
+                    },
+                )
+
             if pending_actions:
                 debug_log(
                     "AgentRuntime",
@@ -791,7 +1045,7 @@ class AgentRuntime:
             if should_fast_forward_final_reply:
                 debug_log(
                     "AgentRuntime",
-                    "自动浏览器快照后直接进入最终总结",
+                    "工具结果已足够，进入最终总结",
                     {
                         "step_index": step_index,
                         "tool_result_count": len(execution_results),
@@ -805,13 +1059,10 @@ class AgentRuntime:
         try:
             check_cancelled(cancel_checker)
             final_started_at = time.perf_counter()
-            final_reply = self.api_client.chat(
-                self._build_final_reply_prompt(),
+            final_reply = self._finalize_tool_loop_reply(
                 working_messages,
-                self.reply_tones,
-                self.reply_portraits,
+                context_source=context_source,
                 cancel_checker=cancel_checker,
-                on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -830,7 +1081,7 @@ class AgentRuntime:
             },
         )
         return AgentResult(
-            reply=final_reply,
+            reply=self._normalize_reply(final_reply),
             actions=emitted_actions,
         )
 
@@ -939,7 +1190,7 @@ class AgentRuntime:
             },
         )
         return AgentResult(
-            reply=reply,
+            reply=self._normalize_reply(reply),
             actions=emitted_actions,
         )
 
@@ -1036,7 +1287,7 @@ class AgentRuntime:
                 return AgentResult(reply=_build_proactive_vision_unsupported_reply())
             raise
         return AgentResult(
-            reply=reply,
+            reply=self._normalize_reply(reply),
             actions=[event_action],
         )
 
@@ -1101,7 +1352,11 @@ class AgentRuntime:
         visible_browser_mode: bool = False,
     ):
         reply_protocol = self._apply_reply_protocol_patches(
-            build_agent_reply_protocol(self.reply_tones, self.reply_portraits)
+            build_agent_reply_protocol(
+                self.reply_tones,
+                self.reply_portraits,
+                portrait_hints=self._portrait_hints() or None,
+            )
         )
         context_strategy = build_context_acquisition_strategy(
             allow_screen_observation=allow_screen_observation
@@ -1312,6 +1567,19 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     if not isinstance(tool_names, list):
         return False
     return any(str(name).startswith("windows__") for name in tool_names)
+
+
+def _trim_working_messages_for_model(working_messages: list[ChatMessage]) -> None:
+    """工具循环内按 token 预算裁剪历史，避免长对话拖慢每次 API。"""
+    trimmed = trim_messages_for_model(working_messages)
+    if len(trimmed) >= len(working_messages):
+        return
+    debug_log(
+        "AgentRuntime",
+        "裁剪入模历史",
+        {"before": len(working_messages), "after": len(trimmed)},
+    )
+    working_messages[:] = trimmed
 
 
 def _reply_has_display_translation(reply: ChatReply) -> bool:
@@ -1989,11 +2257,109 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
                 parts.append(f"笔记「{result.content.get('name', '')}」已读取。")
             elif result.tool_name == "write_note":
                 parts.append(f"笔记「{result.content.get('name', '')}」已保存。")
+            elif result.tool_name in {"web__web_search", "web_search"}:
+                parts.append(_summarize_web_search_result(result.content))
+            elif result.tool_name in {"web__fetch_url", "fetch_url"}:
+                parts.append(_summarize_fetch_url_result(result.content))
             else:
                 parts.append(f"{result.tool_name} 已完成。")
         else:
             parts.append(f"{result.tool_name} 已完成。")
     return " ".join(part for part in parts if part).strip()
+
+
+_DEDUP_TOOL_NAMES_PER_TURN = frozenset({"web__web_search", "web__fetch_url"})
+
+
+@dataclass(frozen=True)
+class _MemoryToolSupplement:
+    continue_loop: bool
+    results: list[ToolExecutionResult]
+    appended_messages: list[ChatMessage]
+
+
+def _try_supplement_missed_memory_tools(
+    *,
+    tools: ToolRegistry,
+    working_messages: list[ChatMessage],
+    turn: ChatCompletionTurn,
+    execution_results: list[ToolExecutionResult],
+    step_index: int,
+    model_vision_enabled: bool,
+) -> _MemoryToolSupplement | None:
+    """模型只回了文本、没调记忆工具时，按用户意图补写或补搜长期记忆。"""
+    if step_index != 0 or turn.tool_calls:
+        return None
+
+    if tool_routing.user_requests_memory_remember(working_messages):
+        if any(result.tool_name == "memory_remember" for result in execution_results):
+            return None
+        if tools.get("memory_remember") is None:
+            return None
+        content = tool_routing.extract_memory_remember_content(working_messages)
+        if not content:
+            return None
+        result = tools.execute("memory_remember", {"content": content})
+        debug_log(
+            "AgentRuntime",
+            "自动补写长期记忆",
+            {
+                "content_chars": len(content),
+                "success": result.success,
+                "error": result.error or "",
+            },
+        )
+        return _MemoryToolSupplement(continue_loop=False, results=[result], appended_messages=[])
+
+    return None
+
+
+def _is_duplicate_tool_call(
+    call: NativeToolCall,
+    execution_results: list[ToolExecutionResult],
+) -> bool:
+    if call.name not in _DEDUP_TOOL_NAMES_PER_TURN:
+        return False
+    return any(result.tool_name == call.name and result.success for result in execution_results)
+
+
+def _build_duplicate_tool_call_result(call: NativeToolCall) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        tool_name=call.name,
+        success=True,
+        content={
+            "skipped": True,
+            "reason": "duplicate_tool_call",
+            "message": "本轮已执行过同名工具，请直接根据之前的工具结果作答，不要重复调用。",
+        },
+        error="",
+    )
+
+
+def _summarize_web_search_result(content: object) -> str:
+    if not isinstance(content, dict):
+        return "搜索已完成。"
+    results = content.get("results")
+    if not isinstance(results, list) or not results:
+        return "搜索已完成，但没有找到可用结果。"
+    titles: list[str] = []
+    for item in results[:2]:
+        if isinstance(item, dict):
+            title = str(item.get("title", "")).strip()
+            if title:
+                titles.append(title)
+    if titles:
+        return f"搜索完成：{'；'.join(titles)}。"
+    return "搜索已完成。"
+
+
+def _summarize_fetch_url_result(content: object) -> str:
+    if not isinstance(content, dict):
+        return "网页内容已读取。"
+    title = str(content.get("title", "")).strip()
+    if title:
+        return f"网页已读取：{title}。"
+    return "网页内容已读取。"
 
 
 def _build_event_messages(event: AgentEvent) -> list[ChatMessage]:

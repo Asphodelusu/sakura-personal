@@ -10,6 +10,7 @@ from app.llm.api_client import (
     OpenAICompatibleClient,
     _build_segmented_reply_instruction,
     _build_chat_completion_payload,
+    _extract_choice_diagnostics,
     _filter_supported_chat_params,
     _is_temperature_unsupported_error,
     resolve_chat_model,
@@ -898,6 +899,16 @@ def test_api_settings_uses_dual_endpoint_requires_text_credentials() -> None:
     vision_settings = api_settings_for_vision(base)
     assert vision_settings.model == "glm-5v-turbo"
     assert vision_settings.base_url == base.base_url
+
+
+def test_extract_choice_diagnostics_reads_finish_reason_and_usage() -> None:
+    data = {
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 0, "total_tokens": 120},
+    }
+    diagnostics = _extract_choice_diagnostics(data)
+    assert diagnostics["finish_reason"] == "stop"
+    assert diagnostics["usage"]["prompt_tokens"] == 120
 
 
 def test_parse_chat_reply_suppresses_tts_for_safe_parse_failure() -> None:
