@@ -7,12 +7,64 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
-> ⚠️ 本仓库为个人自用修改版，不提供 Release，不保证与上游兼容。
-> 如需正式版本，请访问 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)。
-
-[安装教程](docs/SETUP.md) [API配置教程](docs/API_CONFIG.md)
-
 </div>
+
+## ⚠️ 免责声明
+
+**这是一个纯粹的个人项目，仅供我自己使用。**
+
+- 本项目基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)（MIT License），但**不追求与原项目的健壮性、兼容性或通用性**。代码中包含大量针对我个人设备、网络环境和使用习惯的硬编码或假设。
+- 所有的开发和测试仅在我个人的一台 Windows 机器上进行。没有跨平台测试，没有多用户场景测试，没有 CI/CD。
+- **不提供 Release，不提供技术支持，不保证任何功能在他人机器上可正常运行。**
+
+如果你需要一个稳定、文档齐全、有社区支持的桌宠框架，请使用原项目 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)。
+
+---
+
+## 我的运行方式（仅供参考）
+
+以下是我自己运行这个项目的方式。**这不构成任何形式的安装指南或使用建议**——只是记录给我自己和我可能分享的朋友看的。如果你按这些步骤操作，请做好自行排查问题的准备。
+
+### 我的环境
+
+- Windows 10/11，Python 3.11
+- LLM：智谱 GLM-5V-Turbo（视觉模型，通过智谱开放平台 API）
+- TTS：GPT-SoVITS（本地服务）
+- 其他工具：MuMu Android 模拟器、Tesseract OCR、WeChat（通过 HTTP 长轮询）
+
+### 我的启动步骤
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/Asphodelusu/sakura-personal.git
+cd sakura-personal
+
+# 2. 创建虚拟环境并安装依赖
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+# 3. 配置文件（不会被 git 跟踪，需自行创建）
+#    data/config/api.yaml       — API Key / Base URL / 模型
+#    data/config/characters.yaml — 角色配置
+#    参考 docs/API_CONFIG.md 了解配置格式
+
+# 4. 启动
+run.bat
+```
+
+> **注意**：上游项目使用 `start.bat` + 内置 `runtime/` Python。我个人使用 `run.bat` + 自建 `.venv`。`install.bat` 不可用（依赖上游 Release 包中的 `runtime/python.exe`）。
+
+### 已知局限（仅列出我已知且接受的）
+
+- 仅 Windows 测试过，macOS/Linux 理论上不可用
+- PySide6 要求纯英文路径（`D:\sakura` 可，`D:\桌宠\sakura` 不可）
+- 双端点（DeepSeek 文本 + 智谱视觉）下偶有 tool 链兼容问题，重启即可恢复
+- 主动屏幕感知在部分全屏应用下截图可能失败
+- 网络环境需能直连 `open.bigmodel.cn` 和 `api.deepseek.com`（或通过系统代理）
+
+---
+
+> 以下为原始 README 内容。
 
 ## 修改内容
 
