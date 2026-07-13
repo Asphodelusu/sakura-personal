@@ -57,8 +57,15 @@ plugins/*
 !plugins/__init__.py
 !plugins/playwright_browser/
 !plugins/playwright_browser/**
+!plugins/sakura_mobile/
+!plugins/sakura_mobile/**
 plugins/playwright_browser/__pycache__/
 plugins/playwright_browser/**/*.py[cod]
+plugins/sakura_mobile/__pycache__/
+plugins/sakura_mobile/**/*.py[cod]
+# Tauri 本地构建产物
+tools/**/src-tauri/target/
+tools/**/src-tauri/gen/
 # 用户态运行配置：发布包不携带，覆盖升级不冲掉（必须位于上方 ! 白名单之后）
 plugins/playwright_browser/config.json
 
