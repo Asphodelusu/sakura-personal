@@ -1187,7 +1187,7 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
-            reply = self.api_client.chat(
+            reply = self._client_for_messages(final_messages).chat(
                 prompt_build.system_prompt,
                 final_messages,
                 self.reply_tones,
