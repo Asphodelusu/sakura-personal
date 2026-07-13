@@ -100,8 +100,28 @@ cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
 
 ---
 
-## 致谢
+## 致谢与开源许可说明
 
-本项目基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)（MIT License）开发。感谢原作者及 [Shinsekai](https://github.com/RachelForster/Shinsekai) 等开源项目在桌宠与插件生态上的探索。
+Sakura Desktop Pet 受桌面 Agent、桌宠交互与插件化生态中多个开源项目启发。特别感谢 [Shinsekai](https://github.com/RachelForster/Shinsekai) 项目及其插件生态在桌宠、角色交互、插件扩展等方向上的探索，为 Sakura 的兼容设计和功能设计提供了参考。
 
-Copyright © 2026 Rvosy（上游） · Personal fork maintained by Asphodelusu
+本仓库为上游 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) 的个人 fork，**仍适用上游 MIT License**。你可以自由使用、复制、修改、合并、发布、分发、再授权或销售本项目代码，但需要保留本项目的版权声明和 MIT License 文本。
+
+Copyright © 2026 Rvosy
+
+### 第三方代码与兼容说明
+
+本项目中的内置插件 `plugins/playwright_browser` 包含基于以下 MIT 开源项目的代码与改动：
+
+- **Project:** [shinsekai-playwright-browser](https://github.com/RachelForster/shinsekai-playwright-browser)
+- **License:** MIT License
+- **Copyright:** Copyright © 2026 Chihiro
+
+Sakura 在此基础上进行了适配和修改，用于提供 Playwright 浏览器自动化能力。
+
+感谢所有开源项目作者和贡献者。
+
+---
+
+## 关于本 fork
+
+Personal Edition（`0.9.9-personal.N`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，仅供个人使用；与上游发布版本相互独立。
