@@ -3,9 +3,7 @@
 对应 issue #94：把原本散落在 ``PetWindow`` 里的 QThread worker、裸
 Python 线程、子进程、asyncio loop 与服务关闭链路，集中到 App 级
 ``ResourceRegistry`` 与 UI 主线程上的 ``ResourceManager``（``QObject`` wrapper）。
-
-设计与路线图见 ``docs/RUNTIME_RESOURCE_MANAGER_PLAN.md``。本模块同时保留
-lingering 线程与 Shiboken wrapper 保留这两个 native 安全机制。
+本模块同时保留 lingering 线程与 Shiboken wrapper 保留这两个 native 安全机制。
 """
 
 from __future__ import annotations
@@ -38,8 +36,7 @@ SignalBinding = tuple[Any, Callable[..., Any]]
 class ResourceState(str, Enum):
     """受管资源的统一生命周期状态。
 
-    对应 ``docs/RUNTIME_RESOURCE_MANAGER_PLAN.md`` 的状态机：
-    ``NEW → STARTING → READY → STOPPING → STOPPED``，进程类资源额外可进入
+    ``NEW → STARTING → READY → STOPPING → STOPPED``；进程类资源额外可进入
     ``DEGRADED``（健康检查失败但仍存活，可 ``restart()``）。``QtWorkerResource``
     沿用旧实现、不显式标状态，故仅 Thread/Process 资源使用本枚举。
     """

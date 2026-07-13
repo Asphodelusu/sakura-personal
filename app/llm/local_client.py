@@ -18,7 +18,6 @@ from app.config.defaults import (
 )
 from app.core.cancellation import CancelChecker
 from app.core.debug_log import debug_log
-from app.llm.dual_provider_client import create_cloud_llm_client
 from app.llm.api_client import (
     ApiConfigError,
     ApiRequestError,
@@ -359,6 +358,10 @@ class RoutingLlmClient:
             )
         except ApiConfigError:
             self._local_client = None
+
+
+def create_cloud_llm_client(settings: ApiSettings) -> OpenAICompatibleClient:
+    return OpenAICompatibleClient(settings)
 
 
 def create_routing_llm_client(

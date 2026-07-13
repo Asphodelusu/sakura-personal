@@ -28,27 +28,12 @@ def test_removed_internal_public_module_is_not_importable() -> None:
         importlib.import_module("app.agent.tool_registry")
 
 
-def test_old_reexport_symbols_are_not_available_from_former_modules() -> None:
-    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    del qtwidgets
+def test_settings_dialog_module_is_removed() -> None:
+    module_path = Path(__file__).resolve().parents[2] / "app" / "ui" / "settings_dialog.py"
+    assert not module_path.exists()
 
-    tts_module = importlib.import_module("app.voice.tts")
-    for name in (
-        "GPTSoVITSTTSSettings",
-        "TTS_PROVIDER_GPT_SOVITS",
-        "TTS_PLAYBACK_BACKEND_AUDIO_SINK",
-        "ToneReference",
-    ):
-        assert not hasattr(tts_module, name)
 
-    settings_dialog = importlib.import_module("app.ui.settings_dialog")
-    for name in (
-        "ApiConnectionTestWorker",
-        "TTSTestWorker",
-        "ModelComboBox",
-    ):
-        assert not hasattr(settings_dialog, name)
-
+def test_old_reexport_symbols_are_not_available_from_runtime() -> None:
     runtime = importlib.import_module("app.agent.runtime")
     for name in (
         "_should_prefer_browser_page_tools",

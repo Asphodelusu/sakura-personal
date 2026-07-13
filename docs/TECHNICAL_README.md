@@ -114,7 +114,8 @@ flowchart LR
 │   │   └── visual_observation.py       # 视觉观察记录（JSONL）
 │   ├── ui/                             # UI 组件
 │   │   ├── pet_window.py               # 桌宠主窗口
-│   │   ├── settings_dialog.py          # 设置对话框
+│   │   ├── tauri_settings.py           # Tauri 设置桥接
+│   │   └── settings/                   # 设置页后台 Worker（Tauri 复用）
 │   │   ├── history_window.py           # 历史回看
 │   │   ├── portrait_controller.py      # 立绘控制器
 │   │   ├── subtitle_controller.py      # 字幕控制器
@@ -142,7 +143,8 @@ flowchart LR
 ├── docs/                               # 文档
 │   ├── TECHNICAL_README.md             # 技术讲解 README
 │   └── SAKURA_PLUGIN_SDK.md            # 插件开发指南
-├── tools/studio/                       # SakuraCharacterStudio
+├── tools/studio_tauri/                 # Tauri 角色工坊宿主
+├── tools/studio/                       # 兼容入口（转发至 studio_tauri）
 ├── tools/cleanup.py                    # 安全清理工具（默认 dry-run）
 └── tools/mcp/                          # MCP Server 运行时
 ```
