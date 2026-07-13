@@ -5906,8 +5906,11 @@ class PetWindow(QWidget):
         if resolve_tauri_studio_binary(self.base_dir) is None:
             return False
         existing = getattr(self, "tauri_studio_process", None)
-        if existing is not None and existing.focus_window():
-            return True
+        if existing is not None:
+            if existing.focus_window():
+                return True
+            existing.shutdown()
+            self.tauri_studio_process = None
         process = TauriStudioProcess(
             self.base_dir,
             initial_character_id=str(character_id or ""),

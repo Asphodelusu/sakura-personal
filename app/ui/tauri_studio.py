@@ -414,3 +414,57 @@ def _required_str(mapping: dict[str, Any], key: str) -> str:
 
 def _required_path(mapping: dict[str, Any], key: str) -> Path:
     return Path(_required_str(mapping, key))
+
+
+def run_tauri_studio_host(
+    base_dir: Path,
+    *,
+    initial_character_id: str = "",
+    parent: QObject | None = None,
+) -> dict[str, object] | bool:
+    """阻塞运行 Tauri Studio 宿主，直至窗口正常关闭。
+
+    供 ``start_studio.bat``、CLI 与首次引导共用；与 ``PetWindow`` 内非阻塞
+    ``TauriStudioProcess`` 使用同一二进制与 RPC 后端。
+    """
+    from PySide6.QtCore import QEventLoop
+
+    if resolve_tauri_studio_binary(base_dir) is None:
+        return False
+
+    loop = QEventLoop()
+    state: dict[str, object] = {"finished": False, "closed": False}
+    process = TauriStudioProcess(
+        base_dir,
+        initial_character_id=str(initial_character_id or ""),
+        parent=parent,
+    )
+
+    def _on_closed() -> None:
+        state["finished"] = True
+        state["closed"] = True
+        loop.quit()
+
+    def _on_failed(message: object) -> None:
+        state["finished"] = True
+        state["error"] = str(message) or "角色工作室启动失败。"
+        loop.quit()
+
+    process.closed.connect(_on_closed)
+    process.failed.connect(_on_failed)
+    if not process.start():
+        return False
+    try:
+        if not bool(state["finished"]):
+            loop.exec()
+    finally:
+        process.shutdown()
+
+    if "error" in state:
+        raise RuntimeError(str(state["error"]))
+    if not bool(state["closed"]):
+        return False
+    return {
+        "refresh_characters": True,
+        "current_character_id": str(initial_character_id or ""),
+    }

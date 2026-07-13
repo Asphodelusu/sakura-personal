@@ -52,7 +52,7 @@ from app.ui.tauri_settings import (
     resolve_tauri_settings_binary,
     tts_settings_from_tauri_result,
 )
-from app.ui.tauri_studio import TauriStudioProcess, resolve_tauri_studio_binary
+from app.ui.tauri_studio import resolve_tauri_studio_binary, run_tauri_studio_host
 from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
     normalize_portrait_scale_percent,
@@ -524,45 +524,10 @@ def _open_first_run_studio(
     base_dir: Path,
     character_id: str | None = None,
 ) -> dict[str, object] | bool:
-    if resolve_tauri_studio_binary(base_dir) is None:
-        return False
-
-    loop = QEventLoop()
-    state: dict[str, object] = {"finished": False, "closed": False}
-    process = TauriStudioProcess(
+    return run_tauri_studio_host(
         base_dir,
         initial_character_id=str(character_id or ""),
     )
-
-    def _on_closed() -> None:
-        state["finished"] = True
-        state["closed"] = True
-        loop.quit()
-
-    def _on_failed(message: object) -> None:
-        state["finished"] = True
-        state["error"] = str(message) or "角色工作室启动失败。"
-        loop.quit()
-
-    process.closed.connect(_on_closed)
-    process.failed.connect(_on_failed)
-    started = process.start()
-    try:
-        if started and not bool(state["finished"]):
-            loop.exec()
-    finally:
-        shutdown = getattr(process, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
-
-    if "error" in state:
-        raise RuntimeError(str(state["error"]))
-    if not bool(state["closed"]):
-        return False
-    return {
-        "refresh_characters": True,
-        "current_character_id": str(character_id or ""),
-    }
 
 
 def _open_first_run_settings(base_dir: Path) -> AppContext | None:

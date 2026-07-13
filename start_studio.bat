@@ -20,17 +20,16 @@ if exist "%PRJ_ROOT%runtime\python.exe" (
     exit /b 1
 )
 
-set "HF_HOME=%PRJ_ROOT%runtime\hf-cache"
-set "SENTENCE_TRANSFORMERS_HOME=%PRJ_ROOT%runtime\hf-cache"
-if not exist "%HF_HOME%" mkdir "%HF_HOME%"
-
 cd /d "%PRJ_ROOT%"
-"%PYTHON_EXE%" -m tools.studio.main 2> "%PRJ_ROOT%studio_error.log"
+"%PYTHON_EXE%" -m tools.studio_tauri.main 2> "%PRJ_ROOT%studio_error.log"
 if errorlevel 1 (
     echo.
-    echo [ERROR] SakuraCharacterStudio exited with error:
+    echo [ERROR] Sakura Character Studio exited with error:
     echo --------------------------------------------------------
     type "%PRJ_ROOT%studio_error.log"
     echo --------------------------------------------------------
+    echo.
+    echo Build Tauri studio first: cd tools\studio-tauri\src-tauri ^&^& cargo build --release
+    echo Or set SAKURA_TAURI_STUDIO_BIN to sakura-studio.exe
 )
 pause

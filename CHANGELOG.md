@@ -10,7 +10,7 @@
 - `slot_clients`：聊天保留 RoutingLlmClient（双端点 + 本地路由），视觉/记忆按槽位分流
 - AgentRuntime 含图消息走独立 `vision_api_client`
 - 首次启动改为 Tauri onboarding（需已构建 `sakura-settings`）
-- Tauri Studio + `character_studio` 后端
+- Tauri Studio + `character_studio` 后端；`start_studio.bat` 与设置页共用同一宿主
 - `sakura_mobile` 手机网页端插件骨架
 - 设置保存后重建 LLM 客户端（聊天/视觉/记忆整理）
 
