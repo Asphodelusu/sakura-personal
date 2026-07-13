@@ -17,6 +17,7 @@ from app.agent.memory import (
     MEMORY_LAYER_EPISODIC,
     MemoryStore,
 )
+from app.llm.json_completion import complete_background_json, load_json_object
 from app.storage.atomic import atomic_write_text
 
 _logger = logging.getLogger("MemoryReflector")
@@ -109,20 +110,9 @@ def _format_memory_summary(memories: list[dict[str, Any]]) -> str:
 
 def _parse_reflection_output(raw: str) -> list[dict[str, Any]]:
     """解析 LLM 反思输出，非法 JSON 返回空列表。"""
-    raw = raw.strip()
-    # 处理可能的 markdown 代码块包裹
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        # 跳过第一行 (``` 或 ```json 等)
-        lines = lines[1:]
-        # 跳过最后一行的 ```
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        raw = "\n".join(lines).strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        _logger.warning("Reflection: invalid JSON from LLM, raw=%s", raw[:200])
+    data = load_json_object(raw)
+    if not data:
+        _logger.warning("Reflection: invalid JSON from LLM, raw=%s", raw.strip()[:200])
         return []
     reflections = data.get("reflections") or []
     if not isinstance(reflections, list):
@@ -226,30 +216,37 @@ class MemoryReflector:
             _logger.debug("Reflection: too few memories (%d), skipping", len(memories))
             return ReflectionResult()
 
-        # 2. 构建 prompt
+        # 2. 构建 prompt（后台任务只用反思专用说明，不注入完整 Sakura persona）
         summary = _format_memory_summary(memories)
         user_prompt = _build_reflection_user_prompt(summary)
-        system_prompt = (
-            f"{self.system_prompt}\n\n{_REFLECTION_SYSTEM_PROMPT}"
-            if self.system_prompt
-            else _REFLECTION_SYSTEM_PROMPT
-        )
+        system_prompt = _REFLECTION_SYSTEM_PROMPT
+        llm_messages: list[dict[str, str]] = [{"role": "user", "content": user_prompt}]
 
-        # 3. 调用 LLM
+        # 3. 调用 LLM（background 路由 + 低温，提高 JSON 合规率）
+        repair_hint = (
+            "上一条输出不是合法 JSON。请只返回严格 JSON，"
+            '格式为 {"reflections":[{"content":"...","importance":0.7,"confidence":0.6}]}，'
+            "不要解释、不要推理、不要 Markdown。"
+        )
         try:
-            raw_response = self.api_client.complete_raw(
+            data, _raw_response = complete_background_json(
+                self.api_client,
                 system_prompt,
-                [{"role": "user", "content": user_prompt}],
-                temperature=0.7,
-                response_format={"type": "json_object"},
-                max_tokens=2000,
+                llm_messages,
+                cancel_checker=cancel_checker,
+                repair_user_message=repair_hint,
+                log_label="Reflection",
             )
         except Exception as exc:
             _logger.exception("Reflection: LLM call failed")
             return ReflectionResult(errors=[f"LLM 调用失败：{exc}"])
 
         # 4. 解析输出
-        reflections = _parse_reflection_output(raw_response)
+        reflections = [
+            r
+            for r in (data.get("reflections") or [])
+            if isinstance(r, dict) and r.get("content", "").strip()
+        ]
         if not reflections:
             _logger.debug("Reflection: LLM decided nothing worth reflecting")
             return ReflectionResult()

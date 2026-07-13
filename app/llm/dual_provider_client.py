@@ -103,9 +103,10 @@ class DualProviderLlmClient:
         *,
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
+        task: str = "default",
         **chat_params: Any,
     ) -> str:
-        client = self._pick_client(messages)
+        client = self._pick_client(messages, task=task)
         prepared_messages = prepare_messages_for_chat_api(
             messages,
             text_only=client is self._text,
@@ -179,7 +180,10 @@ class DualProviderLlmClient:
         self._mirror_runtime_context_role(client)
         return turn
 
-    def _pick_client(self, messages: list[ChatMessage]) -> OpenAICompatibleClient:
+    def _pick_client(self, messages: list[ChatMessage], *, task: str = "default") -> OpenAICompatibleClient:
+        # 后台 JSON 任务走视觉端点（GLM），利用其原生 json_object + thinking 可控
+        if task == "background":
+            return self._vision
         if messages_contain_image(messages):
             return self._vision
         return self._text

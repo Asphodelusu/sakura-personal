@@ -201,15 +201,21 @@ class VoicePlaybackController:
         sequence_id: int | None,
         phase: str,
     ) -> None:
+        reason = "suppress_tts" if segment.suppress_tts else "language_guard"
         payload = {
             "sequence_id": sequence_id,
             "phase": phase,
+            "reason": reason,
             "text": segment.text,
             "tone": segment.tone,
             "target_lang": self._target_text_lang(),
         }
-        self._log_stage("tts_skipped_language_guard", payload)
-        debug_log("TTS", "语言守卫跳过异常文本 TTS", payload)
+        stage = "tts_skipped_suppress" if segment.suppress_tts else "tts_skipped_language_guard"
+        self._log_stage(stage, payload)
+        if segment.suppress_tts:
+            debug_log("TTS", "suppress_tts 跳过 TTS", payload)
+        else:
+            debug_log("TTS", "语言守卫跳过异常文本 TTS", payload)
 
     def _notify_error(self, message: str) -> None:
         if self._on_error is None:
