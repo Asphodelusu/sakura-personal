@@ -40,6 +40,7 @@ from app.llm.api_client import (
     ChatMessage,
     NativeToolCall,
     OpenAICompatibleClient,
+    STRUCTURED_JSON_RESPONSE_FORMAT,
     is_vision_unsupported_error,
     messages_contain_image,
     strip_image_parts_from_messages,
@@ -65,6 +66,7 @@ from app.llm.prompt_templates import (
     build_event_system_prompt,
     build_proactive_check_tool_system_prefix,
 )
+from app.llm.prompts.recipes import build_segmented_reply_instruction
 from app.plugins.models import ContextProviderContribution, PromptPatchContribution
 
 from app.llm.prompts.runtime import PromptRuntime
@@ -1270,14 +1272,11 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
-            reply = self.api_client.chat(
-                prompt_build.system_prompt,
+            reply = self._request_structured_event_reply(
+                prompt_build,
                 event_messages,
-                self.reply_tones,
-                self.reply_portraits,
-                runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
-                on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
+                progress_callback=progress_callback,
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -1287,8 +1286,63 @@ class AgentRuntime:
                 return AgentResult(reply=_build_proactive_vision_unsupported_reply())
             raise
         return AgentResult(
-            reply=self._normalize_reply(reply),
+            reply=reply,
             actions=[event_action],
+        )
+
+    def _request_structured_event_reply(
+        self,
+        prompt_build,
+        event_messages: list[ChatMessage],
+        *,
+        cancel_checker: CancelChecker | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ChatReply:
+        """事件回复走结构化 JSON + 格式修复，避免 api_client.chat 直接降级兜底。"""
+        segmented_instruction = build_segmented_reply_instruction(
+            self.reply_tones,
+            self.reply_portraits,
+            portrait_hints=self._portrait_hints() or None,
+        )
+        full_system_prompt = f"{prompt_build.system_prompt.strip()}\n\n{segmented_instruction}"
+        dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
+        event_temperature = min(dialogue_temperature, 0.5)
+        on_chunk = _build_stream_progress_emitter(progress_callback, cancel_checker)
+
+        if progress_callback is not None:
+            chunks: list[str] = []
+            for chunk in self.api_client.stream_raw(
+                full_system_prompt,
+                event_messages,
+                temperature=event_temperature,
+                response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
+                cancel_checker=cancel_checker,
+                runtime_context=prompt_build.runtime_context,
+                **dialogue_extra_params,
+            ):
+                chunks.append(chunk)
+                on_chunk(chunk)
+            raw_content = "".join(chunks)
+        else:
+            raw_content = self.api_client.complete_raw(
+                full_system_prompt,
+                event_messages,
+                temperature=event_temperature,
+                response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
+                cancel_checker=cancel_checker,
+                runtime_context=prompt_build.runtime_context,
+                **dialogue_extra_params,
+            )
+
+        parsed = self._parse_final_reply_with_retry(
+            prompt_build.system_prompt,
+            event_messages,
+            raw_content,
+            runtime_context=prompt_build.runtime_context,
+            cancel_checker=cancel_checker,
+        )
+        return self._normalize_reply(
+            sanitize_reply_tones(parsed.reply, self.reply_tones)
         )
 
     def _persona_sections(self) -> list[PromptSection]:

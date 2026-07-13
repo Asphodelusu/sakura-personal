@@ -19,7 +19,14 @@ from app.llm.api_client import (
     api_settings_uses_dual_endpoint,
     normalize_provider_base_url,
 )
-from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply, sanitize_reply_tones
+from app.llm.chat_reply import (
+    ChatReply,
+    ChatSegment,
+    SAFE_PARSE_FAILURE_TEXT,
+    SAFE_PARSE_FAILURE_TRANSLATION,
+    parse_chat_reply,
+    sanitize_reply_tones,
+)
 
 
 def test_sanitize_reply_tones_normalizes_out_of_set_tone() -> None:
@@ -41,6 +48,25 @@ def test_sanitize_reply_tones_normalizes_out_of_set_tone() -> None:
     assert out.segments[0].portrait == "站立待机"
 
 
+def test_sanitize_reply_tones_preserves_suppress_tts() -> None:
+    allowed = ["中性", "害羞"]
+    reply = ChatReply(
+        [
+            ChatSegment(
+                SAFE_PARSE_FAILURE_TEXT,
+                "invalid_tone",
+                SAFE_PARSE_FAILURE_TRANSLATION,
+                suppress_tts=True,
+            )
+        ]
+    )
+
+    out = sanitize_reply_tones(reply, allowed)
+
+    assert out.segments[0].tone == "中性"
+    assert out.segments[0].suppress_tts is True
+
+
 def test_sanitize_reply_tones_keeps_object_when_all_valid() -> None:
     allowed = ["中性", "害羞"]
     reply = ChatReply([ChatSegment("a", "中性"), ChatSegment("b", "害羞")])
@@ -57,6 +83,7 @@ def test_chat_param_filter_keeps_supported_values() -> None:
             "temperature": 0.2,
             "max_tokens": 32,
             "max_completion_tokens": 64,
+            "thinking": {"type": "disabled"},
             "unsupported_internal_flag": True,
             "top_p": None,
         }
@@ -65,7 +92,34 @@ def test_chat_param_filter_keeps_supported_values() -> None:
     assert filtered == {
         "temperature": 0.2,
         "max_completion_tokens": 64,
+        "thinking": {"type": "disabled"},
     }
+
+
+def test_complete_raw_returns_content_without_reasoning(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="glm-5v",
+        )
+    )
+
+    def fake_post(_payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "我们被要求输出JSON...",
+                        "content": '{"reflections":[]}',
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    assert client.complete_raw("system", [{"role": "user", "content": "go"}]) == '{"reflections":[]}'
 
 
 def test_build_chat_payload_drops_unsupported_params() -> None:

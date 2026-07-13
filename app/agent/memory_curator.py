@@ -20,6 +20,7 @@ from app.agent.memory import (
 from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_log
+from app.llm.json_completion import complete_background_json, load_json_object
 from app.storage.atomic import atomic_write_text
 from app.storage.chat_history import ChatHistoryEntry
 
@@ -296,9 +297,8 @@ class MemoryCurator:
             return []
 
     def _build_self_curation_system_prompt(self) -> str:
-        if not self.system_prompt:
-            return _SELF_CURATION_TASK_PROMPT
-        return f"{self.system_prompt}\n\n{_SELF_CURATION_TASK_PROMPT}"
+        """后台 JSON 任务只用整理专用说明，不注入完整人格卡（避免与 JSON 指令冲突）。"""
+        return _SELF_CURATION_TASK_PROMPT
 
     def _load_mood_history_text(self) -> str:
         """读取心情历史并格式化为简短的回顾文本；无历史时返回空串。"""
@@ -336,15 +336,27 @@ class MemoryCurator:
             dialog_entries,
             mood_history_block=mood_history_block,
         )
-        raw = self.api_client.complete_raw(
-            system_prompt,
-            [{"role": "user", "content": user_prompt}],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            max_tokens=2000,
-            cancel_checker=cancel_checker,
+        llm_messages = [{"role": "user", "content": user_prompt}]
+        repair_hint = (
+            "上一条输出不是合法 JSON。请只返回严格 JSON，"
+            '格式为 {"operations":[{"op":"add","content":"...","layer":"semantic"}]}，'
+            "不要解释、不要推理、不要 Markdown。"
         )
-        operations = _parse_curation_operations(raw)
+        try:
+            data, raw = complete_background_json(
+                self.api_client,
+                system_prompt,
+                llm_messages,
+                cancel_checker=cancel_checker,
+                repair_user_message=repair_hint,
+                log_label="MemoryCuration",
+            )
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            debug_log("Memory", "记忆整理 LLM 调用失败", {"error": str(exc)})
+            return []
+        operations = _parse_curation_operations_from_data(data) if data else []
         debug_log(
             "Memory",
             "第一人称记忆整理抽取完成",
@@ -766,8 +778,10 @@ def _build_curation_user_prompt(
 
 def _parse_curation_operations(raw: str) -> list[dict[str, Any]]:
     """解析模型返回的整理操作；非法 JSON 视为无操作，不抛错以免中断整理。"""
+    return _parse_curation_operations_from_data(load_json_object(raw))
 
-    data = _load_json_object(raw)
+
+def _parse_curation_operations_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = data.get("operations") or data.get("operation") or []
     if not isinstance(candidates, list):
         return []
@@ -837,26 +851,6 @@ def _memory_tokens(text: str) -> set[str]:
         if any("\u4e00" <= char <= "\u9fff" for char in normalized[index : index + 2])
     }
     return ascii_tokens | cjk_tokens
-
-
-def _load_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`").strip()
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return {}
-    return data if isinstance(data, dict) else {}
 
 
 def _normalize_state(raw_data: Any) -> dict[str, Any]:

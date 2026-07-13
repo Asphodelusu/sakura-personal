@@ -266,6 +266,7 @@ class RoutingLlmClient:
                 temperature,
                 cancel_checker=cancel_checker,
                 runtime_context=runtime_context,
+                task=task,
                 **chat_params,
             )
         except ApiRequestError as exc:
@@ -281,6 +282,7 @@ class RoutingLlmClient:
                     temperature,
                     cancel_checker=cancel_checker,
                     runtime_context=runtime_context,
+                    task=task,
                     **chat_params,
                 )
             raise

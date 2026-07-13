@@ -41,8 +41,9 @@ def test_curator_adds_memory_from_first_person_view() -> None:
             "source": "self_curation",
         }
     ]
-    # 人格卡注入到第一人称整理的 system prompt。
-    assert "我是 Sakura，这是我的人格卡。" in api.calls[0]["system_prompt"]
+    # 后台 JSON 整理不注入完整人格卡，避免与 JSON 指令冲突。
+    assert "我是 Sakura，这是我的人格卡。" not in api.calls[0]["system_prompt"]
+    assert "第一人称" in api.calls[0]["system_prompt"] or "长期记忆" in api.calls[0]["system_prompt"]
     # 现有记忆（带 id）注入到 user prompt，供模型对照去重。
     user_content = api.calls[0]["messages"][0]["content"]
     assert "[m1]" in user_content
@@ -60,10 +61,9 @@ def test_curator_updates_system_prompt_for_next_curation() -> None:
 
     first_prompt = str(api.calls[0]["system_prompt"])
     second_prompt = str(api.calls[1]["system_prompt"])
-    assert "旧角色人格卡" in first_prompt
-    assert "新角色人格卡" not in first_prompt
-    assert "新角色人格卡" in second_prompt
-    assert "旧角色人格卡" not in second_prompt
+    assert first_prompt == second_prompt
+    assert "旧角色人格卡" not in first_prompt
+    assert "新角色人格卡" not in second_prompt
 
 
 def test_curator_snapshot_keeps_prompt_and_store_context() -> None:
@@ -78,8 +78,8 @@ def test_curator_snapshot_keeps_prompt_and_store_context() -> None:
     snapshot.curate_entries([_entry("user", "整理旧角色对话")])
 
     prompt = str(api.calls[0]["system_prompt"])
-    assert "旧角色人格卡" in prompt
-    assert "新角色人格卡" not in prompt
+    assert snapshot.system_prompt == "旧角色人格卡"
+    assert "旧角色人格卡" not in prompt
     assert snapshot.memory_store is snapshot_store
 
 
@@ -330,22 +330,19 @@ def test_evaluate_idle_curation_trigger_hybrid_rules() -> None:
         pending_turns=2,
     )
     assert not evaluate_idle_curation_trigger(
-        **base_kwargs,
+        **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
         silence_seconds=12 * 60,
         pending_turns=1,
-        seconds_since_last_curation=5 * 60,
     )
     assert evaluate_idle_curation_trigger(
         **base_kwargs,
         silence_seconds=30 * 60,
         pending_turns=1,
-        seconds_since_last_curation=5 * 60,
     )
     assert evaluate_idle_curation_trigger(
-        **base_kwargs,
+        **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
         silence_seconds=12 * 60,
         pending_turns=12,
-        seconds_since_last_curation=5 * 60,
     )
 
 

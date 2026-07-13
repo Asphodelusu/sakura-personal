@@ -75,6 +75,10 @@ def _dummy_api_client() -> MagicMock:
     client.chat.return_value = ChatReply(
         segments=[ChatSegment(ja="おはよう", zh="早安", tone="开心", portrait="站立待机")]
     )
+    client.complete_raw.return_value = json.dumps(
+        {"segments": [{"ja": "おはよう", "zh": "早安", "tone": "开心", "portrait": "站立待机"}]},
+        ensure_ascii=False,
+    )
     # 角色对话入口会读取生成参数；返回内置默认温度与空额外参数，保持原有调用行为。
     client.resolve_dialogue_params.return_value = (0.8, {})
     return client
@@ -359,14 +363,47 @@ class TestProactiveEventFlow:
         runtime.handle_event(event)
         assert client.complete_with_tools.called
 
-    def test_reminder_due_uses_chat_not_tools(self) -> None:
+    def test_reminder_due_uses_structured_reply_not_tools(self) -> None:
         client = _dummy_api_client()
         runtime = AgentRuntime(client, _dummy_system_prompt())
         event = AgentEvent(type="reminder_due", payload={
             "reminder_id": "r1", "reminder_text": "喝水",
         })
         runtime.handle_event(event)
-        assert client.chat.called
+        assert client.complete_raw.called
+        assert not client.chat.called
+
+    def test_reminder_due_retries_when_initial_json_invalid(self) -> None:
+        client = _dummy_api_client()
+        bad_content = '{"segments":[{"ja":"時間だよ","zh":"到时间了"'  # 故意缺闭合
+        repaired_content = json.dumps(
+            {
+                "segments": [
+                    {
+                        "ja": "時間だよ。水を飲んでね。",
+                        "zh": "到时间了，记得喝水哦。",
+                        "tone": "请求",
+                        "portrait": "伸手命令",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        client.complete_raw.return_value = bad_content
+        client.complete_with_tools.side_effect = [
+            MagicMock(content=repaired_content, tool_calls=[]),
+        ]
+        runtime = AgentRuntime(client, _dummy_system_prompt(), reply_tones=["请求"])
+        event = AgentEvent(type="reminder_due", payload={
+            "reminder_id": "r1", "reminder_text": "喝水",
+        })
+
+        result = runtime.handle_event(event)
+
+        assert client.complete_raw.called
+        assert client.complete_with_tools.called
+        assert result.reply.segments[0].text == "時間だよ。水を飲んでね。"
+        assert "返答の形" not in result.reply.segments[0].text
 
 
 class TestAgentRuntimeBasics:

@@ -4711,16 +4711,24 @@ class PetWindow(QWidget):
 
         if not reflection_should_run(
             self.reflection_state_store,
-            is_busy=self.worker_thread is not None,
+            is_busy=self._reflection_is_busy(),
         ):
             return
 
-        # 确保不在对话中
-        if self.worker_thread is not None:
+        # 确保不在对话或主动事件中
+        if self._reflection_is_busy():
             return
 
         debug_log("Memory", "触发记忆反思")
         self._run_memory_reflection()
+
+    def _reflection_is_busy(self) -> bool:
+        return (
+            self.worker_thread is not None
+            or getattr(self, "reflection_worker", None) is not None
+            or bool(self.active_event_type)
+            or self.active_reminder_id is not None
+        )
 
     def _run_memory_reflection(self) -> None:
         """在后台线程中运行记忆反思。"""
@@ -4779,7 +4787,10 @@ class PetWindow(QWidget):
             "记忆反思完成",
             {"memories_created": m_created, "errors": m_errors},
         )
-        mark_reflection_done(self.reflection_state_store, m_created)
+        if m_errors == 0:
+            mark_reflection_done(self.reflection_state_store, m_created)
+        else:
+            debug_log("Memory", "记忆反思有错误，不更新 last_reflection_at，下次重试", {"errors": m_errors})
 
     @Slot(str)
     def _handle_reflection_failed(self, message: str) -> None:

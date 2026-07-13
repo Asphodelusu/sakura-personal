@@ -1565,7 +1565,7 @@ def test_voice_playback_controller_skips_suppressed_tts_segment() -> None:
     assert tts.speak_calls == 0
     assert tts.prepare_calls == 0
     assert events == ["started", "finished"]
-    assert stages == ["tts_skipped_language_guard", "tts_skipped_language_guard"]
+    assert stages == ["tts_skipped_suppress", "tts_skipped_suppress"]
 
 
 def test_voice_playback_controller_skips_prepare_for_chinese_text() -> None:

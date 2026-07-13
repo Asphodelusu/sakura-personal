@@ -30,6 +30,7 @@ SUPPORTED_CHAT_COMPLETION_PARAMS = {
     "stream",
     "tools",
     "tool_choice",
+    "thinking",
 }
 
 
@@ -395,9 +396,14 @@ class OpenAICompatibleClient:
         *,
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
+        task: str | None = None,
         **chat_params: Any,
     ) -> str:
-        """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
+        """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。
+
+        task 仅由 RoutingLlmClient / DualProviderLlmClient 消费，底层直连时忽略。
+        """
+        _ = task
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
         runtime_context_role = self._runtime_context_role
@@ -463,9 +469,7 @@ class OpenAICompatibleClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
 
-        reasoning = data["choices"][0]["message"].get("reasoning_content", "")
-        content = (str(reasoning) + "\n" + str(content)).strip()
-        result = str(content).strip()
+        result = str(content).strip() if content else ""
         debug_log("API", "模型原始文本返回", {"content": result})
         return result
 
