@@ -1,8 +1,43 @@
 # Sakura API 配置教程
 
-本文教你在 Sakura 中配置大模型 API。
+本文说明如何在 Sakura 中配置大模型 API。
 
-Sakura 使用 OpenAI 兼容接口连接大模型。配置时只需要准备 3 个信息：
+## Personal Edition（0.9.9-personal）：model_slots
+
+本 fork 使用 Tauri 设置页管理 **`api_profiles`（供应商）** 与 **`model_slots`（用途分流）**，配置文件为 `data/config/api.yaml`。
+
+典型双供应商配置示例：
+
+```yaml
+api_profiles:
+  - id: text-profile
+    alias: DeepSeek
+    base_url: https://api.deepseek.com
+    api_key: <key>
+    models: [{name: deepseek-v4-pro}]
+  - id: vision-profile
+    alias: 智谱GLM
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: <key>
+    models: [{name: glm-5v-turbo}, {name: glm-4.6v}]
+
+model_slots:
+  chat:              {profile_id: text-profile, model: deepseek-v4-pro}
+  vision_chat:       {profile_id: vision-profile, model: glm-5v-turbo}
+  memory_curation:   {profile_id: vision-profile, model: glm-4.6v}
+```
+
+- **chat** — 主对话与工具循环
+- **vision_chat** — 带图消息、屏幕观察、主动观察 VLM
+- **memory_curation** — 记忆整理与反思（JSON 输出）
+
+`llm` 段保留 chat 槽镜像与对话参数（temperature、timeout 等），**不再使用** `dual_endpoint_*` 字段。
+
+---
+
+## 单供应商快速配置（通用）
+
+Sakura 使用 OpenAI 兼容接口连接大模型。单供应商时只需准备 3 个信息：
 
 | 配置项 | 填什么 |
 |---|---|

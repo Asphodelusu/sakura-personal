@@ -112,51 +112,9 @@ def _friendly_non_json_api_error(base_url: str, body: str) -> str:
 
 
 def api_settings_uses_dual_endpoint(settings: ApiSettings) -> bool:
-    return (
-        settings.model_split_enabled
-        and settings.dual_endpoint_enabled
-        and bool(settings.text_model.strip())
-        and bool(settings.text_base_url.strip())
-        and bool(settings.text_api_key.strip())
-    )
-
-
-def api_settings_for_vision(settings: ApiSettings) -> ApiSettings:
-    """单端点分流或双端点模式下的视觉侧配置。"""
-    return replace(
-        settings,
-        model=settings.model.strip(),
-        text_model="",
-        model_split_enabled=False,
-        dual_endpoint_enabled=False,
-        text_base_url="",
-        text_api_key="",
-    )
-
-
-def api_settings_for_text(settings: ApiSettings) -> ApiSettings:
-    """单端点分流或双端点模式下的文本侧配置。"""
-    if api_settings_uses_dual_endpoint(settings):
-        return replace(
-            settings,
-            base_url=normalize_provider_base_url(settings.text_base_url).strip().rstrip("/"),
-            api_key=settings.text_api_key.strip(),
-            model=settings.text_model.strip(),
-            text_model="",
-            model_split_enabled=False,
-            dual_endpoint_enabled=False,
-            text_base_url="",
-            text_api_key="",
-        )
-    return replace(
-        settings,
-        model=settings.text_model.strip() or settings.model.strip(),
-        text_model="",
-        model_split_enabled=False,
-        dual_endpoint_enabled=False,
-        text_base_url="",
-        text_api_key="",
-    )
+    """双端点模式已移除；槽位分流由 api_profiles + model_slots 承担。"""
+    _ = settings
+    return False
 
 
 @dataclass(frozen=True)

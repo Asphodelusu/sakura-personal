@@ -8,7 +8,7 @@ from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QStyleFactory
 
@@ -22,20 +22,41 @@ from app.core.debug_log import debug_log
 from app.core.instance import SingleInstanceGuard
 from app.core.selfcheck import run_startup_self_check
 from app.storage.paths import StoragePaths
-from app.config.character_loader import CharacterConfigError
+from app.config.character_loader import CharacterConfigError, CharacterRegistry
+from app.config.model_slots import resolve_model_slot
+from app.config.models import MODEL_SLOT_CHAT
 from app.config.settings_service import AppSettingsService, StartupSettings
 from app.agent.mcp import MCPRuntimeSettings
-from app.agent.proactive_care import ProactiveCareSettings
 from app.agent.runtime_limits import RuntimeLoopSettings
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
     ensure_launch_at_login_state,
+    is_launch_at_login_supported,
     set_launch_at_login_enabled,
 )
 from app.ui.pet_window import PetWindow
+from app.ui.control_panel_layout import (
+    DEFAULT_BUBBLE_HEIGHT,
+    DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+    DEFAULT_CONTROL_PANEL_WIDTH,
+    DEFAULT_INPUT_BAR_OFFSET,
+    normalize_bubble_height,
+    normalize_control_panel_vertical_offset,
+    normalize_control_panel_width,
+    normalize_input_bar_offset,
+)
 from app.ui.error_messages import format_failure_message
-from app.ui.settings_dialog import SettingsDialog
-from app.ui.portrait_controller import PORTRAIT_SCALE_DEFAULT_PERCENT
+from app.ui.tauri_settings import (
+    TauriSettingsProcess,
+    TauriSettingsResult,
+    resolve_tauri_settings_binary,
+    tts_settings_from_tauri_result,
+)
+from app.ui.tauri_studio import resolve_tauri_studio_binary, run_tauri_studio_host
+from app.ui.portrait_controller import (
+    PORTRAIT_SCALE_DEFAULT_PERCENT,
+    normalize_portrait_scale_percent,
+)
 from app.ui.subtitle_controller import (
     REPLY_SEGMENT_PAUSE_MS,
     SPEECH_TYPING_INTERVAL_MS,
@@ -424,31 +445,30 @@ def main() -> int:
             _format_data_migration_failure(migration_report),
         )
 
+    initial_setup = False
     try:
-        context = build_initial_app_context(BASE_DIR)
-    except CharacterConfigError as exc:
-        if not _character_packages_missing(BASE_DIR):
-            _write_startup_error("Character", f"配置无效：{exc}")
-            return 1
-        try:
+        initial_setup = _initial_setup_required(BASE_DIR)
+        if initial_setup:
             context = _open_first_run_settings(BASE_DIR)
-        except (CharacterConfigError, OSError, TTSConfigError, ValueError) as first_run_exc:
+        else:
+            context = build_initial_app_context(BASE_DIR)
+    except (CharacterConfigError, OSError, RuntimeError, TTSConfigError, ValueError) as exc:
+        if initial_setup:
             QMessageBox.critical(
                 None,
                 "启动失败",
                 format_failure_message(
                     "首次启动配置没有完成，Sakura 无法继续启动。",
                     "请检查角色包、TTS 配置和 data 目录权限后重试。",
-                    first_run_exc,
+                    exc,
                 ),
             )
-            _write_startup_error("Character", f"配置无效：{first_run_exc}")
+            _write_startup_error("Character", f"配置无效：{exc}")
             return 1
-        if context is None:
-            return 0
-    except (OSError, ValueError) as exc:
         _write_startup_error("Character", f"配置无效：{exc}")
         return 1
+    if context is None:
+        return 0
 
     _ensure_launch_at_login_state(BASE_DIR, context.settings_service)
     pet_window = PetWindow(context)
@@ -485,85 +505,187 @@ def _ensure_launch_at_login_state(
         debug_log("Startup", "同步登录自启动状态失败", {"error": str(exc)})
 
 
-def _open_first_run_settings(base_dir: Path) -> AppContext | None:
+def _initial_setup_required(base_dir: Path) -> bool:
+    if _character_packages_missing(base_dir):
+        return True
     settings_service = AppSettingsService(base_dir=base_dir)
+    settings = settings_service.load_api_settings()
+    chat = resolve_model_slot(
+        settings_service.load_api_profiles(),
+        settings_service.load_model_selection(),
+        MODEL_SLOT_CHAT,
+        settings,
+    )
+    resolved = chat.settings if chat is not None else settings
+    return not all((resolved.base_url, resolved.api_key, resolved.model))
+
+
+def _open_first_run_studio(
+    base_dir: Path,
+    character_id: str | None = None,
+) -> dict[str, object] | bool:
+    return run_tauri_studio_host(
+        base_dir,
+        initial_character_id=str(character_id or ""),
+    )
+
+
+def _open_first_run_settings(base_dir: Path) -> AppContext | None:
+    """首次启动用 Tauri 设置页完成初始配置；缺少二进制时直接报错。"""
+    settings_service = AppSettingsService(base_dir=base_dir)
+    if resolve_tauri_settings_binary(base_dir) is None:
+        raise RuntimeError(
+            "未找到设置程序（sakura-settings）。请先构建 tools/settings-tauri，"
+            "或用环境变量 SAKURA_TAURI_SETTINGS_BIN 指定可执行文件路径。"
+        )
+
     api_settings = settings_service.load_api_settings()
     tts_settings = settings_service.load_tts_settings(
         validate_enabled=False,
         character_profile=None,
     )
     startup_settings = settings_service.load_startup_settings()
-    dialog = SettingsDialog(
-        api_settings=api_settings,
-        tts_settings=tts_settings,
+    ui_settings = settings_service.load_system_values("ui")
+    subtitle_typing_interval_ms, reply_segment_pause_ms = normalize_subtitle_display_speed(
+        ui_settings.get("subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
+        ui_settings.get("reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
+    )
+    character_registry = None
+    current_character = None
+    if not _character_packages_missing(base_dir):
+        character_registry = CharacterRegistry(base_dir)
+        current_character = character_registry.get(
+            settings_service.load_current_character_id(character_registry)
+        )
+
+    process = TauriSettingsProcess(
         base_dir=base_dir,
-        character_registry=None,
-        current_character=None,
-        proactive_care_settings=settings_service.load_proactive_care_settings(),
+        settings=settings_service.load_screen_awareness_settings(),
         mcp_settings=settings_service.load_mcp_runtime_settings(),
-        debug_log_settings=settings_service.load_debug_log_settings(),
         runtime_loop_settings=settings_service.load_runtime_loop_settings(),
-        portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
-        subtitle_typing_interval_ms=SPEECH_TYPING_INTERVAL_MS,
-        reply_segment_pause_ms=REPLY_SEGMENT_PAUSE_MS,
+        debug_log_settings=settings_service.load_debug_log_settings(),
         theme_settings=settings_service.load_theme_settings(),
+        character_registry=character_registry,
+        current_character=current_character,
+        portrait_scale_percent=normalize_portrait_scale_percent(
+            ui_settings.get("portrait_scale_percent", PORTRAIT_SCALE_DEFAULT_PERCENT)
+        ),
+        control_panel_width=normalize_control_panel_width(
+            ui_settings.get("control_panel_width", DEFAULT_CONTROL_PANEL_WIDTH)
+        ),
+        bubble_height=normalize_bubble_height(
+            ui_settings.get("bubble_height", DEFAULT_BUBBLE_HEIGHT)
+        ),
+        control_panel_vertical_offset=normalize_control_panel_vertical_offset(
+            ui_settings.get(
+                "control_panel_vertical_offset",
+                DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+            )
+        ),
+        input_bar_offset=normalize_input_bar_offset(
+            ui_settings.get("input_bar_offset", DEFAULT_INPUT_BAR_OFFSET)
+        ),
+        subtitle_typing_interval_ms=subtitle_typing_interval_ms,
+        reply_segment_pause_ms=reply_segment_pause_ms,
+        api_settings=api_settings,
+        api_profiles=settings_service.load_api_profiles(),
+        model_selection=settings_service.load_model_selection(),
+        tts_settings=tts_settings,
         startup_settings=startup_settings,
+        launch_at_login_supported=is_launch_at_login_supported(),
+        studio_launcher=lambda character_id: _open_first_run_studio(base_dir, character_id),
+        model=getattr(api_settings, "model", None),
+        onboarding=True,
     )
-    if dialog.exec() != QDialog.DialogCode.Accepted:
+
+    loop = QEventLoop()
+    state: dict[str, object] = {}
+
+    def _on_completed(result: object) -> None:
+        state["result"] = result
+        loop.quit()
+
+    def _on_cancelled() -> None:
+        loop.quit()
+
+    def _on_failed(message: object) -> None:
+        state["error"] = str(message) or "设置程序启动失败。"
+        loop.quit()
+
+    def _on_apply_requested(request_id: str, _result: object) -> None:
+        resolve = getattr(process, "resolve_apply_request", None)
+        if callable(resolve):
+            resolve(request_id, ok=True, error="")
+
+    process.completed.connect(_on_completed)
+    process.cancelled.connect(_on_cancelled)
+    process.failed.connect(_on_failed)
+    process.apply_requested.connect(_on_apply_requested)
+
+    if not process.start():
+        raise RuntimeError("无法启动设置程序，请确认已构建 tools/settings-tauri。")
+    loop.exec()
+    shutdown = getattr(process, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+
+    if "error" in state:
+        raise RuntimeError(str(state["error"]))
+    result = state.get("result")
+    if not isinstance(result, TauriSettingsResult):
         return None
-    (
-        subtitle_typing_interval_ms,
-        reply_segment_pause_ms,
-    ) = normalize_subtitle_display_speed(
-        getattr(dialog, "result_subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
-        getattr(dialog, "result_reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
-    )
-    result_theme_settings = getattr(
-        dialog,
-        "result_theme_settings",
-        settings_service.load_theme_settings(),
-    )
-    if (
-        dialog.result_api_settings is None
-        or dialog.result_tts_settings is None
-        or dialog.result_character_id is None
-        or dialog.result_proactive_care_settings is None
-        or dialog.result_mcp_settings is None
-        or dialog.result_runtime_loop_settings is None
-        or dialog.result_debug_log_settings is None
-        or dialog.result_startup_settings is None
-        or dialog.result_portrait_scale_percent is None
-        or result_theme_settings is None
-        or dialog.character_registry is None
-    ):
+
+    registry = CharacterRegistry(base_dir)
+    try:
+        selected_profile = registry.get(result.character.character_id)
+    except CharacterConfigError:
         QMessageBox.warning(None, "配置无效", "请先导入并选择一个角色包。")
         return None
 
-    settings_service.save_api_settings(dialog.result_api_settings)
-    result_local_llm = getattr(dialog, "result_local_llm_settings", None)
-    if result_local_llm is not None:
-        settings_service.save_local_llm_settings(result_local_llm)
-    settings_service.save_tts_settings(dialog.result_tts_settings)
-    settings_service.save_current_character_id(
-        dialog.character_registry,
-        dialog.result_character_id,
+    result_tts_settings = tts_settings_from_tauri_result(
+        result.tts,
+        selected_profile,
+        base_dir,
+        previous=tts_settings,
     )
-    settings_service.save_proactive_care_settings(
-        dialog.result_proactive_care_settings or ProactiveCareSettings()
+    subtitle_typing_interval_ms, reply_segment_pause_ms = normalize_subtitle_display_speed(
+        result.system_basic.subtitle_typing_interval_ms,
+        result.system_basic.reply_segment_pause_ms,
     )
-    settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings or MCPRuntimeSettings())
-    settings_service.save_runtime_loop_settings(
-        dialog.result_runtime_loop_settings or RuntimeLoopSettings()
+    result_startup_settings = (
+        result.system_extra.startup
+        if result.system_extra is not None
+        else startup_settings
     )
-    settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
-    if dialog.result_startup_settings != startup_settings:
-        _apply_launch_at_login_settings(base_dir, dialog.result_startup_settings)
-        settings_service.save_startup_settings(dialog.result_startup_settings)
-    settings_service.save_theme_settings(result_theme_settings)
+
+    if result.api.settings is not None:
+        settings_service.save_api_settings(result.api.settings)
+    if result.api.profiles:
+        settings_service.save_api_profiles(result.api.profiles)
+    if result.api.model_selection is not None:
+        settings_service.save_model_selection(result.api.model_selection)
+    settings_service.save_tts_settings(result_tts_settings)
+    settings_service.save_current_character_id(registry, selected_profile.id)
+    settings_service.save_screen_awareness_settings(result.screen_awareness)
+    settings_service.save_mcp_runtime_settings(result.mcp)
+    settings_service.save_runtime_loop_settings(result.runtime_loop)
+    settings_service.save_debug_log_settings(result.system_basic.debug_log)
+    settings_service.save_memory_curation_settings(result.memory_curation)
+    if result.theme_changed:
+        settings_service.save_theme_settings(result.theme)
+    if result_startup_settings != startup_settings:
+        _apply_launch_at_login_settings(base_dir, result_startup_settings)
+        settings_service.save_startup_settings(result_startup_settings)
     settings_service.save_system_values(
         "ui",
         {
-            "portrait_scale_percent": int(dialog.result_portrait_scale_percent),
+            "portrait_scale_percent": int(result.character.portrait_scale_percent),
+            "control_panel_width": int(result.character.control_panel_width),
+            "bubble_height": int(result.character.bubble_height),
+            "control_panel_vertical_offset": int(
+                result.character.control_panel_vertical_offset
+            ),
+            "input_bar_offset": int(result.character.input_bar_offset),
             "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
             "reply_segment_pause_ms": reply_segment_pause_ms,
         },

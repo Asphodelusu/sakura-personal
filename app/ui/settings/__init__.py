@@ -1,1 +1,1 @@
-"""设置窗口子包：按职责拆分自 settings_dialog.py。"""
+"""Tauri 设置页复用的后台 Worker 与资源任务。"""

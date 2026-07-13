@@ -1,5 +1,48 @@
 # 更新日志
 
+## 0.9.9-personal.2 — 2026-07-13
+
+> 追平上游 0.9.9 基线后的清理与文档版本；分支 `dev2`。
+
+### 阶段 C 收尾
+
+- API 配置以 `api_profiles` + `model_slots` 为唯一真相，移除 `dual_endpoint` 主路径
+- 删除 `DualProviderLlmClient` 与 Qt `SettingsDialog`
+- ProactiveObserver 使用 `vision_chat` 槽；设置保存后自动重启观察器
+
+### 代码清理
+
+- 移除 Qt 角色工坊实现（`tools/studio/` 仅保留 Tauri 转发入口）
+- 删除已落地的内部 plan 文档（记忆/资源管理/TTS 拆分等）
+- 精简 `test_pet_window` 中 Qt 设置相关测试
+
+### 文档
+
+- 重写根目录 `README.md`（Personal Edition 说明）
+- 更新 `docs/API_CONFIG.md`（model_slots 示例）
+
+---
+
+## 0.9.9-personal.1 — 2026-07-13
+
+> 基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) 0.9.9-dev 的个人适配分支（`dev2`）。
+
+### 0.9.9 基础设施
+
+- Tauri 设置页与多 API Profile / model_slots 配置层
+- `slot_clients`：聊天 RoutingLlmClient + 视觉/记忆按 model_slots 分流
+- AgentRuntime 含图消息走独立 `vision_api_client`
+- 首次启动改为 Tauri onboarding（需已构建 `sakura-settings`）
+- Tauri Studio + `character_studio` 后端；`start_studio.bat` 与设置页共用同一宿主
+- `sakura_mobile` 手机网页端插件骨架
+- 设置保存后重建 LLM 客户端（聊天/视觉/记忆整理）
+
+### 保留的个人向增强
+
+- STT 语音输入、记忆反思、主动屏幕感知、本地 LLM 路由等 0.9.8-personal 能力
+
+---
+
 ## 0.9.8-personal.1 — 2026-07-11
 
 > 基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) v0.9.8 的个人修改版。

@@ -391,6 +391,7 @@ class TestBuiltinPluginsDiscoverable:
         specs = PluginDiscovery(PROJECT_ROOT).discover()
         playwright = [spec for spec in specs if spec.plugin_id == "playwright_browser"]
         assert playwright, "playwright_browser 应仍可被发现"
+        assert playwright[0].api_version == 2
         assert "tool" in playwright[0].permissions
-        assert "settings_panel" in playwright[0].permissions
+        assert "plugin_settings" in playwright[0].permissions
 

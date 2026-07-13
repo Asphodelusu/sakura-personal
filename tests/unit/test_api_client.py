@@ -14,8 +14,6 @@ from app.llm.api_client import (
     _filter_supported_chat_params,
     _is_temperature_unsupported_error,
     resolve_chat_model,
-    api_settings_for_text,
-    api_settings_for_vision,
     api_settings_uses_dual_endpoint,
     normalize_provider_base_url,
 )
@@ -935,7 +933,7 @@ def test_normalize_provider_base_url_fixes_deepseek_platform() -> None:
     assert normalize_provider_base_url("https://platform.deepseek.com") == "https://api.deepseek.com"
 
 
-def test_api_settings_uses_dual_endpoint_requires_text_credentials() -> None:
+def test_api_settings_uses_dual_endpoint_is_disabled() -> None:
     base = ApiSettings(
         base_url="https://open.bigmodel.cn/api/paas/v4",
         api_key="zhipu-key",
@@ -946,13 +944,7 @@ def test_api_settings_uses_dual_endpoint_requires_text_credentials() -> None:
         text_base_url="https://api.deepseek.com",
         text_api_key="ds-key",
     )
-    assert api_settings_uses_dual_endpoint(base) is True
-    text_settings = api_settings_for_text(base)
-    assert text_settings.base_url == "https://api.deepseek.com"
-    assert text_settings.model == "deepseek-v4-flash"
-    vision_settings = api_settings_for_vision(base)
-    assert vision_settings.model == "glm-5v-turbo"
-    assert vision_settings.base_url == base.base_url
+    assert api_settings_uses_dual_endpoint(base) is False
 
 
 def test_extract_choice_diagnostics_reads_finish_reason_and_usage() -> None:

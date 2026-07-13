@@ -49,6 +49,10 @@ class PluginCapabilityRegistry:
     def register_settings_panel(self, contribution: SettingsPanelContribution) -> None:
         self.settings_panels.append(contribution)
 
+    def register_plugin_settings(self, contribution: SettingsPanelContribution) -> None:
+        """v2 插件设置页注册入口（声明式 fields + load/save）。"""
+        self.register_settings_panel(contribution)
+
     def register_tools_tab(self, contribution: ToolsTabContribution) -> None:
         self.tools_tabs.append(contribution)
 

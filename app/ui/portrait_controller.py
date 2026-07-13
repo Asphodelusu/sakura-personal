@@ -146,10 +146,10 @@ class PortraitController(QObject):
 
         should_crossfade = should_crossfade_portrait(self.current_path, next_portrait_path)
         next_pixmap = self.load_portrait(next_portrait_path)
-        self.current_path = next_portrait_path
         if should_crossfade:
             self._crossfade(next_pixmap, next_portrait_path)
         else:
+            self.current_path = next_portrait_path
             self.pixmap = next_pixmap
             self.apply_current()
         self._on_portrait_changed(self.pixmap)
@@ -292,6 +292,8 @@ class PortraitController(QObject):
         if self.transition_animation is not None:
             self.transition_animation.deleteLater()
             self.transition_animation = None
+        if self._crossfade_target_path is not None:
+            self.current_path = self._crossfade_target_path
         self._apply_pixmap_to_label(self.main_label, self.pixmap, source_path=self.current_path)
         self.transition_label.hide()
         self.transition_label.clear()

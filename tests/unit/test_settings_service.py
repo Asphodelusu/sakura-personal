@@ -15,7 +15,11 @@ from app.config.settings_service import (
 )
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
-from app.agent.screen_awareness import ScreenAwarenessSettings
+from app.agent.screen_awareness import (
+    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
+    ScreenAwarenessSettings,
+)
+from app.config.models import ApiConfigProfile, ModelSelectionSettings, ModelSlotSelection
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
     DEFAULT_PET_WINDOW_STYLESHEET,
@@ -377,6 +381,71 @@ def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
     assert loaded.python_path == root / "external" / "miniforge3" / "envs" / "gpt-sovits" / "bin" / "python"
     assert loaded.tts_config_path == root / "external" / "GPT-SoVITS" / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
     assert loaded.timeout_seconds == 44
+
+
+def test_settings_service_loads_and_saves_api_profiles_and_model_selection() -> None:
+    root = _runtime_root("yaml_api_profiles")
+    service = AppSettingsService(root)
+    profiles = [
+        ApiConfigProfile(
+            id="glm",
+            alias="智谱",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key="glm-key",
+            models=("glm-4.5v", "glm-4-flash"),
+        ),
+        ApiConfigProfile(
+            id="deepseek",
+            alias="DeepSeek",
+            base_url="https://api.deepseek.com/v1",
+            api_key="ds-key",
+            models=("deepseek-chat",),
+        ),
+    ]
+    selection = ModelSelectionSettings(
+        chat=ModelSlotSelection(profile_id="deepseek", model="deepseek-chat"),
+        vision_chat=ModelSlotSelection(profile_id="glm", model="glm-4.5v"),
+        memory_curation=ModelSlotSelection(profile_id="glm", model="glm-4-flash"),
+    )
+
+    service.save_api_profiles(profiles)
+    service.save_model_selection(selection)
+
+    loaded_profiles = service.load_api_profiles()
+    loaded_selection = service.load_model_selection()
+
+    assert [profile.id for profile in loaded_profiles] == ["glm", "deepseek"]
+    assert loaded_profiles[0].models == ("glm-4.5v", "glm-4-flash")
+    assert loaded_selection.chat == selection.chat
+    assert loaded_selection.vision_chat == selection.vision_chat
+    assert loaded_selection.memory_curation == selection.memory_curation
+
+
+def test_settings_service_loads_empty_api_profiles_when_missing() -> None:
+    root = _runtime_root("yaml_api_profiles_empty")
+    service = AppSettingsService(root)
+
+    assert service.load_api_profiles() == []
+    assert service.load_model_selection() == ModelSelectionSettings()
+
+
+def test_settings_service_loads_and_saves_screen_context_resolution() -> None:
+    root = _runtime_root("yaml_screen_resolution")
+    service = AppSettingsService(root)
+
+    defaults = service.load_screen_awareness_settings()
+    assert defaults.screen_context_resolution == (
+        SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION
+    )
+
+    service.save_screen_awareness_settings(
+        ScreenAwarenessSettings(screen_context_resolution="1080p")
+    )
+
+    loaded = service.load_screen_awareness_settings()
+    assert loaded.screen_context_resolution == "1080p"
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["screen_awareness"]["screen_context_resolution"] == "1080p"
 
 
 def test_settings_service_loads_debug_log_settings() -> None:

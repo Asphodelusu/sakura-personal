@@ -102,9 +102,15 @@ class AgentRuntime:
         prompt_patches: list[PromptPatchContribution] | None = None,
         context_providers: list[ContextProviderContribution] | None = None,
         runtime_loop_settings: RuntimeLoopSettings | None = None,
+        vision_api_client: OpenAICompatibleClient | None = None,
+        character_id: str = "",
+        character_name: str = "",
     ) -> None:
         self.api_client = api_client
+        self._vision_api_client = vision_api_client
         self.system_prompt = system_prompt
+        self.character_id = character_id.strip()
+        self.character_name = character_name.strip()
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
         self.character_profile: CharacterProfile | None = None
@@ -123,6 +129,20 @@ class AgentRuntime:
         self._prompt_inspection_lock = Lock()
         self.model_vision_enabled = True
         self.autonomous_screen_observation_enabled = True
+
+    @property
+    def vision_api_client(self) -> OpenAICompatibleClient | None:
+        return self._vision_api_client
+
+    @vision_api_client.setter
+    def vision_api_client(self, client: OpenAICompatibleClient | None) -> None:
+        self._vision_api_client = client
+
+    def _client_for_messages(self, messages: list[ChatMessage]) -> OpenAICompatibleClient:
+        """含图消息优先走独立视觉 client；未配置时回退主 client。"""
+        if messages_contain_image(messages) and self._vision_api_client is not None:
+            return self._vision_api_client
+        return self.api_client
 
     def update_character(
         self,
@@ -643,7 +663,7 @@ class AgentRuntime:
                 self._record_prompt_inspection(prompt_build.inspection)
                 dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
                 has_tool_defs = bool(tool_defs)
-                turn = self.api_client.complete_with_tools(
+                turn = self._client_for_messages(working_messages).complete_with_tools(
                     prompt_build.system_prompt,
                     working_messages,
                     tools=tool_defs,
@@ -1167,7 +1187,7 @@ class AgentRuntime:
         self._record_prompt_inspection(prompt_build.inspection)
         try:
             check_cancelled(cancel_checker)
-            reply = self.api_client.chat(
+            reply = self._client_for_messages(final_messages).chat(
                 prompt_build.system_prompt,
                 final_messages,
                 self.reply_tones,
@@ -1311,7 +1331,7 @@ class AgentRuntime:
 
         if progress_callback is not None:
             chunks: list[str] = []
-            for chunk in self.api_client.stream_raw(
+            for chunk in self._client_for_messages(event_messages).stream_raw(
                 full_system_prompt,
                 event_messages,
                 temperature=event_temperature,
@@ -1324,7 +1344,7 @@ class AgentRuntime:
                 on_chunk(chunk)
             raw_content = "".join(chunks)
         else:
-            raw_content = self.api_client.complete_raw(
+            raw_content = self._client_for_messages(event_messages).complete_raw(
                 full_system_prompt,
                 event_messages,
                 temperature=event_temperature,

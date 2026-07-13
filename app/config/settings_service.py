@@ -8,7 +8,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_set
 from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
-from app.llm.api_client import ApiSettings, normalize_provider_base_url
+from app.llm.api_client import ApiSettings
 from app.llm.local_client import LocalLlmSettings
 from app.storage.paths import StoragePaths
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
@@ -16,6 +16,7 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
     SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
     SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
+    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
     ScreenAwarenessSettings,
 )
 from app.voice.tts_settings import (
@@ -41,6 +42,7 @@ class DebugLogSettings:
     enabled: bool = False
     body_enabled: bool = False
     file_enabled: bool = False
+    profile: str = "info"
     # 开发者选项:舞台调试框(画窗口/布局/实际立绘三框 + DPR 数值,排查布局/HiDPI)。
     stage_debug_overlay: bool = False
     # 舞台碰撞遮罩(默认开):setMask 到内容矩形并集,立绘四周空白点击穿透,避免误拖/挡点击。
@@ -161,11 +163,6 @@ class AppSettingsService:
             api_key=str(data.get("api_key", "")).strip(),
             model=str(data.get("model", "gpt-4.1-mini")).strip(),
             timeout_seconds=timeout_seconds,
-            text_model=str(data.get("text_model", "")).strip(),
-            model_split_enabled=_bool_value(data.get("model_split_enabled"), False),
-            dual_endpoint_enabled=_bool_value(data.get("dual_endpoint_enabled"), False),
-            text_base_url=normalize_provider_base_url(str(data.get("text_base_url", "")).strip()),
-            text_api_key=str(data.get("text_api_key", "")).strip(),
             temperature=_optional_float(data.get("temperature"), minimum=0.0, maximum=2.0),
             top_p=_optional_float(data.get("top_p"), minimum=0.0, maximum=1.0),
             max_tokens=_optional_positive_int(data.get("max_tokens")),
@@ -181,16 +178,6 @@ class AppSettingsService:
             "model": settings.model.strip(),
             "timeout_seconds": int(settings.timeout_seconds),
         }
-        if settings.model_split_enabled:
-            llm_data["model_split_enabled"] = True
-        if settings.dual_endpoint_enabled:
-            llm_data["dual_endpoint_enabled"] = True
-        if settings.text_model.strip():
-            llm_data["text_model"] = settings.text_model.strip()
-        if settings.text_base_url.strip():
-            llm_data["text_base_url"] = settings.text_base_url.strip()
-        if settings.text_api_key.strip():
-            llm_data["text_api_key"] = settings.text_api_key.strip()
         # 仅写入用户显式配置的高级参数，避免给老配置塞入空键、改变默认行为。
         if settings.temperature is not None:
             llm_data["temperature"] = float(settings.temperature)
@@ -204,6 +191,117 @@ class AppSettingsService:
             llm_data["presence_penalty"] = float(settings.presence_penalty)
         data["llm"] = llm_data
         save_yaml_mapping(self.api_config_path, data)
+
+    def save_api_profiles(self, profiles: list) -> None:
+        """保存 API 供应商配置列表到 api.yaml。"""
+        data = load_yaml_mapping(self.api_config_path)
+        data["api_profiles"] = [
+            {
+                "id": str(getattr(p, "id", "")),
+                "alias": str(getattr(p, "alias", "")),
+                "base_url": str(getattr(p, "base_url", "")).strip().rstrip("/"),
+                "api_key": str(getattr(p, "api_key", "")).strip(),
+                "models": [{"name": name} for name in _dedupe(getattr(p, "models", ()))],
+            }
+            for p in profiles
+        ]
+        save_yaml_mapping(self.api_config_path, data)
+
+    def save_model_selection(self, settings: object) -> None:
+        """保存模型槽位选择到 api.yaml。"""
+        from app.config.models import (
+            MODEL_SLOT_CHAT,
+            MODEL_SLOT_MEMORY_CURATION,
+            MODEL_SLOT_VISION_CHAT,
+        )
+        data = load_yaml_mapping(self.api_config_path)
+        slots: dict[str, dict[str, str]] = {}
+        for slot in (MODEL_SLOT_CHAT, MODEL_SLOT_VISION_CHAT, MODEL_SLOT_MEMORY_CURATION):
+            selection = getattr(settings, "slots", {}).get(slot) if hasattr(settings, "slots") else getattr(settings, slot, None)
+            if selection is None:
+                continue
+            pid = str(getattr(selection, "profile_id", "")).strip()
+            model = str(getattr(selection, "model", "")).strip()
+            if not pid and not model:
+                continue
+            if slot != MODEL_SLOT_CHAT and not pid:
+                continue
+            slots[slot] = {"profile_id": pid, "model": model}
+        data["model_slots"] = slots
+        save_yaml_mapping(self.api_config_path, data)
+
+    def load_api_profiles(self) -> list:
+        """从 api.yaml 读取 API 供应商列表；无有效数据时返回空列表。"""
+        from app.config.model_slots import normalize_provider_models
+        from app.config.models import ApiConfigProfile
+
+        data = load_yaml_mapping(self.api_config_path)
+        raw_profiles = data.get("api_profiles")
+        if not isinstance(raw_profiles, list):
+            return []
+        profiles: list[ApiConfigProfile] = []
+        seen: set[str] = set()
+        for raw in raw_profiles:
+            if not isinstance(raw, dict):
+                continue
+            profile_id = str(raw.get("id", "")).strip()
+            if not profile_id or profile_id in seen:
+                continue
+            base_url = str(raw.get("base_url", "")).strip().rstrip("/")
+            if not base_url:
+                continue
+            models = normalize_provider_models(raw.get("models"))
+            if not models:
+                continue
+            seen.add(profile_id)
+            profiles.append(
+                ApiConfigProfile(
+                    id=profile_id,
+                    alias=str(raw.get("alias", "")).strip() or profile_id,
+                    base_url=base_url,
+                    api_key=str(raw.get("api_key", "")).strip(),
+                    models=models,
+                )
+            )
+        return profiles
+
+    def load_model_selection(self):
+        """从 api.yaml 读取模型槽位选择；无有效数据时返回空 ModelSelectionSettings。"""
+        from app.config.models import (
+            MODEL_SLOT_CHAT,
+            MODEL_SLOT_MEMORY_CURATION,
+            MODEL_SLOT_VISION_CHAT,
+            ModelSelectionSettings,
+            ModelSlotSelection,
+        )
+
+        data = load_yaml_mapping(self.api_config_path)
+        raw_slots = data.get("model_slots")
+        if not isinstance(raw_slots, dict):
+            return ModelSelectionSettings()
+
+        def _slot_selection(slot: str, *, required: bool) -> ModelSlotSelection | None:
+            raw = raw_slots.get(slot)
+            if not isinstance(raw, dict):
+                return None
+            profile_id = str(raw.get("profile_id", "")).strip()
+            model = str(raw.get("model", "")).strip()
+            if not profile_id and not model:
+                return None
+            if required and (not profile_id or not model):
+                return None
+            if not required and not profile_id:
+                return None
+            return ModelSlotSelection(profile_id=profile_id, model=model)
+
+        chat = _slot_selection(MODEL_SLOT_CHAT, required=True)
+        if chat is None:
+            return ModelSelectionSettings()
+        return ModelSelectionSettings(
+            chat=chat,
+            vision_chat=_slot_selection(MODEL_SLOT_VISION_CHAT, required=False),
+            memory_curation=_slot_selection(MODEL_SLOT_MEMORY_CURATION, required=False),
+        )
 
     def load_local_llm_settings(self) -> LocalLlmSettings:
         data = self._api_section("local_llm")
@@ -480,6 +578,12 @@ class AppSettingsService:
                 screen_awareness.get("screen_context_batch_limit"),
                 SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
             ),
+            screen_context_resolution=str(
+                screen_awareness.get(
+                    "screen_context_resolution",
+                    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
+                )
+            ),
         )
 
     def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
@@ -491,6 +595,7 @@ class AppSettingsService:
             "check_interval_minutes": int(normalized.check_interval_minutes),
             "cooldown_minutes": int(normalized.cooldown_minutes),
             "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
+            "screen_context_resolution": normalized.screen_context_resolution,
         }
         save_yaml_mapping(self.system_config_path, data)
 
@@ -687,6 +792,23 @@ def _optional_float(value: Any, *, minimum: float, maximum: float) -> float | No
     except (TypeError, ValueError):
         return None
     return max(minimum, min(maximum, parsed))
+
+
+def _dedupe(values: object) -> list[str]:
+    """去重字符串列表，保持顺序。"""
+    result: list[str] = []
+    if isinstance(values, (str, bytes)):
+        candidates = [str(values)]
+    else:
+        try:
+            candidates = list(values or [])
+        except TypeError:
+            candidates = []
+    for value in candidates:
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _optional_positive_int(value: Any) -> int | None:

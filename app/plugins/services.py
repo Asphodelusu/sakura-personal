@@ -328,8 +328,11 @@ class PluginServices:
         tts_sink: Callable[[str, bool], None] | None = None,
         passive_reply_sink: Callable[[str, dict[str, Any] | None], None] | None = None,
         input_text_sink: Callable[[str], None] | None = None,
+        **kwargs: object,  # 接受未来扩展的关键字参数（如 mobile_*_sink）
     ) -> None:
-        """宿主装配时一次性注入真实后端（任意项可省略）。"""
+        """宿主装配时一次性注入真实后端（任意项可省略）。
+        通过 **kwargs 兼容未来扩展，避免添加新 sink 时因签名不匹配导致启动报错。
+        """
         if bubble_sink is not None:
             self.ui.set_bubble_sink(bubble_sink)
         if tts_sink is not None:

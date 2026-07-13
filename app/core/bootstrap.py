@@ -9,7 +9,8 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.agent.memory_curator import MemoryCurator, MemoryCurationState
 from app.config.settings_service import AppSettingsService
 from app.llm.api_client import ApiSettings
-from app.llm.local_client import LocalLlmSettings, create_routing_llm_client
+from app.llm.local_client import LocalLlmSettings
+from app.llm.slot_clients import build_app_llm_clients, resolve_chat_api_settings
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.extensions import ExtensionRegistry
@@ -69,7 +70,7 @@ def load_startup_state(base_dir: Path) -> StartupState:
     """加载可立即显示立绘所需的轻量启动状态。"""
 
     settings_service = AppSettingsService(base_dir=base_dir)
-    settings = settings_service.load_api_settings()
+    settings = resolve_chat_api_settings(settings_service)
     local_llm_settings = settings_service.load_local_llm_settings()
     debug_log(
         "Startup",
@@ -125,8 +126,8 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     character_registry = startup_state.character_registry
     character_profile = startup_state.character_profile
     system_prompt = startup_state.system_prompt
-    local_llm_settings = settings_service.load_local_llm_settings()
-    api_client = create_routing_llm_client(settings, local_llm_settings)
+    llm_clients = build_app_llm_clients(settings_service, base_settings=settings)
+    api_client = llm_clients.chat
     resource_registry = ResourceRegistry()
     memory_store = MemoryStore(
         base_dir=base_dir,
@@ -149,6 +150,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     history_store = create_history_store(base_dir, character_profile)
     agent_runtime = AgentRuntime(
         api_client=api_client,
+        vision_api_client=llm_clients.vision,
         system_prompt=system_prompt,
         reply_tones=character_profile.reply_tones,
         reply_portraits=character_profile.portrait_choices,
@@ -156,6 +158,8 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         memory=memory_store,
         history_store=history_store,
         runtime_loop_settings=runtime_loop_settings,
+        character_id=character_profile.id,
+        character_name=character_profile.display_name,
     )
     agent_runtime.update_character(
         system_prompt,
@@ -171,7 +175,11 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     memory_curation_state = MemoryCurationState(
         StoragePaths(base_dir).memory_curation_state()
     )
-    memory_curator = MemoryCurator(api_client, memory_store, system_prompt=system_prompt)
+    memory_curator = MemoryCurator(
+        llm_clients.memory_curation,
+        memory_store,
+        system_prompt=system_prompt,
+    )
     screen_awareness_settings = settings_service.load_screen_awareness_settings()
 
     debug_log(
