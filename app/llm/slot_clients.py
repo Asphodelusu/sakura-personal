@@ -1,7 +1,7 @@
 """按 model_slots 构建聊天 / 视觉 / 记忆整理 LLM 客户端。
 
-保留个人 fork 的 RoutingLlmClient（双端点 + 本地路由）作为聊天主路径；
-仅在用户显式配置独立视觉/记忆槽位时附加专用 OpenAICompatibleClient。
+聊天主路径为 RoutingLlmClient（云端 chat 槽 + 可选本地路由）；
+显式配置 vision_chat / memory_curation 槽位时使用独立 OpenAICompatibleClient。
 """
 
 from __future__ import annotations
@@ -40,6 +40,22 @@ def resolve_chat_api_settings(
     if chat_slot is not None:
         return chat_slot.settings
     return base
+
+
+def resolve_vision_api_settings(
+    settings_service: AppSettingsService,
+    base_settings: ApiSettings | None = None,
+) -> ApiSettings | None:
+    """解析显式 vision_chat 槽位；未配置时返回 None。"""
+    base = base_settings or settings_service.load_api_settings()
+    profiles = settings_service.load_api_profiles()
+    if not profiles:
+        return None
+    selection = settings_service.load_model_selection()
+    vision_slot = resolve_model_slot(profiles, selection, MODEL_SLOT_VISION_CHAT, base)
+    if vision_slot is None or vision_slot.source_slot != MODEL_SLOT_VISION_CHAT:
+        return None
+    return vision_slot.settings
 
 
 def build_app_llm_clients(

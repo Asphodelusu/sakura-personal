@@ -10,7 +10,6 @@ from app.llm.api_client import (
     OpenAICompatibleClient,
     api_settings_for_text,
     api_settings_for_vision,
-    api_settings_uses_dual_endpoint,
     messages_contain_image,
     prepare_messages_for_chat_api,
 )
@@ -196,9 +195,7 @@ class DualProviderLlmClient:
             self._text._runtime_context_role = role  # noqa: SLF001
 
 
-def create_cloud_llm_client(settings: ApiSettings) -> OpenAICompatibleClient | DualProviderLlmClient:
-    if api_settings_uses_dual_endpoint(settings):
-        return DualProviderLlmClient(settings)
+def create_cloud_llm_client(settings: ApiSettings) -> OpenAICompatibleClient:
     return OpenAICompatibleClient(settings)
 
 

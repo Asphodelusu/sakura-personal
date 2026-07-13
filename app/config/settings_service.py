@@ -8,7 +8,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_set
 from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
-from app.llm.api_client import ApiSettings, normalize_provider_base_url
+from app.llm.api_client import ApiSettings
 from app.llm.local_client import LocalLlmSettings
 from app.storage.paths import StoragePaths
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
@@ -163,11 +163,6 @@ class AppSettingsService:
             api_key=str(data.get("api_key", "")).strip(),
             model=str(data.get("model", "gpt-4.1-mini")).strip(),
             timeout_seconds=timeout_seconds,
-            text_model=str(data.get("text_model", "")).strip(),
-            model_split_enabled=_bool_value(data.get("model_split_enabled"), False),
-            dual_endpoint_enabled=_bool_value(data.get("dual_endpoint_enabled"), False),
-            text_base_url=normalize_provider_base_url(str(data.get("text_base_url", "")).strip()),
-            text_api_key=str(data.get("text_api_key", "")).strip(),
             temperature=_optional_float(data.get("temperature"), minimum=0.0, maximum=2.0),
             top_p=_optional_float(data.get("top_p"), minimum=0.0, maximum=1.0),
             max_tokens=_optional_positive_int(data.get("max_tokens")),
@@ -183,16 +178,6 @@ class AppSettingsService:
             "model": settings.model.strip(),
             "timeout_seconds": int(settings.timeout_seconds),
         }
-        if settings.model_split_enabled:
-            llm_data["model_split_enabled"] = True
-        if settings.dual_endpoint_enabled:
-            llm_data["dual_endpoint_enabled"] = True
-        if settings.text_model.strip():
-            llm_data["text_model"] = settings.text_model.strip()
-        if settings.text_base_url.strip():
-            llm_data["text_base_url"] = settings.text_base_url.strip()
-        if settings.text_api_key.strip():
-            llm_data["text_api_key"] = settings.text_api_key.strip()
         # 仅写入用户显式配置的高级参数，避免给老配置塞入空键、改变默认行为。
         if settings.temperature is not None:
             llm_data["temperature"] = float(settings.temperature)

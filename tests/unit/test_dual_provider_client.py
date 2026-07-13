@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.llm.dual_provider_client import DualProviderLlmClient, create_cloud_llm_client, is_dual_provider_client
 
 
-def test_create_cloud_llm_client_returns_dual_provider_when_configured() -> None:
+def test_create_cloud_llm_client_returns_openai_compatible_client() -> None:
     settings = ApiSettings(
         base_url="https://open.bigmodel.cn/api/paas/v4",
         api_key="zhipu-key",
@@ -16,11 +16,10 @@ def test_create_cloud_llm_client_returns_dual_provider_when_configured() -> None
         text_api_key="ds-key",
     )
     client = create_cloud_llm_client(settings)
-    assert is_dual_provider_client(client)
-    assert isinstance(client, DualProviderLlmClient)
-    assert client.vision_client.settings.model == "glm-5v-turbo"
-    assert client.text_client.settings.model == "deepseek-v4-flash"
-    assert client.text_client.settings.base_url == "https://api.deepseek.com"
+    assert not is_dual_provider_client(client)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client.settings.model == "glm-5v-turbo"
+    assert client.settings.base_url == "https://open.bigmodel.cn/api/paas/v4"
 
 
 def test_dual_provider_routes_text_and_vision_messages() -> None:

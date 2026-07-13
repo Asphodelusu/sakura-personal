@@ -112,13 +112,9 @@ def _friendly_non_json_api_error(base_url: str, body: str) -> str:
 
 
 def api_settings_uses_dual_endpoint(settings: ApiSettings) -> bool:
-    return (
-        settings.model_split_enabled
-        and settings.dual_endpoint_enabled
-        and bool(settings.text_model.strip())
-        and bool(settings.text_base_url.strip())
-        and bool(settings.text_api_key.strip())
-    )
+    """双端点模式已移除；槽位分流由 api_profiles + model_slots 承担。"""
+    _ = settings
+    return False
 
 
 def api_settings_for_vision(settings: ApiSettings) -> ApiSettings:

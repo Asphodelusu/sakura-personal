@@ -2983,6 +2983,21 @@ class PetWindow(QWidget):
     # Proactive screen observer (desktop-kanojo style)
     # ------------------------------------------------------------------
 
+    def _resolve_proactive_vision_api(self) -> "ApiSettings":
+        """主动观察用的 VLM 端点：优先 vision_chat 槽，避免误用聊天模型。"""
+        from app.llm.api_client import ApiSettings
+        from app.llm.slot_clients import resolve_vision_api_settings
+
+        vision_client = getattr(self.agent_runtime, "vision_api_client", None)
+        if vision_client is not None:
+            return vision_client.settings
+        slot_settings = resolve_vision_api_settings(self.settings_service)
+        if slot_settings is not None:
+            return slot_settings
+        if is_routing_llm_client(self.api_client):
+            return self.api_client.resolve_vision_api_settings()
+        return self.api_client.settings
+
     def _init_proactive_observer(self) -> None:
         """Initialize the desktop-kanojo style proactive screen observer."""
         proactive_cfg = self.settings_service.load_proactive_config()
@@ -2990,12 +3005,7 @@ class PetWindow(QWidget):
         if not config.enabled:
             return
         try:
-            if is_routing_llm_client(self.api_client):
-                # 未测试阶段 resolve 默认回云端；仅用户显式 route=local 时用本地 VLM。
-                vision_api = self.api_client.resolve_vision_api_settings()
-            else:
-                vision_api = self.api_client.settings
-            api = vision_api
+            api = self._resolve_proactive_vision_api()
             observer = ProactiveObserver(
                 api_base_url=api.base_url,
                 api_key=api.api_key,
@@ -3007,7 +3017,11 @@ class PetWindow(QWidget):
                 is_busy=self._is_proactive_observer_busy,
             )
             self._proactive_observer = observer
-            debug_log("PetWindow", "ProactiveObserver 初始化成功")
+            debug_log(
+                "PetWindow",
+                "ProactiveObserver 初始化成功",
+                {"base_url": api.base_url, "model": api.model},
+            )
         except Exception as exc:
             debug_log("PetWindow", "ProactiveObserver 初始化失败", {"error": str(exc)})
 
@@ -5732,8 +5746,6 @@ class PetWindow(QWidget):
         api_settings = getattr(self.api_client, "settings", None)
         api_profiles = self.settings_service.load_api_profiles()
         model_selection = self.settings_service.load_model_selection()
-        if not api_profiles:
-            api_profiles, model_selection = self._build_tauri_api_profiles(api_settings)
 
         speech_font_size, name_font_size, input_font_size, button_font_size = (
             self._load_ui_font_sizes()
@@ -5798,68 +5810,6 @@ class PetWindow(QWidget):
         process.closed.connect(self._on_tauri_settings_closed)
         self._sync_secondary_window_state()
         return True
-
-    @staticmethod
-    def _build_tauri_api_profiles(api_settings: "ApiSettings | None") -> tuple[list, object | None]:
-        """将双端点 ApiSettings 转换为 Tauri UI 期望的 api_profiles + model_selection 格式。"""
-        from app.config.models import (
-            MODEL_SLOT_CHAT,
-            MODEL_SLOT_MEMORY_CURATION,
-            MODEL_SLOT_VISION_CHAT,
-            ApiConfigProfile,
-            ModelSelectionSettings,
-            ModelSlotSelection,
-        )
-
-        if api_settings is None:
-            return [], None
-
-        vision_url = (api_settings.base_url or "").strip().rstrip("/")
-        vision_model = (api_settings.model or "").strip()
-        text_url = (api_settings.text_base_url or "").strip().rstrip("/")
-        text_model = (api_settings.text_model or "").strip()
-        text_key = (api_settings.text_api_key or "").strip()
-
-        profiles: list[ApiConfigProfile] = []
-        selection = ModelSelectionSettings()
-
-        # 视觉端点
-        if vision_url:
-            vid = "vision-profile"
-            profiles.append(
-                ApiConfigProfile(
-                    id=vid,
-                    alias="智谱 (视觉)" if "bigmodel" in vision_url else "视觉端点",
-                    base_url=vision_url,
-                    api_key=api_settings.api_key or "",
-                    models=(vision_model,) if vision_model else (),
-                )
-            )
-            selection = ModelSelectionSettings(
-                chat=selection.chat,
-                vision_chat=ModelSlotSelection(profile_id=vid, model=vision_model),
-                memory_curation=ModelSlotSelection(profile_id=vid, model=vision_model),
-            )
-
-        # 文本端点 (双端点模式)
-        if api_settings.dual_endpoint_enabled and text_url and text_model:
-            tid = "text-profile"
-            profiles.append(
-                ApiConfigProfile(
-                    id=tid,
-                    alias="DeepSeek (文本)" if "deepseek" in text_url.lower() else "文本端点",
-                    base_url=text_url,
-                    api_key=text_key,
-                    models=(text_model,),
-                )
-            )
-            selection = ModelSelectionSettings(
-                chat=ModelSlotSelection(profile_id=tid, model=text_model),
-                vision_chat=selection.vision_chat,
-                memory_curation=selection.memory_curation,
-            )
-
-        return profiles, selection
 
     @Slot(object)
     def _on_tauri_settings_completed(self, result: object) -> None:
@@ -5929,26 +5879,6 @@ class PetWindow(QWidget):
     def _on_tauri_studio_failed(self, _error: str) -> None:
         self.tauri_studio_process = None
 
-    def _merge_tauri_api_settings_for_save(self, resolved: "ApiSettings") -> "ApiSettings":
-        """把 Tauri 解析出的聊天槽位配置合并进当前 ApiSettings，保留双端点等未在 Tauri 编辑的字段。"""
-        from dataclasses import replace
-
-        from app.llm.api_client import ApiSettings as ClientApiSettings
-
-        current = getattr(self.api_client, "settings", None)
-        if not isinstance(current, ClientApiSettings):
-            return resolved
-        return replace(
-            current,
-            base_url=resolved.base_url,
-            api_key=resolved.api_key,
-            model=resolved.model,
-            timeout_seconds=resolved.timeout_seconds,
-            temperature=resolved.temperature,
-            top_p=resolved.top_p,
-            max_tokens=resolved.max_tokens,
-        )
-
     def _refresh_llm_clients_after_settings(
         self,
         *,
@@ -5971,6 +5901,7 @@ class PetWindow(QWidget):
         if reflector is not None:
             reflector.api_client = clients.memory_curation
         self.memory_store.reload_api_settings(chat_settings, wait=False)
+        self._restart_proactive_observer()
 
     def _apply_tauri_settings_result(self, result: object, *, final: bool) -> bool:
         """将 Tauri 设置结果持久化并即时生效。"""
@@ -6069,11 +6000,7 @@ class PetWindow(QWidget):
         )
 
         resolved_api_settings = api.settings if api is not None else None
-        api_settings = (
-            self._merge_tauri_api_settings_for_save(resolved_api_settings)
-            if resolved_api_settings is not None
-            else None
-        )
+        api_settings = resolved_api_settings
         previous_api_settings = getattr(self.api_client, "settings", None)
         api_changed = (
             (api_settings is not None and api_settings != previous_api_settings)
@@ -6125,12 +6052,13 @@ class PetWindow(QWidget):
                     font_values[key] = value
 
         try:
-            if api_settings is not None:
-                self.settings_service.save_api_settings(api_settings)
-            if api is not None and api.profiles:
-                self.settings_service.save_api_profiles(api.profiles)
-            if api is not None and api.model_selection is not None:
-                self.settings_service.save_model_selection(api.model_selection)
+            if api is not None:
+                if api.profiles:
+                    self.settings_service.save_api_profiles(api.profiles)
+                if api.model_selection is not None:
+                    self.settings_service.save_model_selection(api.model_selection)
+                if api_settings is not None:
+                    self.settings_service.save_api_settings(api_settings)
             if tts_settings is not None:
                 self.settings_service.save_tts_settings(tts_settings)
             if character_id:
