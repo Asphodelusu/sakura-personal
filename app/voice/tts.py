@@ -195,7 +195,7 @@ class NullTTSProvider:
         debug_log("TTS", "静音 Provider 跳过服务检测")
         return True, "TTS 已关闭。"
 
-    def close(self) -> None:
+    def close(self, **kwargs: object) -> None:
         debug_log("TTS", "静音 Provider 无需关闭")
 
 
@@ -360,7 +360,7 @@ class GPTSoVITSTTSProvider(QObject):
         """同步检测并预热本地 TTS 服务，委托给服务监督。"""
         return self._supervisor.ensure_ready()
 
-    def close(self) -> None:
+    def close(self, *, fast: bool = False) -> None:
         with self._close_lock:
             if self._closed:
                 return
@@ -369,7 +369,11 @@ class GPTSoVITSTTSProvider(QObject):
         # 先封闭后台投递入口，再等待本地子进程和合成线程收敛；只有此后才能
         # 清理 Qt 播放对象，避免 daemon 线程向析构中的 QObject emit。
         self._playback.begin_shutdown()
-        self._resource_manager.stop_all()
+        if fast:
+            self._supervisor.close(fast=True)
+            self._resource_manager.stop_all(400)
+        else:
+            self._resource_manager.stop_all()
         self._playback.shutdown()
 
     def _is_closed(self) -> bool:

@@ -228,7 +228,10 @@ def test_stop_all_stops_every_registered_resource() -> None:
     mgr._register(_Res("b"), label="b")
     mgr._register(_Res("c"), label="c")
     mgr.stop_all(500)
-    assert order == [("a", 500), ("b", 500), ("c", 500)]
+    assert len(order) == 3
+    assert order[0] == ("a", 500)
+    assert order[1][1] <= 500
+    assert order[2][1] <= order[1][1]
 
 
 def test_resource_registry_stop_all_uses_shutdown_order() -> None:

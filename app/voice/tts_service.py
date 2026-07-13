@@ -1138,7 +1138,14 @@ class TTSServiceSupervisor:
                 self._process_resource = None
             self._server_process = None
 
-    def _stop_local_service(self) -> None:
+    def _stop_local_service(self, *, terminate_timeout_s: float | None = None) -> None:
+        from app.core.resource_manager import DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+
+        timeout_s = (
+            DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+            if terminate_timeout_s is None
+            else terminate_timeout_s
+        )
         with self._service_lifecycle_lock:
             process = self._server_process
             if process is None:
@@ -1148,20 +1155,30 @@ class TTSServiceSupervisor:
                 return
         debug_log("TTS", "关闭本地 TTS 服务进程", {"pid": process.pid, "provider": self.settings.provider})
         try:
-            _terminate_process_tree(process, timeout=5)
+            _terminate_process_tree(process, timeout=timeout_s)
         except Exception as exc:  # noqa: BLE001
             debug_log("TTS", "本地 TTS 服务正常关闭失败，尝试强制结束", {"pid": process.pid, "error": str(exc)})
             try:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=min(timeout_s, 2.0))
             except Exception as kill_exc:  # noqa: BLE001
                 debug_log("TTS", "本地 TTS 服务强制结束失败", {"pid": process.pid, "error": str(kill_exc)})
         finally:
             _track_local_process(self, None)
 
-    def close(self) -> None:
+    def close(self, *, fast: bool = False) -> None:
         """关闭监督的本地服务进程（协调器一般改走 RM.stop_all，本入口供直接调用）。"""
-        self._stop_local_service()
+        from app.core.resource_manager import (
+            APP_EXIT_PROCESS_TERMINATE_TIMEOUT_S,
+            DEFAULT_PROCESS_TERMINATE_TIMEOUT_S,
+        )
+
+        timeout_s = (
+            APP_EXIT_PROCESS_TERMINATE_TIMEOUT_S
+            if fast
+            else DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+        )
+        self._stop_local_service(terminate_timeout_s=timeout_s)
 
 
 class GenieServiceSupervisor(TTSServiceSupervisor):

@@ -32,6 +32,16 @@ from app.agent.tool_policy import (
     WINDOWS_SNAPSHOT_TOOL_NAME,
 )
 import app.agent.tool_routing as tool_routing
+from app.agent.turn_classifier import classify_turn_depth
+from app.agent.turn_routing import (
+    RecallDecision,
+    TurnPlan,
+    TurnRoutingSettings,
+    TurnState,
+    resolve_recall_decision,
+    resolve_turn_plan,
+    should_invoke_turn_classifier,
+)
 from app.agent.tools import ToolExecutionResult, ToolRegistry
 from app.storage.chat_history import ChatHistoryStore
 from app.llm.api_client import (
@@ -103,11 +113,15 @@ class AgentRuntime:
         context_providers: list[ContextProviderContribution] | None = None,
         runtime_loop_settings: RuntimeLoopSettings | None = None,
         vision_api_client: OpenAICompatibleClient | None = None,
+        chat_fast_api_client: OpenAICompatibleClient | None = None,
+        turn_routing_settings: TurnRoutingSettings | None = None,
         character_id: str = "",
         character_name: str = "",
     ) -> None:
         self.api_client = api_client
         self._vision_api_client = vision_api_client
+        self._chat_fast_api_client = chat_fast_api_client
+        self.turn_routing_settings = turn_routing_settings or TurnRoutingSettings()
         self.system_prompt = system_prompt
         self.character_id = character_id.strip()
         self.character_name = character_name.strip()
@@ -138,10 +152,30 @@ class AgentRuntime:
     def vision_api_client(self, client: OpenAICompatibleClient | None) -> None:
         self._vision_api_client = client
 
+    @property
+    def chat_fast_api_client(self) -> OpenAICompatibleClient | None:
+        return self._chat_fast_api_client
+
+    @chat_fast_api_client.setter
+    def chat_fast_api_client(self, client: OpenAICompatibleClient | None) -> None:
+        self._chat_fast_api_client = client
+
     def _client_for_messages(self, messages: list[ChatMessage]) -> OpenAICompatibleClient:
         """含图消息优先走独立视觉 client；未配置时回退主 client。"""
         if messages_contain_image(messages) and self._vision_api_client is not None:
             return self._vision_api_client
+        return self.api_client
+
+    def _client_for_turn(
+        self,
+        messages: list[ChatMessage],
+        turn_plan: TurnPlan,
+    ) -> OpenAICompatibleClient:
+        """按 TurnPlan 选择 LLM 客户端；含图时仍优先视觉 client。"""
+        if messages_contain_image(messages) and self._vision_api_client is not None:
+            return self._vision_api_client
+        if turn_plan.client_key == "chat_fast" and self._chat_fast_api_client is not None:
+            return self._chat_fast_api_client
         return self.api_client
 
     def update_character(
@@ -277,10 +311,80 @@ class AgentRuntime:
 
     def _resolve_dialogue_params(self) -> tuple[float, dict[str, Any]]:
         """读取角色对话生成参数，兼容测试桩和外部传入的旧客户端实现。"""
-        resolver = getattr(self.api_client, "resolve_dialogue_params", None)
+        return self._resolve_dialogue_params_for_client(self.api_client)
+
+    def _resolve_dialogue_params_for_client(
+        self,
+        client: OpenAICompatibleClient,
+    ) -> tuple[float, dict[str, Any]]:
+        resolver = getattr(client, "resolve_dialogue_params", None)
         if callable(resolver):
             return resolver()
         return 0.8, {}
+
+    def _resolve_dialogue_params_for_turn(
+        self,
+        turn_plan: TurnPlan,
+        client: OpenAICompatibleClient,
+    ) -> tuple[float, dict[str, Any]]:
+        temperature, extra = self._resolve_dialogue_params_for_client(client)
+        if not turn_plan.generation_params:
+            return temperature, extra
+        return temperature, {**extra, **turn_plan.generation_params}
+
+    def _resolve_turn_state(
+        self,
+        working_messages: list[ChatMessage],
+        request: ContextRequest,
+        *,
+        proactive_mode: bool,
+    ) -> TurnState:
+        settings = self.turn_routing_settings
+        chat_fast_configured = self._chat_fast_api_client is not None
+        recall_decision = resolve_recall_decision(
+            working_messages,
+            request,
+            proactive_mode=proactive_mode,
+            settings=settings,
+        )
+        classifier_result = None
+        if should_invoke_turn_classifier(
+            working_messages,
+            proactive_mode=proactive_mode,
+            chat_fast_configured=chat_fast_configured,
+            settings=settings,
+            recall_decision=recall_decision,
+        ):
+            classifier_client = self._chat_fast_api_client or self.api_client
+            if isinstance(classifier_client, OpenAICompatibleClient):
+                user_text = tool_routing._latest_user_text(working_messages) or request.current_input
+                classifier_result = classify_turn_depth(
+                    user_text,
+                    client=classifier_client,
+                    timeout_seconds=settings.classifier_timeout_seconds,
+                )
+        turn_plan = resolve_turn_plan(
+            working_messages,
+            request,
+            proactive_mode=proactive_mode,
+            has_vision_client=self._vision_api_client is not None,
+            chat_fast_configured=chat_fast_configured,
+            settings=settings,
+            classifier_result=classifier_result,
+            recall_decision=recall_decision,
+        )
+        debug_log(
+            "AgentRuntime",
+            "Turn 路由决策",
+            {
+                "recall_decision": recall_decision,
+                "tier": turn_plan.tier,
+                "modality": turn_plan.modality,
+                "client_key": turn_plan.client_key,
+                "decided_by": turn_plan.decided_by,
+            },
+        )
+        return TurnState(turn_plan=turn_plan, recall_decision=recall_decision)
 
     def _compose_structured_final_reply(
         self,
@@ -289,6 +393,7 @@ class AgentRuntime:
         *,
         runtime_context: str,
         cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
     ) -> str:
         """工具规划轮结束后，用不含 tools 的请求专门合成 JSON segments。"""
         check_cancelled(cancel_checker)
@@ -304,8 +409,16 @@ class AgentRuntime:
                 ),
             },
         ]
-        dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
-        turn = self.api_client.complete_with_tools(
+        compose_client = self.api_client
+        if turn_state is not None and turn_state.turn_plan.tier == "fast":
+            compose_client = self._client_for_turn(text_messages, turn_state.turn_plan)
+            dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params_for_turn(
+                turn_state.turn_plan,
+                compose_client,
+            )
+        else:
+            dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
+        turn = compose_client.complete_with_tools(
             system_prompt,
             compose_messages,
             tools=[],
@@ -331,6 +444,7 @@ class AgentRuntime:
         working_messages: list[ChatMessage],
         runtime_context: str,
         cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
     ) -> str:
         """首轮直接回复不合格时，走不含 tools 的结构化合成。"""
         reason = self._structured_compose_reason(raw_content)
@@ -349,6 +463,7 @@ class AgentRuntime:
             working_messages,
             runtime_context=runtime_context,
             cancel_checker=cancel_checker,
+            turn_state=turn_state,
         )
 
     def _structured_compose_reason(self, raw_content: str) -> str:
@@ -365,6 +480,7 @@ class AgentRuntime:
         *,
         context_source: str,
         cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
     ) -> ChatReply:
         """工具循环结束后，用单次结构化请求合成最终 segments。"""
         snapshot = self._build_single_context_snapshot(
@@ -378,6 +494,7 @@ class AgentRuntime:
             working_messages,
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
+            turn_state=turn_state,
         )
         parsed = self._parse_final_reply_with_retry(
             prompt_build.system_prompt,
@@ -398,6 +515,7 @@ class AgentRuntime:
         *,
         runtime_context: str = "",
         cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
     ) -> ChatReplyParseResult:
         """最终回复结构不合格时，只重试一次格式修复，避免坏 JSON 进入 UI。"""
         check_cancelled(cancel_checker)
@@ -421,6 +539,7 @@ class AgentRuntime:
                     working_messages,
                     runtime_context=runtime_context,
                     cancel_checker=cancel_checker,
+                    turn_state=turn_state,
                 )
             except ApiRequestError as exc:
                 debug_log("AgentRuntime", "结构化合成失败，回退格式修复", {"error": str(exc)})
@@ -590,6 +709,7 @@ class AgentRuntime:
         turn_memory_fragments = ()
         memory_status = "unknown"
         memory_needs_refresh = True
+        turn_state: TurnState | None = None
         loop_settings = self.runtime_loop_settings
         for step_index in range(loop_settings.max_agent_steps_per_turn):
             check_cancelled(cancel_checker)
@@ -634,10 +754,25 @@ class AgentRuntime:
                     event_payload=event_payload,
                     service_status={"memory": memory_status},
                 )
+                if step_index == 0:
+                    turn_state = self._resolve_turn_state(
+                        working_messages,
+                        request,
+                        proactive_mode=proactive_mode,
+                    )
+                assert turn_state is not None
                 if memory_needs_refresh:
-                    recall = self.memory_recall.recall(request)
-                    turn_memory_fragments = recall.fragments
-                    memory_status = recall.status
+                    if turn_state.recall_decision == "recall":
+                        recall = self.memory_recall.recall(request)
+                        turn_memory_fragments = recall.fragments
+                        memory_status = recall.status
+                    else:
+                        turn_memory_fragments = ()
+                        memory_status = (
+                            "skipped"
+                            if turn_state.recall_decision == "skip"
+                            else "deferred"
+                        )
                     memory_needs_refresh = False
                     request = replace(request, service_status={"memory": memory_status})
                 snapshot = self.context_orchestrator.build_snapshot(
@@ -661,9 +796,13 @@ class AgentRuntime:
                     )
                 )
                 self._record_prompt_inspection(prompt_build.inspection)
-                dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
+                turn_client = self._client_for_turn(working_messages, turn_state.turn_plan)
+                dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params_for_turn(
+                    turn_state.turn_plan,
+                    turn_client,
+                )
                 has_tool_defs = bool(tool_defs)
-                turn = self._client_for_messages(working_messages).complete_with_tools(
+                turn = turn_client.complete_with_tools(
                     prompt_build.system_prompt,
                     working_messages,
                     tools=tool_defs,
@@ -748,9 +887,11 @@ class AgentRuntime:
                         working_messages=working_messages,
                         runtime_context=prompt_build.runtime_context,
                         cancel_checker=cancel_checker,
+                        turn_state=turn_state,
                     ),
                     runtime_context=prompt_build.runtime_context,
                     cancel_checker=cancel_checker,
+                    turn_state=turn_state,
                 )
                 return AgentResult(
                     reply=self._normalize_reply(
@@ -760,9 +901,10 @@ class AgentRuntime:
                         )
                     ),
                     _debug=_build_debug_meta(
-                        self.api_client, execution_results,
+                        turn_client, execution_results,
                         total_tool_calls, turn_started_at,
                         self.get_last_prompt_inspection(),
+                        turn_state=turn_state,
                     ),
                     actions=emitted_actions,
                     mood_update=parsed.mood,
@@ -1037,9 +1179,10 @@ class AgentRuntime:
                 return AgentResult(
                     reply=_build_pending_action_reply(pending_actions),
                     _debug=_build_debug_meta(
-                        self.api_client, execution_results,
+                        turn_client, execution_results,
                         total_tool_calls, turn_started_at,
                         self.get_last_prompt_inspection(),
+                        turn_state=turn_state,
                     ),
                     actions=[
                         *emitted_actions,
@@ -1085,6 +1228,7 @@ class AgentRuntime:
                 working_messages,
                 context_source=context_source,
                 cancel_checker=cancel_checker,
+                turn_state=turn_state,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -2590,9 +2734,10 @@ def _build_debug_meta(
     total_tool_calls: int,
     turn_started_at: float,
     prompt_inspection: dict[str, Any] | None = None,
+    turn_state: TurnState | None = None,
 ) -> dict[str, Any]:
     """构建写入聊天记录的调试元数据，包含工具调用摘要和耗时。"""
-    return {
+    meta: dict[str, Any] = {
         "model": getattr(api_client, "model", getattr(api_client, "model_name", "unknown")),
         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
         "tool_calls_total": total_tool_calls,
@@ -2606,3 +2751,12 @@ def _build_debug_meta(
         ],
         "prompt_inspection": prompt_inspection,
     }
+    if turn_state is not None:
+        meta["turn_routing"] = {
+            "recall_decision": turn_state.recall_decision,
+            "tier": turn_state.turn_plan.tier,
+            "modality": turn_state.turn_plan.modality,
+            "client_key": turn_state.turn_plan.client_key,
+            "decided_by": turn_state.turn_plan.decided_by,
+        }
+    return meta

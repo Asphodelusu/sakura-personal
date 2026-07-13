@@ -11,10 +11,12 @@ from pathlib import Path, PurePosixPath
 
 # 接话意图分类用的句向量底座(probe 头骑在它上面)。常量定义在此(bge 缓存的归属地),
 # 不再从 embedding_classifier 导入——后者将随零样本原型方案一并移除。
+from app.core.hf_hub_download import default_hf_endpoint, download_hf_snapshot
+
 DEFAULT_BACKCHANNEL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 BACKCHANNEL_MODEL_CACHE_NAME = "models--" + DEFAULT_BACKCHANNEL_EMBEDDING_MODEL.replace("/", "--")
-DEFAULT_HUGGINGFACE_ENDPOINT = "https://huggingface.co"
+DEFAULT_HUGGINGFACE_ENDPOINT = default_hf_endpoint()
 
 
 class BackchannelModelImportError(RuntimeError):
@@ -41,7 +43,7 @@ def backchannel_model_cache_kwargs(base_dir: Path) -> dict[str, object]:
 
 
 def backchannel_model_endpoint() -> str:
-    return (os.environ.get("HF_ENDPOINT") or DEFAULT_HUGGINGFACE_ENDPOINT).strip()
+    return default_hf_endpoint()
 
 
 def download_backchannel_model(base_dir: Path) -> BackchannelModelImportResult:
@@ -50,12 +52,13 @@ def download_backchannel_model(base_dir: Path) -> BackchannelModelImportResult:
     destination_root = _project_hf_cache_folder(base_dir)
     destination_root.mkdir(parents=True, exist_ok=True)
     try:
-        _download_hf_snapshot(DEFAULT_BACKCHANNEL_EMBEDDING_MODEL, destination_root)
+        download_hf_snapshot(DEFAULT_BACKCHANNEL_EMBEDDING_MODEL, destination_root)
     except BackchannelModelImportError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise BackchannelModelImportError(
-            "接话模型在线安装失败，请检查 HuggingFace 访问、网络或代理后重试。"
+            "接话模型在线安装失败，已依次尝试官方 Hub 与 hf-mirror。"
+            "请检查网络或代理，或使用设置页的「导入 ZIP」。"
             f"\n\n原始错误：{exc}"
         ) from exc
 
@@ -167,23 +170,6 @@ def _cache_candidates(base_dir: Path) -> list[Path]:
 
 def _project_hf_cache_folder(base_dir: Path) -> Path:
     return Path(base_dir) / "runtime" / "hf-cache" / "hub"
-
-
-def _download_hf_snapshot(repo_id: str, cache_folder: Path) -> str:
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise BackchannelModelImportError(
-            "缺少 huggingface_hub 依赖，无法在线安装接话模型。"
-        ) from exc
-    return str(
-        snapshot_download(
-            repo_id=repo_id,
-            cache_dir=str(cache_folder),
-            endpoint=backchannel_model_endpoint(),
-            local_files_only=False,
-        )
-    )
 
 
 def _validate_model_zip_members(zf: zipfile.ZipFile) -> PurePosixPath:

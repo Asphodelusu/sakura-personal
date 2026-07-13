@@ -86,7 +86,7 @@ def test_download_backchannel_model_uses_project_hf_cache(monkeypatch, tmp_path:
         (snapshot / "model.safetensors").write_bytes(b"fake")
         return str(snapshot)
 
-    monkeypatch.setattr(model_cache_module, "_download_hf_snapshot", fake_download)
+    monkeypatch.setattr(model_cache_module, "download_hf_snapshot", fake_download)
 
     result = download_backchannel_model(tmp_path)
 
