@@ -121,6 +121,28 @@ def theme_to_mapping(settings: ThemeSettings) -> dict[str, object]:
     return data
 
 
+def resolve_effective_theme(
+    profile: "CharacterProfile | None",
+    override: ThemeSettings | None = None,
+    user_ui_settings: ThemeSettings | None = None,
+) -> ThemeSettings:
+    """角色主题颜色优先级：用户覆盖 > 角色包主题 > 内置默认粉色。"""
+    from app.config.character_loader import THEME_SOURCE_PACKAGE
+
+    user = (user_ui_settings or DEFAULT_THEME_SETTINGS).normalized()
+    if override is not None:
+        colors = override.normalized()
+    elif profile is not None and getattr(profile, "theme_source", None) == THEME_SOURCE_PACKAGE:
+        colors = (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+    else:
+        colors = DEFAULT_THEME_SETTINGS
+    return replace(
+        colors,
+        visual_effect_mode=user.visual_effect_mode,
+        ai_enabled=user.ai_enabled,
+    )
+
+
 def merge_theme_with_character(
     saved_settings: ThemeSettings,
     profile: CharacterProfile | None,

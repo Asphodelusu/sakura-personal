@@ -97,6 +97,8 @@ from app.agent.runtime_events import (
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply_result
 from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
+from app.core.mobile_chat_bridge import MobileChatBridge, MobileChatBusyError
+from app.core.mobile_chat_worker import MobileChatWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log, summarize_messages
 from app.config.settings_service import BackchannelSettings, BubbleSettings, StartupSettings
@@ -134,6 +136,7 @@ from app.ui.state import PetUiState, PetUiStateStore
 from app.ui.error_messages import format_failure_message
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
+    is_launch_at_login_supported,
     set_launch_at_login_enabled,
 )
 from app.ui.history_window import HistoryWindow
@@ -503,6 +506,9 @@ class PetWindow(QWidget):
     plugin_input_text_requested = Signal(str)
     # 主动模式评论信号（从后台线程 emit，queued connection 回 UI 线程）
     proactive_comment_arrived = Signal(object)
+    # 手机端聊天完成信号
+    mobile_chat_completed = Signal(object)
+    mobile_chat_requested = Signal(object)
 
     def __init__(
         self,
@@ -511,6 +517,8 @@ class PetWindow(QWidget):
         super().__init__()
         # 插件填充输入框的信号在此连接，确保后台线程触发时 marshal 回 UI 线程。
         self.plugin_input_text_requested.connect(self._apply_plugin_input_text)
+        self.mobile_chat_completed.connect(self._handle_mobile_chat_completed)
+        self.mobile_chat_requested.connect(self._enqueue_mobile_chat)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -540,6 +548,9 @@ class PetWindow(QWidget):
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
+        self.mobile_chat_bridge = MobileChatBridge(self)
+        self._mobile_chat_requests: list[dict[str, Any]] = []
+        self._active_mobile_chat_request: dict[str, Any] | None = None
         self.runtime_event_log = context.runtime_event_log
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
@@ -2347,22 +2358,106 @@ class PetWindow(QWidget):
         if hasattr(self, "tray_icon"):
             self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
-    def _apply_fonts(self) -> None:
-        text_font = _rounded_chinese_font(13, QFont.Weight.Bold)
-        name_font = _rounded_japanese_font(10, QFont.Weight.Bold)
-        button_font = _rounded_chinese_font(11, QFont.Weight.ExtraBold)
+    def _clamp_ui_font_size(
+        self,
+        value: object,
+        minimum: int,
+        maximum: int,
+        default: int,
+    ) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
 
-        self.name_label.setFont(name_font)
-        self._apply_speech_font()
-        self.input_edit.setFont(text_font)
+    def _load_ui_font_sizes(self) -> tuple[int, int, int, int]:
+        from app.config.defaults import (
+            BUTTON_FONT_SIZE_MAX,
+            BUTTON_FONT_SIZE_MIN,
+            DEFAULT_BUTTON_FONT_SIZE,
+            DEFAULT_INPUT_FONT_SIZE,
+            DEFAULT_NAME_FONT_SIZE,
+            DEFAULT_SPEECH_FONT_SIZE,
+            INPUT_FONT_SIZE_MAX,
+            INPUT_FONT_SIZE_MIN,
+            NAME_FONT_SIZE_MAX,
+            NAME_FONT_SIZE_MIN,
+            SPEECH_FONT_SIZE_MAX,
+            SPEECH_FONT_SIZE_MIN,
+        )
+
+        ui = self._load_system_config_values("ui")
+        clamp = self._clamp_ui_font_size
+        return (
+            clamp(
+                ui.get("speech_font_size"),
+                SPEECH_FONT_SIZE_MIN,
+                SPEECH_FONT_SIZE_MAX,
+                DEFAULT_SPEECH_FONT_SIZE,
+            ),
+            clamp(
+                ui.get("name_font_size"),
+                NAME_FONT_SIZE_MIN,
+                NAME_FONT_SIZE_MAX,
+                DEFAULT_NAME_FONT_SIZE,
+            ),
+            clamp(
+                ui.get("input_font_size"),
+                INPUT_FONT_SIZE_MIN,
+                INPUT_FONT_SIZE_MAX,
+                DEFAULT_INPUT_FONT_SIZE,
+            ),
+            clamp(
+                ui.get("button_font_size"),
+                BUTTON_FONT_SIZE_MIN,
+                BUTTON_FONT_SIZE_MAX,
+                DEFAULT_BUTTON_FONT_SIZE,
+            ),
+        )
+
+    def _apply_ui_font_sizes(
+        self,
+        *,
+        speech_font_size: int,
+        name_font_size: int,
+        input_font_size: int,
+        button_font_size: int,
+    ) -> None:
+        self.name_label.setFont(_rounded_japanese_font(name_font_size, QFont.Weight.Bold))
+        if self.subtitle_language == SUBTITLE_LANGUAGE_ZH:
+            self.speech_label.setFont(
+                _rounded_chinese_font(speech_font_size, QFont.Weight.Medium)
+            )
+        else:
+            self.speech_label.setFont(
+                _rounded_japanese_font(speech_font_size, QFont.Weight.Medium)
+            )
+        input_font = _rounded_chinese_font(input_font_size, QFont.Weight.Bold)
+        button_font = _rounded_chinese_font(button_font_size, QFont.Weight.ExtraBold)
+        self.input_edit.setFont(input_font)
         self.screenshot_button.setFont(button_font)
         self.send_button.setFont(button_font)
 
+    def _apply_fonts(self) -> None:
+        speech, name, input_size, button = self._load_ui_font_sizes()
+        self._apply_ui_font_sizes(
+            speech_font_size=speech,
+            name_font_size=name,
+            input_font_size=input_size,
+            button_font_size=button,
+        )
+
     def _apply_speech_font(self) -> None:
+        speech_font_size = self._load_ui_font_sizes()[0]
         if self.subtitle_language == SUBTITLE_LANGUAGE_ZH:
-            self.speech_label.setFont(_rounded_chinese_font(15, QFont.Weight.Medium))
+            self.speech_label.setFont(
+                _rounded_chinese_font(speech_font_size, QFont.Weight.Medium)
+            )
             return
-        self.speech_label.setFont(_rounded_japanese_font(15, QFont.Weight.Medium))
+        self.speech_label.setFont(
+            _rounded_japanese_font(speech_font_size, QFont.Weight.Medium)
+        )
 
     def _current_portrait_size(self) -> tuple[int, int]:
         """当前立绘标签实际尺寸；标签尚未贴图时回退到按缩放的名义尺寸。"""
@@ -5071,7 +5166,13 @@ class PetWindow(QWidget):
         if services is None:
             return
         try:
-            services.set_backends(input_text_sink=self._request_fill_input_text)
+            services.set_backends(
+                input_text_sink=self._request_fill_input_text,
+                mobile_characters_sink=self._mobile_characters,
+                mobile_history_sink=self._mobile_history,
+                mobile_chat_sink=self._mobile_chat,
+                mobile_theme_sink=self._mobile_theme,
+            )
         except Exception as exc:  # noqa: BLE001 — 装配失败不得阻断启动
             debug_log("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
 
@@ -5093,6 +5194,115 @@ class PetWindow(QWidget):
         except RuntimeError as exc:
             # 输入控件可能已被销毁
             debug_log("PetWindow", "填入插件输入文本失败", {"error": str(exc)})
+
+    # ── 手机端插件桥接 ──
+
+    def _mobile_characters(self) -> list[dict[str, str]]:
+        return self.mobile_chat_bridge.characters()
+
+    def _mobile_history(self, character_id: str, limit: int) -> list[dict[str, str]]:
+        return self.mobile_chat_bridge.history(character_id, limit=limit)
+
+    def _mobile_chat(self, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
+        return self.mobile_chat_bridge.chat(character_id, text, image_data_url)
+
+    def _mobile_theme(self) -> dict[str, object]:
+        return theme_colors_to_mapping(getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS))
+
+    MOBILE_CHAT_BUSY_MESSAGE = "Sakura 正忙，请稍后再试。"
+
+    def submit_mobile_chat(self, bridge: MobileChatBridge, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
+        import threading
+        if self._mobile_chat_busy():
+            raise MobileChatBusyError(self.MOBILE_CHAT_BUSY_MESSAGE)
+        request: dict[str, Any] = {
+            "bridge": bridge, "character_id": character_id,
+            "text": text, "image_data_url": image_data_url,
+            "done": threading.Event(), "result": None, "error": "", "busy": False,
+        }
+        self.mobile_chat_requested.emit(request)
+        if not request["done"].wait(timeout=300):
+            raise TimeoutError("移动端聊天等待超时。")
+        if request["busy"]:
+            raise MobileChatBusyError(str(request["error"] or self.MOBILE_CHAT_BUSY_MESSAGE))
+        if request["error"]:
+            raise RuntimeError(str(request["error"]))
+        result = request["result"]
+        if not isinstance(result, dict):
+            raise RuntimeError("移动端聊天未返回有效结果。")
+        return result
+
+    def _mobile_chat_busy(self) -> bool:
+        return bool(
+            self.worker_thread is not None
+            or self._active_mobile_chat_request is not None
+            or self._mobile_chat_requests
+            or self.active_event is not None
+            or self.pending_tool_action is not None
+            or self.pending_screen_observation_messages is not None
+            or self.screen_observation_followup_in_progress
+            or self.screen_observation_encode_thread is not None
+            or self.subtitle_controller.is_reply_sequence_active()
+        )
+
+    @Slot(object)
+    def _handle_mobile_chat_completed(self, payload: object) -> None:
+        pass
+
+    @Slot(object)
+    def _enqueue_mobile_chat(self, request: object) -> None:
+        if not isinstance(request, dict):
+            return
+        if getattr(self, "_shutdown_in_progress", False):
+            request["error"] = "应用正在关闭。"
+            request["done"].set()
+            return
+        if self._mobile_chat_busy():
+            request["busy"] = True
+            request["error"] = self.MOBILE_CHAT_BUSY_MESSAGE
+            request["done"].set()
+            return
+        self._mobile_chat_requests.append(request)
+        self._start_next_mobile_chat()
+
+    def _start_next_mobile_chat(self) -> None:
+        if self.worker_thread is not None or self._active_mobile_chat_request is not None or not self._mobile_chat_requests:
+            return
+        request = self._mobile_chat_requests.pop(0)
+        self._active_mobile_chat_request = request
+        worker = MobileChatWorker(
+            request["bridge"], str(request["character_id"]),
+            str(request["text"]), str(request["image_data_url"]),
+        )
+        self.resource_manager.spawn_qt_worker(
+            worker, parent=self, owner=self,
+            thread_attr="worker_thread", worker_attr="worker",
+            signal_bindings=[
+                (worker.finished, self._handle_mobile_chat_result),
+                (worker.failed, self._handle_mobile_chat_error),
+            ],
+            quit_on=[worker.finished, worker.failed],
+            on_finished=self._finish_mobile_chat_worker,
+        )
+
+    @Slot(object)
+    def _handle_mobile_chat_result(self, result: object) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["result"] = result
+            request["done"].set()
+
+    @Slot(str)
+    def _handle_mobile_chat_error(self, message: str) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["error"] = message
+            request["done"].set()
+
+    def _finish_mobile_chat_worker(self) -> None:
+        self._active_mobile_chat_request = None
+        self._start_next_mobile_chat()
+        self._update_reply_history_buttons()
 
     def _sync_plugin_chat_ui_widgets(self) -> None:
         layout = self.input_bar.layout() if hasattr(self, "input_bar") else None
@@ -5484,6 +5694,9 @@ class PetWindow(QWidget):
     def show_settings(self) -> None:
         if getattr(self, "startup_initializing", False):
             return
+        # 优先使用 Tauri 设置界面
+        if self._try_show_tauri_settings():
+            return
         active_dialog = getattr(self, "settings_dialog", None)
         if active_dialog is not None:
             self._activate_settings_dialog(active_dialog)
@@ -5571,6 +5784,642 @@ class PetWindow(QWidget):
             )
         )
         self._present_registered_secondary_window(dialog)
+
+    def _try_show_tauri_settings(self) -> bool:
+        """尝试启动 Tauri 设置程序；二进制不存在或导入失败时返回 False 以回退到旧版设置。"""
+        try:
+            from app.ui.tauri_settings import (
+                TauriSettingsProcess,
+                resolve_tauri_settings_binary,
+            )
+        except ImportError:
+            return False
+
+        if resolve_tauri_settings_binary(self.base_dir) is None:
+            return False
+
+        existing = getattr(self, "tauri_settings_process", None)
+        if existing is not None:
+            if existing.focus_window():
+                return True
+            existing.shutdown()
+            self.tauri_settings_process = None
+
+        try:
+            tts_settings = self.settings_service.load_tts_settings(
+                validate_enabled=False,
+                character_profile=self.character_profile,
+            )
+        except (OSError, TTSConfigError):
+            tts_settings = self._default_tts_settings()
+
+        screen_awareness_settings = self.settings_service.load_screen_awareness_settings()
+
+        api_settings = getattr(self.api_client, "settings", None)
+        api_profiles = self.settings_service.load_api_profiles()
+        model_selection = self.settings_service.load_model_selection()
+        if not api_profiles:
+            api_profiles, model_selection = self._build_tauri_api_profiles(api_settings)
+
+        speech_font_size, name_font_size, input_font_size, button_font_size = (
+            self._load_ui_font_sizes()
+        )
+
+        process = TauriSettingsProcess(
+            parent=self,
+            base_dir=self.base_dir,
+            settings=screen_awareness_settings,
+            mcp_settings=self.settings_service.load_mcp_runtime_settings(),
+            runtime_loop_settings=self.settings_service.load_runtime_loop_settings(),
+            debug_log_settings=self.settings_service.load_debug_log_settings(),
+            subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
+            reply_segment_pause_ms=self.reply_segment_pause_ms,
+            bubble_settings=self.settings_service.load_bubble_settings(),
+            theme_settings=self.settings_service.load_theme_settings(),
+            character_registry=self.character_registry,
+            current_character=self.character_profile,
+            portrait_scale_percent=self.portrait_scale_percent,
+            control_panel_width=self.control_panel_width,
+            bubble_height=self.bubble_height,
+            control_panel_vertical_offset=self.control_panel_vertical_offset,
+            input_bar_offset=self.input_bar_offset,
+            api_settings=api_settings,
+            api_profiles=api_profiles,
+            model_selection=model_selection,
+            tts_settings=tts_settings,
+            startup_settings=self.settings_service.load_startup_settings(),
+            launch_at_login_supported=is_launch_at_login_supported(),
+            backchannel_settings=self.settings_service.load_backchannel_settings(),
+            memory_curation_settings=self.settings_service.load_memory_curation_settings(),
+            memory_store=self.memory_store,
+            plugin_settings_contributions=getattr(
+                self.plugin_manager, "settings_panels", []
+            ),
+            studio_launcher=self._launch_tauri_studio_from_settings,
+            speech_font_size=speech_font_size,
+            name_font_size=name_font_size,
+            input_font_size=input_font_size,
+            button_font_size=button_font_size,
+            persist_handler=self._apply_tauri_settings_result,
+        )
+        # 记录打开前的布局
+        self._tauri_original_layout = (
+            self.portrait_scale_percent,
+            self.control_panel_width,
+            self.bubble_height,
+            self.control_panel_vertical_offset,
+            self.input_bar_offset,
+        )
+        self._set_secondary_windows_topmost_suppressed(True)
+        if not process.start():
+            self._tauri_original_layout = None
+            self._sync_secondary_window_state()
+            return False
+        self.tauri_settings_process = process
+        process.completed.connect(self._on_tauri_settings_completed)
+        process.applied.connect(self._on_tauri_settings_applied)
+        process.layout_preview.connect(self._on_tauri_settings_layout_preview)
+        process.failed.connect(self._on_tauri_settings_failed)
+        process.cancelled.connect(self._on_tauri_settings_cancelled)
+        process.closed.connect(self._on_tauri_settings_closed)
+        self._sync_secondary_window_state()
+        return True
+
+    @staticmethod
+    def _build_tauri_api_profiles(api_settings: "ApiSettings | None") -> tuple[list, object | None]:
+        """将双端点 ApiSettings 转换为 Tauri UI 期望的 api_profiles + model_selection 格式。"""
+        from app.config.models import (
+            MODEL_SLOT_CHAT,
+            MODEL_SLOT_MEMORY_CURATION,
+            MODEL_SLOT_VISION_CHAT,
+            ApiConfigProfile,
+            ModelSelectionSettings,
+            ModelSlotSelection,
+        )
+
+        if api_settings is None:
+            return [], None
+
+        vision_url = (api_settings.base_url or "").strip().rstrip("/")
+        vision_model = (api_settings.model or "").strip()
+        text_url = (api_settings.text_base_url or "").strip().rstrip("/")
+        text_model = (api_settings.text_model or "").strip()
+        text_key = (api_settings.text_api_key or "").strip()
+
+        profiles: list[ApiConfigProfile] = []
+        selection = ModelSelectionSettings()
+
+        # 视觉端点
+        if vision_url:
+            vid = "vision-profile"
+            profiles.append(
+                ApiConfigProfile(
+                    id=vid,
+                    alias="智谱 (视觉)" if "bigmodel" in vision_url else "视觉端点",
+                    base_url=vision_url,
+                    api_key=api_settings.api_key or "",
+                    models=(vision_model,) if vision_model else (),
+                )
+            )
+            selection = ModelSelectionSettings(
+                chat=selection.chat,
+                vision_chat=ModelSlotSelection(profile_id=vid, model=vision_model),
+                memory_curation=ModelSlotSelection(profile_id=vid, model=vision_model),
+            )
+
+        # 文本端点 (双端点模式)
+        if api_settings.dual_endpoint_enabled and text_url and text_model:
+            tid = "text-profile"
+            profiles.append(
+                ApiConfigProfile(
+                    id=tid,
+                    alias="DeepSeek (文本)" if "deepseek" in text_url.lower() else "文本端点",
+                    base_url=text_url,
+                    api_key=text_key,
+                    models=(text_model,),
+                )
+            )
+            selection = ModelSelectionSettings(
+                chat=ModelSlotSelection(profile_id=tid, model=text_model),
+                vision_chat=selection.vision_chat,
+                memory_curation=selection.memory_curation,
+            )
+
+        return profiles, selection
+
+    @Slot(object)
+    def _on_tauri_settings_completed(self, result: object) -> None:
+        """设置已保存；子进程退出前仍由 TauriSettingsProcess 托管。"""
+        _ = result
+        self._tauri_original_layout = None
+        self._set_secondary_windows_topmost_suppressed(False)
+        self._sync_secondary_window_state()
+
+    @Slot(object)
+    def _on_tauri_settings_applied(self, result: object) -> None:
+        """「应用」后的附加通知；持久化已在 TauriSettingsProcess 内同步完成。"""
+        _ = result
+
+    @Slot(object)
+    def _on_tauri_settings_layout_preview(self, payload: object) -> None:
+        """Tauri 角色页滑块拖动的实时预览。"""
+        if not isinstance(payload, dict):
+            return
+
+        def _int_val(key: str, fallback: int) -> int:
+            try:
+                return int(payload[key])
+            except (KeyError, TypeError, ValueError):
+                return fallback
+
+        self._preview_layout(
+            _int_val("portrait_scale_percent", self.portrait_scale_percent),
+            _int_val("control_panel_width", self.control_panel_width),
+            _int_val("bubble_height", self.bubble_height),
+            _int_val("control_panel_vertical_offset", self.control_panel_vertical_offset),
+            _int_val("input_bar_offset", self.input_bar_offset),
+        )
+
+    def _launch_tauri_studio_from_settings(
+        self,
+        character_id: str | None = None,
+    ) -> bool | dict[str, object]:
+        """从 Tauri 设置页启动角色工作室。"""
+        try:
+            from app.ui.tauri_studio import TauriStudioProcess, resolve_tauri_studio_binary
+        except ImportError:
+            return False
+        if resolve_tauri_studio_binary(self.base_dir) is None:
+            return False
+        existing = getattr(self, "tauri_studio_process", None)
+        if existing is not None and existing.focus_window():
+            return True
+        process = TauriStudioProcess(
+            self.base_dir,
+            initial_character_id=str(character_id or ""),
+            parent=self,
+        )
+        if not process.start():
+            return False
+        self.tauri_studio_process = process
+        process.closed.connect(self._on_tauri_studio_closed)
+        process.failed.connect(self._on_tauri_studio_failed)
+        return True
+
+    def _on_tauri_studio_closed(self) -> None:
+        self.tauri_studio_process = None
+
+    def _on_tauri_studio_failed(self, _error: str) -> None:
+        self.tauri_studio_process = None
+
+    def _merge_tauri_api_settings_for_save(self, resolved: "ApiSettings") -> "ApiSettings":
+        """把 Tauri 解析出的聊天槽位配置合并进当前 ApiSettings，保留双端点等未在 Tauri 编辑的字段。"""
+        from dataclasses import replace
+
+        from app.llm.api_client import ApiSettings as ClientApiSettings
+
+        current = getattr(self.api_client, "settings", None)
+        if not isinstance(current, ClientApiSettings):
+            return resolved
+        return replace(
+            current,
+            base_url=resolved.base_url,
+            api_key=resolved.api_key,
+            model=resolved.model,
+            timeout_seconds=resolved.timeout_seconds,
+            temperature=resolved.temperature,
+            top_p=resolved.top_p,
+            max_tokens=resolved.max_tokens,
+        )
+
+    def _refresh_llm_clients_after_settings(
+        self,
+        *,
+        api_settings: "ApiSettings | None" = None,
+    ) -> None:
+        """设置保存后按 model_slots 重建聊天/视觉/记忆整理客户端。"""
+        from app.llm.slot_clients import build_app_llm_clients, resolve_chat_api_settings
+
+        clients = build_app_llm_clients(self.settings_service, base_settings=api_settings)
+        chat_settings = resolve_chat_api_settings(self.settings_service, api_settings)
+        updater = getattr(self.api_client, "update_settings", None)
+        if callable(updater):
+            updater(chat_settings)
+        else:
+            self.api_client = clients.chat
+            self.agent_runtime.api_client = clients.chat
+        self.agent_runtime.vision_api_client = clients.vision
+        self.memory_curator.api_client = clients.memory_curation
+        self.memory_store.reload_api_settings(chat_settings, wait=False)
+
+    def _apply_tauri_settings_result(self, result: object, *, final: bool) -> bool:
+        """将 Tauri 设置结果持久化并即时生效（对齐 PySide SettingsDialog 保存流程）。"""
+        _ = final
+        try:
+            from app.plugins.discovery import save_plugin_enabled_overrides
+            from app.ui.tauri_settings import (
+                TauriSettingsResult,
+                apply_tauri_plugin_settings,
+                tts_settings_from_tauri_result,
+            )
+        except ImportError as exc:
+            debug_log(
+                "PetWindow",
+                "Tauri 设置模块不可用，跳过应用",
+                {"error": str(exc)},
+            )
+            return False
+        if not isinstance(result, TauriSettingsResult):
+            debug_log("PetWindow", "Tauri 设置结果类型无效", {"type": type(result).__name__})
+            return False
+
+        api = result.api
+        tts_raw = result.tts
+        screen = result.screen_awareness
+        mcp = result.mcp
+        runtime_loop = result.runtime_loop
+        char = result.character
+        system_basic = result.system_basic
+        system_extra = result.system_extra
+        theme = result.theme
+        plugins = result.plugins
+        memory_curation = result.memory_curation
+        theme_changed = bool(result.theme_changed)
+
+        selected_profile = self.character_profile
+        character_id = str(getattr(char, "character_id", "") or "").strip()
+        if character_id:
+            try:
+                selected_profile = self.character_registry.get(character_id)
+            except CharacterConfigError as exc:
+                show_themed_critical(
+                    self,
+                    "角色配置无效",
+                    format_failure_message(
+                        "无法读取当前选择的角色配置。",
+                        "请重新导入或选择一个完整的角色包。",
+                        exc,
+                    ),
+                )
+                return False
+
+        result_bubble_settings = (
+            system_basic.bubble
+            if system_basic is not None
+            else getattr(self, "bubble_settings", BubbleSettings())
+        )
+        current_startup_settings = getattr(self, "startup_settings", StartupSettings())
+        result_startup_settings = (
+            system_extra.startup
+            if system_extra is not None
+            else current_startup_settings
+        )
+        result_backchannel_settings = (
+            system_extra.backchannel
+            if system_extra is not None
+            else getattr(self, "backchannel_settings", BackchannelSettings())
+        )
+        result_runtime_loop_settings = runtime_loop or getattr(
+            self.agent_runtime,
+            "runtime_loop_settings",
+            RuntimeLoopSettings(),
+        )
+        result_memory_curation_settings = (
+            memory_curation or getattr(self, "memory_curation_settings", None)
+        )
+        result_theme_settings = (
+            theme if theme is not None else getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS)
+        )
+        result_subtitle_typing_interval_ms = (
+            system_basic.subtitle_typing_interval_ms
+            if system_basic is not None
+            else self.subtitle_typing_interval_ms
+        )
+        result_reply_segment_pause_ms = (
+            system_basic.reply_segment_pause_ms
+            if system_basic is not None
+            else self.reply_segment_pause_ms
+        )
+        (
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        ) = normalize_subtitle_display_speed(
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        )
+
+        resolved_api_settings = api.settings if api is not None else None
+        api_settings = (
+            self._merge_tauri_api_settings_for_save(resolved_api_settings)
+            if resolved_api_settings is not None
+            else None
+        )
+        previous_api_settings = getattr(self.api_client, "settings", None)
+        api_changed = (
+            (api_settings is not None and api_settings != previous_api_settings)
+            or (api is not None and bool(api.profiles))
+            or (api is not None and api.model_selection is not None)
+        )
+        startup_settings_changed = result_startup_settings != current_startup_settings
+
+        tts_settings: GPTSoVITSTTSSettings | None = None
+        new_tts_provider: TTSProvider | None = None
+        tts_provider_ready = True
+        if tts_raw is not None:
+            try:
+                previous_tts = self.settings_service.load_tts_settings(
+                    validate_enabled=False,
+                    character_profile=selected_profile,
+                )
+            except (OSError, TTSConfigError):
+                previous_tts = None
+            tts_settings = tts_settings_from_tauri_result(
+                tts_raw,
+                selected_profile,
+                self.base_dir,
+                previous=previous_tts,
+            )
+            try:
+                new_tts_provider = self._create_tts_provider_from_settings(tts_settings)
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "PetWindow",
+                    "TTS Provider 创建异常",
+                    {"error": str(exc)},
+                )
+                new_tts_provider = None
+            if new_tts_provider is None:
+                tts_provider_ready = False
+                new_tts_provider = self.tts_provider
+
+        font_values: dict[str, int] = {}
+        if system_basic is not None:
+            for key in (
+                "speech_font_size",
+                "name_font_size",
+                "input_font_size",
+                "button_font_size",
+            ):
+                value = getattr(system_basic, key, None)
+                if isinstance(value, int):
+                    font_values[key] = value
+
+        try:
+            if api_settings is not None:
+                self.settings_service.save_api_settings(api_settings)
+            if api is not None and api.profiles:
+                self.settings_service.save_api_profiles(api.profiles)
+            if api is not None and api.model_selection is not None:
+                self.settings_service.save_model_selection(api.model_selection)
+            if tts_settings is not None:
+                self.settings_service.save_tts_settings(tts_settings)
+            if character_id:
+                self.settings_service.save_current_character_id(
+                    self.character_registry,
+                    selected_profile.id,
+                )
+            if screen is not None:
+                self.settings_service.save_screen_awareness_settings(screen)
+            if mcp is not None:
+                self.settings_service.save_mcp_runtime_settings(mcp)
+            if system_basic is not None and system_basic.debug_log is not None:
+                self.settings_service.save_debug_log_settings(system_basic.debug_log)
+            if system_extra is not None:
+                if startup_settings_changed:
+                    self._apply_launch_at_login_settings(result_startup_settings)
+                self.settings_service.save_startup_settings(result_startup_settings)
+            if theme_changed and result_theme_settings != getattr(
+                self,
+                "theme_settings",
+                DEFAULT_THEME_SETTINGS,
+            ):
+                self.settings_service.save_theme_settings(result_theme_settings)
+            ui_values: dict[str, object] = {
+                "subtitle_typing_interval_ms": result_subtitle_typing_interval_ms,
+                "reply_segment_pause_ms": result_reply_segment_pause_ms,
+            }
+            if char is not None:
+                ui_values["portrait_scale_percent"] = char.portrait_scale_percent
+            if font_values:
+                ui_values.update(font_values)
+            self._save_system_config_values("ui", ui_values)
+            self.settings_service.save_bubble_settings(result_bubble_settings)
+            self.settings_service.save_backchannel_settings(result_backchannel_settings)
+            self.settings_service.save_runtime_loop_settings(result_runtime_loop_settings)
+            if result_memory_curation_settings is not None:
+                self.settings_service.save_memory_curation_settings(
+                    result_memory_curation_settings
+                )
+            if plugins is not None and plugins.settings_by_id:
+                try:
+                    apply_tauri_plugin_settings(
+                        getattr(self.plugin_manager, "settings_panels", []),
+                        plugins.settings_by_id,
+                    )
+                except ValueError as exc:
+                    debug_log(
+                        "PetWindow",
+                        "Tauri 插件设置保存失败",
+                        {"error": str(exc)},
+                    )
+            if plugins is not None and plugins.enabled_by_id:
+                save_plugin_enabled_overrides(self.base_dir, plugins.enabled_by_id)
+        except (CharacterConfigError, OSError, ValueError) as exc:
+            show_themed_critical(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "设置没有保存成功。",
+                    "请检查 data 目录的写入权限和文件占用情况后重试。",
+                    exc,
+                ),
+            )
+            return False
+
+        if api_changed:
+            self._refresh_llm_clients_after_settings(api_settings=api_settings)
+        self.agent_runtime.set_runtime_loop_settings(result_runtime_loop_settings)
+        if char is not None:
+            self._apply_layout_settings(
+                portrait_scale_percent=char.portrait_scale_percent,
+                control_panel_width=char.control_panel_width,
+                bubble_height=char.bubble_height,
+                vertical_offset=char.control_panel_vertical_offset,
+                input_bar_offset=char.input_bar_offset,
+                persist=True,
+            )
+        self._apply_subtitle_display_speed(
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        )
+        self._apply_bubble_settings(result_bubble_settings)
+        if result_memory_curation_settings is not None:
+            self.memory_curation_settings = result_memory_curation_settings
+        if theme_changed:
+            self._apply_theme_settings(result_theme_settings)
+        if screen is not None:
+            self.screen_awareness_settings = screen
+        if mcp is not None:
+            self.mcp_settings = mcp
+        if system_basic is not None and system_basic.debug_log is not None:
+            self.debug_log_settings = system_basic.debug_log
+            eval_logger = getattr(self, "backchannel_eval_logger", None)
+            if eval_logger is not None:
+                eval_logger.set_enabled(self.debug_log_settings.enabled)
+            self._apply_stage_debug_overlay(
+                self.debug_log_settings.stage_debug_overlay,
+                refresh=True,
+            )
+            self._apply_stage_collision_mask(
+                self.debug_log_settings.stage_collision_mask,
+                refresh=True,
+            )
+        self.startup_settings = result_startup_settings
+        sync_screen_awareness_timer = getattr(self, "_sync_screen_awareness_timer", None)
+        if callable(sync_screen_awareness_timer):
+            sync_screen_awareness_timer()
+        else:
+            self._sync_proactive_care_timer()
+        discard_backchannel_audio_cache = getattr(
+            self,
+            "_discard_backchannel_audio_cache",
+            None,
+        )
+        if callable(discard_backchannel_audio_cache):
+            discard_backchannel_audio_cache()
+        if (
+            tts_provider_ready
+            and new_tts_provider is not None
+            and tts_settings is not None
+        ):
+            character_changed = selected_profile.id != getattr(
+                self.character_profile,
+                "id",
+                None,
+            )
+            if _tts_provider_needs_rebuild(
+                self.tts_provider,
+                new_tts_provider,
+                character_changed=character_changed,
+            ):
+                disconnect_tts_error_signal = getattr(
+                    self,
+                    "_disconnect_tts_error_signal",
+                    None,
+                )
+                if callable(disconnect_tts_error_signal):
+                    disconnect_tts_error_signal(self.tts_provider)
+                keep_local_tts_service = _should_keep_tts_local_service(
+                    self.tts_provider,
+                    new_tts_provider,
+                )
+                self._retire_tts_provider(
+                    self.tts_provider,
+                    keep_local_service=keep_local_tts_service,
+                )
+                self.tts_provider = new_tts_provider
+                self.voice_playback_controller.set_provider(new_tts_provider)
+                connect_tts_error_signal = getattr(self, "_connect_tts_error_signal", None)
+                if callable(connect_tts_error_signal):
+                    connect_tts_error_signal(new_tts_provider)
+                self._warm_up_tts_playback(new_tts_provider)
+                start_tts_ready_warmup = getattr(self, "_start_tts_ready_warmup", None)
+                if callable(start_tts_ready_warmup):
+                    start_tts_ready_warmup(new_tts_provider)
+            else:
+                close_unused = getattr(new_tts_provider, "close", None)
+                if callable(close_unused):
+                    try:
+                        close_unused()
+                    except Exception as exc:  # noqa: BLE001
+                        debug_log(
+                            "TTS",
+                            "丢弃未使用的等价 TTS Provider 失败",
+                            {"error": str(exc)},
+                        )
+                debug_log(
+                    "PetWindow",
+                    "TTS 配置与角色均未变,保留现有 Provider,跳过重建",
+                )
+        elif tts_settings is not None and not tts_provider_ready:
+            debug_log(
+                "PetWindow",
+                "TTS 配置无效，已保存其余设置并保留当前语音 Provider",
+            )
+        if character_id:
+            self._apply_character(selected_profile)
+        self._apply_backchannel_settings(result_backchannel_settings)
+        if font_values:
+            default_speech, default_name, default_input, default_button = (
+                self._load_ui_font_sizes()
+            )
+            self._apply_ui_font_sizes(
+                speech_font_size=font_values.get("speech_font_size", default_speech),
+                name_font_size=font_values.get("name_font_size", default_name),
+                input_font_size=font_values.get("input_font_size", default_input),
+                button_font_size=font_values.get("button_font_size", default_button),
+            )
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+        return True
+
+    def _on_tauri_settings_failed(self, error: str) -> None:
+        self._tauri_original_layout = None
+        self._set_secondary_windows_topmost_suppressed(False)
+        self._sync_secondary_window_state()
+        show_themed_warning(self, "设置程序异常", error or "设置启动失败，回退到旧版设置")
+
+    def _on_tauri_settings_cancelled(self) -> None:
+        if self._tauri_original_layout is not None:
+            self._preview_layout(*self._tauri_original_layout)
+            self._tauri_original_layout = None
+        self._set_secondary_windows_topmost_suppressed(False)
+        self._sync_secondary_window_state()
+
+    def _on_tauri_settings_closed(self) -> None:
+        """Tauri 子进程已结束并清理完毕，释放宿主侧引用。"""
+        self.tauri_settings_process = None
+        self._sync_secondary_window_state()
 
     def _on_settings_dialog_finished(
         self,

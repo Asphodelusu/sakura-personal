@@ -3,9 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import ceil, floor, sqrt
 
-SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES = 5
-SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES = 8
+SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES = 2
+SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES = 10
 SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT = 6
+SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION = "fullscreen"
+SCREEN_AWARENESS_SCREEN_CONTEXT_RESOLUTIONS = (
+    "fullscreen",
+    "720p",
+    "1080p",
+    "2160p",
+)
+SCREEN_AWARENESS_SCREEN_CONTEXT_RESOLUTION_BOUNDS = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "2160p": (3840, 2160),
+}
 SCREEN_AWARENESS_IMAGE_DETAIL = "high"
 SCREEN_AWARENESS_TOKEN_PATCH_SIZE = 32
 SCREEN_AWARENESS_HIGH_DETAIL_MAX_EDGE = 2048
@@ -23,25 +35,6 @@ SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS = 10_000
 SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS = 1.0
 SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER = "[已抓取屏幕上下文]"
 
-# 深夜/凌晨没有专门的“安静时段”配置项，这里用当前本地小时数这个已有信号做一个
-# 保守的默认收紧：这段时间用户大概率已经离开或在休息，继续按白天节奏截图搭话
-# 意义不大，还会白白消耗截图/编码/一次事件处理的开销。
-SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR = 1
-SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR = 6
-SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER = 1.8
-
-
-def is_night_quiet_period(hour: int) -> bool:
-    """当前本地小时是否处于深夜/凌晨安静时段（默认 01:00-06:00）。"""
-    return SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR <= hour < SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR
-
-
-def night_quiet_interval_multiplier(hour: int) -> float:
-    """深夜/凌晨时段（默认 01:00-06:00）返回 >1 的倍率以拉长检查/冷却间隔，其余时段返回 1.0。"""
-    if is_night_quiet_period(hour):
-        return SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER
-    return 1.0
-
 
 @dataclass(frozen=True)
 class ScreenAwarenessSettings:
@@ -52,6 +45,7 @@ class ScreenAwarenessSettings:
     check_interval_minutes: int = SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES
     cooldown_minutes: int = SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES
     screen_context_batch_limit: int = SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT
+    screen_context_resolution: str = SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION
 
     def normalized(self) -> "ScreenAwarenessSettings":
         enabled = bool(self.enabled)
@@ -74,6 +68,9 @@ class ScreenAwarenessSettings:
                 min_value=SCREEN_AWARENESS_MIN_SCREEN_CONTEXT_BATCH_LIMIT,
                 max_value=SCREEN_AWARENESS_MAX_SCREEN_CONTEXT_BATCH_LIMIT,
             ),
+            screen_context_resolution=normalize_screen_context_resolution(
+                self.screen_context_resolution
+            ),
         )
 
     def allows_screen_context(self) -> bool:
@@ -90,6 +87,36 @@ def _clamp_bounded_int(value: int, *, min_value: int, max_value: int) -> int:
     return max(
         min_value,
         min(max_value, value),
+    )
+
+
+def normalize_screen_context_resolution(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in SCREEN_AWARENESS_SCREEN_CONTEXT_RESOLUTIONS:
+        return normalized
+    return SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION
+
+
+def screen_context_resolution_size(
+    width: int,
+    height: int,
+    resolution: object,
+) -> tuple[int, int]:
+    """返回所选档位下的等比截图尺寸；固定档位不会放大较小的屏幕。"""
+    image_width = max(1, int(width))
+    image_height = max(1, int(height))
+    normalized = normalize_screen_context_resolution(resolution)
+    bounds = SCREEN_AWARENESS_SCREEN_CONTEXT_RESOLUTION_BOUNDS.get(normalized)
+    if bounds is None:
+        return image_width, image_height
+
+    max_width, max_height = bounds
+    if image_height > image_width:
+        max_width, max_height = max_height, max_width
+    scale = min(1.0, max_width / image_width, max_height / image_height)
+    return (
+        max(1, int(round(image_width * scale))),
+        max(1, int(round(image_height * scale))),
     )
 
 
@@ -255,3 +282,21 @@ def _patch_floor_ratio(value: float) -> float:
     if floored <= 0:
         return 1.0
     return floored / patches
+
+
+# 深夜安静时段（Sakura 自定义扩展）
+SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR = 1
+SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR = 6
+SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER = 1.8
+
+
+def is_night_quiet_period(hour: int) -> bool:
+    """检查是否为深夜安静时段 (1:00-6:00)。"""
+    return SCREEN_AWARENESS_NIGHT_QUIET_START_HOUR <= hour < SCREEN_AWARENESS_NIGHT_QUIET_END_HOUR
+
+
+def night_quiet_interval_multiplier(hour: int) -> float:
+    """深夜时段返回额外倍率，其他时间返回 1.0。"""
+    if is_night_quiet_period(hour):
+        return SCREEN_AWARENESS_NIGHT_QUIET_INTERVAL_MULTIPLIER
+    return 1.0
