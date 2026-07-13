@@ -199,31 +199,42 @@ class ProactiveObserver:
 
     def stop(self) -> None:
         self._running = False
-        if self._http:
+        loop = self._loop
+        if self._http and loop is not None:
             try:
-                # Close in a fire-and-forget coroutine
-                async def _close():
+                async def _close() -> None:
                     await self._http.aclose()
-                asyncio.run_coroutine_threadsafe(_close(), self._loop) if self._loop else None
+
+                asyncio.run_coroutine_threadsafe(_close(), loop)
             except Exception:
                 pass
-            self._http = None
-        self._loop = None
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        self._http = None
+        self._thread = None
         logger.info("ProactiveObserver: stopped")
         _observer_gui_log("主动观察已停止")
 
     def _thread_main(self) -> None:
         """Run the asyncio loop in a dedicated daemon thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
         try:
-            self._loop.run_until_complete(self._run())
+            loop.run_until_complete(self._run())
         except Exception:
             logger.exception("ProactiveObserver: thread crashed")
             _observer_gui_log("主动观察线程异常退出")
         finally:
-            self._loop.close()
-            self._loop = None
+            try:
+                loop.close()
+            except Exception:
+                pass
+            if self._loop is loop:
+                self._loop = None
+            if self._thread is threading.current_thread():
+                self._thread = None
 
     # ---- core loop ----------------------------------------------------------
 
