@@ -28,6 +28,8 @@ DEFAULT_THREAD_SHUTDOWN_WAIT_MS = 1_000
 WRAPPER_RETENTION_MS = 1_000
 # 本地子进程终止的默认宽限时长（秒），沿用旧 _stop_local_service 的 5 秒。
 DEFAULT_PROCESS_TERMINATE_TIMEOUT_S = 5
+# 应用退出时终止本地 TTS 子进程的上限（正常退役仍用 DEFAULT_PROCESS_TERMINATE_TIMEOUT_S）。
+APP_EXIT_PROCESS_TERMINATE_TIMEOUT_S = 1.5
 
 # (signal, slot)：把 worker 的某个信号连接到一个槽。
 SignalBinding = tuple[Any, Callable[..., Any]]
@@ -793,9 +795,13 @@ class ResourceRegistry:
     def stop_all(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> None:
         with self._lock:
             entries = tuple(sorted(self._entries, key=lambda entry: entry.shutdown_order, reverse=True))
+        if not entries:
+            return
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000
         for entry in entries:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             try:
-                entry.resource.stop(timeout_ms)
+                entry.resource.stop(remaining_ms)
             except Exception as exc:  # noqa: BLE001
                 debug_log(
                     "ResourceManager",
@@ -1099,7 +1105,10 @@ class ResourceManager(QObject):
         )
 
     def stop_all(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> None:
-        """停止所有受管资源；按 shutdown_order 从高到低执行。"""
+        """停止所有受管资源；按 shutdown_order 从高到低执行。
+
+        ``timeout_ms`` 为整次关闭的共享预算，而非每个资源各自的上限。
+        """
         self._registry.stop_all(timeout_ms)
 
     def _register(

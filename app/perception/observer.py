@@ -200,17 +200,16 @@ class ProactiveObserver:
     def stop(self) -> None:
         self._running = False
         loop = self._loop
-        if self._http and loop is not None:
+        if loop is not None:
+            # Cancel all pending tasks so the loop exits promptly instead of
+            # blocking on asyncio.sleep() or a mid-flight VLM request.
             try:
-                async def _close() -> None:
-                    await self._http.aclose()
-
-                asyncio.run_coroutine_threadsafe(_close(), loop)
-            except Exception:
-                pass
-        thread = self._thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+                for task in asyncio.all_tasks(loop):
+                    task.cancel()
+            except RuntimeError:
+                pass  # loop already closed
+        # Thread is daemon; do not join.  Task cancellation and the finally
+        # block in _run() handle http cleanup.
         self._http = None
         self._thread = None
         logger.info("ProactiveObserver: stopped")
@@ -223,6 +222,8 @@ class ProactiveObserver:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._run())
+        except asyncio.CancelledError:
+            pass  # expected during shutdown; thread exits cleanly
         except Exception:
             logger.exception("ProactiveObserver: thread crashed")
             _observer_gui_log("主动观察线程异常退出")
@@ -266,7 +267,10 @@ class ProactiveObserver:
                     _observer_gui_log("主动观察循环异常", {"error": str(e)})
         finally:
             if self._http:
-                await self._http.aclose()
+                try:
+                    await asyncio.wait_for(self._http.aclose(), timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
                 self._http = None
 
     def _collect_triggers(self) -> list[str]:

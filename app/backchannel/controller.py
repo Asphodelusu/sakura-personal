@@ -62,6 +62,7 @@ class BackchannelController(QObject):
         self._rng = rng if rng is not None else random.Random()
         self._resolver: TemplateResolver | None = None
         self._pending_text = ""
+        self._pending_phase: str | None = None
         # armed 标志防住一个窄竞态:timeout 事件已入队但 cancel 先被处理。
         self._armed = False
 
@@ -102,8 +103,11 @@ class BackchannelController(QObject):
         self.cancel()
         self._classifier = classifier
 
-    def schedule(self, text: str) -> None:
-        """用户消息已发送:启动接话延迟计时。延迟内回复到达则被 cancel 跳过。"""
+    def schedule(self, text: str, *, phase: str | None = None) -> None:
+        """用户消息已发送:启动接话延迟计时。延迟内回复到达则被 cancel 跳过。
+
+        phase 可由 Turn Orchestrator 注入(如 long_wait),优先匹配 manifest 相位条目。
+        """
         self.cancel()
         if self._shutdown or not self._settings.active or self._resolver is None:
             return
@@ -113,6 +117,7 @@ class BackchannelController(QObject):
         if self._settings.probability < 1.0 and self._rng.random() >= self._settings.probability:
             return
         self._pending_text = text
+        self._pending_phase = phase
         self._armed = True
         self._timer.start(self._settings.delay_ms)
 
@@ -122,6 +127,7 @@ class BackchannelController(QObject):
         in-flight 的后台分类 token 失效,迟到结果在 _on_classify_done 被丢弃。
         """
         self._armed = False
+        self._pending_phase = None
         self._timer.stop()
         self._classify_timeout_timer.stop()
         self._inflight_token = None
@@ -182,6 +188,7 @@ class BackchannelController(QObject):
         thread = self._thread_group.spawn(
             run_classification,
             name=f"sakura-backchannel-{token}",
+            daemon=True,
         )
         if thread is None:
             # 关闭与派发窄竞态：线程组进入终态后不保留 pending token。
@@ -205,9 +212,8 @@ class BackchannelController(QObject):
     def _finish_classification(self, text: str, label: "BackchannelLabel | None") -> None:
         if self._resolver is None:
             return
-        # phase 参数有意不传:相位(repeated_issue/tool_running/long_wait)
-        # 由后续迭代的会话相位跟踪器提供,v1 相位条目仅随清单预置。
-        choice = self._resolver.resolve(label)
+        # phase 可由 Turn Orchestrator 在 schedule() 注入;会话相位跟踪器亦可后续补充。
+        choice = self._resolver.resolve(label, phase=self._pending_phase)
         if self._on_classified is not None:
             self._on_classified(text, label, choice)
         if choice is not None:

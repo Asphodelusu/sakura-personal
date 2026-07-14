@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
 from app.config.models import (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_MEMORY_CURATION,
     MODEL_SLOT_VISION_CHAT,
 )
@@ -22,6 +23,7 @@ from app.llm.local_client import LocalLlmSettings, create_routing_llm_client
 @dataclass(frozen=True)
 class AppLlmClients:
     chat: object
+    chat_fast: OpenAICompatibleClient | None
     vision: OpenAICompatibleClient | None
     memory_curation: object
 
@@ -70,6 +72,9 @@ def build_app_llm_clients(
     local_llm_settings = settings_service.load_local_llm_settings()
     chat_client = create_routing_llm_client(chat_settings, local_llm_settings)
 
+    chat_fast_slot = resolve_model_slot(profiles, selection, MODEL_SLOT_CHAT_FAST, base)
+    chat_fast_client = _client_for_explicit_slot(chat_fast_slot, MODEL_SLOT_CHAT_FAST)
+
     vision_slot = resolve_model_slot(profiles, selection, MODEL_SLOT_VISION_CHAT, base)
     vision_client = _client_for_explicit_slot(vision_slot, MODEL_SLOT_VISION_CHAT)
 
@@ -81,6 +86,7 @@ def build_app_llm_clients(
 
     return AppLlmClients(
         chat=chat_client,
+        chat_fast=chat_fast_client,
         vision=vision_client,
         memory_curation=memory_client,
     )

@@ -151,6 +151,8 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     agent_runtime = AgentRuntime(
         api_client=api_client,
         vision_api_client=llm_clients.vision,
+        chat_fast_api_client=llm_clients.chat_fast,
+        turn_routing_settings=settings_service.load_turn_routing_settings(),
         system_prompt=system_prompt,
         reply_tones=character_profile.reply_tones,
         reply_portraits=character_profile.portrait_choices,

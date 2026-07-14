@@ -2762,6 +2762,7 @@ def _normalized_request_model_selection(
     model = profile.models[0] if profile.models else str(settings.model or _default_api_settings().model)
     return ModelSelectionSettings(
         chat=ModelSlotSelection(profile_id=profile.id, model=model),
+        chat_fast=selection.chat_fast,
         vision_chat=selection.vision_chat,
         memory_curation=selection.memory_curation,
     )
@@ -2850,6 +2851,7 @@ def _model_selection_from_mapping_required(mapping: dict[str, Any]) -> ModelSele
     assert chat is not None
     return ModelSelectionSettings(
         chat=chat,
+        chat_fast=_slot_selection_from_mapping(slots, "chat_fast", required=False),
         vision_chat=_slot_selection_from_mapping(slots, "vision_chat", required=False),
         memory_curation=_slot_selection_from_mapping(slots, "memory_curation", required=False),
     )

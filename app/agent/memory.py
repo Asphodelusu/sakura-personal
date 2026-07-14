@@ -19,13 +19,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from app.agent.persona_state import normalize_emotion
 from app.core.resource_manager import (
-    DEFAULT_THREAD_SHUTDOWN_WAIT_MS,
     ResourceRegistry,
     ThreadGroupResource,
 )
 from app.storage.atomic import atomic_write_text, rename_with_retry
 from app.storage.chat_history import ChatHistoryEntry
 from app.storage.paths import StoragePaths
+from app.core.hf_hub_download import default_hf_endpoint, download_hf_snapshot
 
 if TYPE_CHECKING:
     from app.llm.api_client import ApiSettings
@@ -37,6 +37,8 @@ MEM0_VENDOR_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mem0"
 DEFAULT_MEMORY_SCOPE = "sakura"
 DEFAULT_COLLECTION_NAME = "sakura_memories"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
+# 记忆后台加载线程为 daemon；应用退出时不必长时间 join。
+MEMORY_STORE_EXIT_THREAD_WAIT_MS = 400
 DEFAULT_EMBEDDING_DIMS = 768
 DEFAULT_MEMORY_LIMIT = 20
 MEMORY_LAYER_CORE_PROFILE = "core_profile"
@@ -72,7 +74,7 @@ CORE_PROFILE_CONTEXT_BUDGET = 1200
 MOOD_CONTEXT_BUDGET = 500
 SESSION_CONTEXT_BUDGET = 600
 MEMORY_SECTION_CHAR_BUDGET = 1600
-DEFAULT_HUGGINGFACE_ENDPOINT = "https://huggingface.co"
+DEFAULT_HUGGINGFACE_ENDPOINT = default_hf_endpoint()
 DEFAULT_EMBEDDING_MODEL_CACHE_NAME = "models--" + DEFAULT_EMBEDDING_MODEL.replace("/", "--")
 DEFAULT_EMBEDDING_MODEL_ALLOW_PATTERNS = (
     "1_Pooling/config.json",
@@ -472,7 +474,7 @@ class MemoryStore:
             self._reload_error = ""
             self._status = "stopped"
             self._status_message = "长期记忆系统已关闭。"
-        self._thread_group.stop(DEFAULT_THREAD_SHUTDOWN_WAIT_MS)
+        self._thread_group.stop(MEMORY_STORE_EXIT_THREAD_WAIT_MS)
         _close_memory_client(old_memory)
 
     def is_ready(self) -> bool:
@@ -489,7 +491,7 @@ class MemoryStore:
     def embedding_model_endpoint(self) -> str:
         """返回当前嵌入模型下载端点，便于 UI 提示用户。"""
 
-        return (os.environ.get("HF_ENDPOINT") or DEFAULT_HUGGINGFACE_ENDPOINT).strip()
+        return default_hf_endpoint()
 
     def import_embedding_model_archive(self, path: Path) -> EmbeddingModelImportResult:
         """导入离线嵌入模型 ZIP，并重置长期记忆运行时以复用新缓存。"""
@@ -1726,18 +1728,19 @@ def download_embedding_model(base_dir: Path | None = None) -> EmbeddingModelImpo
 
 def _download_hf_snapshot(repo_id: str, cache_folder: Path) -> str:
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise MemoryModelImportError("缺少 huggingface_hub 依赖，无法在线安装记忆模型。") from exc
-    return str(
-        snapshot_download(
-            repo_id=repo_id,
-            cache_dir=str(cache_folder),
-            endpoint=(os.environ.get("HF_ENDPOINT") or DEFAULT_HUGGINGFACE_ENDPOINT).strip(),
-            allow_patterns=list(DEFAULT_EMBEDDING_MODEL_ALLOW_PATTERNS),
-            local_files_only=False,
+        return download_hf_snapshot(
+            repo_id,
+            cache_folder,
+            allow_patterns=DEFAULT_EMBEDDING_MODEL_ALLOW_PATTERNS,
         )
-    )
+    except RuntimeError as exc:
+        raise MemoryModelImportError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise MemoryModelImportError(
+            "记忆模型在线安装失败，已依次尝试官方 Hub 与 hf-mirror。"
+            "请检查网络或代理，或使用设置页的「导入 ZIP」。"
+            f"\n\n原始错误：{exc}"
+        ) from exc
 
 
 def _validate_embedding_model_zip_members(zf: zipfile.ZipFile) -> PurePosixPath:

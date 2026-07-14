@@ -211,12 +211,14 @@ class AppSettingsService:
         """保存模型槽位选择到 api.yaml。"""
         from app.config.models import (
             MODEL_SLOT_CHAT,
+            MODEL_SLOT_CHAT_FAST,
             MODEL_SLOT_MEMORY_CURATION,
+            MODEL_SLOT_ORDER,
             MODEL_SLOT_VISION_CHAT,
         )
         data = load_yaml_mapping(self.api_config_path)
         slots: dict[str, dict[str, str]] = {}
-        for slot in (MODEL_SLOT_CHAT, MODEL_SLOT_VISION_CHAT, MODEL_SLOT_MEMORY_CURATION):
+        for slot in MODEL_SLOT_ORDER:
             selection = getattr(settings, "slots", {}).get(slot) if hasattr(settings, "slots") else getattr(settings, slot, None)
             if selection is None:
                 continue
@@ -270,6 +272,7 @@ class AppSettingsService:
         from app.config.models import (
             MODEL_SLOT_CHAT,
             MODEL_SLOT_MEMORY_CURATION,
+            MODEL_SLOT_ORDER,
             MODEL_SLOT_VISION_CHAT,
             ModelSelectionSettings,
             ModelSlotSelection,
@@ -297,11 +300,12 @@ class AppSettingsService:
         chat = _slot_selection(MODEL_SLOT_CHAT, required=True)
         if chat is None:
             return ModelSelectionSettings()
-        return ModelSelectionSettings(
-            chat=chat,
-            vision_chat=_slot_selection(MODEL_SLOT_VISION_CHAT, required=False),
-            memory_curation=_slot_selection(MODEL_SLOT_MEMORY_CURATION, required=False),
-        )
+        optional_slots = {
+            slot: _slot_selection(slot, required=False)
+            for slot in MODEL_SLOT_ORDER
+            if slot != MODEL_SLOT_CHAT
+        }
+        return ModelSelectionSettings(chat=chat, **optional_slots)
 
     def load_local_llm_settings(self) -> LocalLlmSettings:
         data = self._api_section("local_llm")
@@ -655,6 +659,31 @@ class AppSettingsService:
             "probability": float(normalized.probability),
             "tts_enabled": bool(normalized.tts_enabled),
             "timeout_ms": int(normalized.timeout_ms),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
+    def load_turn_routing_settings(self):
+        from app.agent.turn_routing import TurnRoutingSettings
+
+        section = self._system_section("turn_routing")
+        return TurnRoutingSettings(
+            enabled=_bool_value(section.get("enabled"), True),
+            classifier_enabled=_bool_value(section.get("classifier_enabled"), False),
+            backchannel_orchestration_enabled=_bool_value(
+                section.get("backchannel_orchestration_enabled"), False
+            ),
+            simple_greeting_max_chars=_int_value(section.get("simple_greeting_max_chars"), 12),
+            classifier_timeout_seconds=_int_value(section.get("classifier_timeout_seconds"), 1),
+        )
+
+    def save_turn_routing_settings(self, settings) -> None:
+        data = load_yaml_mapping(self.system_config_path)
+        data["turn_routing"] = {
+            "enabled": bool(settings.enabled),
+            "classifier_enabled": bool(settings.classifier_enabled),
+            "backchannel_orchestration_enabled": bool(settings.backchannel_orchestration_enabled),
+            "simple_greeting_max_chars": int(settings.simple_greeting_max_chars),
+            "classifier_timeout_seconds": int(settings.classifier_timeout_seconds),
         }
         save_yaml_mapping(self.system_config_path, data)
 

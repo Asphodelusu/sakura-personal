@@ -370,11 +370,21 @@ def _windows_no_window_kwargs() -> dict[str, object]:
 
 
 def _terminate_process_tree(process: _LocalProcessHandle, timeout: int) -> None:
+    """Terminate the process tree within a total deadline of ``timeout`` seconds.
+
+    On Windows, ``taskkill /T /F`` is near-instant; the budget is reserved for
+    ``process.wait``.  On other platforms, ``terminate`` → ``kill`` share the
+    same deadline so the worst case stays bounded by ``timeout`` instead of
+    ``timeout * 3``.
+    """
+    deadline = time.monotonic() + max(0.5, timeout)
     pid = getattr(process, "pid", None)
     if sys.platform == "win32" and pid is not None:
         try:
-            _run_windows_taskkill(pid, timeout)
-            process.wait(timeout=timeout)
+            _run_windows_taskkill(pid, timeout=2)  # /F is fast; 2 s is generous
+            remaining = deadline - time.monotonic()
+            if remaining > 0.1:
+                process.wait(timeout=remaining)
             if process.poll() is not None:
                 return
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -382,10 +392,14 @@ def _terminate_process_tree(process: _LocalProcessHandle, timeout: int) -> None:
 
     process.terminate()
     try:
-        process.wait(timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining > 0.1:
+            process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining > 0.1:
+            process.wait(timeout=remaining)
 
 
 def _build_genie_start_command(python_exe: Path, host: str, port: int) -> list[str]:
@@ -1138,7 +1152,14 @@ class TTSServiceSupervisor:
                 self._process_resource = None
             self._server_process = None
 
-    def _stop_local_service(self) -> None:
+    def _stop_local_service(self, *, terminate_timeout_s: float | None = None) -> None:
+        from app.core.resource_manager import DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+
+        timeout_s = (
+            DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+            if terminate_timeout_s is None
+            else terminate_timeout_s
+        )
         with self._service_lifecycle_lock:
             process = self._server_process
             if process is None:
@@ -1148,20 +1169,30 @@ class TTSServiceSupervisor:
                 return
         debug_log("TTS", "关闭本地 TTS 服务进程", {"pid": process.pid, "provider": self.settings.provider})
         try:
-            _terminate_process_tree(process, timeout=5)
+            _terminate_process_tree(process, timeout=timeout_s)
         except Exception as exc:  # noqa: BLE001
             debug_log("TTS", "本地 TTS 服务正常关闭失败，尝试强制结束", {"pid": process.pid, "error": str(exc)})
             try:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=min(timeout_s, 2.0))
             except Exception as kill_exc:  # noqa: BLE001
                 debug_log("TTS", "本地 TTS 服务强制结束失败", {"pid": process.pid, "error": str(kill_exc)})
         finally:
             _track_local_process(self, None)
 
-    def close(self) -> None:
+    def close(self, *, fast: bool = False) -> None:
         """关闭监督的本地服务进程（协调器一般改走 RM.stop_all，本入口供直接调用）。"""
-        self._stop_local_service()
+        from app.core.resource_manager import (
+            APP_EXIT_PROCESS_TERMINATE_TIMEOUT_S,
+            DEFAULT_PROCESS_TERMINATE_TIMEOUT_S,
+        )
+
+        timeout_s = (
+            APP_EXIT_PROCESS_TERMINATE_TIMEOUT_S
+            if fast
+            else DEFAULT_PROCESS_TERMINATE_TIMEOUT_S
+        )
+        self._stop_local_service(terminate_timeout_s=timeout_s)
 
 
 class GenieServiceSupervisor(TTSServiceSupervisor):

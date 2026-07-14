@@ -71,6 +71,7 @@ from app.agent.memory_reflector import (
 )
 from app.agent.runtime_limits import RuntimeLoopSettings
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
+from app.agent.turn_routing import resolve_backchannel_schedule
 from app.core.app_context import AppContext
 from app.config.character_loader import (
     THEME_SOURCE_PACKAGE,
@@ -244,6 +245,8 @@ MEMORY_STATUS_DISPLAY_MS = 7_000
 MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SPEAKING_STATE_TIMEOUT_MS = 45_000
 THREAD_SHUTDOWN_WAIT_MS = 1_000
+# 退出时所有受管资源共享的关闭预算，避免 N 个资源各等 1s 叠成数秒。
+SHUTDOWN_TOTAL_BUDGET_MS = 2_500
 USER_IDLE_THRESHOLD_SECONDS = 30
 USER_IDLE_CHECK_INTERVAL_MS = 5_000
 TRANSIENT_PROGRESS_MESSAGE_KEY = "_sakura_transient_progress"
@@ -1367,12 +1370,20 @@ class PetWindow(QWidget):
         subtitle_controller = getattr(self, "subtitle_controller", None)
         if subtitle_controller is not None:
             subtitle_controller.cancel_reply_flow()
+        worker = getattr(self, "worker", None)
+        cancel_worker = getattr(worker, "cancel", None)
+        if callable(cancel_worker):
+            cancel_worker()
         backchannel_controller = getattr(self, "backchannel_controller", None)
-        cancel_backchannel = getattr(backchannel_controller, "cancel", None)
-        if callable(cancel_backchannel):
-            cancel_backchannel()
+        if backchannel_controller is not None:
+            cancel_backchannel = getattr(backchannel_controller, "cancel", None)
+            if callable(cancel_backchannel):
+                cancel_backchannel()
+            shutdown_backchannel = getattr(backchannel_controller, "shutdown", None)
+            if callable(shutdown_backchannel):
+                shutdown_backchannel(timeout=0.25)
         self._stop_proactive_observer()
-        self.resource_manager.stop_all(THREAD_SHUTDOWN_WAIT_MS)
+        self.resource_manager.stop_all(SHUTDOWN_TOTAL_BUDGET_MS)
         self.user_idle_timer.stop()
         self.reminder_timer.stop()
         self.screen_awareness_timer.stop()
@@ -1522,7 +1533,10 @@ class PetWindow(QWidget):
             if not callable(close):
                 continue
             try:
-                close()
+                if getattr(self, "_shutdown_in_progress", False):
+                    close(fast=True)
+                else:
+                    close()
             except Exception as exc:  # noqa: BLE001
                 debug_log(
                     "TTS",
@@ -3412,10 +3426,6 @@ class PetWindow(QWidget):
         self._collapse_auto_fit_bubble_height()
         self._show_waiting_reply_placeholder()
         self._log_interaction_stage("placeholder_reply_shown")
-        # 等待期接话:延迟后若主回复尚未到达,显示一句角色化过渡反应。
-        backchannel = getattr(self, "backchannel_controller", None)
-        if backchannel is not None:
-            backchannel.schedule(text)
 
         visual_observation_jobs: list[VisualObservationJob] = []
         if manual_observation is not None:
@@ -3448,6 +3458,23 @@ class PetWindow(QWidget):
                 runtime_event_queue.drain(),
             )
         request_messages = trim_messages_for_model(request_messages)
+        backchannel = getattr(self, "backchannel_controller", None)
+        if backchannel is not None:
+            turn_settings = getattr(self.agent_runtime, "turn_routing_settings", None)
+            if turn_settings is not None and turn_settings.backchannel_orchestration_enabled:
+                hint = resolve_backchannel_schedule(
+                    request_messages,
+                    proactive_mode=False,
+                    has_vision_client=getattr(self.agent_runtime, "vision_api_client", None)
+                    is not None,
+                    chat_fast_configured=getattr(self.agent_runtime, "chat_fast_api_client", None)
+                    is not None,
+                    settings=turn_settings,
+                )
+                if hint.should_schedule:
+                    backchannel.schedule(text, phase=hint.phase)
+            else:
+                backchannel.schedule(text)
         debug_log(
             "PetWindow",
             "用户消息入队",
@@ -5896,6 +5923,7 @@ class PetWindow(QWidget):
             self.api_client = clients.chat
             self.agent_runtime.api_client = clients.chat
         self.agent_runtime.vision_api_client = clients.vision
+        self.agent_runtime.chat_fast_api_client = clients.chat_fast
         self.memory_curator.api_client = clients.memory_curation
         reflector = getattr(self, "memory_reflector", None)
         if reflector is not None:

@@ -12,34 +12,40 @@ from dataclasses import dataclass, field
 
 
 MODEL_SLOT_CHAT = "chat"
+MODEL_SLOT_CHAT_FAST = "chat_fast"
 MODEL_SLOT_VISION_CHAT = "vision_chat"
 MODEL_SLOT_MEMORY_CURATION = "memory_curation"
 
 MODEL_SLOT_ORDER = (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_MEMORY_CURATION,
 )
 
 MODEL_SLOT_UI_ORDER = (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_MEMORY_CURATION,
 )
 
 MODEL_SLOT_LABELS = {
     MODEL_SLOT_CHAT: "聊天模型",
+    MODEL_SLOT_CHAT_FAST: "快速聊天模型",
     MODEL_SLOT_VISION_CHAT: "视觉模型",
     MODEL_SLOT_MEMORY_CURATION: "记忆整理模型",
 }
 
 MODEL_SLOT_DESCRIPTIONS = {
     MODEL_SLOT_CHAT: "全局默认的角色聊天模型，必填。",
+    MODEL_SLOT_CHAT_FAST: "简单寒暄等轻量轮次使用的快速模型；留空则轻量轮次仍走聊天模型。",
     MODEL_SLOT_VISION_CHAT: "当聊天模型不支持图片，或想要自定义视觉模型时使用；留空则由聊天模型直接看原图。",
     MODEL_SLOT_MEMORY_CURATION: "用于自动整理长期记忆；留空则继承聊天模型。",
 }
 
 MODEL_SLOT_FALLBACKS = {
+    MODEL_SLOT_CHAT_FAST: (MODEL_SLOT_CHAT,),
     MODEL_SLOT_VISION_CHAT: (MODEL_SLOT_CHAT,),
     MODEL_SLOT_MEMORY_CURATION: (MODEL_SLOT_CHAT,),
 }
@@ -92,12 +98,15 @@ class ModelSelectionSettings:
     """各功能实际使用的模型配置。"""
 
     chat: ModelSlotSelection = field(default_factory=ModelSlotSelection)
+    chat_fast: ModelSlotSelection | None = None
     vision_chat: ModelSlotSelection | None = None
     memory_curation: ModelSlotSelection | None = None
 
     def get(self, slot: str) -> ModelSlotSelection | None:
         if slot == MODEL_SLOT_CHAT:
             return self.chat
+        if slot == MODEL_SLOT_CHAT_FAST:
+            return self.chat_fast
         if slot == MODEL_SLOT_VISION_CHAT:
             return self.vision_chat
         if slot == MODEL_SLOT_MEMORY_CURATION:

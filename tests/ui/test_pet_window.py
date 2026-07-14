@@ -1071,6 +1071,10 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
         def cancel(self) -> None:
             order.append("backchannel_cancel")
 
+        def shutdown(self, timeout: float | None = None) -> bool:
+            order.append("backchannel_shutdown")
+            return True
+
     class RecordingResourceManager(ResourceManager):
         def stop_all(self, timeout_ms: int = 1000) -> None:
             order.append("stop_all")
@@ -1118,11 +1122,13 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     assert worker.cancelled is True
     assert thread.interrupted is True
     assert thread.quit_called is True
-    assert thread.waits == [1000]
+    from app.ui.pet_window import SHUTDOWN_TOTAL_BUDGET_MS
+
+    assert thread.waits == [SHUTDOWN_TOTAL_BUDGET_MS]
     assert manager._lingering == [(thread, worker)]
     assert window.messages == []
     assert subtitle.cancelled is True
-    assert order == ["backchannel_cancel", "stop_all"]
+    assert order == ["backchannel_cancel", "backchannel_shutdown", "stop_all"]
 
 
 def test_pet_window_registers_runtime_services_in_registry_order() -> None:
