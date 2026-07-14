@@ -38,8 +38,11 @@ cd sakura-personal
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 
-# 编译 Tauri 设置页与角色工坊（需预先安装 Rust：https://rustup.rs）
-cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..   # 退回到 sakura-personal 根目录
+# 编译 Tauri 设置页与角色工坊
+# 需预先安装 Rust，推荐用 winget：winget install Rustlang.Rustup
+# 或访问 https://rustup.rs 下载安装器。装完后重启终端即可使用 cargo。
+# 以下命令需在项目根目录（sakura-personal）下执行：
+cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..   # 退回到根目录
 cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..     # 同上
 
 # 首次启动会自动进入 Tauri 设置页，在界面内配置 API Profile、模型槽位和角色即可。
