@@ -370,11 +370,21 @@ def _windows_no_window_kwargs() -> dict[str, object]:
 
 
 def _terminate_process_tree(process: _LocalProcessHandle, timeout: int) -> None:
+    """Terminate the process tree within a total deadline of ``timeout`` seconds.
+
+    On Windows, ``taskkill /T /F`` is near-instant; the budget is reserved for
+    ``process.wait``.  On other platforms, ``terminate`` → ``kill`` share the
+    same deadline so the worst case stays bounded by ``timeout`` instead of
+    ``timeout * 3``.
+    """
+    deadline = time.monotonic() + max(0.5, timeout)
     pid = getattr(process, "pid", None)
     if sys.platform == "win32" and pid is not None:
         try:
-            _run_windows_taskkill(pid, timeout)
-            process.wait(timeout=timeout)
+            _run_windows_taskkill(pid, timeout=2)  # /F is fast; 2 s is generous
+            remaining = deadline - time.monotonic()
+            if remaining > 0.1:
+                process.wait(timeout=remaining)
             if process.poll() is not None:
                 return
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -382,10 +392,14 @@ def _terminate_process_tree(process: _LocalProcessHandle, timeout: int) -> None:
 
     process.terminate()
     try:
-        process.wait(timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining > 0.1:
+            process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining > 0.1:
+            process.wait(timeout=remaining)
 
 
 def _build_genie_start_command(python_exe: Path, host: str, port: int) -> list[str]:
