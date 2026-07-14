@@ -24,30 +24,78 @@
 |------|------|
 | 系统 | 主要在 **Windows 10/11** 下开发与测试 |
 | Python | 3.10+（推荐 3.11），路径需为**纯英文** |
-| 构建 | Tauri 设置/工坊需预先 `cargo build`（见下方） |
-| 网络 | 需能访问所配置的 LLM / TTS 服务端点 |
+| 构建 | 首次需本地编出 Tauri **设置页**（见下方）；角色工坊可选 |
+| 网络 | 需能访问所配置的 LLM / TTS 服务端点；角色包从上游 Release 下载 |
 
 ---
 
-## 快速开始
+## 快速开始（Windows CMD）
 
-```powershell
+下列命令按 **CMD** 书写。已有 `.venv`、已编过设置页、已有角色包时，**跳过对应步骤**，直接 `run.bat` 即可，不必重装。
+
+> 本 fork 使用 `run.bat` + 自建 `.venv`，**不要**跟 `docs/SETUP.md` 里上游的 `install.bat` / `start.bat` / `runtime/`（那是 Release 完整包流程）。
+
+### 1. 拉取
+
+```bat
 git clone https://github.com/Asphodelusu/sakura-personal.git
 cd sakura-personal
-
-python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
-
-# 首次构建 Tauri 宿主（设置 + 角色工坊）
-cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..
-cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
-
-# 首次启动会自动进入 Tauri 设置页，在界面内配置 API Profile、模型槽位和角色即可。
-# 详细配置说明见 docs/API_CONFIG.md。
-.\run.bat
 ```
 
-> 本 fork 使用 `run.bat` + 自建 `.venv`，而非上游 `start.bat` + 内置 `runtime/`。
+### 2. Python 依赖（仅当还没有 `.venv`）
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
+
+已有可用的 `.venv` 则跳过。`requirements.txt` 含 `sentence-transformers` 等，**首次安装可能较慢**。
+
+### 3. Tauri 设置页（仅当还没有 `sakura-settings.exe`）
+
+首次启动会打开设置程序；缺失时会直接报错。检测：
+
+```bat
+dir tools\settings-tauri\src-tauri\target\release\sakura-settings.exe
+```
+
+若提示找不到文件，先装好 [Rust](https://rustup.rs)（或 `winget install Rustlang.Rustup`），装完**重新打开 CMD**，再在项目根目录执行：
+
+```bat
+cd tools\settings-tauri\src-tauri
+cargo build --release
+cd ..\..\..
+```
+
+Windows 上若 `cargo` 报找不到 `link.exe`，需另装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（勾选“使用 C++ 的桌面开发”）。多数 Win10/11 已带 WebView2；若设置页窗口起不来再装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+
+角色工坊**不是**首启必需。只有要用 `start_studio.bat` / 设置里改角色时才编：
+
+```bat
+cd tools\studio-tauri\src-tauri
+cargo build --release
+cd ..\..\..
+```
+
+### 4. 默认角色包（仅当还没有 `characters\*\character.json`）
+
+本仓库不附带角色资源（`characters/` 已 gitignore）。可从上游 **v0.9.9** Release 下载默认包（约数百 MB）：
+
+```bat
+curl -L -o Sakura.char https://github.com/Rvosy/Sakura/releases/download/v0.9.9/Sakura.char
+```
+
+浏览器下载也行：[Rvosy/Sakura Releases](https://github.com/Rvosy/Sakura/releases) → 附件 **`Sakura.char`**。
+
+启动后会进入首次设置页，在界面里 **导入 .char**（选刚下的文件）。已有角色目录则可跳过本步。
+
+### 5. 启动
+
+```bat
+run.bat
+```
+
+首次进入 Tauri 设置后配置 API Profile、模型槽位，并完成角色导入。详细说明见 [docs/API_CONFIG.md](docs/API_CONFIG.md)。
 
 ---
 
@@ -97,7 +145,7 @@ cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
 | 文档 | 内容 |
 |------|------|
 | [API 配置](docs/API_CONFIG.md) | Profile、model_slots、供应商示例 |
-| [安装指南](docs/SETUP.md) | 详细安装与角色包 |
+| [安装指南](docs/SETUP.md) | 上游 Release 完整包流程（**本 fork 源码请优先看上方快速开始**） |
 | [技术说明](docs/TECHNICAL_README.md) | 架构与目录结构 |
 | [更新日志](CHANGELOG.md) | 版本变更记录 |
 | [AGENTS.md](AGENTS.md) | 仓库内 AI Agent 协作约定 |

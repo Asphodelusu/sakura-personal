@@ -1,6 +1,20 @@
 # Sakura 安装与配置指南
 
-> 快速开始请看 [README.md](../README.md)；API 配置教程请看 [API_CONFIG.md](API_CONFIG.md)；macOS 专项问题请看 [MACOS_SETUP.md](MACOS_SETUP.md)。
+> **Personal Edition / 源码用户：** 请先看根目录 [README.md](../README.md) 的「快速开始（Windows CMD）」——本 fork 使用 `.venv` + `run.bat`，**不要**按下文安装 `runtime/` 或运行 `install.bat` / `start.bat`。  
+> API 配置见 [API_CONFIG.md](API_CONFIG.md)；macOS 专项见 [MACOS_SETUP.md](MACOS_SETUP.md)。  
+> 下文主要保留上游 **Release 完整包** 的安装说明，并补充角色包来源。
+
+---
+
+## 角色包（`.char`）——源码用户也可单独下载
+
+上游 Release 附件中的 **`Sakura.char`**（约数百 MB）为含语音资源的默认角色包。CMD 示例（版本号可随上游最新 Release 调整）：
+
+```bat
+curl -L -o Sakura.char https://github.com/Rvosy/Sakura/releases/download/v0.9.9/Sakura.char
+```
+
+页面入口：[Rvosy/Sakura Releases](https://github.com/Rvosy/Sakura/releases)。下载后在软件设置中 **导入 .char**。
 
 ---
 
