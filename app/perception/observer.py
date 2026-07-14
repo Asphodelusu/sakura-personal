@@ -51,7 +51,7 @@ OnMemoryRecordFn = Callable[[str], "None"]
 # ---------------------------------------------------------------------------
 
 _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚才悄悄看了一眼用户的屏幕，给你看。
-你要严格按 JSON 输出，判断要不要插一句话。
+你要严格按 JSON 输出，判断要不要插一句话，以及建议下次多久后再看。
 
 判断标准：
 - 用户在专心工作（写代码、读文档、写文章）：should_speak=false，别打扰
@@ -60,8 +60,14 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚
 - 看到有趣的/错的/奇怪的内容：可以吐槽
 - 不确定：选 false，宁静默不烦人
 
+suggested_interval 是你觉得下次看屏幕之前的等待秒数：
+- 用户很专注（写代码/文档/开会）：建议长一点（600-1800 秒）
+- 用户在休闲（浏览/看视频）：建议短一点（120-480 秒）
+- 默认/不确定：480 秒
+- 有效范围 120-1800 秒
+
 只输出 JSON，不要 markdown 不要解释：
-{"should_speak": true|false, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
+{"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
 
 comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
 """
@@ -85,6 +91,11 @@ class ProactiveConfig:
     request_timeout: float = 30.0  # VLM API 超时
     eval_temperature: float = 0.7
     max_tokens: int = 1024
+    # 自适应间隔范围（秒）
+    adaptive_interval_min: float = 120.0
+    adaptive_interval_max: float = 1800.0
+    # away_mode 最大持续时间（秒），超时自动恢复
+    away_max_seconds: float = 12 * 3600
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "ProactiveConfig":
@@ -103,6 +114,9 @@ class ProactiveConfig:
             request_timeout=float(d.get("request_timeout", 30.0)),
             eval_temperature=float(d.get("eval_temperature", 0.7)),
             max_tokens=int(d.get("max_tokens", 1024)),
+            adaptive_interval_min=float(d.get("adaptive_interval_min", 120.0)),
+            adaptive_interval_max=float(d.get("adaptive_interval_max", 1800.0)),
+            away_max_seconds=float(d.get("away_max_seconds", 12 * 3600)),
         )
 
 
@@ -149,9 +163,14 @@ class ProactiveObserver:
         self._last_user_at = time.monotonic()
         self._last_window_title = ""
         self._last_timer_check = time.monotonic()
+        self._next_timer_at: float = 0.0  # 自适应下次检查时间
         self._last_eval_at = 0.0
         self._last_window_trigger_at = 0.0
         self._idle_armed = True
+
+        # Away mode（用户明确告知离开时暂停感知）
+        self._away_mode: bool = False
+        self._away_set_at: float = 0.0
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -173,6 +192,30 @@ class ProactiveObserver:
     def notify_user_spoke(self) -> None:
         self._last_user_at = time.monotonic()
         self._idle_armed = True
+        # 用户发消息 → 自动退出 away_mode
+        if self._away_mode:
+            self.set_away_mode(False)
+            logger.info("ProactiveObserver: away_mode cleared by user message")
+            _observer_gui_log("用户归来，away_mode 自动解除")
+
+    # ---- away mode -----------------------------------------------------------
+
+    def set_away_mode(self, value: bool) -> None:
+        """设置离开模式：True=暂停感知，False=恢复正常。"""
+        self._away_mode = bool(value)
+        self._away_set_at = time.monotonic() if value else 0.0
+        if value:
+            self._idle_armed = True
+            self._next_timer_at = 0.0  # 重置自适应计时器
+            logger.info("ProactiveObserver: away_mode ON")
+            _observer_gui_log("away_mode 已开启")
+        else:
+            logger.info("ProactiveObserver: away_mode OFF")
+            _observer_gui_log("away_mode 已关闭")
+
+    @property
+    def away_mode(self) -> bool:
+        return self._away_mode
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -276,6 +319,17 @@ class ProactiveObserver:
     def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
 
+        # Away mode check — hard silence when user explicitly said they're away
+        if self._away_mode:
+            away_elapsed = now - self._away_set_at
+            if away_elapsed >= self.config.away_max_seconds:
+                # 超时自动恢复
+                self.set_away_mode(False)
+                logger.info("ProactiveObserver: away_mode auto-expired after {:.0f}s", away_elapsed)
+                _observer_gui_log("away_mode 超时自动恢复")
+            else:
+                return []  # 完全静默，不截图不评估
+
         # Absolute filters — silence required
         if now - self._last_user_at < self.config.min_silence_after_user:
             return []
@@ -286,9 +340,12 @@ class ProactiveObserver:
 
         triggers: list[str] = []
 
-        if now - self._last_timer_check >= self.config.timer_seconds:
+        # Adaptive timer: use LLM-suggested interval if available, else fallback to fixed
+        timer_target = self._next_timer_at if self._next_timer_at > 0 else (self._last_timer_check + self.config.timer_seconds)
+        if now >= timer_target:
             triggers.append("timer")
             self._last_timer_check = now
+            self._next_timer_at = 0.0  # reset, will be set again after evaluation
 
         if self.config.window_switch_enabled:
             cur = get_active_window_title()
@@ -376,6 +433,16 @@ class ProactiveObserver:
         if not parsed:
             logger.warning("ProactiveObserver: no JSON in response: {!r}", response[:200])
             return
+
+        # Adaptive interval: use LLM-suggested value, clamped to safe range
+        suggested = parsed.get("suggested_interval")
+        if isinstance(suggested, (int, float)) and suggested > 0:
+            clamped = max(self.config.adaptive_interval_min,
+                          min(float(suggested), self.config.adaptive_interval_max))
+            self._next_timer_at = time.monotonic() + clamped
+            logger.debug("ProactiveObserver: adaptive interval set to {:.0f}s (requested {:.0f}s)", clamped, suggested)
+        else:
+            self._next_timer_at = 0.0  # fallback to default timer
 
         if not parsed.get("should_speak"):
             logger.debug("ProactiveObserver: silent (reason: {})", parsed.get("reason", ""))

@@ -7,11 +7,8 @@ from app.llm.prompts.types import PromptBlock
 DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
 DEFAULT_REPLY_PORTRAITS = ["站立待机"]
 
-DESKTOP_PET_CONTEXT = """【桌宠运行规则】
-- 你是桌面宠物，存在于用户电脑桌面，通过窗口、语音和文字互动。
-- 回复应自然适合朗读，不输出 Markdown、动作旁白、括号心理活动或系统说明。
-- 不声称拥有现实身体或触感；现实行动转成桌宠式陪伴（送别、等待、提醒安全）。
-- 现实接触保持温柔边界：可以说隔着屏幕陪伴，不描写真实身体接触。"""
+DESKTOP_PET_CONTEXT = """【互动方式】
+你的声音和文字，就是你触碰他的方式。"""
 
 JSON_ONLY_INSTRUCTION = "只返回 JSON，不用 Markdown 代码块，不输出额外解释。"
 
