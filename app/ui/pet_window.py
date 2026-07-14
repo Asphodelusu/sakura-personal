@@ -3123,6 +3123,40 @@ class PetWindow(QWidget):
         self._init_proactive_observer()
         self._start_proactive_observer()
 
+    # ------------------------------------------------------------------
+    # Away mode detection — user explicitly says they're leaving
+    # ------------------------------------------------------------------
+
+    _AWAY_PATTERNS: tuple[tuple[str, ...], ...] = (
+        ("我出去了", "先走了", "出门了", "我走了", "离开一下", "我出去了哦"),
+        ("别回", "不要回", "别说话", "不用回", "不用说话", "暂时不要说话"),
+        ("忙去了", "去忙", "工作去了", "开会去了"),
+        ("睡", "晚安", "おやすみ"),
+    )
+
+    def _detect_away_from_message(self, text: str) -> None:
+        """检测用户消息是否隐含'我要离开'意图，触发 away_mode。
+
+        只要用户发了任意新消息，notify_user_spoke() 就会自动清除 away_mode，
+        所以这里只负责开启。"""
+        observer = getattr(self, "_proactive_observer", None)
+        if observer is None:
+            return
+        if observer.away_mode:
+            return  # already in away mode
+
+        text_lower = text.lower()
+        for group in self._AWAY_PATTERNS:
+            for keyword in group:
+                if keyword in text:
+                    debug_log(
+                        "PetWindow",
+                        "检测到离开意图，触发 away_mode",
+                        {"keyword": keyword, "text": text[:80]},
+                    )
+                    observer.set_away_mode(True)
+                    return
+
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
         observer = getattr(self, "_proactive_observer", None)
@@ -3374,6 +3408,7 @@ class PetWindow(QWidget):
         text = self.input_edit.text().strip()
         manual_observation = self.pending_manual_screen_observation
         self._mark_user_activity()
+        self._detect_away_from_message(text)
         if not self.active_interaction_id:
             self._begin_interaction(source)
         self._log_interaction_stage(
