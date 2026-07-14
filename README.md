@@ -2,7 +2,7 @@
 
 # Sakura Desktop Pet — Personal Edition
 
-基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) **0.9.9** 的个人维护分支（[`dev2`](https://github.com/Asphodelusu/sakura-personal)）。
+基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) **0.9.9** 的个人维护分支（[`main`](https://github.com/Asphodelusu/sakura-personal)）。
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -42,7 +42,8 @@ python -m venv .venv
 cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..
 cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
 
-# 配置 data/config/api.yaml、characters.yaml 等（见 docs/API_CONFIG.md）
+# 首次启动会自动进入 Tauri 设置页，在界面内配置 API Profile、模型槽位和角色即可。
+# 详细配置说明见 docs/API_CONFIG.md。
 .\run.bat
 ```
 
@@ -62,13 +63,16 @@ cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
 
 ### 个人向增强（相对上游）
 
-- **三分流 LLM** — 例如 DeepSeek 聊天 + 智谱视觉/记忆整理（`api_profiles` + `model_slots`）
-- **STT 语音输入** — SenseVoice，`Alt+T` 快捷键
-- **记忆反思** — 空闲时自动回顾与整理长期记忆
-- **主动屏幕感知** — ProactiveObserver + 定时批次截图上下文
+- **多模型槽位分流** — chat / chat_fast / vision / memory_curation 独立配置（`api_profiles` + `model_slots`）
+- **STT 语音输入** — SenseVoice，`Alt+T` 快捷键，VAD 自动结束
+- **记忆系统** — 记忆整理（混合静默触发）+ 记忆反思（定时深层回顾），向量数据库时间衰减召回
+- **主动屏幕感知** — ProactiveObserver + 定时截图 + 隐私过滤，视觉模型评估是否发言
+- **双语对话** — 气泡显示中文，TTS 播放日语，多参考音色自动选段
+- **心情系统（心の記録）** — Sakura 自行判断是否记录心情笔记，不强制
 - **Agent 工具循环优化** — 工具组按需激活、网页搜索收束、同轮去重
 - **立绘映射** — tone → portrait 自动回退
 - **本地 LLM 路由预留** — `RoutingLlmClient`（默认走云端，本地为实验项）
+- **Backchannel 接话** — 对话间隙自然插话（⚠️ 测试中，效果不理想，不建议使用）
 
 ### 已移除的旧实现
 
