@@ -38,9 +38,9 @@ cd sakura-personal
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 
-# 首次构建 Tauri 宿主（设置 + 角色工坊）
-cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..
-cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..
+# 编译 Tauri 设置页与角色工坊（需预先安装 Rust：https://rustup.rs）
+cd tools\settings-tauri\src-tauri && cargo build --release && cd ..\..\..   # 退回到 sakura-personal 根目录
+cd tools\studio-tauri\src-tauri && cargo build --release && cd ..\..\..     # 同上
 
 # 首次启动会自动进入 Tauri 设置页，在界面内配置 API Profile、模型槽位和角色即可。
 # 详细配置说明见 docs/API_CONFIG.md。
