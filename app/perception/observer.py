@@ -366,6 +366,8 @@ class ProactiveObserver:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._http: httpx.AsyncClient | None = None
         self._last_busy_log_at: float = 0.0
+        self._was_busy = False
+        self._last_busy_reason = ""
 
     @property
     def enabled(self) -> bool:
@@ -485,10 +487,12 @@ class ProactiveObserver:
                 try:
                     busy = self._is_busy()
                     if busy:
+                        reason = busy if isinstance(busy, str) else "busy"
+                        self._was_busy = True
+                        self._last_busy_reason = reason
                         now_busy = time.monotonic()
                         if now_busy - self._last_busy_log_at >= 60.0:
                             self._last_busy_log_at = now_busy
-                            reason = busy if isinstance(busy, str) else "busy"
                             logger.info(
                                 "ProactiveObserver: UI busy, holding triggers ({})",
                                 reason,
@@ -498,6 +502,12 @@ class ProactiveObserver:
                                 {"reason": reason},
                             )
                         continue
+                    if self._was_busy:
+                        self._was_busy = False
+                        logger.info(
+                            "ProactiveObserver: UI idle, resuming (was: {})",
+                            self._last_busy_reason,
+                        )
                     triggers = await self._collect_triggers()
                     if not triggers:
                         continue
