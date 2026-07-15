@@ -729,3 +729,58 @@ def _latest_user_text(messages: list[ChatMessage]) -> str | None:
             return "\n".join(parts)
         return ""
     return None
+
+
+# ---- 助手搜索意图检测 ----
+
+_SEARCH_INTENT_JA_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"調べてくる|調べてきます|調べてみる|調べてみよう"),
+    re.compile(r"検索してみる|検索してみよう|検索してくる"),
+    re.compile(r"探してくる|探してみる|探してみよう"),
+    re.compile(r"(攻略|情報|データ|詳細|意味).*(調べ|検索|探)"),
+)
+
+_SEARCH_INTENT_ZH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(我去|我来|帮你|给你|替你|帮你).{0,4}(查|搜|搜索|找)(一下|看|一查|一搜|找)"),
+    re.compile(r"(查|搜|搜索)一下(攻略|资料|信息|看看)"),
+    re.compile(r"(攻略|信息|资料|数据).{0,3}(查|搜|搜索|找)"),
+)
+
+
+def assistant_intends_web_search(assistant_content: str) -> bool:
+    """检查助手的 segmented JSON 回复是否表达了『我去查/搜』的意图。
+
+    当助手嘴上说了要去搜索但没有实际发起 tool_call 时，
+    工具循环应补激活 mcp 组并继续，让模型兑现承诺。
+    """
+    text = _extract_segmented_text(assistant_content)
+    if not text:
+        return False
+    for pattern in _SEARCH_INTENT_JA_PATTERNS:
+        if pattern.search(text):
+            return True
+    for pattern in _SEARCH_INTENT_ZH_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _extract_segmented_text(segmented_json: str) -> str:
+    """从 segmented reply JSON 中提取 ja + zh 可读文本。"""
+    try:
+        data = json.loads(segmented_json)
+    except (json.JSONDecodeError, TypeError):
+        return segmented_json
+    segments = data.get("segments") if isinstance(data, dict) else None
+    if not isinstance(segments, list):
+        return ""
+    parts: list[str] = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            ja = seg.get("ja")
+            zh = seg.get("zh")
+            if isinstance(ja, str):
+                parts.append(ja)
+            if isinstance(zh, str):
+                parts.append(zh)
+    return " ".join(parts)

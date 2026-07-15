@@ -561,46 +561,30 @@ class AppSettingsService:
         save_yaml_mapping(self.system_config_path, data)
 
     def load_screen_awareness_settings(self) -> ScreenAwarenessSettings:
-        screen_awareness = self._system_section("screen_awareness")
-        if not screen_awareness:
-            screen_awareness = self._system_section("proactive_care")
+        """已合并到 ProactiveObserver；从 proactive 配置读取 enabled 状态。
+
+        若尚未写入 proactive.enabled，则回退到旧 screen_awareness.enabled，避免迁移后误开。
+        """
+        enabled = self._resolve_proactive_enabled(default=True)
+        # observer 接管了旧系统；仅 enabled 字段有效，其余返回默认值（不再使用）
         return ScreenAwarenessSettings(
-            enabled=_bool_value(screen_awareness.get("enabled"), True),
-            screen_context_enabled=_bool_value(
-                screen_awareness.get("screen_context_enabled"),
-                True,
-            ),
-            check_interval_minutes=_int_value(
-                screen_awareness.get("check_interval_minutes"),
-                SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
-            ),
-            cooldown_minutes=_int_value(
-                screen_awareness.get("cooldown_minutes"),
-                SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
-            ),
-            screen_context_batch_limit=_int_value(
-                screen_awareness.get("screen_context_batch_limit"),
-                SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
-            ),
-            screen_context_resolution=str(
-                screen_awareness.get(
-                    "screen_context_resolution",
-                    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
-                )
-            ),
+            enabled=enabled,
+            screen_context_enabled=True,  # observer 不需要单独的 context 开关
+            check_interval_minutes=SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
+            cooldown_minutes=SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
+            screen_context_batch_limit=SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
+            screen_context_resolution=SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
         )
 
     def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
+        """已合并到 ProactiveObserver；写入 proactive.enabled。"""
         normalized = settings.normalized()
         data = load_yaml_mapping(self.system_config_path)
-        data["screen_awareness"] = {
-            "enabled": bool(normalized.enabled),
-            "screen_context_enabled": bool(normalized.screen_context_enabled),
-            "check_interval_minutes": int(normalized.check_interval_minutes),
-            "cooldown_minutes": int(normalized.cooldown_minutes),
-            "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
-            "screen_context_resolution": normalized.screen_context_resolution,
-        }
+        proactive = data.get("proactive", {})
+        if not isinstance(proactive, dict):
+            proactive = {}
+        proactive["enabled"] = bool(normalized.enabled)
+        data["proactive"] = proactive
         save_yaml_mapping(self.system_config_path, data)
 
     def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
@@ -610,9 +594,20 @@ class AppSettingsService:
     def load_proactive_config(self) -> dict[str, Any]:
         """加载主动屏幕感知 ProactiveObserver 的运行时配置。"""
         proactive = self._system_section("proactive")
-        if not isinstance(proactive, dict):
-            return {}
-        return dict(proactive)
+        result = dict(proactive) if isinstance(proactive, dict) else {}
+        if "enabled" not in result:
+            result["enabled"] = self._resolve_proactive_enabled(default=True)
+        return result
+
+    def _resolve_proactive_enabled(self, *, default: bool) -> bool:
+        """优先 proactive.enabled，其次旧 screen_awareness.enabled。"""
+        proactive = self._system_section("proactive")
+        if isinstance(proactive, dict) and "enabled" in proactive:
+            return _bool_value(proactive.get("enabled"), default)
+        legacy = self._system_section("screen_awareness")
+        if isinstance(legacy, dict) and "enabled" in legacy:
+            return _bool_value(legacy.get("enabled"), default)
+        return default
 
     def save_proactive_care_settings(self, settings: ScreenAwarenessSettings) -> None:
         """兼容旧调用点；新代码请使用 save_screen_awareness_settings。"""

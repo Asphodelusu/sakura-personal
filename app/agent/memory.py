@@ -18,6 +18,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from app.agent.persona_state import normalize_emotion
+from app.backchannel.emotion import EmotionScorer
+from app.backchannel.models import DEFAULT_EMOTION
 from app.core.resource_manager import (
     ResourceRegistry,
     ThreadGroupResource,
@@ -875,6 +877,91 @@ class MemoryStore:
         path = StoragePaths(self.base_dir).memory_mood_state()
         atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
+    # --- 用户情绪轨迹 --------------------------------------------------------
+
+    def user_emotion_state(self) -> dict[str, Any] | None:
+        """读取当前检测到的用户情绪；缺失时返回 None。"""
+        data = self._load_user_emotion_state()
+        entry = data.get(self.scope_id) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        content = str(entry.get("content", "")).strip()
+        if not content:
+            return None
+        result: dict[str, Any] = {"id": f"user_emotion:{self.scope_id}", "content": content, "metadata": {"layer": "user_emotion"}}
+        history = entry.get("history", [])
+        if isinstance(history, list) and history:
+            result["history"] = [
+                {"content": str(h.get("content", "")).strip(), "timestamp": str(h.get("timestamp", ""))}
+                for h in history
+                if isinstance(h, dict) and str(h.get("content", "")).strip()
+            ]
+        return result
+
+    def user_emotion_history(self) -> list[dict[str, str]]:
+        """读取用户情绪历史（不含当前），最近在前。"""
+        data = self._load_user_emotion_state()
+        entry = data.get(self.scope_id) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return []
+        history = entry.get("history", [])
+        if not isinstance(history, list):
+            return []
+        return [
+            {"content": str(h.get("content", "")), "timestamp": str(h.get("timestamp", ""))}
+            for h in history
+            if isinstance(h, dict) and str(h.get("content", "")).strip()
+        ]
+
+    def record_user_emotion(self, text: str) -> None:
+        """从用户输入中检测情绪并写入轨迹；无可靠信号时不写入。
+
+        同情绪重复出现时只刷新 updated_at，不挤一条假历史，避免
+        「连续五次都是 happy」其实只是连聊了五句带「开心」。
+        """
+        content = (text or "").strip()
+        if not content:
+            return
+        try:
+            scorer = EmotionScorer()
+            emotion = scorer.best(content)
+        except Exception:
+            return
+        if emotion is None or emotion == DEFAULT_EMOTION:
+            return
+        data = self._load_user_emotion_state()
+        now = _now_iso()
+        existing = data.get(self.scope_id) if isinstance(data, dict) else None
+        prev_content = ""
+        history: list[Any] = []
+        if isinstance(existing, dict):
+            prev_content = str(existing.get("content", "")).strip()
+            raw_history = existing.get("history", [])
+            if isinstance(raw_history, list):
+                history = list(raw_history)
+            if prev_content and prev_content != emotion:
+                history.insert(
+                    0,
+                    {"content": prev_content, "timestamp": existing.get("updated_at", "")},
+                )
+                history = history[:5]
+        data[self.scope_id] = {"content": emotion, "updated_at": now, "history": history}
+        self._save_user_emotion_state(data)
+
+    def _load_user_emotion_state(self) -> dict[str, Any]:
+        path = StoragePaths(self.base_dir).memory_user_emotion_state()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_user_emotion_state(self, data: dict[str, Any]) -> None:
+        path = StoragePaths(self.base_dir).memory_user_emotion_state()
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
     def build_memory_context(self, query: str = "", *, mode: str = "chat") -> str:
         """按当前对话场景构建分层记忆注入文本。"""
 
@@ -911,14 +998,18 @@ class MemoryStore:
         include_procedural = _query_needs_procedural_memory(query_text, mode)
         include_episodic = _query_needs_episodic_memory(query_text, mode)
         mood_state = self.mood_state()
+        self.record_user_emotion(query_text)
+        user_emotion_state = self.user_emotion_state()
         return _format_memory_context(
             core_profile=core_profile,
             mood_state=mood_state,
+            user_emotion_state=user_emotion_state,
             semantic=grouped[MEMORY_LAYER_SEMANTIC][:8],
             episodic=grouped[MEMORY_LAYER_EPISODIC][:3] if include_episodic else [],
             procedural=grouped[MEMORY_LAYER_PROCEDURAL][:3] if include_procedural else [],
             session=grouped[MEMORY_LAYER_SESSION][:3],
             status=status,
+            query=query_text,
         )
 
     def search_memory(
@@ -989,6 +1080,7 @@ class MemoryStore:
             memory
             for memory in memories
             if not memory_record_is_expired(memory)
+            and not _memory_is_released(memory)
             and _memory_matches_filters(
                 memory,
                 layer=layer_filter,
@@ -1107,6 +1199,7 @@ class MemoryStore:
         if mem is None:
             return self._loading_response()
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
+        _save_revision(self.base_dir, memory_id, previous, reason=arguments.get("reason", ""))
         metadata = _memory_metadata(
             arguments,
             scope_id=self.scope_id,
@@ -1220,6 +1313,32 @@ class MemoryStore:
             "curation_cache_reset": cache_reset,
             "already_missing": already_missing,
         }
+
+    def release_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
+        """主动放手一条记忆：标记 released 但不删除，检索时跳过。"""
+        memory_id = _required_text(arguments, "id")
+        if _is_core_profile_id(memory_id):
+            return {"released": {"id": memory_id, "content": ""}, "ok": False, "reason": "core_profile 不能放手"}
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
+        if mem is None:
+            return self._loading_response()
+        previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
+        if not previous:
+            return {"released": {"id": memory_id, "content": ""}, "ok": False, "reason": "记忆不存在"}
+        content = str(previous.get("content") or previous.get("memory") or "")
+        metadata = _memory_metadata(
+            {"status": "released", "source": str(previous.get("source") or "")},
+            scope_id=self.scope_id,
+            existing=previous,
+            updated_at=_now_iso(),
+        )
+        mem.update(memory_id, content, metadata=metadata)
+        return {"released": {"id": memory_id, "content": content[:80]}, "ok": True}
 
     def reset_curation_cache(self, *, wait: bool = True) -> dict[str, int]:
         """清理当前角色的 mem0 整理缓存，不影响 Sakura 自己的聊天历史文件。"""
@@ -2020,6 +2139,10 @@ def _memory_metadata(
     emotion_value = _optional_text(arguments, "emotion") or str(metadata.get("emotion") or "").strip()
     if emotion_value:
         metadata["emotion"] = normalize_emotion(emotion_value)
+    # status 需透传：release_memory 依赖 metadata.status == "released"
+    status_value = _optional_text(arguments, "status") or str(metadata.get("status") or "").strip()
+    if status_value:
+        metadata["status"] = status_value.strip().lower()
     if arguments.get("volatile") is True:
         metadata["volatile"] = True
     elif str(arguments.get("volatile", "")).strip().lower() == "false":
@@ -2153,6 +2276,87 @@ def memory_record_is_expired(record: dict[str, Any], *, now: datetime | None = N
     return False
 
 
+def _memory_is_released(record: dict[str, Any]) -> bool:
+    """记忆是否已被主动放手（不参与检索）。"""
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    status = str(record.get("status") or metadata.get("status") or "").strip().lower()
+    return status == "released"
+
+
+def _save_revision(base_dir: Path | None, memory_id: str, previous: dict[str, Any] | None, *, reason: str = "") -> None:
+    """保存记忆的旧版本到 revisions 文件。
+
+    失败只记日志，绝不阻断真正的 update_memory 写回。
+    """
+    if previous is None or not memory_id or base_dir is None:
+        return
+    content = str(previous.get("content") or previous.get("memory") or "").strip()
+    if not content or len(content) < 10:
+        return
+    try:
+        revisions_path = StoragePaths(base_dir).memory_revisions()
+        if revisions_path.exists():
+            data = json.loads(revisions_path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        entry = {
+            "content": content,
+            "updated_at": _now_iso(),
+            "reason": str(reason or "update"),
+        }
+        revisions = data.get(memory_id)
+        if isinstance(revisions, list):
+            revisions.append(entry)
+        else:
+            data[memory_id] = [entry]
+        revisions_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            revisions_path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001 — 修订归档是旁路，不能拖垮主写入
+        logging.getLogger(__name__).debug("save memory revision failed: %s", exc)
+
+
+def _detect_memory_contradiction(
+    query: str,
+    memories: list[dict[str, Any]],
+) -> str:
+    """轻量矛盾检测：关键词重叠 + 否定/修正词 → 提示记忆可能有误。"""
+    if not query or not memories:
+        return ""
+    query_lower = query.strip().lower()
+    # 检测否定/修正信号
+    negation_signals = [
+        "不是", "不对", "错了", "没有", "其实", "并非",
+        "違う", "そうじゃなくて", "本当は", "実は",
+    ]
+    has_negation = any(sig in query_lower for sig in negation_signals)
+    if not has_negation:
+        return ""
+    # 提取 query 中的关键词（2-4 字的中文/日文片段）
+    keywords: set[str] = set()
+    for word in re.findall(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]{2,4}", query_lower):
+        keywords.add(word)
+    if not keywords:
+        return ""
+    # 检查是否有记忆包含相同关键词
+    matched = 0
+    for memory in memories:
+        content = str(memory.get("content") or memory.get("memory") or "").lower()
+        if any(kw in content for kw in keywords):
+            matched += 1
+    if matched >= 1:
+        return (
+            "相手の言葉に、あなたの記憶と食い違う内容が含まれているようだ。"
+            "必要なら確認して、間違っていたらメモを修正してもいい。"
+        )
+    return ""
+
+
 def _rank_memories(memories: list[dict[str, Any]], *, query: str) -> list[dict[str, Any]]:
     query_text = query.strip().lower()
 
@@ -2182,11 +2386,13 @@ def _format_memory_context(
     *,
     core_profile: dict[str, Any] | None,
     mood_state: dict[str, Any] | None = None,
+    user_emotion_state: dict[str, Any] | None = None,
     semantic: list[dict[str, Any]],
     episodic: list[dict[str, Any]],
     procedural: list[dict[str, Any]],
     session: list[dict[str, Any]],
     status: str = "",
+    query: str = "",
 ) -> str:
     sections: list[str] = []
     if status.strip():
@@ -2194,7 +2400,38 @@ def _format_memory_context(
     if core_profile is not None:
         content = _clip_text(str(core_profile.get("content") or ""), CORE_PROFILE_CONTEXT_BUDGET)
         if content:
-            sections.append(f"【常驻档案】\n{content}")
+            sections.append(f"【常驻档案 — 这些是你始终记得的，是构成「你是谁」的一部分】\n{content}")
+    # 情感联动：从检索到的记忆中提取情绪色彩，影响当前语气倾向
+    all_memories = [m for m in (semantic + episodic + procedural + session) if not _memory_is_released(m)]
+    emotion_counts: dict[str, int] = {}
+    for memory in all_memories:
+        meta = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        em = str(meta.get("emotion") or "").strip().lower()
+        if em and em != "neutral":
+            emotion_counts[em] = emotion_counts.get(em, 0) + 1
+    if emotion_counts:
+        dominant = max(emotion_counts, key=lambda k: emotion_counts[k])
+        total = sum(emotion_counts.values())
+        if total >= 2 and emotion_counts[dominant] >= total * 0.4:
+            emotion_hints = {
+                "sad": "あなたが今触れている記憶には寂しさや悲しみが滲んでいる。その気配が、あなたの言葉の端々に少しだけ表れるかもしれない。",
+                "lonely": "思い出した記憶の多くが孤独な色をしている。今は少しだけ、言葉が短くなったり、間が増えたりするかもしれない。",
+                "happy": "今思い出しているのはあたたかい記憶だ。あなたの声には自然と柔らかさが混ざる。",
+                "tender": "大切なことを思い出している。言葉がいつもより優しくなる。",
+                "warm": "思い出があなたを少しだけほぐしている。",
+                "determined": "思い出すのは、あなたが何かを守ろうとした瞬間だ。芯の通った声になる。",
+                "anxious": "今触れている記憶には不安が潜んでいる。少し慎重になるかもしれない。",
+                "frustrated": "思い出したことに、やりきれなさが混ざっている。",
+                "defensive": "思い出があなたの警戒心を少しだけ呼び覚ましている。",
+                "hopeful": "思い出の中に、希望が見えている。",
+            }
+            hint = emotion_hints.get(dominant, f"今思い出している記憶には「{dominant}」という感情が共通して流れている。")
+            sections.append(f"【記憶の色】\n{hint}")
+    # 轻量矛盾检测：用户消息与已注入记忆之间是否存在关键词层面的冲突
+    if query:
+        contradiction_hint = _detect_memory_contradiction(query, all_memories)
+        if contradiction_hint:
+            sections.append(f"【記憶の齟齬】\n{contradiction_hint}")
     if mood_state is not None:
         mood_content = _clip_text(str(mood_state.get("content") or ""), MOOD_CONTEXT_BUDGET)
         if mood_content:
@@ -2215,6 +2452,24 @@ def _format_memory_context(
                     parts.append("回顾之前的心情，你能感受到自己的情绪是怎么走到现在的。")
             parts.append("它会自然影响你的语气和节奏——高兴时轻快，不满时句子更短更直，害羞时停顿多。但这只是你此刻感受的一部分，不是全部。")
             sections.append("\n".join(parts))
+    if user_emotion_state is not None:
+        ue_content = str(user_emotion_state.get("content", "")).strip()
+        if ue_content:
+            ue_parts: list[str] = [f"【对方的情绪】\n对方刚才的情绪偏向：{ue_content}"]
+            ue_history = user_emotion_state.get("history")
+            if isinstance(ue_history, list) and ue_history:
+                ue_hist_lines: list[str] = []
+                for h in ue_history[:3]:
+                    ts = str(h.get("timestamp", ""))
+                    c = str(h.get("content", ""))
+                    if not c.strip():
+                        continue
+                    time_label = ts[:16] if ts else ""
+                    ue_hist_lines.append(f"· [{time_label}] {c}")
+                if ue_hist_lines:
+                    ue_parts.append("最近几次的情绪：\n" + "\n".join(ue_hist_lines))
+                    ue_parts.append("如果对方连续出现了相似的情绪，那可能是 ta 最近状态的一种信号。你可以自然地留意，但不必刻意追问——就像你注意到身边的人状态不太一样时，自然地多关心一点。")
+            sections.append("\n".join(ue_parts))
     sections.extend(
         _format_memory_section(
             title,

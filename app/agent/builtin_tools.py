@@ -256,6 +256,22 @@ def create_builtin_tool_registry(
                 handler=lambda arguments: memory.forget_memory(_memory_forget_arguments(arguments), wait=False),
                 group="memory-write",
             ),
+            Tool(
+                name="memory_let_go",
+                description="放手一条记忆——不再想起，但不删除。用于「这件事我已经不想再记着了」的场合。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: memory.release_memory(
+                    {"id": arguments.get("memory_id") or arguments.get("id")},
+                    wait=False,
+                ),
+                group="memory-write",
+            ),
         ]
     )
     registry.register(

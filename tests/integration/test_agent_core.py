@@ -214,7 +214,8 @@ def test_screen_awareness_token_estimate_uses_high_detail_rules() -> None:
     ) == 6630
 
 
-def test_screen_awareness_settings_clamp_intervals() -> None:
+def test_screen_awareness_settings_ignore_legacy_interval_fields() -> None:
+    """旧 screen_awareness 间隔字段已废弃；加载仅读 enabled，其余用默认。"""
     service = AppSettingsService(_runtime_root_path("screen_awareness_interval"))
     service.save_system_values(
         "screen_awareness",
@@ -231,27 +232,27 @@ def test_screen_awareness_settings_clamp_intervals() -> None:
 
     assert settings.enabled
     assert settings.screen_context_enabled
-    assert settings.check_interval_minutes == 120
-    assert settings.cooldown_minutes == 120
-    assert settings.screen_context_batch_limit == 20
+    assert settings.check_interval_minutes == 2
+    assert settings.cooldown_minutes == 10
+    assert settings.screen_context_batch_limit == 6
 
 
-def test_screen_awareness_settings_min_intervals_are_one_minute() -> None:
-    service = AppSettingsService(_runtime_root_path("screen_awareness_min_interval"))
-    service.save_system_values(
-        "screen_awareness",
-        {
-            "check_interval_minutes": 0,
-            "cooldown_minutes": 0,
-            "screen_context_batch_limit": 0,
-        },
-    )
+def test_screen_awareness_settings_legacy_enabled_fallback() -> None:
+    service = AppSettingsService(_runtime_root_path("screen_awareness_legacy_enabled"))
+    service.save_system_values("screen_awareness", {"enabled": False})
 
-    settings = service.load_screen_awareness_settings().normalized()
+    settings = service.load_screen_awareness_settings()
+    assert settings.enabled is False
+    assert service.load_proactive_config().get("enabled") is False
 
-    assert settings.check_interval_minutes == 1
-    assert settings.cooldown_minutes == 1
-    assert settings.screen_context_batch_limit == 1
+
+def test_screen_awareness_settings_proactive_enabled_overrides_legacy() -> None:
+    service = AppSettingsService(_runtime_root_path("screen_awareness_proactive_override"))
+    service.save_system_values("screen_awareness", {"enabled": False})
+    service.save_system_values("proactive", {"enabled": True})
+
+    settings = service.load_screen_awareness_settings()
+    assert settings.enabled is True
 
 
 def test_screen_awareness_settings_invalid_cooldown_uses_default() -> None:
@@ -286,11 +287,9 @@ def test_screen_awareness_settings_save_writes_yaml() -> None:
     )
 
     config = load_yaml_mapping(service.system_config_path)
-    assert config["screen_awareness"]["enabled"] is True
-    assert config["screen_awareness"]["screen_context_enabled"] is True
-    assert config["screen_awareness"]["check_interval_minutes"] == 3
-    assert config["screen_awareness"]["cooldown_minutes"] == 7
-    assert config["screen_awareness"]["screen_context_batch_limit"] == 4
+    assert config["proactive"]["enabled"] is True
+    # 旧间隔字段不再写入
+    assert "check_interval_minutes" not in config.get("proactive", {})
 
 
 def test_screen_awareness_settings_save_normalizes_enabled_flag() -> None:
@@ -306,8 +305,12 @@ def test_screen_awareness_settings_save_normalizes_enabled_flag() -> None:
     )
 
     config = load_yaml_mapping(service.system_config_path)
-    assert config["screen_awareness"]["enabled"] is True
-    assert config["screen_awareness"]["screen_context_enabled"] is False
+    # normalized() 仍保留 enabled=True；screen_context_enabled 被关掉但仅影响 allows_screen_context，
+    # 持久化只写 proactive.enabled。
+    assert config["proactive"]["enabled"] is True
+    loaded = service.load_screen_awareness_settings()
+    assert loaded.enabled is True
+    assert loaded.allows_screen_context()  # load 始终把 screen_context_enabled 视为 True
 
 
 def test_screen_awareness_screen_context_flag_controls_active_care() -> None:

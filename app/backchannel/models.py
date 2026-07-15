@@ -36,6 +36,12 @@ EMOTIONS = (
     "happy",
     "playful",
     "embarrassed",
+    "lonely",
+    "tender",
+    "warm",
+    "determined",
+    "defensive",
+    "hopeful",
 )
 PHASES = ("repeated_issue", "tool_running", "long_wait")
 

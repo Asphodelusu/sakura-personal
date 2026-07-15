@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, PendingToolAction
 from app.agent.context_orchestrator import ContextOrchestrator, build_context_request
@@ -869,6 +869,35 @@ class AgentRuntime:
                     if supplement.continue_loop:
                         working_messages.extend(supplement.appended_messages)
                         continue
+                # 检测模型嘴上说要去搜/查但没有实际调用工具
+                if (
+                    step_index == 0
+                    and supplement is None
+                    and tool_routing.assistant_intends_web_search(turn.content)
+                    and "mcp" not in active_groups
+                    and self.tools.get("web__web_search") is not None
+                ):
+                    working_messages.append(
+                        _assistant_turn_message(turn)
+                    )
+                    working_messages.append({
+                        "role": "user",
+                        "content": (
+                            "（注意：你上一轮的文字里说了要去查/搜/調べる。"
+                            "如果确实需要查信息，请现在使用 web__web_search 工具实际查询，"
+                            "不要只说不做。）"
+                        ),
+                    })
+                    active_groups.add("mcp")
+                    debug_log(
+                        "AgentRuntime",
+                        "模型表达了搜索意图但未调用工具，补激活 mcp 组并继续循环",
+                        {
+                            "step_index": step_index,
+                            "content_preview": turn.content[:200],
+                        },
+                    )
+                    continue
                 debug_log(
                     "AgentRuntime",
                     "多步循环完成，返回模型回复",
@@ -2494,6 +2523,11 @@ class _MemoryToolSupplement:
     continue_loop: bool
     results: list[ToolExecutionResult]
     appended_messages: list[ChatMessage]
+
+
+def _assistant_turn_message(turn: "ChatCompletionTurn") -> ChatMessage:
+    """从 ChatCompletionTurn 构建可追加到 working_messages 的 assistant 消息。"""
+    return cast(ChatMessage, dict(turn.message))
 
 
 def _try_supplement_missed_memory_tools(

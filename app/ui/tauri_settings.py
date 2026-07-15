@@ -543,27 +543,21 @@ def build_tauri_settings_request(
     )
     normalized_bubble = (bubble_settings or BubbleSettings()).normalized()
     width, height = _screen_estimate_size(parent_widget)
+    estimated_tokens = estimate_screen_context_image_tokens_for_size(width, height, model=model)
+    # 保留兼容旧前端（rebuilt 后可移除）
     screen_resolution_estimates = {}
     for resolution in SCREEN_AWARENESS_SCREEN_CONTEXT_RESOLUTIONS:
-        estimate_width, estimate_height = screen_context_resolution_size(
-            width,
-            height,
-            resolution,
-        )
+        est_w, est_h = screen_context_resolution_size(width, height, resolution)
         screen_resolution_estimates[resolution] = {
-            "width": estimate_width,
-            "height": estimate_height,
-            "tokens": estimate_screen_context_image_tokens_for_size(
-                estimate_width,
-                estimate_height,
-                model=model,
-            ),
+            "width": est_w, "height": est_h,
+            "tokens": estimate_screen_context_image_tokens_for_size(est_w, est_h, model=model),
         }
     return {
         "version": TAURI_SETTINGS_PROTOCOL_VERSION,
         "nonce": nonce or secrets.token_urlsafe(16),
         "onboarding": bool(onboarding),
         "screen_awareness": _screen_awareness_to_mapping(normalized_screen_awareness),
+        "estimated_tokens_per_image": estimated_tokens,
         "mcp": _mcp_to_mapping(normalized_mcp),
         "runtime_loop": _runtime_loop_to_mapping(normalized_runtime_loop),
         "system_basic": _system_basic_to_mapping(
@@ -619,18 +613,9 @@ def build_tauri_settings_request(
             for mode in VisualEffectMode.available_modes()
         ],
         "limits": {
-            "check_interval_minutes": [
-                SCREEN_AWARENESS_MIN_CHECK_INTERVAL_MINUTES,
-                SCREEN_AWARENESS_MAX_CHECK_INTERVAL_MINUTES,
-            ],
-            "cooldown_minutes": [
-                SCREEN_AWARENESS_MIN_COOLDOWN_MINUTES,
-                SCREEN_AWARENESS_MAX_COOLDOWN_MINUTES,
-            ],
-            "screen_context_batch_limit": [
-                SCREEN_AWARENESS_MIN_SCREEN_CONTEXT_BATCH_LIMIT,
-                SCREEN_AWARENESS_MAX_SCREEN_CONTEXT_BATCH_LIMIT,
-            ],
+            "check_interval_minutes": [1, 120],      # 保留兼容旧前端，实际由 observer 自适应
+            "cooldown_minutes": [1, 120],
+            "screen_context_batch_limit": [1, 20],
             "max_agent_steps_per_turn": [
                 MIN_AGENT_STEPS_PER_TURN,
                 MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,
@@ -708,7 +693,7 @@ def build_tauri_settings_request(
             height,
             model=model,
         ),
-        "screen_resolution_estimates": screen_resolution_estimates,
+        "screen_resolution_estimates": screen_resolution_estimates,  # 兼容旧前端
     }
 
 
@@ -798,15 +783,10 @@ def parse_tauri_settings_payload(
         screen_awareness=ScreenAwarenessSettings(
             enabled=_required_bool(settings, "enabled"),
             screen_context_enabled=_required_bool(settings, "screen_context_enabled"),
-            check_interval_minutes=_required_int(settings, "check_interval_minutes"),
-            cooldown_minutes=_required_int(settings, "cooldown_minutes"),
-            screen_context_batch_limit=_required_int(settings, "screen_context_batch_limit"),
-            screen_context_resolution=str(
-                settings.get(
-                    "screen_context_resolution",
-                    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
-                )
-            ),
+            check_interval_minutes=settings.get("check_interval_minutes", 2),
+            cooldown_minutes=settings.get("cooldown_minutes", 10),
+            screen_context_batch_limit=settings.get("screen_context_batch_limit", 6),
+            screen_context_resolution=str(settings.get("screen_context_resolution", "fullscreen")),
         ).normalized(),
         mcp=normalize_mcp_runtime_settings(
             MCPRuntimeSettings(windows_enabled=_required_bool(mcp, "windows_enabled"))
@@ -1862,7 +1842,7 @@ def _screen_awareness_to_mapping(settings: ScreenAwarenessSettings) -> dict[str,
     return {
         "enabled": bool(settings.enabled),
         "screen_context_enabled": bool(settings.screen_context_enabled),
-        "check_interval_minutes": int(settings.check_interval_minutes),
+        "check_interval_minutes": int(settings.check_interval_minutes),           # 保留兼容旧前端
         "cooldown_minutes": int(settings.cooldown_minutes),
         "screen_context_batch_limit": int(settings.screen_context_batch_limit),
         "screen_context_resolution": settings.screen_context_resolution,
@@ -2914,18 +2894,26 @@ def _path_to_text(path: Path | None) -> str:
 
 
 def _screen_estimate_size(parent_widget: QWidget | None) -> tuple[int, int]:
+    """估算主动感知单张截图尺寸：整屏几何，再按 ProactiveObserver max_edge 钳制。"""
     screen = parent_widget.screen() if parent_widget is not None else None
     if screen is None:
         app = QApplication.instance()
         screen = app.primaryScreen() if app is not None else None
     if screen is None:
-        return 1280, 720
-    geometry = screen.geometry()
-    dpr = screen.devicePixelRatio() or 1.0
-    return (
-        max(1, round(geometry.width() * dpr)),
-        max(1, round(geometry.height() * dpr)),
-    )
+        width, height = 1280, 720
+    else:
+        geometry = screen.geometry()
+        dpr = screen.devicePixelRatio() or 1.0
+        width = max(1, round(geometry.width() * dpr))
+        height = max(1, round(geometry.height() * dpr))
+    # 与 ProactiveConfig.max_edge 默认一致（聚焦窗截图上界）
+    max_edge = 1920
+    long_edge = max(width, height)
+    if long_edge > max_edge:
+        scale = max_edge / float(long_edge)
+        width = max(1, round(width * scale))
+        height = max(1, round(height * scale))
+    return width, height
 
 
 def _required_bool(mapping: dict[str, Any], key: str) -> bool:
