@@ -411,6 +411,7 @@ class MemoryCurator:
         ignored = 0
         event_counts: dict[str, int] = {}
         superseded = 0
+        _added_in_batch: set[tuple[str, str]] = set()
         for operation in operations[:MAX_CURATION_OPERATIONS]:
             if not isinstance(operation, dict):
                 ignored += 1
@@ -443,6 +444,11 @@ class MemoryCurator:
                 if action == "add":
                     if not content:
                         ignored += 1
+                        continue
+                    batch_key = (content, layer)
+                    if batch_key in _added_in_batch:
+                        ignored += 1
+                        event_counts["SKIP_BATCH_DUP"] = event_counts.get("SKIP_BATCH_DUP", 0) + 1
                         continue
                     matched = _find_existing_memory_for_candidate(
                         existing,
@@ -503,6 +509,7 @@ class MemoryCurator:
                         allow_sensitive=True,
                     )
                     created += 1
+                    _added_in_batch.add(batch_key)
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["ADD"] = event_counts.get("ADD", 0) + 1
                     superseded += _expire_superseded_volatile(
