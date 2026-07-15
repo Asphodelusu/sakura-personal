@@ -230,47 +230,14 @@
             <div class="setting-row">
               <label class="setting-row-text" for="enabled">
                 <span class="setting-title">启用主动屏幕感知</span>
-                <span class="setting-desc">桌宠定时截屏判断是否主动找你搭话。</span>
+                <span class="setting-desc">自动聚焦当前窗口截图，并结合 UIA 读取可见文字；通过切屏检测、空闲检测和自适应定时器判断是否主动搭话。密码管理器等敏感窗口有内置黑名单会跳过截图（当前不可在设置中配置）。频率和冷却由 AI 自行调节。</span>
               </label>
               <span class="setting-toggle"><input id="enabled" type="checkbox" /></span>
             </div>
             <div class="setting-row">
-              <label class="setting-row-text" for="checkInterval">
-                <span class="setting-title">主动检查间隔</span>
-                <span class="setting-desc">每隔多久截屏检查一次屏幕内容。</span>
-              </label>
-              <span class="field-unit"><input id="checkInterval" type="number" step="1" /><span class="unit">分钟</span></span>
-            </div>
-            <div class="setting-row">
-              <label class="setting-row-text" for="cooldown">
-                <span class="setting-title">主动发言冷却</span>
-                <span class="setting-desc">两次主动搭话之间的最短间隔。</span>
-              </label>
-              <span class="field-unit"><input id="cooldown" type="number" step="1" /><span class="unit">分钟</span></span>
-            </div>
-            <div class="setting-row">
-              <label class="setting-row-text" for="batchLimit">
-                <span class="setting-title">单次最多发送截图</span>
-                <span class="setting-desc">一次主动感知最多附带的截图张数。</span>
-              </label>
-              <span class="field-unit"><input id="batchLimit" type="number" step="1" /><span class="unit">张</span></span>
-            </div>
-            <div class="setting-row">
-              <label class="setting-row-text" for="screenResolution">
-                <span class="setting-title">截图分辨率</span>
-                <span class="setting-desc">发送前等比缩小截图；固定档位不会放大小于目标尺寸的屏幕。</span>
-              </label>
-              <select id="screenResolution">
-                <option value="fullscreen">全屏分辨率</option>
-                <option value="720p">720p</option>
-                <option value="1080p">1080p</option>
-                <option value="2160p">2160p</option>
-              </select>
-            </div>
-            <div class="setting-row">
               <div class="setting-row-text">
                 <span class="setting-title">预计图像 token</span>
-                <span class="setting-desc">按当前屏幕和所选分辨率估算每张截图消耗的 token。</span>
+                <span class="setting-desc">按聚焦窗口截图（最长边约 1920px）估算每张图像消耗的 token，实际随窗口大小浮动。</span>
               </div>
               <p id="tokenEstimate" class="hint"></p>
             </div>

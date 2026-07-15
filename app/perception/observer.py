@@ -20,10 +20,15 @@ from typing import Any, Callable
 import httpx
 from loguru import logger
 
+from app.core.debug_log import debug_log
 from app.perception.privacy import PrivacyGuard
 from app.perception.screen_capture import ScreenCapture
-from app.perception.win32 import get_active_window_title, get_idle_seconds
-from app.core.debug_log import debug_log
+from app.perception.screen_reader import WindowText, read_active_window
+from app.perception.win32 import (
+    get_active_window_process_name,
+    get_active_window_title,
+    get_idle_seconds,
+)
 
 
 def _observer_gui_log(message: str, data: Any | None = None) -> None:
@@ -31,6 +36,153 @@ def _observer_gui_log(message: str, data: Any | None = None) -> None:
         debug_log("ProactiveObserver", message, data)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Thread-isolated UIA reader — prevents SEH crashes in uiautomation native
+# code from killing the observer thread.
+# ---------------------------------------------------------------------------
+
+_UIA_ISOLATE_TIMEOUT = 3.0
+_OCR_ISOLATE_TIMEOUT = 8.0
+_COINIT_APARTMENTTHREADED = 0x2
+
+
+def _read_window_text_isolated() -> WindowText:
+    """Call read_active_window() in a dedicated thread with COM init."""
+    import ctypes as _ctypes
+    import queue as _queue
+
+    result_queue: _queue.Queue[WindowText] = _queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        _ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+        try:
+            result_queue.put(read_active_window())
+        except Exception:
+            result_queue.put(WindowText())
+        finally:
+            _ctypes.windll.ole32.CoUninitialize()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        return result_queue.get(timeout=_UIA_ISOLATE_TIMEOUT)
+    except _queue.Empty:
+        logger.warning(
+            "ProactiveObserver: UIA read timed out after {:.0f}s",
+            _UIA_ISOLATE_TIMEOUT,
+        )
+        return WindowText()
+    finally:
+        t.join(timeout=0.5)
+
+
+def _ocr_game_dialogue_isolated() -> str:
+    """OCR the bottom third of the focused window in an isolated thread.
+
+    WinRT awaits can hang or crash the observer loop; keep blast radius contained.
+    """
+    import ctypes as _ctypes
+    import queue as _queue
+
+    result_queue: _queue.Queue[str] = _queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        _ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result_queue.put(loop.run_until_complete(_ocr_game_dialogue_async()))
+        except Exception as e:
+            logger.debug("ProactiveObserver: game OCR worker failed: {}", e)
+            result_queue.put("")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            _ctypes.windll.ole32.CoUninitialize()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        return result_queue.get(timeout=_OCR_ISOLATE_TIMEOUT)
+    except _queue.Empty:
+        logger.warning(
+            "ProactiveObserver: game OCR timed out after {:.0f}s",
+            _OCR_ISOLATE_TIMEOUT,
+        )
+        return ""
+    finally:
+        t.join(timeout=0.5)
+
+
+async def _ocr_game_dialogue_async() -> str:
+    """OCR focus-window bottom ~1/3 (common dialogue / subtitle region)."""
+    tmp_path = ""
+    try:
+        from ctypes import byref, windll
+        from ctypes.wintypes import RECT
+        import os as _os
+        import tempfile as _tempfile
+
+        import mss as _mss
+        from PIL import Image as _Image
+        from winsdk.windows.graphics.imaging import BitmapDecoder
+        from winsdk.windows.media.ocr import OcrEngine
+        from winsdk.windows.storage import StorageFile
+        from winsdk.windows.storage.streams import RandomAccessStreamReference
+
+        hwnd = windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        rect = RECT()
+        windll.user32.GetWindowRect(hwnd, byref(rect))
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w < 200 or h < 200:
+            return ""
+
+        bottom_h = max(80, h // 3)
+        mon = {
+            "left": rect.left,
+            "top": rect.top + h - bottom_h,
+            "width": w,
+            "height": bottom_h,
+        }
+        with _mss.MSS() as sct:
+            raw = sct.grab(mon)
+        img = _Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+
+        tmp = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp_path = tmp.name
+        img.save(tmp_path, format="PNG")
+        tmp.close()
+
+        file = await StorageFile.get_file_from_path_async(tmp_path)
+        stream_ref = RandomAccessStreamReference.create_from_file(file)
+        stream = await stream_ref.open_read_async()
+        decoder = await BitmapDecoder.create_async(stream)
+        bitmap = await decoder.get_software_bitmap_async()
+        engine = OcrEngine.try_create_from_user_profile_languages()
+        if engine is None:
+            return ""
+        result = await engine.recognize_async(bitmap)
+        return (result.text or "").strip()
+    except ImportError:
+        return ""
+    except Exception as e:
+        logger.debug("ProactiveObserver: game OCR failed: {}", e)
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                import os as _os
+
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+
 
 @dataclass(frozen=True)
 class ProactiveSpeakPayload:
@@ -41,16 +193,17 @@ class ProactiveSpeakPayload:
     tone: str = "中性"
 
 
-OnSpeakFn = Callable[[ProactiveSpeakPayload], "None"]
-IsBusyFn = Callable[[], bool]
-OnMemoryRecordFn = Callable[[str], "None"]
+OnSpeakFn = Callable[[ProactiveSpeakPayload], None]
+OnEvaluateFn = Callable[[str, bool], None]
+IsBusyFn = Callable[[], Any]
+OnMemoryRecordFn = Callable[[str], None]
 
 
-# ---------------------------------------------------------------------------
-# Proactive evaluation prompt — adapted from desktop-kanojo OpenMeido
-# ---------------------------------------------------------------------------
+_PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。用户消息里可能有：
+- 截图（传统方式）
+- [UIA 直接读取] 标记的文字（系统无障碍接口直接读的窗口内容，不需要 OCR）
+- [OCR 游戏文本] 标记的文字（判定为游戏/自绘界面时，对对话框区域 OCR 的结果；可能有识别误差）
 
-_PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚才悄悄看了一眼用户的屏幕，给你看。
 你要严格按 JSON 输出，判断要不要插一句话，以及建议下次多久后再看。
 
 判断标准：
@@ -58,6 +211,7 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。我刚
 - 用户在摸鱼、看视频、看新闻、玩游戏：可以评论
 - 用户长时间不动：可以关心
 - 看到有趣的/错的/奇怪的内容：可以吐槽
+- UIA / OCR 读取到的文字和截图内容应相互印证；文字能告诉你在什么应用、在看什么页面或台词
 - 不确定：选 false，宁静默不烦人
 
 suggested_interval 是你觉得下次看屏幕之前的等待秒数：
@@ -72,65 +226,87 @@ suggested_interval 是你觉得下次看屏幕之前的等待秒数：
 comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
 """
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+_NON_GAME_PROCESSES = frozenset({
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "code.exe", "cursor.exe", "devenv.exe", "notepad.exe", "notepad++.exe",
+    "explorer.exe", "windowsterminal.exe", "cmd.exe", "powershell.exe",
+    "pwsh.exe", "discord.exe", "slack.exe", "teams.exe", "outlook.exe",
+    "winword.exe", "excel.exe", "powerpnt.exe", "wechat.exe", "weixin.exe",
+    "qq.exe", "telegram.exe", "spotify.exe", "obs64.exe", "obs32.exe",
+})
+_GAME_PROCESS_HINTS = (
+    "unity", "unreal", "ue4", "ue5", "godot", "gamemaker",
+    "krkr", "kiri", "renpy", "rpg_", "rpgmaker", "nw.exe",
+    "game", "galgame", "siglus", "bgi.exe", "yuris",
+)
 
 
 @dataclass
 class ProactiveConfig:
     enabled: bool = True
-    timer_seconds: float = 480  # 定期检查间隔（8 分钟）
-    cooldown_seconds: float = 600  # 两次主动发言最小间隔
-    min_silence_after_user: float = 10  # 用户发言后这时间内不触发
+    timer_seconds: float = 480
+    cooldown_seconds: float = 600
+    min_silence_after_user: float = 10
     window_switch_enabled: bool = True
-    window_switch_cooldown: float = 120  # 窗口切换触发后的冷却
-    idle_threshold_seconds: float = 600  # 空闲多久触发
-    poll_interval: float = 5.0  # 状态轮询间隔
-    max_edge: int = 1024  # 截图最长边像素
-    request_timeout: float = 30.0  # VLM API 超时
+    window_switch_cooldown: float = 45
+    focus_settle_delay: float = 15
+    idle_threshold_seconds: float = 600
+    poll_interval: float = 5.0
+    content_check_interval: float = 30.0
+    content_min_chars: int = 30
+    game_ocr_enabled: bool = True
+    max_edge: int = 1920
+    request_timeout: float = 60.0
     eval_temperature: float = 0.7
     max_tokens: int = 1024
-    # 自适应间隔范围（秒）
     adaptive_interval_min: float = 120.0
     adaptive_interval_max: float = 1800.0
-    # away_mode 最大持续时间（秒），超时自动恢复
     away_max_seconds: float = 12 * 3600
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "ProactiveConfig":
         if not isinstance(d, dict):
             return cls()
+        base = cls()
         return cls(
-            enabled=bool(d.get("enabled", True)),
-            timer_seconds=float(d.get("timer_seconds", 600)),
-            cooldown_seconds=float(d.get("cooldown_seconds", 600)),
-            min_silence_after_user=float(d.get("min_silence_after_user", 30)),
-            window_switch_enabled=bool(d.get("window_switch_enabled", True)),
-            window_switch_cooldown=float(d.get("window_switch_cooldown", 300)),
-            idle_threshold_seconds=float(d.get("idle_threshold_seconds", 600)),
-            poll_interval=float(d.get("poll_interval", 5.0)),
-            max_edge=int(d.get("max_edge", 1024)),
-            request_timeout=float(d.get("request_timeout", 30.0)),
-            eval_temperature=float(d.get("eval_temperature", 0.7)),
-            max_tokens=int(d.get("max_tokens", 1024)),
-            adaptive_interval_min=float(d.get("adaptive_interval_min", 120.0)),
-            adaptive_interval_max=float(d.get("adaptive_interval_max", 1800.0)),
-            away_max_seconds=float(d.get("away_max_seconds", 12 * 3600)),
+            enabled=bool(d.get("enabled", base.enabled)),
+            timer_seconds=float(d.get("timer_seconds", base.timer_seconds)),
+            cooldown_seconds=float(d.get("cooldown_seconds", base.cooldown_seconds)),
+            min_silence_after_user=float(
+                d.get("min_silence_after_user", base.min_silence_after_user)
+            ),
+            window_switch_enabled=bool(
+                d.get("window_switch_enabled", base.window_switch_enabled)
+            ),
+            window_switch_cooldown=float(
+                d.get("window_switch_cooldown", base.window_switch_cooldown)
+            ),
+            focus_settle_delay=float(d.get("focus_settle_delay", base.focus_settle_delay)),
+            idle_threshold_seconds=float(
+                d.get("idle_threshold_seconds", base.idle_threshold_seconds)
+            ),
+            poll_interval=float(d.get("poll_interval", base.poll_interval)),
+            content_check_interval=float(
+                d.get("content_check_interval", base.content_check_interval)
+            ),
+            content_min_chars=int(d.get("content_min_chars", base.content_min_chars)),
+            game_ocr_enabled=bool(d.get("game_ocr_enabled", base.game_ocr_enabled)),
+            max_edge=int(d.get("max_edge", base.max_edge)),
+            request_timeout=float(d.get("request_timeout", base.request_timeout)),
+            eval_temperature=float(d.get("eval_temperature", base.eval_temperature)),
+            max_tokens=int(d.get("max_tokens", base.max_tokens)),
+            adaptive_interval_min=float(
+                d.get("adaptive_interval_min", base.adaptive_interval_min)
+            ),
+            adaptive_interval_max=float(
+                d.get("adaptive_interval_max", base.adaptive_interval_max)
+            ),
+            away_max_seconds=float(d.get("away_max_seconds", base.away_max_seconds)),
         )
 
 
-# ---------------------------------------------------------------------------
-# Observer
-# ---------------------------------------------------------------------------
-
-
 class ProactiveObserver:
-    """Watches the desktop and decides — via VLM — whether to speak.
-
-    Lifecycle: start() → running loop → stop()
-    Callbacks: on_speak, is_busy, on_memory_record (optional)
-    """
+    """Watches the desktop and decides — via VLM — whether to speak."""
 
     def __init__(
         self,
@@ -142,6 +318,7 @@ class ProactiveObserver:
         config: ProactiveConfig | None = None,
         privacy: PrivacyGuard | None = None,
         on_speak: OnSpeakFn | None = None,
+        on_evaluate: OnEvaluateFn | None = None,
         is_busy: IsBusyFn | None = None,
         on_memory_record: OnMemoryRecordFn | None = None,
     ) -> None:
@@ -153,22 +330,33 @@ class ProactiveObserver:
         self.privacy = privacy or PrivacyGuard()
 
         self.on_speak = on_speak or (lambda _payload: None)
+        self.on_evaluate = on_evaluate or (lambda _reason, _should_speak: None)
         self._is_busy = is_busy or (lambda: False)
         self._on_memory_record = on_memory_record or (lambda _: None)
 
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
-        # State
         self._last_proactive_at = 0.0
         self._last_user_at = time.monotonic()
         self._last_window_title = ""
+        self._previous_window_title = ""
         self._last_timer_check = time.monotonic()
-        self._next_timer_at: float = 0.0  # 自适应下次检查时间
+        self._next_timer_at: float = 0.0
         self._last_eval_at = 0.0
         self._last_window_trigger_at = 0.0
+        self._focus_settled_at: float = 0.0
+        self._pending_window: str = ""
         self._idle_armed = True
 
-        # Away mode（用户明确告知离开时暂停感知）
+        self._last_frame_dhash: int | None = None
+        self._last_dedup_skip_at: float = 0.0
+
+        self._last_text_hash: int | None = None
+        self._last_content_check_at: float = 0.0
+        self._cached_window_text: WindowText | None = None
+        self._cached_window_text_at: float = 0.0
+        self._cached_window_title: str = ""
+
         self._away_mode: bool = False
         self._away_set_at: float = 0.0
 
@@ -176,8 +364,7 @@ class ProactiveObserver:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._http: httpx.AsyncClient | None = None
-
-    # ---- state --------------------------------------------------------------
+        self._last_busy_log_at: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -192,21 +379,17 @@ class ProactiveObserver:
     def notify_user_spoke(self) -> None:
         self._last_user_at = time.monotonic()
         self._idle_armed = True
-        # 用户发消息 → 自动退出 away_mode
         if self._away_mode:
             self.set_away_mode(False)
             logger.info("ProactiveObserver: away_mode cleared by user message")
             _observer_gui_log("用户归来，away_mode 自动解除")
 
-    # ---- away mode -----------------------------------------------------------
-
     def set_away_mode(self, value: bool) -> None:
-        """设置离开模式：True=暂停感知，False=恢复正常。"""
         self._away_mode = bool(value)
         self._away_set_at = time.monotonic() if value else 0.0
         if value:
             self._idle_armed = True
-            self._next_timer_at = 0.0  # 重置自适应计时器
+            self._next_timer_at = 0.0
             logger.info("ProactiveObserver: away_mode ON")
             _observer_gui_log("away_mode 已开启")
         else:
@@ -217,8 +400,6 @@ class ProactiveObserver:
     def away_mode(self) -> bool:
         return self._away_mode
 
-    # ---- lifecycle ----------------------------------------------------------
-
     def start(self) -> None:
         if self._running:
             return
@@ -226,10 +407,11 @@ class ProactiveObserver:
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
         logger.info(
-            "ProactiveObserver: started (timer={}s, cooldown={}s, idle={}s)",
+            "ProactiveObserver: started (timer={}s, cooldown={}s, idle={}s, model={})",
             self.config.timer_seconds,
             self.config.cooldown_seconds,
             self.config.idle_threshold_seconds,
+            self._api_model,
         )
         _observer_gui_log(
             "主动观察已启动",
@@ -237,6 +419,8 @@ class ProactiveObserver:
                 "timer_seconds": self.config.timer_seconds,
                 "cooldown_seconds": self.config.cooldown_seconds,
                 "idle_threshold_seconds": self.config.idle_threshold_seconds,
+                "model": self._api_model,
+                "base_url": self._api_base_url,
             },
         )
 
@@ -244,43 +428,45 @@ class ProactiveObserver:
         self._running = False
         loop = self._loop
         if loop is not None:
-            # Cancel all pending tasks so the loop exits promptly instead of
-            # blocking on asyncio.sleep() or a mid-flight VLM request.
             try:
                 for task in asyncio.all_tasks(loop):
                     task.cancel()
             except RuntimeError:
-                pass  # loop already closed
-        # Thread is daemon; do not join.  Task cancellation and the finally
-        # block in _run() handle http cleanup.
+                pass
         self._http = None
         self._thread = None
         logger.info("ProactiveObserver: stopped")
         _observer_gui_log("主动观察已停止")
 
     def _thread_main(self) -> None:
-        """Run the asyncio loop in a dedicated daemon thread."""
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._run())
-        except asyncio.CancelledError:
-            pass  # expected during shutdown; thread exits cleanly
-        except Exception:
-            logger.exception("ProactiveObserver: thread crashed")
-            _observer_gui_log("主动观察线程异常退出")
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
-            if self._loop is loop:
-                self._loop = None
-            if self._thread is threading.current_thread():
-                self._thread = None
+        import ctypes as _ctypes
 
-    # ---- core loop ----------------------------------------------------------
+        _com_initialized = (
+            _ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED) == 0
+        )
+        try:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._run())
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("ProactiveObserver: thread crashed")
+                _observer_gui_log("主动观察线程异常退出")
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                if self._loop is loop:
+                    self._loop = None
+                if self._thread is threading.current_thread():
+                    self._thread = None
+        finally:
+            if _com_initialized:
+                _ctypes.windll.ole32.CoUninitialize()
 
     async def _run(self) -> None:
         self._http = httpx.AsyncClient(timeout=self.config.request_timeout)
@@ -296,11 +482,23 @@ class ProactiveObserver:
                     continue
 
                 try:
-                    triggers = self._collect_triggers()
-                    if not triggers:
+                    busy = self._is_busy()
+                    if busy:
+                        now_busy = time.monotonic()
+                        if now_busy - self._last_busy_log_at >= 60.0:
+                            self._last_busy_log_at = now_busy
+                            reason = busy if isinstance(busy, str) else "busy"
+                            logger.info(
+                                "ProactiveObserver: UI busy, holding triggers ({})",
+                                reason,
+                            )
+                            _observer_gui_log(
+                                "UI 忙碌，暂缓评估（不消耗触发）",
+                                {"reason": reason},
+                            )
                         continue
-                    if self._is_busy():
-                        logger.debug("ProactiveObserver: UI busy, skipping")
+                    triggers = await self._collect_triggers()
+                    if not triggers:
                         continue
                     logger.info("ProactiveObserver: evaluating, triggers={}", triggers)
                     _observer_gui_log("正在评估是否发言", {"triggers": triggers})
@@ -316,21 +514,21 @@ class ProactiveObserver:
                     pass
                 self._http = None
 
-    def _collect_triggers(self) -> list[str]:
+    async def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
 
-        # Away mode check — hard silence when user explicitly said they're away
         if self._away_mode:
             away_elapsed = now - self._away_set_at
             if away_elapsed >= self.config.away_max_seconds:
-                # 超时自动恢复
                 self.set_away_mode(False)
-                logger.info("ProactiveObserver: away_mode auto-expired after {:.0f}s", away_elapsed)
+                logger.info(
+                    "ProactiveObserver: away_mode auto-expired after {:.0f}s",
+                    away_elapsed,
+                )
                 _observer_gui_log("away_mode 超时自动恢复")
             else:
-                return []  # 完全静默，不截图不评估
+                return []
 
-        # Absolute filters — silence required
         if now - self._last_user_at < self.config.min_silence_after_user:
             return []
         if self._last_proactive_at and now - self._last_proactive_at < self.config.cooldown_seconds:
@@ -340,20 +538,45 @@ class ProactiveObserver:
 
         triggers: list[str] = []
 
-        # Adaptive timer: use LLM-suggested interval if available, else fallback to fixed
-        timer_target = self._next_timer_at if self._next_timer_at > 0 else (self._last_timer_check + self.config.timer_seconds)
-        if now >= timer_target:
-            triggers.append("timer")
-            self._last_timer_check = now
-            self._next_timer_at = 0.0  # reset, will be set again after evaluation
-
         if self.config.window_switch_enabled:
             cur = get_active_window_title()
             if cur and cur != self._last_window_title:
+                self._next_timer_at = 0.0
+                self._invalidate_window_text_cache()
+                self._last_text_hash = None
                 if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
-                    triggers.append(f"window:{self._last_window_title!r}->{cur!r}")
-                    self._last_window_trigger_at = now
+                    self._previous_window_title = self._last_window_title
+                    self._pending_window = cur
+                    self._focus_settled_at = now + self.config.focus_settle_delay
                 self._last_window_title = cur
+
+            if self._focus_settled_at > 0 and now >= self._focus_settled_at:
+                if self._pending_window and self._pending_window == get_active_window_title():
+                    from_title = self._previous_window_title or "(unknown)"
+                    triggers.append(f"window:{from_title!r}->{self._pending_window!r}")
+                    self._last_window_trigger_at = now
+                self._focus_settled_at = 0.0
+                self._pending_window = ""
+                self._previous_window_title = ""
+
+        if self._focus_settled_at == 0:
+            timer_target = (
+                self._next_timer_at
+                if self._next_timer_at > 0
+                else (self._last_timer_check + self.config.timer_seconds)
+            )
+            if now >= timer_target:
+                triggers.append("timer")
+                self._last_timer_check = now
+                self._next_timer_at = 0.0
+
+        if not triggers and self._focus_settled_at == 0:
+            if now - self._last_content_check_at >= self.config.content_check_interval:
+                self._last_content_check_at = now
+                if self._check_content_changed():
+                    if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
+                        triggers.append("content")
+                        self._last_window_trigger_at = now
 
         idle = get_idle_seconds()
         if idle >= self.config.idle_threshold_seconds and self._idle_armed:
@@ -362,26 +585,129 @@ class ProactiveObserver:
 
         return triggers
 
+    def _invalidate_window_text_cache(self) -> None:
+        self._cached_window_text = None
+        self._cached_window_text_at = 0.0
+        self._cached_window_title = ""
+
+    def _store_window_text_cache(self, window_text: WindowText, title: str = "") -> None:
+        self._cached_window_text = window_text
+        self._cached_window_text_at = time.monotonic()
+        self._cached_window_title = (
+            title or window_text.window_title or get_active_window_title()
+        )
+
+    def _get_window_text_for_eval(self) -> WindowText:
+        title = get_active_window_title()
+        cached = self._cached_window_text
+        if (
+            cached is not None
+            and title
+            and title == self._cached_window_title
+            and (time.monotonic() - self._cached_window_text_at)
+            <= max(self.config.content_check_interval, 15.0)
+        ):
+            return cached
+        window_text = _read_window_text_isolated()
+        self._store_window_text_cache(window_text, title)
+        return window_text
+
+    def _check_content_changed(self) -> bool:
+        blocked, matched = self.privacy.check_active_window()
+        if blocked:
+            logger.debug("ProactiveObserver: content check privacy skip ({})", matched)
+            return False
+
+        window_text = _read_window_text_isolated()
+        title = get_active_window_title()
+        self._store_window_text_cache(window_text, title)
+
+        if not window_text.is_accessible:
+            return False
+        text = window_text.text_content.strip()
+        if len(text) < self.config.content_min_chars:
+            return False
+
+        h = hash(text)
+        if self._last_text_hash is None:
+            self._last_text_hash = h
+            return False
+        if h != self._last_text_hash:
+            self._last_text_hash = h
+            return True
+        return False
+
+    def _looks_like_game_context(self, window_text: WindowText) -> bool:
+        proc = (get_active_window_process_name() or window_text.process_name or "").casefold()
+        if proc in _NON_GAME_PROCESSES:
+            return False
+        if any(hint in proc for hint in _GAME_PROCESS_HINTS):
+            return True
+        if window_text.app_type == "custom_ui":
+            return True
+        uia_chars = len(window_text.text_content.strip()) if window_text.is_accessible else 0
+        if uia_chars < self.config.content_min_chars and proc and proc not in _NON_GAME_PROCESSES:
+            return True
+        return False
+
+    def _safe_on_evaluate(self, reason: str, should_speak: bool) -> None:
+        try:
+            self.on_evaluate(reason, should_speak)
+        except Exception as e:
+            logger.warning("ProactiveObserver: on_evaluate callback error: {}", e)
+
     async def _do_evaluation(self, triggers: list[str]) -> None:
         now = time.monotonic()
         self._last_eval_at = now
 
-        # Privacy check — must happen BEFORE screenshot
         blocked, matched = self.privacy.check_active_window()
         if blocked:
             logger.info("ProactiveObserver: privacy block ({})", matched)
             _observer_gui_log("隐私拦截", {"matched": matched})
+            self._safe_on_evaluate(f"隐私拦截：{matched}", False)
             return
 
-        # Capture screen
         try:
             obs = self.capture.grab()
         except Exception as e:
             logger.warning("ProactiveObserver: screen capture failed: {}", e)
             _observer_gui_log("截图失败", {"error": str(e)})
+            self._safe_on_evaluate(f"截图失败：{e}", False)
             return
 
-        # Build context
+        if obs.dhash and self._last_frame_dhash is not None:
+            hamming = (obs.dhash ^ self._last_frame_dhash).bit_count()
+            if hamming <= 4:
+                logger.info(
+                    "ProactiveObserver: frame dedup (hamming={}), skipping VLM",
+                    hamming,
+                )
+                _observer_gui_log("画面重复，跳过 VLM 评估", {"hamming": hamming})
+                self._last_frame_dhash = obs.dhash
+                self._last_dedup_skip_at = now
+                self._safe_on_evaluate("画面未变化（dHash去重）", False)
+                return
+        if obs.dhash:
+            self._last_frame_dhash = obs.dhash
+
+        window_text = self._get_window_text_for_eval()
+        if window_text.is_accessible and window_text.text_content.strip():
+            logger.debug(
+                "ProactiveObserver: UIA read {} chars from {} elements in {:.0f}ms",
+                len(window_text.text_content),
+                window_text.element_count,
+                window_text.walk_time_ms,
+            )
+            _observer_gui_log(
+                "UIA 文字提取",
+                {
+                    "app_type": window_text.app_type,
+                    "chars": len(window_text.text_content),
+                    "elements": window_text.element_count,
+                    "walk_ms": int(window_text.walk_time_ms),
+                },
+            )
+
         window_title = get_active_window_title()
         idle_s = int(get_idle_seconds())
 
@@ -394,32 +720,80 @@ class ProactiveObserver:
             ctx_parts.append(f"距离最后输入：{idle_s} 秒")
         if triggers:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
-        ctx_text = "\n".join(ctx_parts) or "（无额外上下文）"
 
+        uia_enough = (
+            window_text.is_accessible
+            and len(window_text.text_content.strip()) >= self.config.content_min_chars
+        )
+        if window_text.is_accessible and window_text.text_content.strip():
+            uia_lines = [f"[UIA 直接读取] 应用类型：{window_text.app_type}"]
+            if window_text.process_name:
+                uia_lines.append(f"进程：{window_text.process_name}")
+            uia_lines.append(f"窗口内可见文字：\n{window_text.text_content}")
+            ctx_parts.append("\n".join(uia_lines))
+
+        if (
+            self.config.game_ocr_enabled
+            and not uia_enough
+            and self._looks_like_game_context(window_text)
+        ):
+            _observer_gui_log("开始游戏态 OCR")
+            ocr_text = await asyncio.to_thread(_ocr_game_dialogue_isolated)
+            if ocr_text:
+                proc = get_active_window_process_name()
+                if proc:
+                    ocr_block = (
+                        f"[OCR 游戏文本] 进程：{proc}\n"
+                        f"对话框区域识别（可能有误差）：\n{ocr_text}"
+                    )
+                else:
+                    ocr_block = (
+                        "[OCR 游戏文本] 对话框区域识别（可能有误差）：\n" + ocr_text
+                    )
+                ctx_parts.append(ocr_block)
+                _observer_gui_log(
+                    "游戏态 OCR",
+                    {"chars": len(ocr_text), "process": proc or ""},
+                )
+            else:
+                _observer_gui_log("游戏态 OCR 无结果（超时/失败/空）")
+
+        ctx_text = "\n".join(ctx_parts) or "（无额外上下文）"
         user_text = f"{ctx_text}\n\n（截图见下）"
 
-        # Build messages
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": self._build_full_system_prompt()}]},
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self._build_full_system_prompt()}],
+            },
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user_text},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:{obs.mime};base64,{obs.image_b64}"},
+                        "image_url": {
+                            "url": f"data:{obs.mime};base64,{obs.image_b64}"
+                        },
                     },
                 ],
             },
         ]
 
-        # Call VLM
+        _observer_gui_log(
+            "正在调用视觉模型",
+            {"model": self._api_model, "base_url": self._api_base_url},
+        )
         try:
             response = await self._chat_completion(messages)
         except Exception as e:
-            logger.warning("ProactiveObserver: VLM call failed: {}", e)
-            _observer_gui_log("VLM 调用失败", {"error": str(e)})
-            # 代理切换等会破坏 httpcore 连接池，重建一次
+            logger.warning(
+                "ProactiveObserver: VLM call failed: {} ({})", e, type(e).__name__
+            )
+            _observer_gui_log(
+                "VLM 调用失败", {"error": str(e), "type": type(e).__name__}
+            )
+            self._safe_on_evaluate(f"VLM 调用失败：{e}", False)
             try:
                 old = self._http
                 self._http = httpx.AsyncClient(timeout=self.config.request_timeout)
@@ -431,26 +805,52 @@ class ProactiveObserver:
 
         parsed = _extract_json(response)
         if not parsed:
-            logger.warning("ProactiveObserver: no JSON in response: {!r}", response[:200])
+            logger.warning(
+                "ProactiveObserver: no JSON in response: {!r}", response[:200]
+            )
+            _observer_gui_log(
+                "VLM 返回无法解析",
+                {"preview": (response or "")[:120], "model": self._api_model},
+            )
+            self._safe_on_evaluate(
+                "VLM 返回无法解析为 JSON（请确认 vision 槽位用支持识图的模型）",
+                False,
+            )
             return
 
-        # Adaptive interval: use LLM-suggested value, clamped to safe range
         suggested = parsed.get("suggested_interval")
         if isinstance(suggested, (int, float)) and suggested > 0:
-            clamped = max(self.config.adaptive_interval_min,
-                          min(float(suggested), self.config.adaptive_interval_max))
+            clamped = max(
+                self.config.adaptive_interval_min,
+                min(float(suggested), self.config.adaptive_interval_max),
+            )
             self._next_timer_at = time.monotonic() + clamped
-            logger.debug("ProactiveObserver: adaptive interval set to {:.0f}s (requested {:.0f}s)", clamped, suggested)
+            logger.debug(
+                "ProactiveObserver: adaptive interval set to {:.0f}s (requested {:.0f}s)",
+                clamped,
+                suggested,
+            )
         else:
-            self._next_timer_at = 0.0  # fallback to default timer
+            self._next_timer_at = 0.0
 
         if not parsed.get("should_speak"):
-            logger.debug("ProactiveObserver: silent (reason: {})", parsed.get("reason", ""))
+            reason = str(parsed.get("reason", "")).strip() or "模型选择不发言"
+            logger.info("ProactiveObserver: silent (reason: {})", reason)
+            self._safe_on_evaluate(reason, False)
             return
 
         comment = str(parsed.get("comment", "")).strip()
         if not comment:
+            reason = (
+                str(parsed.get("reason", "")).strip()
+                or "should_speak=true 但 comment 为空"
+            )
+            logger.warning("ProactiveObserver: {}", reason)
+            self._safe_on_evaluate(reason, False)
             return
+
+        reason = str(parsed.get("reason", "")).strip() or "主动搭话"
+        self._safe_on_evaluate(reason, True)
 
         self._last_proactive_at = time.monotonic()
         self._idle_armed = True
@@ -461,12 +861,17 @@ class ProactiveObserver:
             tone=str(parsed.get("tone", "")).strip() or "中性",
         )
 
-        # Deliver to UI（正式回复管线由 PetWindow 负责：字幕/TTS/历史/立绘）
         try:
             self.on_speak(payload)
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
             _observer_gui_log("主动发言回调失败", {"error": str(e)})
+
+    def _safe_on_evaluate(self, reason: str, should_speak: bool) -> None:
+        try:
+            self.on_evaluate(reason, should_speak)
+        except Exception as e:
+            logger.warning("ProactiveObserver: on_evaluate callback error: {}", e)
 
     def _build_full_system_prompt(self) -> str:
         parts = []
@@ -476,7 +881,6 @@ class ProactiveObserver:
         return "\n\n---\n\n".join(parts)
 
     async def _chat_completion(self, messages: list[dict]) -> str:
-        """Simple non-streaming chat completion via httpx."""
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=self.config.request_timeout)
 
@@ -501,15 +905,14 @@ class ProactiveObserver:
         if not content:
             logger.warning(
                 "ProactiveObserver: VLM returned empty content (finish={}, model={})",
-                finish, self._api_model,
+                finish,
+                self._api_model,
             )
-            logger.debug("ProactiveObserver: raw response: {}", json.dumps(data, ensure_ascii=False)[:500])
+            logger.debug(
+                "ProactiveObserver: raw response: {}",
+                json.dumps(data, ensure_ascii=False)[:500],
+            )
         return content or ""
-
-
-# ---------------------------------------------------------------------------
-# JSON helpers
-# ---------------------------------------------------------------------------
 
 
 def _extract_json(text: str) -> dict | None:
@@ -518,14 +921,12 @@ def _extract_json(text: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Try fenced code block
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if fence:
         try:
             return json.loads(fence.group(1))
         except json.JSONDecodeError:
             pass
-    # Try bare JSON object
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         try:

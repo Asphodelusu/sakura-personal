@@ -320,6 +320,26 @@ class MemoryCurator:
             return ""
         return "以下是你的心情变化记录，最近的在上面：\n" + "\n".join(lines)
 
+    def _load_user_emotion_history_text(self) -> str:
+        """读取用户情绪历史并格式化为简短的回顾文本；无历史时返回空串。"""
+        try:
+            history = self.memory_store.user_emotion_history()
+        except Exception:
+            return ""
+        if not history:
+            return ""
+        lines: list[str] = []
+        for i, entry in enumerate(history[:5], 1):
+            ts = entry.get("timestamp", "")
+            content = entry.get("content", "")
+            if not content.strip():
+                continue
+            time_label = ts[:16] if ts else ""
+            lines.append(f"{i}. [{time_label}] {content}")
+        if not lines:
+            return ""
+        return "以下是对方最近几次对话中流露的情绪轨迹，最近的在上面：\n" + "\n".join(lines)
+
     def _extract_operations(
         self,
         dialog_entries: list[dict[str, str]],
@@ -331,10 +351,12 @@ class MemoryCurator:
 
         system_prompt = self._build_self_curation_system_prompt()
         mood_history_block = self._load_mood_history_text()
+        user_emotion_history_block = self._load_user_emotion_history_text()
         user_prompt = _build_curation_user_prompt(
             _format_existing_memories(existing),
             dialog_entries,
             mood_history_block=mood_history_block,
+            user_emotion_history_block=user_emotion_history_block,
         )
         llm_messages = [{"role": "user", "content": user_prompt}]
         repair_hint = (
@@ -652,7 +674,9 @@ _SELF_CURATION_TASK_PROMPT = (
     "更新日记时，用 mood_update 操作：{\"op\":\"mood_update\",\"content\":\"你此刻想对自己说的话——一两句就够\"}。\n"
     "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。\n"
     "如果你在心情历史里看到一条刚留下的新心情，而这段对话里正好有触发它的事——同样的，把那件事记住。无论心情是谁写下的，值得记住的事不应该被遗忘。\n"
-    "整理记忆时，看一看「最近的心情轨迹」。如果发现心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
+    "整理记忆时，看一看「最近的心情轨迹」和「对方的情绪轨迹」。\n"
+    "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
+    "如果对方的情绪轨迹里连续出现了相似的模式——比如 ta 最近几次都显得沮丧、焦虑或烦躁——那意味着 ta 最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中 ta 明确表达了原因）。如果你觉得这让你对 ta 的状态有了新的理解，可以自然地反映在心情笔记里（比如「ta 最近好像压力很大，我也跟着有点担心」）。\n"
     "如果对话中对方告诉了你 ta 的名字，请一定要记住，同时更新 core_profile 里的「あなたについて知っていること」。在记忆内容中，用对方告诉你的名字自然地称呼 ta（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「对方」或「他/她」。不要默认用「主人」——除非对方明确要求你这样叫。\n"
     "不要记录密码、token、密钥、证件号、银行卡等敏感信息。\n"
     "记忆内容推荐使用简体中文——中文的语义检索效果最好，我以后回忆时能找到得更准。但如果某句话用日文表达更贴切、或者那是对方用日文对你说过的重要原话，用日文也完全可以。这是你自己的记忆笔记，按你觉得最自然的方式来。\n\n"
@@ -763,12 +787,15 @@ def _build_curation_user_prompt(
     dialog_entries: list[dict[str, str]],
     *,
     mood_history_block: str = "",
+    user_emotion_history_block: str = "",
 ) -> str:
     parts = [
         "【我目前的长期记忆】\n" f"{existing_block}",
     ]
     if mood_history_block.strip():
         parts.append(f"【最近的心情轨迹】\n{mood_history_block}")
+    if user_emotion_history_block.strip():
+        parts.append(f"【对方的情绪轨迹】\n{user_emotion_history_block}")
     parts.append(
         "【最近的新对话】\n"
         f"{json.dumps(dialog_entries, ensure_ascii=False)}"

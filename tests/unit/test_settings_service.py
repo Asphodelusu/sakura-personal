@@ -118,7 +118,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
     assert system["debug"]["body_enabled"] is True
     assert system["debug"]["file_enabled"] is True
     assert system["startup"]["launch_at_login"] is True
-    assert system["screen_awareness"]["check_interval_minutes"] == 5
+    assert system["proactive"]["enabled"] is True
 
 
 def test_settings_service_loads_and_saves_startup_settings() -> None:
@@ -429,23 +429,31 @@ def test_settings_service_loads_empty_api_profiles_when_missing() -> None:
     assert service.load_model_selection() == ModelSelectionSettings()
 
 
-def test_settings_service_loads_and_saves_screen_context_resolution() -> None:
+def test_settings_service_loads_and_saves_screen_awareness_enabled() -> None:
     root = _runtime_root("yaml_screen_resolution")
     service = AppSettingsService(root)
 
     defaults = service.load_screen_awareness_settings()
+    assert defaults.enabled is True
     assert defaults.screen_context_resolution == (
         SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION
     )
 
     service.save_screen_awareness_settings(
-        ScreenAwarenessSettings(screen_context_resolution="1080p")
+        ScreenAwarenessSettings(enabled=False, screen_context_resolution="1080p")
     )
 
     loaded = service.load_screen_awareness_settings()
-    assert loaded.screen_context_resolution == "1080p"
+    assert loaded.enabled is False
+    # 分辨率等字段已由 ProactiveObserver 接管，保存不再写入，加载始终返回默认值
+    assert loaded.screen_context_resolution == (
+        SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION
+    )
     system = load_yaml_mapping(service.system_config_path)
-    assert system["screen_awareness"]["screen_context_resolution"] == "1080p"
+    assert system["proactive"]["enabled"] is False
+    assert "screen_awareness" not in system or "screen_context_resolution" not in system.get(
+        "screen_awareness", {}
+    )
 
 
 def test_settings_service_loads_debug_log_settings() -> None:

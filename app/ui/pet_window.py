@@ -507,6 +507,7 @@ class PetWindow(QWidget):
     plugin_input_text_requested = Signal(str)
     # 主动模式评论信号（从后台线程 emit，queued connection 回 UI 线程）
     proactive_comment_arrived = Signal(object)
+    proactive_evaluate_arrived = Signal(str, bool)  # reason, should_speak
     # 手机端聊天完成信号
     mobile_chat_completed = Signal(object)
     mobile_chat_requested = Signal(object)
@@ -646,7 +647,10 @@ class PetWindow(QWidget):
         self.memory_status_last_message = ""
         self.memory_failure_dialog_last_message = ""
         self.memory_failure_dialog_pending_message = ""
-        self.last_user_activity_at = time.perf_counter()
+        # 回溯到冷却窗外，避免启动瞬间被当成「刚聊过」，Observer 开场 3 分钟全是 UI busy。
+        self.last_user_activity_at = (
+            time.perf_counter() - PROACTIVE_POST_INTERACTION_GRACE_SECONDS
+        )
         self.last_screen_awareness_at: float | None = None
         self.last_screen_awareness_context_at: float | None = None
         self.screen_awareness_context_batch_started_at: float | None = None
@@ -655,6 +659,7 @@ class PetWindow(QWidget):
         # ---- proactive observer ----
         self._proactive_observer: ProactiveObserver | None = None
         self.proactive_comment_arrived.connect(self._show_proactive_comment)
+        self.proactive_evaluate_arrived.connect(self._record_proactive_evaluate)
         self._init_proactive_observer()
         # ----
         self.interaction_sequence = 0
@@ -3028,6 +3033,7 @@ class PetWindow(QWidget):
                 config=config,
                 privacy=PrivacyGuard(),
                 on_speak=self._on_proactive_speak,
+                on_evaluate=self._on_proactive_evaluate,
                 is_busy=self._is_proactive_observer_busy,
             )
             self._proactive_observer = observer
@@ -3057,37 +3063,75 @@ class PetWindow(QWidget):
             except Exception:
                 pass
 
-    def _is_proactive_observer_busy(self) -> bool:
-        """ProactiveObserver 评估/发言前的忙碌门：避免打断正式对话或字幕播放。"""
+    def _proactive_observer_busy_reason(self) -> str:
+        """返回忙碌原因；空字符串表示空闲，可供 Observer/日志使用。"""
         if getattr(self, "startup_initializing", False):
-            return True
-        if (
-            self.worker_thread is not None
-            or self.active_reminder_id is not None
-            or self.active_event_type
-            or self.pending_tool_action is not None
-            or self.pending_screen_observation_messages is not None
-            or self.screen_observation_followup_in_progress
-            or self.screen_observation_encode_thread is not None
-            or self.active_interaction_id
-        ):
-            return True
-        if self.input_edit.text().strip() or self.speech_timer.isActive():
-            return True
-        if time.perf_counter() - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
-            return True
+            return "startup_initializing"
+        if self.worker_thread is not None:
+            return "worker_thread"
+        if self.active_reminder_id is not None:
+            return "active_reminder"
+        if self.active_event_type:
+            return "active_event"
+        if self.pending_tool_action is not None:
+            return "pending_tool_action"
+        if self.pending_screen_observation_messages is not None:
+            return "pending_screen_observation"
+        if self.screen_observation_followup_in_progress:
+            return "screen_observation_followup"
+        if self.screen_observation_encode_thread is not None:
+            return "screen_observation_encode"
+        if self.active_interaction_id:
+            return "active_interaction"
+        if self.input_edit.text().strip():
+            return "input_not_empty"
+        if self.speech_timer.isActive():
+            return "speech_timer"
+        remaining = PROACTIVE_POST_INTERACTION_GRACE_SECONDS - (
+            time.perf_counter() - self.last_user_activity_at
+        )
+        if remaining > 0:
+            return f"post_interaction_grace:{int(remaining)}s"
         subtitle_controller = getattr(self, "subtitle_controller", None)
         if subtitle_controller is not None and (
             subtitle_controller.current_segment_in_progress()
             or subtitle_controller.is_reply_sequence_active()
         ):
-            return True
+            return "subtitle_active"
         if subtitle_controller is None and getattr(self, "current_segment_sequence_id", None) is not None and (
             not getattr(self, "current_segment_speech_done", True)
             or not getattr(self, "current_segment_tts_done", True)
         ):
-            return True
-        return False
+            return "segment_playback"
+        return ""
+
+    def _is_proactive_observer_busy(self) -> bool | str:
+        """ProactiveObserver 忙碌门；返回原因字符串（空串=空闲）。truthy 即忙碌。"""
+        return self._proactive_observer_busy_reason()
+
+    def _on_proactive_evaluate(self, reason: str, should_speak: bool) -> None:
+        """Observer 后台线程回调，通过 Signal 转发到主线程记录历史。"""
+        try:
+            self.proactive_evaluate_arrived.emit(reason, should_speak)
+        except Exception:
+            pass
+
+    @Slot(str, bool)
+    def _record_proactive_evaluate(self, reason: str, should_speak: bool) -> None:
+        """在主线程写入 "[看了一下屏幕]" 到聊天历史。"""
+        try:
+            status = "发言" if should_speak else "未发言"
+            mark = f"[看了一下屏幕] {status}"
+            if reason:
+                mark += f"：{reason}"
+            self._record_history("system", mark)
+            debug_log(
+                "ProactiveObserver",
+                "评估结果已写入历史",
+                {"should_speak": should_speak, "reason": reason[:120]},
+            )
+        except Exception as exc:
+            debug_log("ProactiveObserver", "评估结果写入历史失败", {"error": str(exc)})
 
     def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
         """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
@@ -4155,28 +4199,8 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_screen_awareness(self) -> None:
-        if getattr(self, "startup_initializing", False):
-            return
-        if not self._screen_awareness_context_allowed():
-            return
-        if not self._can_run_screen_awareness():
-            return
-
-        now = time.perf_counter()
-        if self._should_capture_screen_awareness_context(now):
-            self._capture_screen_awareness_context(now)
-        if not self._should_send_screen_awareness_batch(now):
-            return
-
-        event = self._build_screen_awareness_event(now)
-        self.pending_event_visual_observation_jobs = [
-            *getattr(self, "pending_event_visual_observation_jobs", []),
-            *_build_screen_awareness_visual_observation_jobs(event),
-        ]
-        self.last_screen_awareness_at = now
-        self._record_history("system", SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER)
-        self._clear_screen_awareness_context_batch("sent")
-        self._run_event_worker(event)
+        # 已由 ProactiveObserver 接管；旧 timer 路径保留仅作兼容，不再执行截图/主动会话。
+        return
 
     def _can_run_screen_awareness(self) -> bool:
         if not self._screen_awareness_context_allowed():
@@ -4362,11 +4386,9 @@ class PetWindow(QWidget):
         }
 
     def _sync_screen_awareness_timer(self) -> None:
-        if self._screen_awareness_context_allowed():
-            if not self.screen_awareness_timer.isActive():
-                self.screen_awareness_timer.start()
-        else:
-            self.screen_awareness_timer.stop()
+        # ProactiveObserver 已接管主动屏幕感知；旧 QTimer 一律停用，避免双通路并行截图。
+        self.screen_awareness_timer.stop()
+        if not self._screen_awareness_context_allowed():
             self._clear_screen_awareness_context_batch("disabled")
 
     def _clear_screen_awareness_context_batch(self, reason: str) -> None:
@@ -4380,26 +4402,8 @@ class PetWindow(QWidget):
 
     # 兼容旧方法名；新代码请使用 screen_awareness 命名。
     def _check_proactive_care(self) -> None:
-        if getattr(self, "startup_initializing", False):
-            return
-        if not self._can_run_proactive_care():
-            return
-
-        now = time.perf_counter()
-        if self._should_capture_proactive_screen_context(now):
-            self._capture_proactive_screen_context(now)
-        if not self._should_send_proactive_care_batch(now):
-            return
-
-        event = self._build_proactive_care_event(now)
-        self.pending_event_visual_observation_jobs = [
-            *getattr(self, "pending_event_visual_observation_jobs", []),
-            *_build_screen_awareness_visual_observation_jobs(event),
-        ]
-        self.last_proactive_care_at = now
-        self._record_history("system", SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER)
-        self._clear_proactive_screen_context_batch("sent")
-        self._run_event_worker(event)
+        # 已由 ProactiveObserver 接管；与 _check_screen_awareness 相同，不再执行旧截图批次逻辑。
+        return
 
     def _can_run_proactive_care(self) -> bool:
         if not self._proactive_screen_context_allowed():
@@ -4559,12 +4563,7 @@ class PetWindow(QWidget):
         return PetWindow._current_screen_awareness_settings(self).allows_screen_context()
 
     def _sync_proactive_care_timer(self) -> None:
-        if self._proactive_screen_context_allowed():
-            if not self.proactive_care_timer.isActive():
-                self.proactive_care_timer.start()
-        else:
-            self.proactive_care_timer.stop()
-            self._clear_proactive_screen_context_batch("disabled")
+        self._sync_screen_awareness_timer()
 
     def _clear_proactive_screen_context_batch(self, reason: str) -> None:
         had_batch = bool(self.proactive_screen_contexts)
@@ -6231,6 +6230,9 @@ class PetWindow(QWidget):
             sync_screen_awareness_timer()
         else:
             self._sync_proactive_care_timer()
+        # 隐私页开关只改 proactive.enabled；若 API 未变则不会走客户端重建，需显式重启 Observer。
+        if screen is not None:
+            self._restart_proactive_observer()
         discard_backchannel_audio_cache = getattr(
             self,
             "_discard_backchannel_audio_cache",

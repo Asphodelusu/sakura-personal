@@ -74,12 +74,28 @@ def build_screen_observation_user_message(
     text: str,
     observation: ScreenObservation,
 ) -> dict[str, object]:
-    """构造 OpenAI 兼容的多模态用户消息。"""
+    """构造 OpenAI 兼容的多模态用户消息，附赠 UIA 直接读取的窗口文字。"""
     prompt_text = (
         f"{text.strip()}\n\n"
         f"当前屏幕截图信息：{observation.width}x{observation.height}，"
         f"捕获时间 {observation.captured_at}，屏幕 {observation.screen_name}。"
     ).strip()
+
+    # 附加 UIA 直接读取的窗口文字（免费，不经过 OCR）
+    try:
+        from app.perception.screen_reader import read_active_window
+        uia = read_active_window()
+        if uia.is_accessible and uia.text_content.strip():
+            uia_block = (
+                f"\n\n[UIA 直接读取] 以下文字来自系统无障碍接口，已从屏幕控件直接提取，无需 OCR：\n"
+                f"应用类型：{uia.app_type}\n"
+                f"进程：{uia.process_name}\n"
+                f"{uia.text_content}"
+            )
+            prompt_text += uia_block
+    except Exception:
+        pass  # UIA 不可用时静默跳过，截图仍正常发送
+
     return {
         "role": "user",
         "content": [
@@ -91,7 +107,6 @@ def build_screen_observation_user_message(
                 "type": "image_url",
                 "image_url": {
                     "url": observation.data_url,
-                    "detail": "low",
                 },
             },
         ],

@@ -15,10 +15,6 @@ const fields = {
   controlPanelOffset: document.getElementById("controlPanelOffset"),
   inputBarOffset: document.getElementById("inputBarOffset"),
   enabled: document.getElementById("enabled"),
-  checkInterval: document.getElementById("checkInterval"),
-  cooldown: document.getElementById("cooldown"),
-  batchLimit: document.getElementById("batchLimit"),
-  screenResolution: document.getElementById("screenResolution"),
   windowsMcp: document.getElementById("windowsMcp"),
   agentSteps: document.getElementById("agentSteps"),
   toolCallsPerStep: document.getElementById("toolCallsPerStep"),
@@ -823,25 +819,12 @@ function initializeOnboarding() {
 
 function syncEnabledState() {
   const enabled = fields.enabled.checked;
-  setControlDisabled(fields.checkInterval, !enabled);
-  setControlDisabled(fields.cooldown, !enabled);
-  setControlDisabled(fields.batchLimit, !enabled);
-  setControlDisabled(fields.screenResolution, !enabled);
 }
 
 function updateScreenResolutionEstimate() {
-  if (!request) {
-    return;
-  }
-  const resolution = fields.screenResolution.value || "fullscreen";
-  const estimate = request.screen_resolution_estimates?.[resolution];
-  if (estimate) {
-    fields.tokenEstimate.textContent =
-      `预计发送 ${estimate.width}×${estimate.height}：约 ${estimate.tokens.toLocaleString("zh-CN")} token/张。`;
-    return;
-  }
+  if (!request) return;
   fields.tokenEstimate.textContent =
-    `按当前屏幕估算：约 ${request.estimated_tokens_per_image.toLocaleString("zh-CN")} token/张。`;
+    `聚焦窗口截图（最长边约 1920px）：约 ${request.estimated_tokens_per_image?.toLocaleString("zh-CN") || "—"} token/张。`;
 }
 
 function syncRuntimeLoopState() {
@@ -3971,16 +3954,8 @@ function requestFontPreview() {
 }
 
 function collectScreenAwarenessSettings() {
-  const limits = request.limits;
   const enabled = fields.enabled.checked;
-  return {
-    enabled,
-    screen_context_enabled: enabled,
-    check_interval_minutes: clampInt(fields.checkInterval.value, limits.check_interval_minutes),
-    cooldown_minutes: clampInt(fields.cooldown.value, limits.cooldown_minutes),
-    screen_context_batch_limit: clampInt(fields.batchLimit.value, limits.screen_context_batch_limit),
-    screen_context_resolution: fields.screenResolution.value || "fullscreen",
-  };
+  return { enabled, screen_context_enabled: enabled };
 }
 
 function collectRuntimeLoopSettings() {
@@ -4272,16 +4247,12 @@ async function load() {
   enhanceSelect(fields.visualEffectMode);
   enhanceSelect(fields.ttsProvider);
   enhanceSelect(fields.backchannelMode);
-  enhanceSelect(fields.screenResolution);
   enhanceSelect(fields.memoryLayerFilter);
   enhanceSelect(fields.memorySort);
   enhanceSelect(fields.memoryLayer);
   enhanceSelect(fields.pluginStatusFilter);
   enhanceSelect(fields.pluginPermissionFilter);
 
-  setNumericBounds(fields.checkInterval, request.limits.check_interval_minutes);
-  setNumericBounds(fields.cooldown, request.limits.cooldown_minutes);
-  setNumericBounds(fields.batchLimit, request.limits.screen_context_batch_limit);
   setNumericBounds(fields.agentSteps, request.limits.max_agent_steps_per_turn);
   setNumericBounds(fields.toolCallsPerStep, request.limits.max_tool_calls_per_step);
   setNumericBounds(fields.toolCallsPerTurn, request.limits.max_tool_calls_per_turn);
@@ -4313,10 +4284,6 @@ async function load() {
 
   const settings = request.screen_awareness;
   fields.enabled.checked = settings.enabled && settings.screen_context_enabled;
-  fields.checkInterval.value = settings.check_interval_minutes;
-  fields.cooldown.value = settings.cooldown_minutes;
-  fields.batchLimit.value = settings.screen_context_batch_limit;
-  fields.screenResolution.value = settings.screen_context_resolution || "fullscreen";
   syncDesktopMcpControl(request.mcp);
   fields.windowsMcp.checked = request.mcp.windows_enabled;
   fields.agentSteps.value = request.runtime_loop.max_agent_steps_per_turn;
@@ -4381,7 +4348,6 @@ async function load() {
   refreshSelect(fields.characterSelect);
   refreshSelect(fields.ttsProvider);
   refreshSelect(fields.backchannelMode);
-  refreshSelect(fields.screenResolution);
   renderMemoryPage();
   renderPluginPage();
   renderResourceCards();
@@ -4426,7 +4392,6 @@ fields.ttsVoiceImportButton.addEventListener("click", importCharacterVoiceArchiv
 fields.characterExportButton.addEventListener("click", exportCharacterArchive);
 fields.characterEditorButton.addEventListener("click", launchCharacterStudio);
 fields.enabled.addEventListener("change", syncEnabledState);
-fields.screenResolution.addEventListener("change", updateScreenResolutionEstimate);
 fields.toolCallsPerStep.addEventListener("input", syncRuntimeLoopState);
 fields.addProviderButton.addEventListener("click", openAddProviderChooser);
 fields.onboardingCharacterStep.addEventListener("click", () => showOnboardingStep("character"));

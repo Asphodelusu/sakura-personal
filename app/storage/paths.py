@@ -114,6 +114,12 @@ class StoragePaths:
     def memory_mood_state(self) -> Path:
         return self.memory_dir / "mood_state.json"
 
+    def memory_user_emotion_state(self) -> Path:
+        return self.memory_dir / "user_emotion_state.json"
+
+    def memory_revisions(self) -> Path:
+        return self.memory_dir / "memory_revisions.json"
+
     def memory_curation_state(self) -> Path:
         return self._data / "memory_curation_state.json"
 
