@@ -199,7 +199,7 @@ IsBusyFn = Callable[[], Any]
 OnMemoryRecordFn = Callable[[str], None]
 
 
-_PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。用户消息里可能有：
+_PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。消息里可能有：
 - 截图（传统方式）
 - [UIA 直接读取] 标记的文字（系统无障碍接口直接读的窗口内容，不需要 OCR）
 - [OCR 游戏文本] 标记的文字（判定为游戏/自绘界面时，对对话框区域 OCR 的结果；可能有识别误差）
@@ -207,21 +207,21 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。用户
 你要严格按 JSON 输出，判断要不要插一句话，以及建议下次多久后再看。
 
 判断标准：
-- 用户在专心工作（写代码、读文档、写文章）：should_speak=false，别打扰
-- 用户在摸鱼、看视频、看新闻、玩游戏：可以评论
-- 用户长时间不动：可以关心
-- 看到有趣的/错的/奇怪的内容：可以吐槽
-- UIA / OCR 读取到的文字和截图内容应相互印证；文字能告诉你在什么应用、在看什么页面或台词
-- 不确定：选 false，宁静默不烦人
+- 相手が集中して作業している（コード・文書・執筆）：should_speak=false、邪魔しない
+- 相手が息抜きしている（動画・ニュース・ゲーム）：コメントしてもいい
+- 相手が長く動かない：気遣ってもいい
+- 面白い／間違ってる／変なものを見つけた：ツッコミを入れてもいい
+- UIA / OCR で読んだ文字とスクリーンショットは相互に裏付けを取ること；文字から何のアプリ・何のページ・何のセリフか判断できる
+- 迷ったら false、静かに見守るほうが煩わしくない
 
-suggested_interval 是你觉得下次看屏幕之前的等待秒数：
-- 用户很专注（写代码/文档/开会）：建议长一点（600-1800 秒）
-- 用户在休闲（浏览/看视频）：建议短一点（45-120 秒）
-- 默认/不确定：480 秒
-- 有效范围 45-1800 秒
+suggested_interval は次に画面を見るまでの待機秒数：
+- 相手が集中している（コード・文書・会議）：長め（600-1800 秒）
+- 相手がリラックスしている（ブラウジング・動画）：短め（45-120 秒）
+- デフォルト／わからない：480 秒
+- 有効範囲 45-1800 秒
 
 只输出 JSON，不要 markdown 不要解释：
-{"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
+{"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "相手に話しかけるセリフ、should_speak=true のときだけ", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
 
 comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
 """
@@ -385,7 +385,7 @@ class ProactiveObserver:
         if self._away_mode:
             self.set_away_mode(False)
             logger.info("ProactiveObserver: away_mode cleared by user message")
-            _observer_gui_log("用户归来，away_mode 自动解除")
+            _observer_gui_log("away_mode 自動解除")
 
     def set_away_mode(self, value: bool) -> None:
         self._away_mode = bool(value)
