@@ -914,7 +914,11 @@ class MemoryStore:
         ]
 
     def record_user_emotion(self, text: str) -> None:
-        """从用户输入中检测情绪并写入轨迹；无可靠信号时不写入。"""
+        """从用户输入中检测情绪并写入轨迹；无可靠信号时不写入。
+
+        同情绪重复出现时只刷新 updated_at，不挤一条假历史，避免
+        「连续五次都是 happy」其实只是连聊了五句带「开心」。
+        """
         content = (text or "").strip()
         if not content:
             return
@@ -927,16 +931,20 @@ class MemoryStore:
             return
         data = self._load_user_emotion_state()
         now = _now_iso()
-        previous_entry = None
         existing = data.get(self.scope_id) if isinstance(data, dict) else None
+        prev_content = ""
+        history: list[Any] = []
         if isinstance(existing, dict):
             prev_content = str(existing.get("content", "")).strip()
-            if prev_content:
-                previous_entry = {"content": prev_content, "timestamp": existing.get("updated_at", "")}
-        history = existing.get("history", []) if isinstance(existing, dict) else []
-        if previous_entry:
-            history.insert(0, previous_entry)
-        history = history[:5]
+            raw_history = existing.get("history", [])
+            if isinstance(raw_history, list):
+                history = list(raw_history)
+            if prev_content and prev_content != emotion:
+                history.insert(
+                    0,
+                    {"content": prev_content, "timestamp": existing.get("updated_at", "")},
+                )
+                history = history[:5]
         data[self.scope_id] = {"content": emotion, "updated_at": now, "history": history}
         self._save_user_emotion_state(data)
 
@@ -2131,6 +2139,10 @@ def _memory_metadata(
     emotion_value = _optional_text(arguments, "emotion") or str(metadata.get("emotion") or "").strip()
     if emotion_value:
         metadata["emotion"] = normalize_emotion(emotion_value)
+    # status 需透传：release_memory 依赖 metadata.status == "released"
+    status_value = _optional_text(arguments, "status") or str(metadata.get("status") or "").strip()
+    if status_value:
+        metadata["status"] = status_value.strip().lower()
     if arguments.get("volatile") is True:
         metadata["volatile"] = True
     elif str(arguments.get("volatile", "")).strip().lower() == "false":
@@ -2272,38 +2284,41 @@ def _memory_is_released(record: dict[str, Any]) -> bool:
 
 
 def _save_revision(base_dir: Path | None, memory_id: str, previous: dict[str, Any] | None, *, reason: str = "") -> None:
-    """保存记忆的旧版本到 revisions 文件。"""
+    """保存记忆的旧版本到 revisions 文件。
+
+    失败只记日志，绝不阻断真正的 update_memory 写回。
+    """
     if previous is None or not memory_id or base_dir is None:
         return
     content = str(previous.get("content") or previous.get("memory") or "").strip()
     if not content or len(content) < 10:
         return
-    revisions_path = StoragePaths(base_dir).memory_revisions
     try:
+        revisions_path = StoragePaths(base_dir).memory_revisions()
         if revisions_path.exists():
             data = json.loads(revisions_path.read_text(encoding="utf-8"))
         else:
             data = {}
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    entry = {
-        "content": content,
-        "updated_at": _now_iso(),
-        "reason": str(reason or "update"),
-    }
-    revisions = data.get(memory_id)
-    if isinstance(revisions, list):
-        revisions.append(entry)
-    else:
-        data[memory_id] = [entry]
-    revisions_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(
-        revisions_path,
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+        if not isinstance(data, dict):
+            data = {}
+        entry = {
+            "content": content,
+            "updated_at": _now_iso(),
+            "reason": str(reason or "update"),
+        }
+        revisions = data.get(memory_id)
+        if isinstance(revisions, list):
+            revisions.append(entry)
+        else:
+            data[memory_id] = [entry]
+        revisions_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            revisions_path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001 — 修订归档是旁路，不能拖垮主写入
+        logging.getLogger(__name__).debug("save memory revision failed: %s", exc)
 
 
 def _detect_memory_contradiction(

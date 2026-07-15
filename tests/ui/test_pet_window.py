@@ -4197,6 +4197,9 @@ class _DummyTextInput:
     def text(self) -> str:
         return ""
 
+    def hasFocus(self) -> bool:
+        return False
+
 
 class _DummyEditableInput:
     def __init__(self, text: str) -> None:
@@ -5383,11 +5386,13 @@ def _build_minimal_proactive_window(
     window.current_segment_speech_done = True
     window.current_segment_tts_done = True
     window.last_user_activity_at = 0.0
+    window.last_proactive_interaction_at = 0.0
     window.last_proactive_care_at = None
     window.last_proactive_screen_context_at = None
     window.proactive_screen_context_batch_started_at = None
     window.proactive_screen_contexts = []
     window.proactive_screen_context_dropped_count = 0
+    window._user_was_idle = False
     window.confirm_action_button = _DummyButton()
     window.cancel_action_button = _DummyButton()
     captured_events = events if events is not None else []

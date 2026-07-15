@@ -648,9 +648,10 @@ class PetWindow(QWidget):
         self.memory_failure_dialog_last_message = ""
         self.memory_failure_dialog_pending_message = ""
         # 回溯到冷却窗外，避免启动瞬间被当成「刚聊过」，Observer 开场 3 分钟全是 UI busy。
-        self.last_user_activity_at = (
-            time.perf_counter() - PROACTIVE_POST_INTERACTION_GRACE_SECONDS
-        )
+        _startup_activity = time.perf_counter() - PROACTIVE_POST_INTERACTION_GRACE_SECONDS
+        self.last_user_activity_at = _startup_activity
+        # 仅真实对话/截图/语音等才刷新；输入框按键不刷新，避免退格清空又卡 3 分钟。
+        self.last_proactive_interaction_at = _startup_activity
         self.last_screen_awareness_at: float | None = None
         self.last_screen_awareness_context_at: float | None = None
         self.screen_awareness_context_batch_started_at: float | None = None
@@ -2934,7 +2935,8 @@ class PetWindow(QWidget):
         )
 
     def _log_input_key_event(self, event: object) -> None:
-        self._mark_user_activity()
+        # 仅更新桌面空闲计时；不计入主动感知冷却，也不通知 Observer「用户发言」。
+        self.last_user_activity_at = time.perf_counter()
         key_event = event if isinstance(event, QKeyEvent) else None
         debug_log(
             "Input",
@@ -3083,15 +3085,16 @@ class PetWindow(QWidget):
             return "screen_observation_encode"
         if self.active_interaction_id:
             return "active_interaction"
-        if self.input_edit.text().strip():
-            return "input_not_empty"
+        # 只在正在打字（有焦点）时暂缓；框里留字但已失焦不挡主动感知。
+        if self.input_edit.hasFocus():
+            return "input_focused"
         if self.speech_timer.isActive():
             return "speech_timer"
         remaining = PROACTIVE_POST_INTERACTION_GRACE_SECONDS - (
-            time.perf_counter() - self.last_user_activity_at
+            time.perf_counter() - self.last_proactive_interaction_at
         )
         if remaining > 0:
-            return f"post_interaction_grace:{int(remaining)}s"
+            return f"post_interaction_grace:{max(1, int(remaining))}s"
         subtitle_controller = getattr(self, "subtitle_controller", None)
         if subtitle_controller is not None and (
             subtitle_controller.current_segment_in_progress()
@@ -3201,11 +3204,19 @@ class PetWindow(QWidget):
                     observer.set_away_mode(True)
                     return
 
-    def _mark_user_activity(self) -> None:
-        self.last_user_activity_at = time.perf_counter()
-        observer = getattr(self, "_proactive_observer", None)
-        if observer is not None:
-            observer.notify_user_spoke()
+    def _mark_user_activity(self, *, proactive: bool = True) -> None:
+        """记录用户活动。
+
+        proactive=True（默认）：真实对话意图（发送/语音/截图等），刷新主动感知冷却并通知 Observer。
+        proactive=False：仅刷新桌面空闲计时，不延长主动感知沉默窗。
+        """
+        now = time.perf_counter()
+        self.last_user_activity_at = now
+        if proactive:
+            self.last_proactive_interaction_at = now
+            observer = getattr(self, "_proactive_observer", None)
+            if observer is not None:
+                observer.notify_user_spoke()
         if self._user_was_idle:
             self._user_was_idle = False
             self._emit_bus_event(EVENT_USER_RETURNED, {
@@ -3218,19 +3229,19 @@ class PetWindow(QWidget):
             return
         if self.worker_thread is not None:
             return
-        self._begin_interaction("return_pressed")
+        # 不在此 begin：空发送不应开启 interaction，也不应刷新主动感知冷却。
         self.send_message("return_pressed")
 
     @Slot()
     def _handle_send_button_clicked(self) -> None:
         if getattr(self, "startup_initializing", False):
             return
-        self._begin_interaction("send_button_clicked")
         self.send_message("send_button_clicked")
 
     @Slot()
     def _handle_screenshot_button_clicked(self) -> None:
-        self._mark_user_activity()
+        # 仅算桌面活跃；真正带截图发送时由 send_message 刷新主动感知冷却。
+        self._mark_user_activity(proactive=False)
         if getattr(self, "startup_initializing", False):
             return
         if self.worker_thread is not None:
@@ -3341,7 +3352,8 @@ class PetWindow(QWidget):
     # ── 语音输入 ──────────────────────────────────────────────
 
     def _handle_voice_button_clicked(self) -> None:
-        self._mark_user_activity()
+        # 点开麦克风不算一次「对话」；内容真正发出时由 send_message 刷新冷却。
+        self._mark_user_activity(proactive=False)
         if getattr(self, "startup_initializing", False):
             return
         if self.worker_thread is not None:
@@ -3451,10 +3463,6 @@ class PetWindow(QWidget):
             return
         text = self.input_edit.text().strip()
         manual_observation = self.pending_manual_screen_observation
-        self._mark_user_activity()
-        self._detect_away_from_message(text)
-        if not self.active_interaction_id:
-            self._begin_interaction(source)
         self._log_interaction_stage(
             "send_message_enter",
             {
@@ -3482,13 +3490,22 @@ class PetWindow(QWidget):
                     "worker_busy": self.worker_thread is not None,
                 },
             )
-            self._end_interaction("ignored")
+            # 空发送/忙碌：不 begin、不刷新主动感知冷却（否则点一下发送就卡 180s）。
+            if self.active_interaction_id:
+                self._end_interaction("ignored")
             return
         if manual_observation is not None and not self.screen_observation_enabled:
             show_themed_information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
             self._clear_manual_screen_observation()
-            self._end_interaction("ignored")
+            if self.active_interaction_id:
+                self._end_interaction("ignored")
             return
+
+        # 真正有内容发出后才算一次用户交互。
+        self._mark_user_activity()
+        self._detect_away_from_message(text)
+        if not self.active_interaction_id:
+            self._begin_interaction(source)
 
         if not text and manual_observation is not None:
             text = MANUAL_SCREENSHOT_DEFAULT_TEXT
@@ -4512,7 +4529,7 @@ class PetWindow(QWidget):
             return False
         if self.proactive_screen_context_batch_started_at is None:
             return False
-        if now - self.last_user_activity_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
+        if now - self.last_proactive_interaction_at < PROACTIVE_POST_INTERACTION_GRACE_SECONDS:
             return False
         settings = PetWindow._current_screen_awareness_settings(self)
         cooldown_seconds = (

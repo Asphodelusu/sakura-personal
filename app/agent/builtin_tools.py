@@ -266,7 +266,10 @@ def create_builtin_tool_registry(
                     },
                     "required": ["memory_id"],
                 },
-                handler=lambda arguments: memory.release_memory({"id": arguments.get("memory_id") or arguments.get("id")}),
+                handler=lambda arguments: memory.release_memory(
+                    {"id": arguments.get("memory_id") or arguments.get("id")},
+                    wait=False,
+                ),
                 group="memory-write",
             ),
         ]

@@ -27,6 +27,7 @@ from app.perception.screen_reader import WindowText, read_active_window
 from app.perception.win32 import (
     get_active_window_process_name,
     get_active_window_title,
+    get_foreground_hwnd,
     get_idle_seconds,
 )
 
@@ -248,8 +249,10 @@ class ProactiveConfig:
     cooldown_seconds: float = 600
     min_silence_after_user: float = 10
     window_switch_enabled: bool = True
-    window_switch_cooldown: float = 45
-    focus_settle_delay: float = 15
+    # APP_FOCUS 类型冷却（对齐同类 ~20s；冷却内切换记 deferred，结束后补票）
+    window_switch_cooldown: float = 25
+    # 前台稳定多久才算一次切应用触发（快切会不断重置）
+    focus_settle_delay: float = 5
     idle_threshold_seconds: float = 600
     poll_interval: float = 5.0
     content_check_interval: float = 30.0
@@ -306,6 +309,25 @@ class ProactiveConfig:
         )
 
 
+@dataclass(frozen=True)
+class FocusSnapshot:
+    """Foreground identity: process+HWND = APP_FOCUS; title is display only."""
+
+    hwnd: int
+    process: str
+    title: str
+    changed_at: float = 0.0
+
+    @property
+    def app_key(self) -> str:
+        proc = (self.process or "").casefold()
+        return f"{proc}|{int(self.hwnd)}"
+
+    @property
+    def label(self) -> str:
+        return self.title or self.process or f"hwnd:{self.hwnd}"
+
+
 class ProactiveObserver:
     """Watches the desktop and decides — via VLM — whether to speak."""
 
@@ -339,14 +361,18 @@ class ProactiveObserver:
 
         self._last_proactive_at = 0.0
         self._last_user_at = time.monotonic()
+        # 兼容旧日志字段：始终等于当前焦点标题
         self._last_window_title = ""
-        self._previous_window_title = ""
+        self._focus_current: FocusSnapshot | None = None
+        self._focus_previous: FocusSnapshot | None = None
+        self._pending_focus: FocusSnapshot | None = None
+        self._focus_settled_at: float = 0.0
+        self._deferred_focus: FocusSnapshot | None = None
+        self._ready_focus_trigger: str = ""
         self._last_timer_check = time.monotonic()
         self._next_timer_at: float = 0.0
         self._last_eval_at = 0.0
         self._last_window_trigger_at = 0.0
-        self._focus_settled_at: float = 0.0
-        self._pending_window: str = ""
         self._idle_armed = True
 
         self._last_frame_dhash: int | None = None
@@ -362,6 +388,7 @@ class ProactiveObserver:
         self._away_set_at: float = 0.0
 
         self._running = False
+        self._run_epoch = 0
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._http: httpx.AsyncClient | None = None
@@ -406,8 +433,19 @@ class ProactiveObserver:
     def start(self) -> None:
         if self._running:
             return
+        # 旧线程若仍在收尾（崩溃/stop 竞态），先等一下避免双循环。
+        old = self._thread
+        if old is not None and old.is_alive() and old is not threading.current_thread():
+            old.join(timeout=2.0)
+        self._run_epoch += 1
+        epoch = self._run_epoch
         self._running = True
-        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            args=(epoch,),
+            daemon=True,
+            name="ProactiveObserver",
+        )
         self._thread.start()
         logger.info(
             "ProactiveObserver: started (timer={}s, cooldown={}s, idle={}s, model={})",
@@ -429,19 +467,26 @@ class ProactiveObserver:
 
     def stop(self) -> None:
         self._running = False
+        thread = self._thread
         loop = self._loop
         if loop is not None:
             try:
-                for task in asyncio.all_tasks(loop):
-                    task.cancel()
+                def _cancel_all() -> None:
+                    for task in asyncio.all_tasks(loop):
+                        task.cancel()
+
+                loop.call_soon_threadsafe(_cancel_all)
             except RuntimeError:
                 pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         self._http = None
-        self._thread = None
+        if self._thread is thread:
+            self._thread = None
         logger.info("ProactiveObserver: stopped")
         _observer_gui_log("主动观察已停止")
 
-    def _thread_main(self) -> None:
+    def _thread_main(self, epoch: int) -> None:
         import ctypes as _ctypes
 
         _com_initialized = (
@@ -465,15 +510,21 @@ class ProactiveObserver:
                     pass
                 if self._loop is loop:
                     self._loop = None
-                if self._thread is threading.current_thread():
-                    self._thread = None
         finally:
             if _com_initialized:
-                _ctypes.windll.ole32.CoUninitialize()
+                try:
+                    _ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+            # 仅本代线程清除闸门，避免 stop→start 竞态把新循环的 _running 打回 False。
+            if self._run_epoch == epoch:
+                self._running = False
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     async def _run(self) -> None:
         self._http = httpx.AsyncClient(timeout=self.config.request_timeout)
-        self._last_window_title = get_active_window_title()
+        self._sync_focus_tracking(time.monotonic(), seed_only=True)
         try:
             while self._running:
                 try:
@@ -485,6 +536,10 @@ class ProactiveObserver:
                     continue
 
                 try:
+                    now = time.monotonic()
+                    # busy / 冷却期间也持续跟踪焦点，避免丢切换、错计时。
+                    self._sync_focus_tracking(now)
+
                     busy = self._is_busy()
                     if busy:
                         reason = busy if isinstance(busy, str) else "busy"
@@ -511,6 +566,7 @@ class ProactiveObserver:
                     triggers = await self._collect_triggers()
                     if not triggers:
                         continue
+                    self._consume_focus_triggers(triggers)
                     logger.info("ProactiveObserver: evaluating, triggers={}", triggers)
                     _observer_gui_log("正在评估是否发言", {"triggers": triggers})
                     await self._do_evaluation(triggers)
@@ -524,6 +580,134 @@ class ProactiveObserver:
                 except (asyncio.TimeoutError, Exception):
                     pass
                 self._http = None
+
+    def _read_focus_snapshot(self, *, now: float | None = None) -> FocusSnapshot | None:
+        hwnd = int(get_foreground_hwnd() or 0)
+        title = get_active_window_title()
+        process = get_active_window_process_name()
+        if hwnd <= 0 and not title and not process:
+            return None
+        return FocusSnapshot(
+            hwnd=hwnd,
+            process=process or "",
+            title=title or "",
+            changed_at=time.monotonic() if now is None else now,
+        )
+
+    def _arm_focus_settle(self, snap: FocusSnapshot, *, now: float) -> None:
+        """开始/重置 settle；快切时不断重置截止时间。"""
+        self._pending_focus = snap
+        self._focus_settled_at = now + self.config.focus_settle_delay
+        self._deferred_focus = None
+
+    def _defer_focus(self, snap: FocusSnapshot) -> None:
+        """类型冷却中：记下脏焦点，冷却结束后补票。"""
+        self._deferred_focus = snap
+        self._pending_focus = None
+        self._focus_settled_at = 0.0
+
+    def _promote_deferred_focus(self, *, now: float) -> None:
+        deferred = self._deferred_focus
+        current = self._focus_current
+        if deferred is None or current is None:
+            return
+        if deferred.app_key != current.app_key:
+            return
+        if now - self._last_window_trigger_at < self.config.window_switch_cooldown:
+            return
+        # 冷却期已在前台稳住的时间可计入 settle
+        elapsed = max(0.0, now - deferred.changed_at)
+        settle = self.config.focus_settle_delay
+        if elapsed >= settle:
+            self._emit_ready_focus_trigger(previous=self._focus_previous, current=current, now=now)
+            self._deferred_focus = None
+            self._pending_focus = None
+            self._focus_settled_at = 0.0
+        else:
+            self._pending_focus = current
+            self._focus_settled_at = deferred.changed_at + settle
+            self._deferred_focus = None
+
+    def _emit_ready_focus_trigger(
+        self,
+        *,
+        previous: FocusSnapshot | None,
+        current: FocusSnapshot,
+        now: float,
+    ) -> None:
+        from_label = previous.label if previous is not None else "(unknown)"
+        self._ready_focus_trigger = f"window:{from_label!r}->{current.label!r}"
+        self._last_window_trigger_at = now
+
+    def _sync_focus_tracking(self, now: float, *, seed_only: bool = False) -> None:
+        """始终跟踪前台 APP_FOCUS（进程+HWND）。busy/冷却也调用，保证不丢切换。"""
+        if not self.config.window_switch_enabled and not seed_only:
+            return
+
+        snap = self._read_focus_snapshot(now=now)
+        if snap is None:
+            return
+
+        self._last_window_title = snap.title
+
+        if self._focus_current is None or seed_only:
+            self._focus_current = snap
+            self._last_window_title = snap.title
+            return
+
+        current = self._focus_current
+        if snap.app_key == current.app_key:
+            # 同应用仅标题变化：更新展示名，不重置 APP_FOCUS settle
+            if snap.title != current.title or snap.process != current.process:
+                self._focus_current = FocusSnapshot(
+                    hwnd=current.hwnd,
+                    process=snap.process or current.process,
+                    title=snap.title or current.title,
+                    changed_at=current.changed_at,
+                )
+                self._last_window_title = self._focus_current.title
+            self._promote_deferred_focus(now=now)
+            self._finalize_focus_settle(now=now)
+            return
+
+        # —— APP_FOCUS 切换 ——
+        self._next_timer_at = 0.0
+        self._invalidate_window_text_cache()
+        self._last_text_hash = None
+        self._focus_previous = current
+        self._focus_current = snap
+        self._last_window_title = snap.title
+        self._ready_focus_trigger = ""
+
+        if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
+            self._arm_focus_settle(snap, now=now)
+        else:
+            self._defer_focus(snap)
+
+        self._promote_deferred_focus(now=now)
+        self._finalize_focus_settle(now=now)
+
+    def _finalize_focus_settle(self, *, now: float) -> None:
+        if self._focus_settled_at <= 0 or now < self._focus_settled_at:
+            return
+        pending = self._pending_focus
+        current = self._focus_current
+        if (
+            pending is not None
+            and current is not None
+            and pending.app_key == current.app_key
+        ):
+            self._emit_ready_focus_trigger(
+                previous=self._focus_previous,
+                current=current,
+                now=now,
+            )
+        self._pending_focus = None
+        self._focus_settled_at = 0.0
+
+    def _consume_focus_triggers(self, triggers: list[str]) -> None:
+        if any(t.startswith("window:") for t in triggers):
+            self._ready_focus_trigger = ""
 
     async def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
@@ -542,57 +726,49 @@ class ProactiveObserver:
 
         if now - self._last_user_at < self.config.min_silence_after_user:
             return []
-        if self._last_proactive_at and now - self._last_proactive_at < self.config.cooldown_seconds:
-            return []
-        if now - self._last_eval_at < self.config.poll_interval * 1.5:
-            return []
+
+        # 焦点触发不走「刚说过话的全局冷却」——分层：开口冷却 ≠ 看屏冷却。
+        # timer/content/idle 仍尊重 cooldown_seconds。
+        speak_cooldown = bool(
+            self._last_proactive_at
+            and now - self._last_proactive_at < self.config.cooldown_seconds
+        )
+        eval_throttle = now - self._last_eval_at < self.config.poll_interval * 1.5
 
         triggers: list[str] = []
+        if self._ready_focus_trigger:
+            triggers.append(self._ready_focus_trigger)
 
-        if self.config.window_switch_enabled:
-            cur = get_active_window_title()
-            if cur and cur != self._last_window_title:
-                self._next_timer_at = 0.0
-                self._invalidate_window_text_cache()
-                self._last_text_hash = None
-                if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
-                    self._previous_window_title = self._last_window_title
-                    self._pending_window = cur
-                    self._focus_settled_at = now + self.config.focus_settle_delay
-                self._last_window_title = cur
+        if eval_throttle and not triggers:
+            return []
+        if eval_throttle and triggers:
+            # 允许带上已就绪的切窗触发，避免被短节流吞掉。
+            return triggers
 
-            if self._focus_settled_at > 0 and now >= self._focus_settled_at:
-                if self._pending_window and self._pending_window == get_active_window_title():
-                    from_title = self._previous_window_title or "(unknown)"
-                    triggers.append(f"window:{from_title!r}->{self._pending_window!r}")
-                    self._last_window_trigger_at = now
-                self._focus_settled_at = 0.0
-                self._pending_window = ""
-                self._previous_window_title = ""
+        if not speak_cooldown:
+            if self._focus_settled_at == 0:
+                timer_target = (
+                    self._next_timer_at
+                    if self._next_timer_at > 0
+                    else (self._last_timer_check + self.config.timer_seconds)
+                )
+                if now >= timer_target:
+                    triggers.append("timer")
+                    self._last_timer_check = now
+                    self._next_timer_at = 0.0
 
-        if self._focus_settled_at == 0:
-            timer_target = (
-                self._next_timer_at
-                if self._next_timer_at > 0
-                else (self._last_timer_check + self.config.timer_seconds)
-            )
-            if now >= timer_target:
-                triggers.append("timer")
-                self._last_timer_check = now
-                self._next_timer_at = 0.0
+            if not triggers and self._focus_settled_at == 0 and not self._ready_focus_trigger:
+                if now - self._last_content_check_at >= self.config.content_check_interval:
+                    self._last_content_check_at = now
+                    if self._check_content_changed():
+                        if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
+                            triggers.append("content")
+                            self._last_window_trigger_at = now
 
-        if not triggers and self._focus_settled_at == 0:
-            if now - self._last_content_check_at >= self.config.content_check_interval:
-                self._last_content_check_at = now
-                if self._check_content_changed():
-                    if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
-                        triggers.append("content")
-                        self._last_window_trigger_at = now
-
-        idle = get_idle_seconds()
-        if idle >= self.config.idle_threshold_seconds and self._idle_armed:
-            triggers.append(f"idle:{int(idle)}s")
-            self._idle_armed = False
+            idle = get_idle_seconds()
+            if idle >= self.config.idle_threshold_seconds and self._idle_armed:
+                triggers.append(f"idle:{int(idle)}s")
+                self._idle_armed = False
 
         return triggers
 
@@ -879,12 +1055,6 @@ class ProactiveObserver:
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
             _observer_gui_log("主动发言回调失败", {"error": str(e)})
-
-    def _safe_on_evaluate(self, reason: str, should_speak: bool) -> None:
-        try:
-            self.on_evaluate(reason, should_speak)
-        except Exception as e:
-            logger.warning("ProactiveObserver: on_evaluate callback error: {}", e)
 
     def _build_full_system_prompt(self) -> str:
         parts = []

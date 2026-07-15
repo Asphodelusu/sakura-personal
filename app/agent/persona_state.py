@@ -15,6 +15,18 @@ _EMOTION_AFFINITY: dict[tuple[str, str], float] = {
     ("playful", "happy"): 0.75,
     ("embarrassed", "anxious"): 0.4,
     ("confused", "anxious"): 0.35,
+    ("sad", "lonely"): 0.7,
+    ("lonely", "sad"): 0.7,
+    ("happy", "warm"): 0.7,
+    ("warm", "happy"): 0.7,
+    ("warm", "tender"): 0.75,
+    ("tender", "warm"): 0.75,
+    ("hopeful", "happy"): 0.55,
+    ("happy", "hopeful"): 0.55,
+    ("defensive", "frustrated"): 0.5,
+    ("frustrated", "defensive"): 0.5,
+    ("determined", "hopeful"): 0.45,
+    ("hopeful", "determined"): 0.45,
 }
 
 EMOTION_CONGRUENCE_MAX_BOOST = 0.14
