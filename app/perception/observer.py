@@ -216,9 +216,9 @@ _PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。用户
 
 suggested_interval 是你觉得下次看屏幕之前的等待秒数：
 - 用户很专注（写代码/文档/开会）：建议长一点（600-1800 秒）
-- 用户在休闲（浏览/看视频）：建议短一点（120-480 秒）
+- 用户在休闲（浏览/看视频）：建议短一点（45-120 秒）
 - 默认/不确定：480 秒
-- 有效范围 120-1800 秒
+- 有效范围 45-1800 秒
 
 只输出 JSON，不要 markdown 不要解释：
 {"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "对用户说的日文台词，仅当 should_speak=true 时填", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
@@ -254,12 +254,13 @@ class ProactiveConfig:
     poll_interval: float = 5.0
     content_check_interval: float = 30.0
     content_min_chars: int = 30
-    game_ocr_enabled: bool = True
+    # 暂时默认关闭：WinRT OCR 在游戏窗上常超时(~8s)，拖慢评估且收益不稳。
+    game_ocr_enabled: bool = False
     max_edge: int = 1920
     request_timeout: float = 60.0
     eval_temperature: float = 0.7
     max_tokens: int = 1024
-    adaptive_interval_min: float = 120.0
+    adaptive_interval_min: float = 45.0
     adaptive_interval_max: float = 1800.0
     away_max_seconds: float = 12 * 3600
 
@@ -732,7 +733,9 @@ class ProactiveObserver:
             uia_lines.append(f"窗口内可见文字：\n{window_text.text_content}")
             ctx_parts.append("\n".join(uia_lines))
 
-        if (
+        # 游戏态 OCR 暂关（见 ProactiveConfig.game_ocr_enabled 默认 False）。
+        # 重新启用：配置 game_ocr_enabled=true，或把下方条件改回仅看 config。
+        if False and (
             self.config.game_ocr_enabled
             and not uia_enough
             and self._looks_like_game_context(window_text)
