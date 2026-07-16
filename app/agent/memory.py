@@ -1012,6 +1012,38 @@ class MemoryStore:
             query=query_text,
         )
 
+    def build_continuity_context(self) -> str:
+        """构建每轮必注入的连续性上下文：心情 + 关系摘要。
+
+        不做向量搜索，仅读取本地持久化的 mood_state 和 core_profile 动态部分，
+        与 card（静态角色定义）互补而不重叠。
+        """
+        sections: list[str] = []
+
+        # 心情（动态，不在 card 中）
+        mood = self.mood_state()
+        if mood is not None:
+            mood_content = _clip_text(str(mood.get("content") or ""), MOOD_CONTEXT_BUDGET)
+            if mood_content:
+                sections.append(
+                    f"【今の気持ち】\n"
+                    f"{mood_content}\n"
+                    f"（这是你现在的心情，它会自然影响你的语气和节奏——高兴时轻快，"
+                    f"低落时句子更短更安静，害羞时停顿多。但它只是此刻感受的一部分，不是全部。）"
+                )
+
+        # 关系快照（从 core_profile 中只取「今の関係」段，避免与 card 重复）
+        cp = self.core_profile()
+        if cp is not None:
+            cp_content = str(cp.get("content") or "")
+            rel_section = _extract_core_profile_section(cp_content, "今の関係")
+            if not rel_section:
+                rel_section = _extract_core_profile_section(cp_content, "今の私")
+            if rel_section:
+                sections.append(f"【今の関係】\n{_clip_text(rel_section, 200)}")
+
+        return "\n\n".join(sections) if sections else ""
+
     def search_memory(
         self,
         arguments: dict[str, Any],
@@ -1199,6 +1231,7 @@ class MemoryStore:
         if mem is None:
             return self._loading_response()
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
+        # 保存旧版本用于未来纠错/回滚（当前仅写入，读取端未实现；见 _save_revision TODO）
         _save_revision(self.base_dir, memory_id, previous, reason=arguments.get("reason", ""))
         metadata = _memory_metadata(
             arguments,
@@ -1224,7 +1257,11 @@ class MemoryStore:
         valid_until: str | None = None,
         wait: bool = True,
     ) -> bool:
-        """将可变近况标记为过去（写 valid_until，不删正文）。"""
+        """将可变近况标记为过去（写 valid_until，不删正文）。
+
+        同时设置 volatile 标记——召回层会将此视为"临别提权"信号，
+        在记忆彻底过期前给予最后一次优先展示机会。
+        """
         memory_id = str(memory_id).strip()
         if not memory_id or _is_core_profile_id(memory_id):
             return False
@@ -2287,6 +2324,9 @@ def _save_revision(base_dir: Path | None, memory_id: str, previous: dict[str, An
     """保存记忆的旧版本到 revisions 文件。
 
     失败只记日志，绝不阻断真正的 update_memory 写回。
+
+    TODO: 当前仅写入，无读取端。未来做记忆纠错/回滚时在此补充
+          _load_revision / _rollback_memory 等读取接口。
     """
     if previous is None or not memory_id or base_dir is None:
         return
@@ -2633,3 +2673,17 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, number)
+
+def _extract_core_profile_section(content: str, section_name: str) -> str:
+    """从 core_profile 中提取以 ＜section_name 开头的段落内容。"""
+    import re
+    # 匹配 ＜section_name...＞ 到下一个 ＜ 或字符串末尾
+    pattern = rf"[<＜]{{1,2}}{re.escape(section_name)}[^＞>]*[＞>]\s*\n?"
+    match = re.search(pattern, content)
+    if not match:
+        return ""
+    start = match.end()
+    # 找到下一个 ＜ 标记（全角或半角）的位置
+    next_section = re.search(r"[<＜]{1,2}[^＞>]+[＞>]", content[start:])
+    end = start + next_section.start() if next_section else len(content)
+    return content[start:end].strip()

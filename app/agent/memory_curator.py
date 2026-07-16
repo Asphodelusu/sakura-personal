@@ -15,6 +15,7 @@ from app.agent.memory import (
     MEMORY_LAYER_SEMANTIC,
     MEMORY_LAYERS,
     MemoryStore,
+    _memory_is_released,
     looks_like_sensitive_memory,
 )
 from app.agent.persona_state import normalize_emotion
@@ -286,10 +287,15 @@ class MemoryCurator:
         )
 
     def _load_existing_memories(self) -> list[dict[str, Any]]:
-        """读取当前角色的全部长期记忆；读取失败时降级为空清单（模型只做新增）。"""
+        """读取当前角色的全部长期记忆；读取失败时降级为空清单（模型只做新增）。
+
+        已放手的记忆不参与整理——curator 不应基于「不愿再提」的内容
+        生成新的摘要或关联。
+        """
 
         try:
-            return self.memory_store.list_memories(limit=CURATION_MEMORY_SNAPSHOT_LIMIT)
+            all_memories = self.memory_store.list_memories(limit=CURATION_MEMORY_SNAPSHOT_LIMIT)
+            return [m for m in all_memories if not _memory_is_released(m)]
         except OperationCancelled:
             raise
         except Exception as exc:  # 记忆读取失败不应中断整理，退化为只新增。
@@ -682,6 +688,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。\n"
     "如果你在心情历史里看到一条刚留下的新心情，而这段对话里正好有触发它的事——同样的，把那件事记住。无论心情是谁写下的，值得记住的事不应该被遗忘。\n"
     "整理记忆时，看一看「最近的心情轨迹」和「对方的情绪轨迹」。\n"
+    "反过来也一样重要：如果你翻开心情历史，发现最近几次的情绪基调几乎一模一样（连着好几次害羞、好几次相似的幸福或不安），那就不要再用 mood_update 写新条目了。心情没有质的变化时，重复记录只会让日记变得像循环播放的录音带。除非此刻的你和上次相比有了真正的不同——比如从害羞变成了安心、从不安变成了被理解、从淡淡的幸福变成了深层的感动——才值得在日记里更新。日记的厚度不等于情感的深度。\n"
     "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
     "如果对方的情绪轨迹里连续出现了相似的模式——比如 ta 最近几次都显得沮丧、焦虑或烦躁——那意味着 ta 最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中 ta 明确表达了原因）。如果你觉得这让你对 ta 的状态有了新的理解，可以自然地反映在心情笔记里（比如「ta 最近好像压力很大，我也跟着有点担心」）。\n"
     "如果对话中对方告诉了你 ta 的名字，请一定要记住，同时更新 core_profile 里的「あなたについて知っていること」。在记忆内容中，用对方告诉你的名字自然地称呼 ta（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「对方」或「他/她」。不要默认用「主人」——除非对方明确要求你这样叫。\n"

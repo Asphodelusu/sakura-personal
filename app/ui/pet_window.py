@@ -267,7 +267,7 @@ PROACTIVE_ASSISTANT_JUST_SPOKE_HINT = (
     "不要延续同一提醒、同一关心句式或同一屏幕评论。"
 )
 # 用户刚有过互动后的冷却：屏幕批次已凑齐也先不发，避免聊完立刻又主动搭话。
-PROACTIVE_POST_INTERACTION_GRACE_SECONDS = 180
+PROACTIVE_POST_INTERACTION_GRACE_SECONDS = 5
 # 对话刚结束后的记忆整理缓冲：等字幕/朗读收尾后再启动，避免边说话边整理。
 MEMORY_CURATION_POST_TURN_GRACE_MS = 45_000
 SCREEN_AWARENESS_EVENT_TYPE = "screen_awareness_check"
