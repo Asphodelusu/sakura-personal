@@ -741,6 +741,8 @@ class MemoryStore:
             if limit is not None or len(memories) < top_k:
                 break
             top_k *= 2
+        # 过滤已放手记忆，避免反思等下游收到不应再想起的内容
+        memories = [m for m in memories if not _memory_is_released(m)]
         core_profile = self.core_profile()
         if core_profile is not None:
             memories.insert(0, core_profile)
@@ -1231,8 +1233,8 @@ class MemoryStore:
         if mem is None:
             return self._loading_response()
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
-        # 保存旧版本用于未来纠错/回滚（当前仅写入，读取端未实现；见 _save_revision TODO）
-        _save_revision(self.base_dir, memory_id, previous, reason=arguments.get("reason", ""))
+        # 修订历史暂时禁用：当前仅写入无读取端、无上限控制；待未来回滚/纠错需求时再启用
+        # _save_revision(self.base_dir, memory_id, previous, reason=arguments.get("reason", ""))
         metadata = _memory_metadata(
             arguments,
             scope_id=self.scope_id,
