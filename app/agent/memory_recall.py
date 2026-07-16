@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from app.agent.memory import MemoryStore
+from app.agent.memory import MemoryStore, _bounded_float
 from app.agent.persona_state import (
     PersonaState,
     emotion_congruence_factor,
@@ -124,7 +124,7 @@ class MemoryRecallService:
         self.limit = max(1, limit)
         self.threshold = threshold
 
-    def recall(self, request: ContextRequest) -> MemoryRecallResult:
+    def recall(self, request: ContextRequest, *, light_mode: bool = False) -> MemoryRecallResult:
         query = _build_memory_query(request)
         if not query:
             return MemoryRecallResult(query="")
@@ -136,9 +136,13 @@ class MemoryRecallService:
             )
         _load_access_tracker()
 
+        limit = DEFAULT_MEMORY_RECALL_CANDIDATES
+        if light_mode:
+            limit = 3  # 轻量模式只取少量候选
+
         try:
             response = self.memory.search_memory(
-                {"query": query, "limit": DEFAULT_MEMORY_RECALL_CANDIDATES},
+                {"query": query, "limit": limit},
                 wait=False,
             )
         except Exception:  # noqa: BLE001 - 记忆故障不得阻断普通聊天
@@ -153,10 +157,16 @@ class MemoryRecallService:
         now = datetime.now().astimezone()
         persona = _resolve_recall_persona(self.memory, query)
         due_commitments = _select_due_commitment_memories(self.memory, now=now)
+        # 实体扩展：从首轮结果中提取专有名词，追加相关记忆
+        expanded = _expand_by_entities(memories, self.memory, self.threshold, self.limit)
+        if expanded:
+            memories = _deduplicate_memories(memories + expanded)
+
+        select_limit = 2 if light_mode else self.limit
         selected = _select_memories(
             memories,
             self.threshold,
-            self.limit,
+            select_limit,
             now=now,
             persona=persona,
         )
@@ -248,6 +258,9 @@ def _select_memories(
         effective_ts = last_accessed or updated_at or created_at
         days = _days_since(effective_ts, now)
         decay_weight = _compute_decay_weight(importance, days)
+        # volatile 并非"易变应淡出"——它是 expire_memory 设的"临别提权"标记。
+        # 即将过期的记忆在消失前需要最后一次露脸机会，让 LLM 能基于它产生替代记忆。
+        # 因此这里对 volatile 记忆给予 12% 权重加成，而非衰减。
         if metadata.get("volatile") is True:
             decay_weight = min(1.0, decay_weight * 1.12)
         decay_weight = min(
@@ -446,3 +459,71 @@ def _is_expired(value: Any, now: datetime) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=now.tzinfo)
     return expires_at <= now
+
+def _expand_by_entities(
+    memories: list[dict[str, Any]],
+    memory_store: Any,
+    threshold: float,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """从已检索记忆中提取专有名词，追加相关记忆（多跳召回）。
+
+    例如：搜「最好的朋友」→ 命中「ソフィア是挚友」→
+    提取「ソフィア」→ 追加搜索 → 命中「ソフィア会帮我翻译」。
+    """
+    import re
+    entities: set[str] = set()
+    # 日文/中文专有名词模式：片假名连续、汉字名（2-4字）、英文名
+    entity_patterns = [
+        r"[\u30a0-\u30ff]{2,}",           # 片假名（ソフィア、カシマ）
+        r"[\u4e00-\u9fff]{2,4}(?:くん|さん|ちゃん|先生|先輩)?",  # 汉字名+敬称
+        r"[A-Z][a-z]+(?:\s[A-Z][a-z]+)?",  # 英文名
+    ]
+    for mem in memories[:5]:  # 只从前5条中提取
+        content = str(mem.get("content") or "")
+        for pat in entity_patterns:
+            for match in re.finditer(pat, content):
+                entity = match.group().rstrip("くんさんちゃん先生先輩")
+                if len(entity) >= 2 and entity not in ("私", "僕", "俺", "彼", "彼女"):
+                    entities.add(entity)
+
+    if not entities:
+        return []
+
+    # 用提取到的实体做第二轮搜索
+    entity_query = " ".join(sorted(entities)[:3])  # 最多3个实体
+    try:
+        response = memory_store.search_memory(
+            {"query": entity_query, "limit": limit},
+            wait=False,
+        )
+    except Exception:
+        return []
+    extra = response.get("memories", [])
+    if not isinstance(extra, list):
+        return []
+    # 过滤掉已经有的和低分的
+    existing_ids = {str(m.get("id", "")) for m in memories}
+    result = []
+    for m in extra:
+        if str(m.get("id", "")) in existing_ids:
+            continue
+        score = _bounded_float(m.get("score"), default=0.0)
+        if score >= threshold:
+            result.append(m)
+    return result
+
+
+def _deduplicate_memories(
+    memories: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for m in memories:
+        mid = str(m.get("id", ""))
+        if mid and mid not in seen:
+            seen.add(mid)
+            result.append(m)
+        elif not mid:
+            result.append(m)
+    return result

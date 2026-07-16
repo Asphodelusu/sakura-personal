@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -251,12 +252,29 @@ class MemoryReflector:
             _logger.debug("Reflection: LLM decided nothing worth reflecting")
             return ReflectionResult()
 
-        # 5. 写入记忆
+        # 5. 写入记忆（跳过已存在的重复内容）
         created = 0
+        skipped_dupes = 0
         errors: list[str] = []
+        # 预取现有记忆哈希集合，避免每轮反思重复写入相同内容
+        existing_hashes: set[str] = set()
+        try:
+            raw_memories = store.list_memories(limit=500)
+            for m in raw_memories:
+                h = (m.get("metadata") or {}).get("hash") or m.get("hash", "")
+                if h:
+                    existing_hashes.add(h)
+        except Exception:
+            pass  # 无法预取时退化为不检查，允许写入
         for r in reflections[:MAX_REFLECTION_MEMORIES]:
             content = str(r.get("content", "")).strip()
             if not content:
+                continue
+            # 去重：与 mem0 一致的 MD5 哈希
+            content_hash = hashlib.md5(content.encode()).hexdigest()
+            if content_hash in existing_hashes:
+                skipped_dupes += 1
+                _logger.debug("Reflection: skipping duplicate: %s", content[:60])
                 continue
             importance = float(r.get("importance", 0.5))
             confidence = float(r.get("confidence", 0.5))
@@ -275,11 +293,12 @@ class MemoryReflector:
                     allow_sensitive=True,
                 )
                 created += 1
+                existing_hashes.add(content_hash)
             except Exception as exc:
                 _logger.exception("Reflection: failed to write memory")
                 errors.append(f"写入反思记忆失败：{exc}")
 
-        _logger.info("Reflection: created %d meta-memories", created)
+        _logger.info("Reflection: created %d meta-memories, skipped %d duplicates", created, skipped_dupes)
         return ReflectionResult(memories_created=created, errors=errors)
 
 

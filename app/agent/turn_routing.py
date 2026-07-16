@@ -16,7 +16,7 @@ from app.agent.context_orchestrator import build_context_request
 from app.llm.api_client import ChatMessage, messages_contain_image
 from app.llm.prompts.types import ContextRequest
 
-RecallDecision = Literal["skip", "recall", "defer"]
+RecallDecision = Literal["skip", "recall", "defer", "light"]
 TurnTier = Literal["fast", "standard"]
 TurnModality = Literal["text", "vision"]
 
@@ -200,7 +200,8 @@ def resolve_recall_decision(
         return "recall"
     if _is_simple_greeting(messages, settings):
         return "skip"
-    return "defer"
+    # 普通对话默认轻量召回：连续性上下文 + 1-2 条相关情节记忆
+    return "light"
 
 
 def resolve_turn_plan(

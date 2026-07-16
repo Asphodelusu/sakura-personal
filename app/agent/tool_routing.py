@@ -114,6 +114,13 @@ _MEMORY_FORGET_MARKERS: tuple[str, ...] = (
     "忘掉",
     "forget",
     "别记住",
+    "不想再提",
+    "别提",
+    "不要再记",
+    "放手",
+    "放了",
+    "算了",
+    "不说了",
 )
 
 _MEMORY_RECALL_MARKERS: tuple[str, ...] = (

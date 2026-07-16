@@ -710,6 +710,13 @@ class AgentRuntime:
         memory_status = "unknown"
         memory_needs_refresh = True
         turn_state: TurnState | None = None
+        # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
+        user_text = _latest_user_text(working_messages)
+        if user_text:
+            try:
+                self.memory.record_user_emotion(user_text)
+            except Exception:
+                pass
         loop_settings = self.runtime_loop_settings
         for step_index in range(loop_settings.max_agent_steps_per_turn):
             check_cancelled(cancel_checker)
@@ -766,8 +773,49 @@ class AgentRuntime:
                         recall = self.memory_recall.recall(request)
                         turn_memory_fragments = recall.fragments
                         memory_status = recall.status
+                    elif turn_state.recall_decision == "light":
+                        # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
+                        light_recall = self.memory_recall.recall(
+                            request, light_mode=True,
+                        )
+                        continuity = self.memory.build_continuity_context()
+                        combined = list(light_recall.fragments)
+                        if continuity:
+                            combined.insert(
+                                0,
+                                ContextFragment(
+                                    fragment_id="memory.continuity",
+                                    source="memory",
+                                    content=continuity,
+                                    trust="trusted",
+                                    priority=90,
+                                    token_budget=600,
+                                    sensitivity="private",
+                                    cache_scope="turn",
+                                    required=True,
+                                ),
+                            )
+                        turn_memory_fragments = tuple(combined)
+                        memory_status = "light"
                     else:
-                        turn_memory_fragments = ()
+                        # defer/skip：仅注入连续性上下文（心情+关系快照）
+                        continuity = self.memory.build_continuity_context()
+                        if continuity:
+                            turn_memory_fragments = (
+                                ContextFragment(
+                                    fragment_id="memory.continuity",
+                                    source="memory",
+                                    content=continuity,
+                                    trust="trusted",
+                                    priority=90,
+                                    token_budget=600,
+                                    sensitivity="private",
+                                    cache_scope="turn",
+                                    required=True,
+                                ),
+                            )
+                        else:
+                            turn_memory_fragments = ()
                         memory_status = (
                             "skipped"
                             if turn_state.recall_decision == "skip"
