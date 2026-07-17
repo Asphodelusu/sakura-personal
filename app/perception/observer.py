@@ -14,6 +14,7 @@ import json
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -225,6 +226,7 @@ suggested_interval は次に画面を見るまでの待機秒数：
 {"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "相手に話しかけるセリフ、should_speak=true のときだけ", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
 
 comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
+一言か二言まで。長文厳禁。どうしても言いたいことが多い時は、一番大事なことだけに絞って。
 """
 
 _NON_GAME_PROCESSES = frozenset({
@@ -328,6 +330,17 @@ class FocusSnapshot:
         return self.title or self.process or f"hwnd:{self.hwnd}"
 
 
+@dataclass
+class ObservationRecord:
+    """A single observation evaluated by the VLM."""
+
+    timestamp: float
+    window_title: str
+    should_speak: bool
+    reason: str
+    comment: str = ""
+
+
 class ProactiveObserver:
     """Watches the desktop and decides — via VLM — whether to speak."""
 
@@ -356,6 +369,8 @@ class ProactiveObserver:
         self.on_evaluate = on_evaluate or (lambda _reason, _should_speak: None)
         self._is_busy = is_busy or (lambda: False)
         self._on_memory_record = on_memory_record or (lambda _: None)
+        self._get_recent_history: Callable[[], str] = lambda: ""
+        self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
 
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
@@ -405,6 +420,10 @@ class ProactiveObserver:
         self.config.enabled = bool(value)
         if not value:
             self._idle_armed = True
+
+    def set_recent_history_provider(self, provider: Callable[[], str]) -> None:
+        """Set a callback that returns recent conversation history as a string."""
+        self._get_recent_history = provider
 
     def notify_user_spoke(self) -> None:
         self._last_user_at = time.monotonic()
@@ -908,6 +927,19 @@ class ProactiveObserver:
         if triggers:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
 
+        # 最近观测历史，避免对相似场景说重复的话
+        obs_ctx = self._format_obs_history()
+        if obs_ctx:
+            ctx_parts.append(obs_ctx)
+
+        # 最近对话历史，让 VLM 知道用户回复了什么
+        try:
+            chat_ctx = self._get_recent_history()
+            if chat_ctx:
+                ctx_parts.append(chat_ctx)
+        except Exception:
+            pass
+
         uia_enough = (
             window_text.is_accessible
             and len(window_text.text_content.strip()) >= self.config.content_min_chars
@@ -1026,6 +1058,7 @@ class ProactiveObserver:
             reason = str(parsed.get("reason", "")).strip() or "模型选择不发言"
             logger.info("ProactiveObserver: silent (reason: {})", reason)
             self._safe_on_evaluate(reason, False)
+            self._record_observation(window_title, False, reason)
             return
 
         comment = str(parsed.get("comment", "")).strip()
@@ -1036,6 +1069,7 @@ class ProactiveObserver:
             )
             logger.warning("ProactiveObserver: {}", reason)
             self._safe_on_evaluate(reason, False)
+            self._record_observation(window_title, False, reason)
             return
 
         reason = str(parsed.get("reason", "")).strip() or "主动搭话"
@@ -1043,6 +1077,8 @@ class ProactiveObserver:
 
         self._last_proactive_at = time.monotonic()
         self._idle_armed = True
+
+        self._record_observation(window_title, True, reason, comment)
 
         payload = ProactiveSpeakPayload(
             text=comment,
@@ -1055,6 +1091,46 @@ class ProactiveObserver:
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
             _observer_gui_log("主动发言回调失败", {"error": str(e)})
+
+    def _record_observation(
+        self,
+        window_title: str,
+        should_speak: bool,
+        reason: str,
+        comment: str = "",
+    ) -> None:
+        self._obs_history.append(
+            ObservationRecord(
+                timestamp=time.monotonic(),
+                window_title=window_title,
+                should_speak=should_speak,
+                reason=reason,
+                comment=comment,
+            )
+        )
+
+    def _format_obs_history(self) -> str:
+        if not self._obs_history:
+            return ""
+        now = time.monotonic()
+        lines = ["[最近の観測履歴]"]
+        for r in reversed(self._obs_history):
+            ago_s = int(now - r.timestamp)
+            if ago_s < 60:
+                ago_str = f"{ago_s}秒前"
+            elif ago_s < 3600:
+                ago_str = f"{ago_s // 60}分前"
+            else:
+                ago_str = f"{ago_s // 3600}時間前"
+            win = r.window_title or "(未知窗口)"
+            if r.should_speak:
+                line = (
+                    f"- {ago_str} | {win} | 发言：\u300c{r.comment}\u300d | {r.reason}"
+                )
+            else:
+                line = f"- {ago_str} | {win} | 不说话 | {r.reason}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def _build_full_system_prompt(self) -> str:
         parts = []

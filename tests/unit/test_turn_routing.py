@@ -134,7 +134,7 @@ def test_presence_probe_zaima_standard_not_fast() -> None:
         recall_decision=recall,
     )
 
-    assert recall == "defer"
+    assert recall == "light"
     assert plan.tier == "standard"
     assert plan.client_key == "chat"
     assert plan.decided_by == "presence_probe"
@@ -227,7 +227,7 @@ def test_default_pro_without_classifier() -> None:
         recall_decision=recall,
     )
 
-    assert recall == "defer"
+    assert recall == "light"
     assert plan.tier == "standard"
     assert plan.decided_by == "default"
 
@@ -315,7 +315,7 @@ def test_classifier_failure_falls_back_to_standard() -> None:
         recall_decision=recall,
     )
 
-    assert recall == "defer"
+    assert recall == "light"
     assert plan.tier == "standard"
     assert plan.decided_by == "default"
 

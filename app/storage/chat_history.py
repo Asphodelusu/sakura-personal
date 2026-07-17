@@ -57,9 +57,28 @@ class ChatHistoryStore:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def load(self) -> list[ChatHistoryEntry]:
+        return self._read_all_entries()
+
+    def load_tail(self, limit: int) -> tuple[list[ChatHistoryEntry], bool]:
+        """读取最后 N 条记录。返回 (entries, has_more)。"""
+        entries = self._read_all_entries()
+        if len(entries) <= limit:
+            return entries, False
+        return entries[-limit:], True
+
+    def load_older(self, skip_last: int, limit: int) -> tuple[list[ChatHistoryEntry], bool]:
+        """跳过最后 N 条，读取更早的 M 条。返回 (entries, has_more)。"""
+        entries = self._read_all_entries()
+        end = max(0, len(entries) - skip_last)
+        start = max(0, end - limit)
+        result = entries[start:end]
+        return result, start > 0
+
+    # ------------------------------------------------------------------
+
+    def _read_all_entries(self) -> list[ChatHistoryEntry]:
         if not self.path.exists():
             return []
-
         entries: list[ChatHistoryEntry] = []
         for raw_line in self.path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -71,7 +90,6 @@ class ChatHistoryStore:
                 continue
             if not isinstance(data, dict):
                 continue
-
             created_at = data.get("created_at")
             role = data.get("role")
             content = data.get("content")

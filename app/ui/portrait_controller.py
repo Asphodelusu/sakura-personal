@@ -125,6 +125,15 @@ class PortraitController(QObject):
         segment = resolve_reply_segment(segment, self.profile)
         resolved_label = segment.portrait or self.profile.resolve_portrait_label(segment.portrait, segment.tone)
         next_portrait_path = self.profile.portrait_for_segment(segment.portrait, segment.tone)
+        if next_portrait_path == self.current_path:
+            return
+        # 交叉淡入进行中且目标相同：跳过重复切换，避免动画被打断后闪跳。
+        if (
+            self.transition_animation is not None
+            and self._crossfade_target_path == next_portrait_path
+        ):
+            return
+
         debug_log(
             "Portrait",
             "分段立绘切换",
@@ -135,14 +144,6 @@ class PortraitController(QObject):
                 "current_path": str(self.current_path),
             },
         )
-        if next_portrait_path == self.current_path:
-            return
-        # 交叉淡入进行中且目标相同：跳过重复切换，避免动画被打断后闪跳。
-        if (
-            self.transition_animation is not None
-            and self._crossfade_target_path == next_portrait_path
-        ):
-            return
 
         should_crossfade = should_crossfade_portrait(self.current_path, next_portrait_path)
         next_pixmap = self.load_portrait(next_portrait_path)
