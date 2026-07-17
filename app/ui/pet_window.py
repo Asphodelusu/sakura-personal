@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -677,6 +678,8 @@ class PetWindow(QWidget):
         self.reply_history_segments: list[ChatSegment] = []
         self.reply_history_index: int | None = None
         self.reply_history_review_active = False
+        self._history_has_more = False
+        self._history_loaded_entries = 0
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(REMINDER_CHECK_INTERVAL_MS)
         self.reminder_timer.timeout.connect(self._check_due_reminders)
@@ -1727,7 +1730,9 @@ class PetWindow(QWidget):
             timer.stop()
         # 正式回复开始:放弃尚未触发的接话(已显示的接话被正式字幕自然覆盖)。
         self._cancel_backchannel()
-        segment = resolve_reply_segment(segment, self.character_profile)
+        segment = resolve_reply_segment(
+            segment, self.character_profile, interaction_id=self.active_interaction_id
+        )
         # 同轮回复内各段高度延续：不在此重置，避免"段间先缩后扩"产生闪现。
         # 高度重置由 _collapse_auto_fit_bubble_height 在 cancel_reply_flow 前统一处理。
         self.portrait_controller.apply_for_segment(segment)
@@ -2221,11 +2226,12 @@ class PetWindow(QWidget):
 
     def _load_reply_history_from_store(self) -> None:
         try:
-            entries = self.history_store.load()
+            entries, has_more = self.history_store.load_tail(200)
         except OSError as exc:
             debug_log("History", "回溯历史读取失败", {"error": str(exc)})
-            debug_log("History", "回溯历史读取失败", {"error": str(exc)})
-            entries = []
+            entries, has_more = [], False
+        self._history_has_more = has_more
+        self._history_loaded_entries = len(entries)
         self.reply_history_segments = _reply_history_segments_from_entries(entries)
         self.reply_history_index = (
             len(self.reply_history_segments) - 1
@@ -2233,6 +2239,32 @@ class PetWindow(QWidget):
             else None
         )
         self.reply_history_review_active = False
+        self._update_reply_history_buttons()
+
+    def _load_more_reply_history(self) -> None:
+        try:
+            entries, has_more = self.history_store.load_older(
+                skip_last=self._history_loaded_entries,
+                limit=200,
+            )
+        except OSError as exc:
+            debug_log("History", "加载更早历史失败", {"error": str(exc)})
+            entries, has_more = [], False
+        if not entries:
+            self._history_has_more = False
+            self._update_reply_history_buttons()
+            return
+        new_segments = _reply_history_segments_from_entries(entries)
+        if not new_segments:
+            self._history_has_more = has_more
+            self._update_reply_history_buttons()
+            return
+        added_count = len(new_segments)
+        self.reply_history_segments = new_segments + self.reply_history_segments
+        if self.reply_history_index is not None:
+            self.reply_history_index += added_count
+        self._history_loaded_entries += len(entries)
+        self._history_has_more = has_more
         self._update_reply_history_buttons()
 
     def _sync_reply_history_index_for_segment(self, segment: ChatSegment) -> None:
@@ -2253,6 +2285,12 @@ class PetWindow(QWidget):
     def _show_previous_reply_history(self) -> None:
         index = self._normalized_reply_history_index()
         if index is None:
+            return
+        # 已到最早一条且有更多历史：加载更早的批次
+        if index == 0 and self._history_has_more:
+            self._load_more_reply_history()
+            index = self._normalized_reply_history_index()
+        if index is None or index == 0:
             return
         self._show_reply_history_at(index - 1)
 
@@ -2335,7 +2373,11 @@ class PetWindow(QWidget):
 
         index = self._normalized_reply_history_index()
         can_review = self._can_review_reply_history()
-        previous_button.setEnabled(can_review and index is not None and index > 0)
+        previous_button.setEnabled(
+            can_review
+            and index is not None
+            and (index > 0 or self._history_has_more)
+        )
         next_button.setEnabled(
             can_review
             and index is not None
@@ -3038,6 +3080,7 @@ class PetWindow(QWidget):
                 on_evaluate=self._on_proactive_evaluate,
                 is_busy=self._is_proactive_observer_busy,
             )
+            observer.set_recent_history_provider(self._format_recent_history)
             self._proactive_observer = observer
             debug_log(
                 "PetWindow",
@@ -3136,6 +3179,31 @@ class PetWindow(QWidget):
         except Exception as exc:
             debug_log("ProactiveObserver", "评估结果写入历史失败", {"error": str(exc)})
 
+    def _format_recent_history(self) -> str:
+        """Format last few conversation turns for the observer VLM context."""
+        msgs = self.messages[-10:]
+        if not msgs:
+            return ""
+        lines: list[str] = []
+        count = 0
+        for m in reversed(msgs):
+            role = m.get("role", "")
+            content = str(m.get("content", "")).strip()
+            if not content or role not in ("user", "assistant"):
+                continue
+            name = "Sakura" if role == "assistant" else "相手"
+            # Truncate long messages
+            if len(content) > 120:
+                content = content[:120] + "…"
+            lines.append(f"[{name}] {content}")
+            count += 1
+            if count >= 6:
+                break
+        if not lines:
+            return ""
+        lines.reverse()
+        return "[最近の会話]\n" + "\n".join(lines)
+
     def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
         """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
         if not payload.text.strip():
@@ -3156,12 +3224,9 @@ class PetWindow(QWidget):
             debug_log("PetWindow", "主动发言被跳过（UI 忙碌）", {"comment": payload.text[:40]})
             return
 
-        segment = ChatSegment(
-            text=payload.text,
-            translation=payload.translation,
-            tone=payload.tone or "中性",
-        )
-        result = AgentResult(reply=ChatReply(segments=[segment]))
+        # 长文按日文句末标点拆分为多段，避免一口气说一大段（与 prompt 约束互补）。
+        segments = _split_proactive_comment(payload.text, payload.translation, payload.tone)
+        result = AgentResult(reply=ChatReply(segments=segments))
         self._consume_agent_result(result)
 
     def _restart_proactive_observer(self) -> None:
@@ -6687,8 +6752,9 @@ class PetWindow(QWidget):
         if callable(cancel_backchannel):
             cancel_backchannel()
         self._exit_reply_history_review(update_buttons=False)
+        interaction_id = self.active_interaction_id
         segments = [
-            resolve_reply_segment(segment, self.character_profile)
+            resolve_reply_segment(segment, self.character_profile, interaction_id=interaction_id)
             for segment in segments
         ]
         self._remember_reply_history_segments(segments)
@@ -7735,6 +7801,34 @@ def _reply_history_segments_from_entries(entries: list[ChatHistoryEntry]) -> lis
                 portrait=entry.portrait.strip(),
             )
         segments.append(segment)
+    return segments
+
+
+_SENTENCE_RE = re.compile(r"(?<=[。！？!?])")
+
+
+def _split_japanese_sentences(text: str) -> list[str]:
+    """按日文句末标点拆分，保留标点在句子末尾。"""
+    parts = _SENTENCE_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _split_proactive_comment(
+    text: str, translation: str, tone: str
+) -> list[ChatSegment]:
+    """将主动发言按句末标点拆分为多段。1-2 句保持原样，3+ 句拆开。"""
+    sentences = _split_japanese_sentences(text)
+    if len(sentences) <= 2:
+        return [ChatSegment(text=text, translation=translation, tone=tone or "中性")]
+    segments = []
+    for i, sentence in enumerate(sentences):
+        segments.append(
+            ChatSegment(
+                text=sentence,
+                translation=translation if i == 0 else "",
+                tone=tone or "中性",
+            )
+        )
     return segments
 
 

@@ -149,6 +149,17 @@ def sanitize_reply_tones(reply: ChatReply, allowed_tones: list[str] | None) -> C
     new_segments: list[ChatSegment] = []
     for segment in reply.segments:
         if segment.tone and segment.tone not in allowed:
+            from app.core.debug_log import debug_log
+            debug_log(
+                "Portrait",
+                "tone 被清洗",
+                {
+                    "original_tone": segment.tone,
+                    "sanitized_to": DEFAULT_TONE,
+                    "allowed_tones": sorted(allowed),
+                    "text_preview": (segment.text or "")[:40],
+                },
+            )
             new_segments.append(
                 ChatSegment(
                     segment.text,

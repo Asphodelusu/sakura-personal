@@ -346,9 +346,15 @@ def save_character_theme(
     _write_character_theme_manifest(manifest_path, raw_data, settings, source=source)
 
 
-def resolve_reply_segment(segment: "ChatSegment", profile: CharacterProfile | None) -> "ChatSegment":
+def resolve_reply_segment(
+    segment: "ChatSegment",
+    profile: CharacterProfile | None,
+    *,
+    interaction_id: str = "",
+) -> "ChatSegment":
     """把单段回复的 portrait 规整到角色包词表（展示/TTS 前调用）。"""
     from app.backchannel.emotion import EmotionScorer
+    from app.core.debug_log import debug_log
     from app.llm.chat_reply import ChatSegment
 
     if profile is None:
@@ -363,6 +369,21 @@ def resolve_reply_segment(segment: "ChatSegment", profile: CharacterProfile | No
         segment.tone,
         emotion=emotion,
     )
+
+    debug_log(
+        "Portrait",
+        "立绘解析",
+        {
+            "tone": segment.tone,
+            "portrait_input": segment.portrait or None,
+            "emotion_detected": emotion,
+            "portrait_resolved": resolved,
+            "default_label": default_label,
+            "text_preview": (segment.text or "")[:40],
+            **({"interaction_id": interaction_id} if interaction_id else {}),
+        },
+    )
+
     if resolved == segment.portrait:
         return segment
     return ChatSegment(
