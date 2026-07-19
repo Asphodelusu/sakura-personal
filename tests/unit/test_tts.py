@@ -1454,7 +1454,8 @@ def test_tts_provider_finish_fallback_advances_queue_without_player_end_signal(m
 
     provider._playback._play_next()
     provider._playback._handle_playback_state(MediaPlayerStub.PlaybackState.PlayingState)
-    assert timers[0][0] == 2000
+    # 100ms 音频 + 3000ms 宽限 = 3100ms（宽限期见 _AUDIO_FINISH_FALLBACK_GRACE_MS）
+    assert timers[0][0] == 3100
 
     timers[0][1]()
 

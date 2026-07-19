@@ -36,12 +36,24 @@ def build_segmented_reply_instruction(
     ]
     if len(portraits) > 1:
         if portrait_hints:
-            rules.append("- 每段根据情绪填写 portrait；不要整轮都填默认立绘。")
+            rules.append(
+                "- 站立微笑是 Sakura 的默认表情，表达冷静淡然。当对话中自然出现了明确的情绪变化时，"
+                "用对应的立绘去传达。按自己的情绪节奏走，该换就换，没换也正常。"
+            )
+            rules.append(
+                "- 脸红可以叠加在基础表情上：开心时笑得脸红、被说得哑口无言的脸红——"
+                "这时 portrait 直接写「害羞脸红」「脸红无语」，tone 保持不变。"
+                "这是一种自然的表达方式，该用就用。"
+            )
         else:
             rules.append(
-                "- Sakura 的默认表情是冷静淡然。日常对话用「站立待机」，"
-                "只有当语境确实触发了害羞、不满、惊讶等明确情绪时才换对应立绘。"
-                "不要为了回避默认立绘而强行换表情。"
+                "- 站立微笑是 Sakura 的默认表情，表达冷静淡然。当对话中自然出现了明确的情绪变化时，"
+                "用对应的立绘去传达。按自己的情绪节奏走，该换就换，没换也正常。"
+            )
+            rules.append(
+                "- 脸红可以叠加在基础表情上：开心时笑得脸红、被说得哑口无言的脸红——"
+                "这时 portrait 直接写「害羞脸红」「脸红无语」，tone 保持不变。"
+                "这是一种自然的表达方式，该用就用。"
             )
     if include_no_single_segment_rule:
         rules.extend(

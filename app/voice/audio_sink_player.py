@@ -13,6 +13,10 @@ from app.core.debug_log import debug_log
 _SINK_WRITE_INTERVAL_MS = 20
 # PCM 全部写入后的排空延迟上限（毫秒）
 _SINK_DRAIN_MAX_MS = 1000
+# 排空到点但 sink 仍在 ActiveState 时的复查间隔与次数上限
+# （300ms x 20 = 最多再等 6 秒；超过后强制收尾，外层 fallback 定时器仍兜底）
+_SINK_DRAIN_RECHECK_INTERVAL_MS = 300
+_SINK_DRAIN_RECHECK_MAX = 20
 # 日志限速：每隔 N 次写入记录一次详细日志
 _SINK_LOG_INTERVAL = 50
 
@@ -63,6 +67,7 @@ class AudioSinkPlayer(QObject):
         self._all_pcm_written: bool = False
         self._finishing: bool = False
         self._finished_emitted: bool = False
+        self._drain_recheck_count: int = 0
 
     # ---- 公开 API ----
 
@@ -80,6 +85,7 @@ class AudioSinkPlayer(QObject):
         self._all_pcm_written = False
         self._finishing = False
         self._finished_emitted = False
+        self._drain_recheck_count = 0
 
         # 1. 使用 wave 打开文件并校验格式
         try:
@@ -350,7 +356,6 @@ class AudioSinkPlayer(QObject):
             self._finish_once("write_error")
 
     @Slot()
-    @Slot()
     def _finish_if_drained(self) -> None:
         if self._finishing:
             return
@@ -368,6 +373,25 @@ class AudioSinkPlayer(QObject):
         except Exception:
             pass
 
+        # 声卡还在播缓冲里的余音（ActiveState）时不能收，否则会剪掉尾巴；
+        # 复查有次数上限，且外层 fallback 定时器仍兜底，不会因此挂起。
+        if (
+            "ActiveState" in state_name_drain
+            and self._drain_recheck_count < _SINK_DRAIN_RECHECK_MAX
+        ):
+            self._drain_recheck_count += 1
+            debug_log(
+                "TTS",
+                "AudioSink: drain 到点但仍在播放，延后复查",
+                {
+                    "audio_path": str(self._audio_path) if self._audio_path else "",
+                    "sink_state": state_name_drain,
+                    "recheck": self._drain_recheck_count,
+                },
+            )
+            QTimer.singleShot(_SINK_DRAIN_RECHECK_INTERVAL_MS, self._finish_if_drained)
+            return
+
         debug_log(
             "TTS",
             "AudioSink: drain timer fired",
@@ -375,6 +399,7 @@ class AudioSinkPlayer(QObject):
                 "audio_path": str(self._audio_path) if self._audio_path else "",
                 "ever_active": self._ever_active,
                 "sink_state": state_name_drain,
+                "drain_rechecks": self._drain_recheck_count,
             },
         )
 
