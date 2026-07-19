@@ -201,32 +201,69 @@ IsBusyFn = Callable[[], Any]
 OnMemoryRecordFn = Callable[[str], None]
 
 
-_PROACTIVE_SYSTEM_PROMPT = """你现在是后台运行的"主动模式"。消息里可能有：
-- 截图（传统方式）
-- [UIA 直接读取] 标记的文字（系统无障碍接口直接读的窗口内容，不需要 OCR）
-- [OCR 游戏文本] 标记的文字（判定为游戏/自绘界面时，对对话框区域 OCR 的结果；可能有识别误差）
+_PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。画面を見て、心の中で思ったことをそのまま書き留めるだけのモードです。
 
-你要严格按 JSON 输出，判断要不要插一句话，以及建议下次多久后再看。
+メッセージには以下が含まれます：
+- スクリーンショット（画面の様子）
+- [UIA 直接読み取り] のテキスト（システムが直接読んだウィンドウ内の文字）
+- [OCR ゲームテキスト] のテキスト（ゲーム画面から OCR した文字、誤認識あり）
 
-判断标准：
-- 相手が集中して作業している（コード・文書・執筆）：should_speak=false、邪魔しない
-- 相手が息抜きしている（動画・ニュース・ゲーム）：コメントしてもいい
-- 相手が長く動かない：気遣ってもいい
-- 面白い／間違ってる／変なものを見つけた：ツッコミを入れてもいい
-- UIA / OCR で読んだ文字とスクリーンショットは相互に裏付けを取ること；文字から何のアプリ・何のページ・何のセリフか判断できる
-- 迷ったら false、静かに見守るほうが煩わしくない
+やること：
+1. 画面に何が映っているか、相手が何をしているかを見る
+2. それを見て自分がどう感じたか、何を思ったかを、心の中の独り言として日本語で書く
+3. 次に画面を見るまでの待機秒数（suggested_interval）を提案する
 
-suggested_interval は次に画面を見るまでの待機秒数：
-- 相手が集中している（コード・文書・会議）：長め（600-1800 秒）
-- 相手がリラックスしている（ブラウジング・動画）：短め（45-120 秒）
-- デフォルト／わからない：480 秒
-- 有効範囲 45-1800 秒
+注意：
+- 話しかけるかどうかは考えなくていい。独り言に徹する。
+- 独り言は 1〜3 文、自然な口調で。
+- 面白い／気になる／心配なことがあれば素直に。なければ「いつも通り」でいい。
+- UIA/OCR の文字とスクリーンショットを突き合わせて判断すること。
+- [观察者上下文] が含まれている場合は、前回までの状況の要約です。すでに知っていることを改めて「発見」する必要はありません。
 
-只输出 JSON，不要 markdown 不要解释：
-{"should_speak": true|false, "suggested_interval": 480, "reason": "给我自己看的简短理由", "comment": "相手に話しかけるセリフ、should_speak=true のときだけ", "translation": "comment 的中文译文（可选，无则空字符串）", "tone": "中性|不满|害羞|请求|困惑|惊讶 之一，可选，默认中性"}
+suggested_interval（次に見るまでの秒数）：
+- 相手が集中（コード・文書・会議）：600〜1800 秒
+- 相手がリラックス（ブラウジング・動画・ゲーム）：45〜120 秒
+- わからない／デフォルト：480 秒
+- 有効範囲：45〜1800 秒
 
-comment 必须保持你的角色风格：短句、口语、自然、不打破角色设定，用日文。
-一言か二言まで。長文厳禁。どうしても言いたいことが多い時は、一番大事なことだけに絞って。
+JSON のみ出力。Markdown や説明は不要：
+{"inner_thought": "心の中の独り言（日本語）", "suggested_interval": 480}
+"""
+
+_SPEECH_DECISION_INSTRUCTION = """
+---
+
+あなたは今、画面を見て心の中で思ったことを踏まえて、「これから口に出すかどうか」を決める段階です。
+
+[内心独白] はさっきあなたが画面を見て思ったことです。
+[最近の会話] は相手との直近のやりとりです。
+[最近の観測履歴] はさっきまでの観測の記録です。
+
+判断基準：
+- 内心独白の中に、相手に言いたくなることがある → should_speak=true
+- ただの観察で、特に話すことはない → should_speak=false
+- 相手が集中してそう → 邪魔しない（false）
+- 相手の状態変化に気づいた（嬉しそう／悩んでそう／休憩中） → 声をかけてもいい
+- ついさっき話したばかり → なるべく控える
+- 迷ったら false
+
+should_speak=true の場合：
+- comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
+- translation：comment の中国語訳
+- tone：中性｜不满｜害羞｜请求｜惊讶｜困惑 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
+
+should_speak=false のときは comment/translation/tone は空文字列でよい。
+
+reason は発言する／しない理由（1 文、内部用、表示されない）。true/false どちらでも必ず書く。
+
+situational_summary は、次回の画面観測者が状況を引き継ぐための要約です（1〜2文、日本語）。
+相手が今何をしているか、どのアプリ／ゲームを使っているか、状態や進行状況を簡潔に書く。
+should_speak の true/false に関わらず、常に出力すること。
+例：「相手が原神をプレイ中。リーユエ地方で探索している様子。」
+例：「相手がVSCodeでコーディング中。Pythonのプロジェクトを編集している。」
+
+JSON のみ出力。Markdown や説明は不要：
+{"should_speak": true|false, "reason": "简短理由", "comment": "日本語セリフ", "translation": "中文翻译", "tone": "中性", "situational_summary": "日本語要約"}
 """
 
 _NON_GAME_PROCESSES = frozenset({
@@ -254,7 +291,7 @@ class ProactiveConfig:
     # APP_FOCUS 类型冷却（对齐同类 ~20s；冷却内切换记 deferred，结束后补票）
     window_switch_cooldown: float = 25
     # 前台稳定多久才算一次切应用触发（快切会不断重置）
-    focus_settle_delay: float = 5
+    focus_settle_delay: float = 15
     idle_threshold_seconds: float = 600
     poll_interval: float = 5.0
     content_check_interval: float = 30.0
@@ -351,6 +388,9 @@ class ProactiveObserver:
         api_key: str,
         api_model: str,
         system_prompt: str = "",
+        chat_api_base_url: str = "",
+        chat_api_key: str = "",
+        chat_api_model: str = "",
         config: ProactiveConfig | None = None,
         privacy: PrivacyGuard | None = None,
         on_speak: OnSpeakFn | None = None,
@@ -361,7 +401,11 @@ class ProactiveObserver:
         self._api_base_url = api_base_url.rstrip("/")
         self._api_key = api_key
         self._api_model = api_model
+        self._chat_api_base_url = chat_api_base_url.rstrip("/")
+        self._chat_api_key = chat_api_key
+        self._chat_api_model = chat_api_model
         self._system_prompt = system_prompt
+        self._speech_decision_configured = bool(chat_api_base_url and chat_api_key and chat_api_model)
         self.config = config or ProactiveConfig()
         self.privacy = privacy or PrivacyGuard()
 
@@ -371,6 +415,8 @@ class ProactiveObserver:
         self._on_memory_record = on_memory_record or (lambda _: None)
         self._get_recent_history: Callable[[], str] = lambda: ""
         self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
+        # LLM → VLM 单向情景上下文：VLM 读（不重复发现），LLM 写（不自读）
+        self._observer_context: str = ""
 
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
@@ -390,6 +436,9 @@ class ProactiveObserver:
         self._last_window_trigger_at = 0.0
         self._idle_armed = True
 
+        # per-app 评估记录：同窗口评过后 cooldown 内不再因切窗重新评估
+        self._last_eval_per_app: dict[str, float] = {}
+
         self._last_frame_dhash: int | None = None
         self._last_dedup_skip_at: float = 0.0
 
@@ -407,6 +456,7 @@ class ProactiveObserver:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._http: httpx.AsyncClient | None = None
+        self._chat_http: httpx.AsyncClient | None = None
         self._last_busy_log_at: float = 0.0
         self._was_busy = False
         self._last_busy_reason = ""
@@ -500,6 +550,7 @@ class ProactiveObserver:
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
         self._http = None
+        self._chat_http = None
         if self._thread is thread:
             self._thread = None
         logger.info("ProactiveObserver: stopped")
@@ -599,6 +650,12 @@ class ProactiveObserver:
                 except (asyncio.TimeoutError, Exception):
                     pass
                 self._http = None
+            if self._chat_http:
+                try:
+                    await asyncio.wait_for(self._chat_http.aclose(), timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                self._chat_http = None
 
     def _read_focus_snapshot(self, *, now: float | None = None) -> FocusSnapshot | None:
         hwnd = int(get_foreground_hwnd() or 0)
@@ -756,7 +813,19 @@ class ProactiveObserver:
 
         triggers: list[str] = []
         if self._ready_focus_trigger:
-            triggers.append(self._ready_focus_trigger)
+            # per-app 冷却：同一窗口「评过之后」cooldown 内不再因切窗重新评估。
+            # 注意用成员判断而非 get(..., 0.0)：从未评估过的窗口不应被冷却，
+            # 否则在 monotonic 时钟较小时（刚开机/测试）会误杀首次切窗触发。
+            app_key = self._focus_current.app_key if self._focus_current else ""
+            last_eval = self._last_eval_per_app.get(app_key)
+            if (
+                app_key
+                and last_eval is not None
+                and now - last_eval < self.config.cooldown_seconds
+            ):
+                self._ready_focus_trigger = ""
+            else:
+                triggers.append(self._ready_focus_trigger)
 
         if eval_throttle and not triggers:
             return []
@@ -862,6 +931,85 @@ class ProactiveObserver:
         except Exception as e:
             logger.warning("ProactiveObserver: on_evaluate callback error: {}", e)
 
+    async def _decide_speech(self, inner_thought: str) -> dict | None:
+        """调用 LLM（DeepSeek），基于内心独白 + 上下文决定是否说话。
+
+        返回 parsed JSON dict，失败返回 None。
+        """
+        if not self._speech_decision_configured:
+            return None
+
+        if self._chat_http is None:
+            self._chat_http = httpx.AsyncClient(timeout=self.config.request_timeout)
+
+        system_prompt = (
+            (self._system_prompt.strip() + _SPEECH_DECISION_INSTRUCTION)
+            if self._system_prompt.strip()
+            else _SPEECH_DECISION_INSTRUCTION.lstrip()
+        )
+
+        parts = [f"[内心独白]\n{inner_thought}"]
+        try:
+            chat_ctx = self._get_recent_history()
+            if chat_ctx:
+                parts.append(chat_ctx)
+        except Exception:
+            pass
+        obs_ctx = self._format_obs_history()
+        if obs_ctx:
+            parts.append(obs_ctx)
+        user_text = "\n\n".join(parts)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+
+        url = f"{self._chat_api_base_url}/chat/completions"
+        payload = {
+            "model": self._chat_api_model,
+            "messages": messages,
+            "temperature": 0.5,
+            "max_tokens": 1024,
+            "thinking": {"type": "disabled"},
+        }
+        headers = {
+            "Authorization": f"Bearer {self._chat_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = await self._chat_http.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            finish = choice.get("finish_reason", "")
+            if not content:
+                logger.warning(
+                    "ProactiveObserver: LLM returned empty content (finish={}, model={}) raw={}",
+                    finish,
+                    self._chat_api_model,
+                    json.dumps(data, ensure_ascii=False)[:300],
+                )
+                return None
+            parsed = _extract_json(content)
+            if not parsed:
+                logger.warning(
+                    "ProactiveObserver: LLM speech decision JSON parse failed (finish={}): {!r}",
+                    finish,
+                    content[:200],
+                )
+                return None
+            return parsed
+        except Exception as e:
+            logger.warning(
+                "ProactiveObserver: LLM speech decision call failed: {} ({})",
+                e,
+                type(e).__name__,
+            )
+            return None
+
     async def _do_evaluation(self, triggers: list[str]) -> None:
         now = time.monotonic()
         self._last_eval_at = now
@@ -927,18 +1075,15 @@ class ProactiveObserver:
         if triggers:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
 
-        # 最近观测历史，避免对相似场景说重复的话
+        # LLM → VLM 情景上下文（单向：VLM 读、LLM 写）
+        if self._observer_context:
+            ctx_parts.append(f"[观察者上下文]\n{self._observer_context}")
+
+        # 最近观测历史（VLM 用于避免对相似场景写重复独白）
+        # 对话历史留给 LLM 阶段，VLM 不需要，去掉省 token。
         obs_ctx = self._format_obs_history()
         if obs_ctx:
             ctx_parts.append(obs_ctx)
-
-        # 最近对话历史，让 VLM 知道用户回复了什么
-        try:
-            chat_ctx = self._get_recent_history()
-            if chat_ctx:
-                ctx_parts.append(chat_ctx)
-        except Exception:
-            pass
 
         uia_enough = (
             window_text.is_accessible
@@ -1022,6 +1167,13 @@ class ProactiveObserver:
                     await old.aclose()
             except Exception:
                 pass
+            try:
+                old_chat = self._chat_http
+                self._chat_http = None
+                if old_chat:
+                    await old_chat.aclose()
+            except Exception:
+                pass
             return
 
         parsed = _extract_json(response)
@@ -1039,6 +1191,7 @@ class ProactiveObserver:
             )
             return
 
+        inner_thought = str(parsed.get("inner_thought", "")).strip()
         suggested = parsed.get("suggested_interval")
         if isinstance(suggested, (int, float)) and suggested > 0:
             clamped = max(
@@ -1054,25 +1207,60 @@ class ProactiveObserver:
         else:
             self._next_timer_at = 0.0
 
-        if not parsed.get("should_speak"):
-            reason = str(parsed.get("reason", "")).strip() or "模型选择不发言"
+        # 记录 per-app 评估时间
+        if self._focus_current is not None:
+            self._last_eval_per_app[self._focus_current.app_key] = time.monotonic()
+
+        if not inner_thought:
+            logger.info("ProactiveObserver: VLM returned empty inner_thought")
+            self._safe_on_evaluate("VLM 内心独白为空", False)
+            return
+
+        logger.info("ProactiveObserver: inner_thought: {}", inner_thought[:120])
+
+        # ---- Stage 2: LLM decides whether to speak ----
+        speech_decision: dict | None = None
+        if self._speech_decision_configured:
+            _observer_gui_log(
+                "正在调用语言模型决定发言",
+                {"model": self._chat_api_model},
+            )
+            speech_decision = await self._decide_speech(inner_thought)
+        else:
+            logger.warning(
+                "ProactiveObserver: LLM speech decision not configured, falling back to silent"
+            )
+
+        # LLM → VLM 单向上下文更新（失败/未配置则保留旧值）
+        if speech_decision is not None:
+            summary = str(speech_decision.get("situational_summary", "")).strip()
+            if summary:
+                self._observer_context = summary
+                logger.debug("ProactiveObserver: observer_context updated: {}", summary[:120])
+
+        if speech_decision is None:
+            reason = "LLM 发言决策失败或未配置"
             logger.info("ProactiveObserver: silent (reason: {})", reason)
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
             return
 
-        comment = str(parsed.get("comment", "")).strip()
+        if not speech_decision.get("should_speak"):
+            reason = str(speech_decision.get("reason", "")).strip() or "LLM 选择不发言"
+            logger.info("ProactiveObserver: silent (reason: {})", reason)
+            self._safe_on_evaluate(reason, False)
+            self._record_observation(window_title, False, reason)
+            return
+
+        comment = str(speech_decision.get("comment", "")).strip()
         if not comment:
-            reason = (
-                str(parsed.get("reason", "")).strip()
-                or "should_speak=true 但 comment 为空"
-            )
+            reason = "should_speak=true 但 comment 为空"
             logger.warning("ProactiveObserver: {}", reason)
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
             return
 
-        reason = str(parsed.get("reason", "")).strip() or "主动搭话"
+        reason = str(speech_decision.get("reason", "")).strip() or f"内心独白: {inner_thought[:80]}..."
         self._safe_on_evaluate(reason, True)
 
         self._last_proactive_at = time.monotonic()
@@ -1082,8 +1270,8 @@ class ProactiveObserver:
 
         payload = ProactiveSpeakPayload(
             text=comment,
-            translation=str(parsed.get("translation", "")).strip(),
-            tone=str(parsed.get("tone", "")).strip() or "中性",
+            translation=str(speech_decision.get("translation", "")).strip(),
+            tone=str(speech_decision.get("tone", "")).strip() or "中性",
         )
 
         try:
@@ -1133,11 +1321,8 @@ class ProactiveObserver:
         return "\n".join(lines)
 
     def _build_full_system_prompt(self) -> str:
-        parts = []
-        if self._system_prompt.strip():
-            parts.append(self._system_prompt.strip())
-        parts.append(_PROACTIVE_SYSTEM_PROMPT)
-        return "\n\n---\n\n".join(parts)
+        # VLM 只做视觉观察，不需要完整角色卡；轻量角色线索已在 prompt 模板中。
+        return _PROACTIVE_SYSTEM_PROMPT
 
     async def _chat_completion(self, messages: list[dict]) -> str:
         if self._http is None:
