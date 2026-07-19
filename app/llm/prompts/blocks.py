@@ -5,7 +5,7 @@ from app.llm.prompts.types import PromptBlock
 
 
 DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
-DEFAULT_REPLY_PORTRAITS = ["站立待机"]
+DEFAULT_REPLY_PORTRAITS = ["站立微笑"]
 
 DESKTOP_PET_CONTEXT = """【互动方式】
 你的声音和文字，就是你触碰他的方式。"""

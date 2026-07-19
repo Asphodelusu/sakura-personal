@@ -3069,11 +3069,15 @@ class PetWindow(QWidget):
             return
         try:
             api = self._resolve_proactive_vision_api()
+            chat_api = self.api_client.settings
             observer = ProactiveObserver(
                 api_base_url=api.base_url,
                 api_key=api.api_key,
                 api_model=api.model,
                 system_prompt=self.system_prompt,
+                chat_api_base_url=getattr(chat_api, "base_url", ""),
+                chat_api_key=getattr(chat_api, "api_key", ""),
+                chat_api_model=getattr(chat_api, "model", ""),
                 config=config,
                 privacy=PrivacyGuard(),
                 on_speak=self._on_proactive_speak,
@@ -3085,7 +3089,11 @@ class PetWindow(QWidget):
             debug_log(
                 "PetWindow",
                 "ProactiveObserver 初始化成功",
-                {"base_url": api.base_url, "model": api.model},
+                {
+                    "vlm_base_url": api.base_url,
+                    "vlm_model": api.model,
+                    "llm_model": getattr(chat_api, "model", ""),
+                },
             )
         except Exception as exc:
             debug_log("PetWindow", "ProactiveObserver 初始化失败", {"error": str(exc)})
@@ -7816,19 +7824,38 @@ def _split_japanese_sentences(text: str) -> list[str]:
 def _split_proactive_comment(
     text: str, translation: str, tone: str
 ) -> list[ChatSegment]:
-    """将主动发言按句末标点拆分为多段。1-2 句保持原样，3+ 句拆开。"""
+    """将主动发言按句末标点拆分为多段，供 TTS/字幕逐句播放。
+
+    1-2 句保持原样；3+ 句拆开。有中文翻译时也按同样标点切开，再按序号配对，
+    避免整段译文只挂在第一句、后续句子回退显示日文。句数对不齐时，把多出来的
+    原文/译文并入最后一段，保证每段都有对应译文（有译文输入时）。
+    """
+    tone = tone or "中性"
     sentences = _split_japanese_sentences(text)
     if len(sentences) <= 2:
-        return [ChatSegment(text=text, translation=translation, tone=tone or "中性")]
-    segments = []
-    for i, sentence in enumerate(sentences):
+        return [ChatSegment(text=text, translation=translation, tone=tone)]
+
+    zh_parts = _split_japanese_sentences(translation) if translation.strip() else []
+    if not zh_parts:
+        return [ChatSegment(text=sentence, translation="", tone=tone) for sentence in sentences]
+
+    pair_count = min(len(sentences), len(zh_parts))
+    segments: list[ChatSegment] = []
+    for index in range(pair_count - 1):
         segments.append(
             ChatSegment(
-                text=sentence,
-                translation=translation if i == 0 else "",
-                tone=tone or "中性",
+                text=sentences[index],
+                translation=zh_parts[index],
+                tone=tone,
             )
         )
+    segments.append(
+        ChatSegment(
+            text="".join(sentences[pair_count - 1 :]),
+            translation="".join(zh_parts[pair_count - 1 :]),
+            tone=tone,
+        )
+    )
     return segments
 
 

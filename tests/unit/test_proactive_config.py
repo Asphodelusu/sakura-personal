@@ -19,7 +19,7 @@ def test_proactive_config_from_dict_empty_matches_defaults() -> None:
     assert loaded.content_check_interval == base.content_check_interval
     assert loaded.content_min_chars == base.content_min_chars
     assert loaded.game_ocr_enabled == base.game_ocr_enabled
-    assert base.focus_settle_delay == 5
+    assert base.focus_settle_delay == 15
     assert base.window_switch_cooldown == 25
 
 

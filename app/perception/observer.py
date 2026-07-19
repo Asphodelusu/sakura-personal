@@ -250,7 +250,7 @@ _SPEECH_DECISION_INSTRUCTION = """
 should_speak=true の場合：
 - comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
 - translation：comment の中国語訳
-- tone：中性｜不满｜害羞｜请求｜惊讶｜困惑 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
+- tone：中性｜不满｜害羞｜请求｜惊讶｜困惑｜开心｜高兴｜难过｜自信｜温柔｜认真｜吃醋 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
 
 should_speak=false のときは comment/translation/tone は空文字列でよい。
 
@@ -265,6 +265,10 @@ should_speak の true/false に関わらず、常に出力すること。
 JSON のみ出力。Markdown や説明は不要：
 {"should_speak": true|false, "reason": "简短理由", "comment": "日本語セリフ", "translation": "中文翻译", "tone": "中性", "situational_summary": "日本語要約"}
 """
+
+# 情景上下文（LLM→VLM 摘要）的有效期：超过后视为过时，清空让 VLM 重新观察，
+# 避免长时间挂机/离开后仍被告知"这些都是已知的"而压制新鲜反应。
+_OBSERVER_CONTEXT_TTL_SECONDS = 1800.0
 
 _NON_GAME_PROCESSES = frozenset({
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -417,6 +421,7 @@ class ProactiveObserver:
         self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
         # LLM → VLM 单向情景上下文：VLM 读（不重复发现），LLM 写（不自读）
         self._observer_context: str = ""
+        self._observer_context_updated_at: float = 0.0
 
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
@@ -489,6 +494,9 @@ class ProactiveObserver:
         if value:
             self._idle_armed = True
             self._next_timer_at = 0.0
+            # 离开期间桌面状态大概率会变，旧情景摘要清掉，回来后让 VLM 重新观察
+            self._observer_context = ""
+            self._observer_context_updated_at = 0.0
             logger.info("ProactiveObserver: away_mode ON")
             _observer_gui_log("away_mode 已开启")
         else:
@@ -1075,7 +1083,13 @@ class ProactiveObserver:
         if triggers:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
 
-        # LLM → VLM 情景上下文（单向：VLM 读、LLM 写）
+        # LLM → VLM 情景上下文（单向：VLM 读、LLM 写），过期即清
+        if self._observer_context and (
+            now - self._observer_context_updated_at > _OBSERVER_CONTEXT_TTL_SECONDS
+        ):
+            logger.debug("ProactiveObserver: observer_context expired, cleared")
+            self._observer_context = ""
+            self._observer_context_updated_at = 0.0
         if self._observer_context:
             ctx_parts.append(f"[观察者上下文]\n{self._observer_context}")
 
@@ -1236,6 +1250,7 @@ class ProactiveObserver:
             summary = str(speech_decision.get("situational_summary", "")).strip()
             if summary:
                 self._observer_context = summary
+                self._observer_context_updated_at = time.monotonic()
                 logger.debug("ProactiveObserver: observer_context updated: {}", summary[:120])
 
         if speech_decision is None:
@@ -1321,8 +1336,11 @@ class ProactiveObserver:
         return "\n".join(lines)
 
     def _build_full_system_prompt(self) -> str:
-        # VLM 只做视觉观察，不需要完整角色卡；轻量角色线索已在 prompt 模板中。
-        return _PROACTIVE_SYSTEM_PROMPT
+        parts = []
+        if self._system_prompt.strip():
+            parts.append(self._system_prompt.strip())
+        parts.append(_PROACTIVE_SYSTEM_PROMPT)
+        return "\n\n---\n\n".join(parts)
 
     async def _chat_completion(self, messages: list[dict]) -> str:
         if self._http is None:

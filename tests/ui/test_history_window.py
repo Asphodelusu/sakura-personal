@@ -384,3 +384,56 @@ def test_history_window_scrolls_to_bottom_after_batched_layout_settles(qtbot) ->
     assert scrollbar.maximum() > 0
     assert scrollbar.value() == scrollbar.maximum()
     window.close()
+
+
+def test_history_window_loads_recent_page_then_older_entries(qtbot) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.history_window import HistoryWindow
+
+    QApplication = qtwidgets.QApplication
+    QLabel = qtwidgets.QLabel
+    app = QApplication.instance() or QApplication([])
+
+    class PagedHistoryStore:
+        assistant_name = "桜"
+
+        def __init__(self) -> None:
+            self.entries = [_entry("user", f"历史内容 {index}") for index in range(201)]
+
+        def load_tail(self, limit: int) -> tuple[list[ChatHistoryEntry], bool]:
+            return self.entries[-limit:], len(self.entries) > limit
+
+        def load_older(
+            self,
+            skip_last: int,
+            limit: int,
+        ) -> tuple[list[ChatHistoryEntry], bool]:
+            end = max(0, len(self.entries) - skip_last)
+            start = max(0, end - limit)
+            return self.entries[start:end], start > 0
+
+        def load(self) -> list[ChatHistoryEntry]:
+            raise AssertionError("分页存储不应退回全量读取")
+
+    window = HistoryWindow(PagedHistoryStore())  # type: ignore[arg-type]
+    qtbot.addWidget(window)
+    window.refresh()
+    _finish_batched_history_render(window)
+
+    initial_texts = [label.text() for label in window.findChildren(QLabel)]
+    assert "历史内容 0" not in initial_texts
+    assert "历史内容 1" in initial_texts
+    assert window._loaded_entry_count == 200
+    assert window._has_more_entries is True
+
+    window.load_older_entries()
+    _finish_batched_history_render(window)
+
+    loaded_texts = [label.text() for label in window.findChildren(QLabel)]
+    assert "历史内容 0" in loaded_texts
+    assert window._loaded_entry_count == 201
+    assert window._has_more_entries is False
+    window.close()

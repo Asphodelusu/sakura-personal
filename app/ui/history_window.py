@@ -39,6 +39,7 @@ _HISTORY_MARKER_DISPLAY_TEXT = {
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER: "刚才留意了一下屏幕状态。",
 }
 _RENDER_BATCH_SIZE = 40
+_HISTORY_PAGE_SIZE = 200
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,9 @@ class HistoryWindow(QDialog):
         self._render_generation = 0
         self._refresh_scheduled = False
         self._staged_history_content: QWidget | None = None
+        self._loaded_entry_count = 0
+        self._has_more_entries = False
+        self._scroll_to_bottom_after_render = True
 
         self.setWindowTitle("历史记录")
         self.resize(620, 680)
@@ -161,8 +165,15 @@ class HistoryWindow(QDialog):
 
     def refresh(self) -> None:
         self._refresh_scheduled = False
-        entries = self.history_store.load()
-        self.count_label.setText(f"{len(entries)} 条记录")
+        load_tail = getattr(self.history_store, "load_tail", None)
+        if callable(load_tail):
+            entries, self._has_more_entries = load_tail(_HISTORY_PAGE_SIZE)
+        else:
+            # 兼容测试桩和旧的自定义历史存储实现。
+            entries = self.history_store.load()
+            self._has_more_entries = False
+        self._loaded_entry_count = len(entries)
+        self._update_count_label()
 
         if not entries:
             self._clear_entries()
@@ -172,9 +183,42 @@ class HistoryWindow(QDialog):
             return
 
         self._stage_entries_for_render()
+        self._scroll_to_bottom_after_render = True
         self._pending_entries = entries
         self._render_index = 0
         self._render_next_batch(self._render_generation)
+
+    def load_older_entries(self) -> None:
+        if not self._has_more_entries or self._staged_history_content is not None:
+            return
+        load_older = getattr(self.history_store, "load_older", None)
+        if not callable(load_older):
+            self._has_more_entries = False
+            self._update_count_label()
+            return
+
+        entries, has_more = load_older(
+            skip_last=self._loaded_entry_count,
+            limit=_HISTORY_PAGE_SIZE,
+        )
+        self._has_more_entries = has_more
+        if not entries:
+            self._update_count_label()
+            return
+
+        self._loaded_entry_count += len(entries)
+        all_entries = entries + self._pending_entries
+        self._stage_entries_for_render()
+        # 用户从顶部主动加载旧记录后停留在新增的旧记录区域，不跳回最新消息。
+        self._scroll_to_bottom_after_render = False
+        self._pending_entries = all_entries
+        self._render_index = 0
+        self._update_count_label()
+        self._render_next_batch(self._render_generation)
+
+    def _update_count_label(self) -> None:
+        suffix = "（还有更早记录）" if self._has_more_entries else ""
+        self.count_label.setText(f"已显示 {self._loaded_entry_count} 条记录{suffix}")
 
     def clear_history(self) -> None:
         result = QMessageBox.question(
@@ -240,6 +284,11 @@ class HistoryWindow(QDialog):
         self.history_content = content
         self.history_layout = layout
         self._bubble_frames = []
+        if self._has_more_entries:
+            load_older_button = QPushButton("加载更早记录", content)
+            load_older_button.setObjectName("secondaryButton")
+            load_older_button.clicked.connect(self.load_older_entries)
+            layout.addWidget(load_older_button, 0, Qt.AlignmentFlag.AlignHCenter)
 
     def _show_loading_state(self) -> None:
         self.count_label.setText("读取中...")
@@ -292,7 +341,9 @@ class HistoryWindow(QDialog):
                 list(self._bubble_frames),
             )
             self._staged_history_content = None
-            self._schedule_layout_update()
+            self._schedule_layout_update(
+                scroll_to_bottom=self._scroll_to_bottom_after_render
+            )
             return
         QTimer.singleShot(0, lambda generation=generation: self._render_next_batch(generation))
 
@@ -362,11 +413,16 @@ class HistoryWindow(QDialog):
             bubble.setFixedWidth(max_width)
             bubble.updateGeometry()
 
-    def _schedule_layout_update(self) -> None:
+    def _schedule_layout_update(self, *, scroll_to_bottom: bool = True) -> None:
         for delay_ms in (0, 60, 160, 320):
-            QTimer.singleShot(delay_ms, self._sync_history_layout)
+            QTimer.singleShot(
+                delay_ms,
+                lambda scroll_to_bottom=scroll_to_bottom: self._sync_history_layout(
+                    scroll_to_bottom=scroll_to_bottom
+                ),
+            )
 
-    def _sync_history_layout(self) -> None:
+    def _sync_history_layout(self, *, scroll_to_bottom: bool = True) -> None:
         # 延迟触发的 singleShot 可能在窗口被销毁后才执行（典型场景是 pytest-qt
         # 拆除时的 processEvents），此时底层 C++ QObject 已失效，直接访问会抛
         # ``RuntimeError: Internal C++ object already deleted``。先确认存活再继续。
@@ -379,7 +435,8 @@ class HistoryWindow(QDialog):
         self._update_bubble_widths()
         self.history_layout.activate()
         self.history_content.adjustSize()
-        self._scroll_to_bottom()
+        if scroll_to_bottom:
+            self._scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
         scrollbar = self.history_view.verticalScrollBar()

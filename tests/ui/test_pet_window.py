@@ -4729,6 +4729,39 @@ def test_reply_history_segments_load_from_persisted_history_entries() -> None:
     ]
 
 
+def test_split_proactive_comment_pairs_translation_per_sentence() -> None:
+    from app.ui.pet_window import _split_proactive_comment
+
+    text = (
+        "……ふふ。私の表情、ちゃんと見てるんだ。"
+        "閉眼微笑、使ってみてほしいなら、そう言えばいいのに。"
+    )
+    translation = "……呵呵。我的表情，你有在好好看呢。想让我用闭眼微笑的话，直说就好了。"
+    segments = _split_proactive_comment(text, translation, "害羞")
+
+    assert len(segments) == 3
+    assert [segment.translation for segment in segments] == [
+        "……呵呵。",
+        "我的表情，你有在好好看呢。",
+        "想让我用闭眼微笑的话，直说就好了。",
+    ]
+    assert all(segment.tone == "害羞" for segment in segments)
+
+
+def test_split_proactive_comment_merges_when_sentence_counts_mismatch() -> None:
+    from app.ui.pet_window import _split_proactive_comment
+
+    text = "第一句。第二句。第三句。"
+    translation = "中文一。中文二三合在一起。"
+    segments = _split_proactive_comment(text, translation, "中性")
+
+    assert len(segments) == 2
+    assert segments[0].text == "第一句。"
+    assert segments[0].translation == "中文一。"
+    assert segments[1].text == "第二句。第三句。"
+    assert segments[1].translation == "中文二三合在一起。"
+
+
 def test_reply_history_segments_recover_json_string_history_entry() -> None:
     from app.storage.chat_history import ChatHistoryEntry
     from app.ui.pet_window import _reply_history_segments_from_entries

@@ -570,6 +570,11 @@ class MemoryCurator:
                     if not content:
                         ignored += 1
                         continue
+                    # 与最近心情历史做相似度检查，避免重复写入
+                    if self._is_mood_duplicate(content):
+                        ignored += 1
+                        event_counts["MOOD_DEDUP"] = event_counts.get("MOOD_DEDUP", 0) + 1
+                        continue
                     try:
                         self.memory_store.set_mood_state(content)
                         updated += 1
@@ -600,6 +605,30 @@ class MemoryCurator:
             "ignored": ignored,
             "event_counts": event_counts,
         }
+
+    def _is_mood_duplicate(self, content: str) -> bool:
+        """检查心情内容是否与最近历史高度重复，避免日记变成循环录音带。"""
+        try:
+            history = self.memory_store.mood_history()
+        except Exception:
+            return False
+        if not history:
+            return False
+        for entry in history[:3]:
+            existing = entry.get("content", "")
+            if not existing.strip():
+                continue
+            if _memory_similarity(content, existing) >= 0.80:
+                debug_log(
+                    "Memory",
+                    "跳过重复心情笔记",
+                    {
+                        "new_len": len(content),
+                        "similar_to": existing[:80] + ("…" if len(existing) > 80 else ""),
+                    },
+                )
+                return True
+        return False
 
 
 def _merge_event_counts(target: dict[str, int], source: dict[str, int]) -> None:
