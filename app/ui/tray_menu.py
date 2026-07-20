@@ -7,6 +7,9 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
+RESTART_EXIT_CODE = 73
+
+
 def build_pet_tray_menu(
     parent: QWidget,
     *,
@@ -21,6 +24,7 @@ def build_pet_tray_menu(
     on_show_history: Callable[[], None],
     on_show_runtime_log: Callable[[], None],
     on_show_settings: Callable[[], None],
+    on_restart: Callable[[], None],
     window_visible: bool = True,
     interactions_enabled: bool = True,
 ) -> QMenu:
@@ -81,6 +85,11 @@ def build_pet_tray_menu(
     menu.addAction(settings_action)
 
     menu.addSeparator()
+
+    restart_action = QAction("重启 Sakura", parent)
+    restart_action.setEnabled(interactions_enabled)
+    restart_action.triggered.connect(on_restart)
+    menu.addAction(restart_action)
 
     quit_action = QAction("退出", parent)
     quit_action.triggered.connect(QApplication.quit)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+
+from app.agent.builtin_tools import intimacy_mode_state
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -220,6 +222,14 @@ def resolve_turn_plan(
     )
     if not settings.enabled:
         return _standard_plan(recall_decision=recall, decided_by="disabled")
+
+    # —— 亲密模式：模型自启 set_intimacy_mode 后走 fast 回复 ——
+    # アクティブな間は fast plan（thinking 無効）で応答。モデルが明示的に
+    # on=false を呼ぶか、一定ターン数経過で自動解除。
+    if intimacy_mode_state.active:
+        if intimacy_mode_state.consume_turn():
+            return _fast_plan(recall_decision=recall, decided_by="intimacy_mode")
+        # counter exhausted → auto-exit（consume_turn 内で既に active=False に設定済み）
 
     has_image = messages_contain_image(messages)
     if proactive_mode:

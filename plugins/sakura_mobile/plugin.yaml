@@ -5,7 +5,7 @@ author: pa1n9
 description: 提供可通过局域网或 Tailscale 访问的手机网页聊天入口。
 version: 1.0.0
 entry: plugin:SakuraMobilePlugin
-enabled: false
+enabled: true
 priority: 70
 permissions:
   - plugin_settings

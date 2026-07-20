@@ -16,6 +16,7 @@ class ChatHistoryEntry:
     translation: str = ""
     tone: str = ""
     portrait: str = ""
+    channel: str = ""
 
     def display_content(self, subtitle_language: str) -> str:
         if self.role == "assistant" and subtitle_language == "zh" and self.translation.strip():
@@ -37,6 +38,7 @@ class ChatHistoryStore:
         translation: str = "",
         tone: str = "",
         portrait: str = "",
+        channel: str = "",
         _debug: dict | None = None,
     ) -> None:
         entry = {
@@ -50,6 +52,8 @@ class ChatHistoryStore:
             entry["tone"] = tone.strip()
         if portrait.strip():
             entry["portrait"] = portrait.strip()
+        if channel.strip():
+            entry["channel"] = channel.strip()
         if _debug is not None:
             entry["_debug"] = _debug
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +100,7 @@ class ChatHistoryStore:
             translation = data.get("translation", "")
             tone = data.get("tone", "")
             portrait = data.get("portrait", "")
+            channel = data.get("channel", "")
             if not all(isinstance(value, str) for value in (created_at, role, content)):
                 continue
             if not isinstance(translation, str):
@@ -104,6 +109,8 @@ class ChatHistoryStore:
                 tone = ""
             if not isinstance(portrait, str):
                 portrait = ""
+            if not isinstance(channel, str):
+                channel = ""
             entries.append(
                 ChatHistoryEntry(
                     created_at=created_at,
@@ -112,6 +119,7 @@ class ChatHistoryStore:
                     translation=translation,
                     tone=tone,
                     portrait=portrait,
+                    channel=channel,
                 )
             )
         return entries

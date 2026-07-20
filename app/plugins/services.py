@@ -308,6 +308,7 @@ class ScopedPluginServices:
         self.tts = services.tts
         self.agent = services.agent
         self.input = services.input
+        self.mobile = services.mobile
         self.resources = services.resources.for_plugin(plugin_id)
 
 
@@ -319,6 +320,7 @@ class PluginServices:
         self.tts = PluginTTSService()
         self.agent = PluginAgentService()
         self.input = PluginInputService()
+        self.mobile = PluginMobileService()
         self.resources = PluginResourceService()
 
     def set_backends(
@@ -341,6 +343,18 @@ class PluginServices:
             self.agent.set_passive_reply_sink(passive_reply_sink)
         if input_text_sink is not None:
             self.input.set_input_text_sink(input_text_sink)
+        mobile_chars = kwargs.get("mobile_characters_sink")
+        if callable(mobile_chars):
+            self.mobile.set_characters_sink(mobile_chars)
+        mobile_hist = kwargs.get("mobile_history_sink")
+        if callable(mobile_hist):
+            self.mobile.set_history_sink(mobile_hist)
+        mobile_chat = kwargs.get("mobile_chat_sink")
+        if callable(mobile_chat):
+            self.mobile.set_chat_sink(mobile_chat)
+        mobile_theme = kwargs.get("mobile_theme_sink")
+        if callable(mobile_theme):
+            self.mobile.set_theme_sink(mobile_theme)
 
     def set_resource_registry(self, registry: ResourceRegistry) -> None:
         """宿主注入 App 级资源域。"""
@@ -349,3 +363,49 @@ class PluginServices:
     def for_plugin(self, plugin_id: str) -> ScopedPluginServices:
         """构造绑定插件 ID 的服务视图，避免插件看到全局资源门面。"""
         return ScopedPluginServices(self, plugin_id)
+
+
+class PluginMobileService:
+    """手机端相关的安全入口。
+
+    为手机端插件提供角色列表、聊天历史、聊天和主题等桥接方法，
+    通过宿主注入的 sink 回调转发到真实的 UI/业务后端。
+    """
+
+    def __init__(self) -> None:
+        self._characters_sink: Callable[[], list[dict[str, str]]] | None = None
+        self._history_sink: Callable[[str, int], list[dict[str, str]]] | None = None
+        self._chat_sink: Callable[[str, str, str], dict[str, Any]] | None = None
+        self._theme_sink: Callable[[], dict[str, object]] | None = None
+
+    def set_characters_sink(self, sink: Callable[[], list[dict[str, str]]] | None) -> None:
+        self._characters_sink = sink
+
+    def set_history_sink(self, sink: Callable[[str, int], list[dict[str, str]]] | None) -> None:
+        self._history_sink = sink
+
+    def set_chat_sink(self, sink: Callable[[str, str, str], dict[str, Any]] | None) -> None:
+        self._chat_sink = sink
+
+    def set_theme_sink(self, sink: Callable[[], dict[str, object]] | None) -> None:
+        self._theme_sink = sink
+
+    def characters(self) -> list[dict[str, str]]:
+        if self._characters_sink is not None:
+            return self._characters_sink()
+        return []
+
+    def history(self, character_id: str, *, limit: int = 50) -> list[dict[str, str]]:
+        if self._history_sink is not None:
+            return self._history_sink(character_id, limit)
+        return []
+
+    def chat(self, character_id: str, text: str, image_data_url: str = "") -> dict[str, Any]:
+        if self._chat_sink is not None:
+            return self._chat_sink(character_id, text, image_data_url)
+        return {"error": "手机端聊天后端未就绪"}
+
+    def theme(self) -> dict[str, object]:
+        if self._theme_sink is not None:
+            return self._theme_sink()
+        return {}

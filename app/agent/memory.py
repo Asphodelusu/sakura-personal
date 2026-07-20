@@ -267,10 +267,16 @@ def _import_backup_memories(mem: Any, base_dir: Path | None = None) -> None:
 
 @dataclass(frozen=True)
 class MemoryRecord:
-    """Sakura 业务层统一记忆记录，屏蔽 mem0 原始字段差异。"""
+    """Sakura 业务层统一记忆记录，屏蔽 mem0 原始字段差异。
+
+    title 字段用于渐进检索索引模式——约 20 字摘要，供 LLM 扫描标题
+    后决定是否展开全文。若未显式设置，调用方应从 metadata 或 content
+    首段提取。
+    """
 
     id: str
     content: str
+    title: str = ""
     layer: str = DEFAULT_MEMORY_LAYER
     category: str = ""
     importance: float = DEFAULT_MEMORY_IMPORTANCE
@@ -301,6 +307,7 @@ class MemoryRecord:
             "id": self.id,
             "content": self.content,
             "memory": self.content,
+            "title": self.title,
             "layer": self.layer,
             "category": self.category,
             "importance": self.importance,
@@ -1014,6 +1021,7 @@ class MemoryStore:
             query=query_text,
         )
 
+
     def build_continuity_context(self) -> str:
         """构建每轮必注入的连续性上下文：心情 + 关系摘要。
 
@@ -1051,13 +1059,19 @@ class MemoryStore:
         arguments: dict[str, Any],
         *,
         wait: bool = True,
+        mode: str = "full",
     ) -> dict[str, Any]:
+        mode_value = str(arguments.get("mode") or mode or "full").strip().lower()
         query = _optional_text(arguments, "query") or _optional_text(arguments, "keyword")
         limit = _positive_int(arguments.get("limit") or arguments.get("top_k"), DEFAULT_MEMORY_LIMIT)
         layer_filter = _optional_memory_layer(arguments.get("layer"))
         category_filter = _optional_text(arguments, "category").lower()
         scope = _normalize_scope_id(_optional_text(arguments, "scope") or self.scope_id)
         core_profile = self.core_profile() if scope == self.scope_id else None
+        if mode_value == "index":
+            return self._search_index(query=query, limit=limit, layer_filter=layer_filter,
+                                      category_filter=category_filter, scope=scope,
+                                      core_profile=core_profile, wait=wait)
         if layer_filter == MEMORY_LAYER_CORE_PROFILE:
             memories = []
             if (
@@ -1138,6 +1152,147 @@ class MemoryStore:
                 if not memories
                 else {}
             ),
+        }
+
+    # ---- 渐进检索：按 ID 取全文（Layer 3） ----
+
+    def get_memory_detail(
+        self,
+        arguments: dict[str, Any],
+        *,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        """按 memory_id 列表批量取回完整记忆内容。
+
+        对应 claude-mem 的 get_observations（Layer 3）。
+        调用方应先通过 search_memory(mode="index") 获取标题索
+        引，再按需用本方法展开感兴趣的条目。
+
+        过滤已释放（released）、已过期（expired）及非本 scope
+        的记忆——与索引模式的过滤语义保持一致。
+        """
+        memory_ids: list[str] = []
+        raw_ids = arguments.get("ids") or arguments.get("memory_ids") or []
+        if isinstance(raw_ids, str):
+            memory_ids = [i.strip() for i in raw_ids.split(",") if i.strip()]
+        elif isinstance(raw_ids, list):
+            memory_ids = [str(i).strip() for i in raw_ids if str(i).strip()]
+        if not memory_ids:
+            return {"memories": [], "count": 0}
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
+        if mem is None:
+            return self._loading_response()
+        memories: list[dict[str, Any]] = []
+        for mid in memory_ids:
+            if _is_core_profile_id(mid):
+                cp = self.core_profile()
+                if cp is not None:
+                    memories.append(cp)
+                continue
+            try:
+                raw = mem.get(mid)
+            except Exception:
+                continue
+            memory = _normalize_memory_record(raw, default_scope=self.scope_id)
+            if memory is None:
+                continue
+            # 与 search/index 过滤语义对齐：已释放、已过期、跨 scope 跳过
+            if _memory_is_released(memory):
+                continue
+            if memory_record_is_expired(memory):
+                continue
+            mem_scope = str(memory.get("scope") or "").strip()
+            if mem_scope and mem_scope != self.scope_id:
+                continue
+            memories.append(memory)
+        return {"memories": memories, "count": len(memories)}
+
+    # ---- 渐进检索：纯标题索引（Layer 1） ----
+
+    def _search_index(
+        self,
+        *,
+        query: str,
+        limit: int,
+        layer_filter: str | None,
+        category_filter: str,
+        scope: str,
+        core_profile: dict[str, Any] | None,
+        wait: bool,
+    ) -> dict[str, Any]:
+        """search_memory 的索引模式：只返回元信息（id / title / layer /
+        created_at / importance / approx_tokens），不含完整正文。
+
+        对应 claude-mem 的 search（Layer 1）。
+        """
+        if layer_filter == MEMORY_LAYER_CORE_PROFILE:
+            memories: list[dict[str, Any]] = []
+            if (
+                core_profile is not None
+                and _memory_matches_query(core_profile, query)
+                and _memory_matches_filters(
+                    core_profile,
+                    layer=layer_filter,
+                    category=category_filter,
+                    scope=scope,
+                )
+            ):
+                memories = [_index_record(core_profile)]
+            return {
+                "agent_id": scope,
+                "query": query,
+                "count": len(memories),
+                "memories": memories,
+                "mode": "index",
+            }
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
+        if mem is None:
+            return self._loading_response()
+        try:
+            raw = (
+                mem.get_all(filters={"user_id": scope}, top_k=max(limit, DEFAULT_MEMORY_LIMIT))
+                if not query
+                else mem.search(query, filters={"user_id": scope}, top_k=max(limit, DEFAULT_MEMORY_LIMIT))
+            )
+        except Exception as exc:
+            if _is_closed_client_error(exc):
+                error = str(exc)
+                self._mark_runtime_failed(error)
+                return self._failed_response(error)
+            raise
+        memories = _normalize_memory_results(raw, default_scope=scope)
+        if core_profile is not None and _memory_matches_query(core_profile, query):
+            memories.insert(0, core_profile)
+        memories = [
+            memory
+            for memory in memories
+            if not memory_record_is_expired(memory)
+            and not _memory_is_released(memory)
+            and _memory_matches_filters(
+                memory,
+                layer=layer_filter,
+                category=category_filter,
+                scope=scope,
+            )
+        ]
+        memories = _rank_memories(memories, query=query)[:limit]
+        index_memories = [_index_record(m) for m in memories]
+        return {
+            "agent_id": scope,
+            "query": query,
+            "count": len(index_memories),
+            "memories": index_memories,
+            "mode": "index",
         }
 
     def create_memory(
@@ -1298,8 +1453,14 @@ class MemoryStore:
         mem.update(memory_id, content, metadata=metadata)
         return True
 
-    def list_scope_memories(self, *, limit: int = 200, wait: bool = False) -> list[dict[str, Any]]:
-        """列出当前角色记忆（供整理/到点召回等后台逻辑使用）。"""
+    def list_scope_memories(
+        self, *, limit: int = 200, wait: bool = False, include_released: bool = False,
+    ) -> list[dict[str, Any]]:
+        """列出当前角色记忆（供整理/到点召回等后台逻辑使用）。
+
+        include_released=False 时自动过滤已放手记忆，
+        与 search_memory / build_memory_context 的默认行为一致。
+        """
         capped = max(1, min(500, int(limit)))
         try:
             mem = self._get_memory(wait=wait)
@@ -1314,7 +1475,10 @@ class MemoryStore:
         except Exception:
             return []
         memories = _normalize_memory_results(raw, default_scope=self.scope_id)
-        return [memory for memory in memories if not memory_record_is_expired(memory)]
+        memories = [memory for memory in memories if not memory_record_is_expired(memory)]
+        if not include_released:
+            memories = [m for m in memories if not _memory_is_released(m)]
+        return memories
 
     def delete_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
@@ -2322,6 +2486,21 @@ def _memory_is_released(record: dict[str, Any]) -> bool:
     return status == "released"
 
 
+def _derive_title(memory: dict[str, Any], *, max_chars: int = 44) -> str:
+    """从记忆记录提取标题（供 _index_record / timeline 等共享）。
+
+    优先顺序：memory.title → metadata.title → 正文前 max_chars 字截断。
+    """
+    content = str(memory.get("content") or memory.get("memory") or "")
+    metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+    title = str(memory.get("title") or metadata.get("title") or "").strip()
+    if not title and content:
+        title = content[:max_chars].rstrip()
+        if len(content) > max_chars:
+            title = title[:max_chars - 3] + "…"
+    return title
+
+
 def _save_revision(base_dir: Path | None, memory_id: str, previous: dict[str, Any] | None, *, reason: str = "") -> None:
     """保存记忆的旧版本到 revisions 文件。
 
@@ -2422,6 +2601,27 @@ def _parse_iso_timestamp(value: str) -> float:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+
+def _index_record(memory: dict[str, Any]) -> dict[str, Any]:
+    """从完整记忆记录提取索引字段（id / title / layer /
+    created_at / importance / approx_tokens）。
+
+    title 调用共享函数 _derive_title，与 timeline 的 _compact 保持一致。
+    """
+    content = str(memory.get("content") or memory.get("memory") or "")
+    title = _derive_title(memory)
+    # 估算 token 数：中文字符约 0.5 token/字，英文约 0.25 token/字
+    # 使用保守估算 ~0.6 token/字符
+    approx_tokens = max(1, int(len(content) * 0.6))
+    return {
+        "id": str(memory.get("id") or ""),
+        "title": title,
+        "layer": str(memory.get("layer") or DEFAULT_MEMORY_LAYER),
+        "created_at": str(memory.get("created_at") or ""),
+        "importance": _bounded_float(memory.get("importance"), default=DEFAULT_MEMORY_IMPORTANCE),
+        "approx_tokens": approx_tokens,
+    }
 
 
 def _format_memory_context(
@@ -2596,9 +2796,12 @@ def _normalize_memory_record(raw: Any, *, default_scope: str = DEFAULT_MEMORY_SC
     updated_at = str(raw.get("updated_at") or metadata.get("updated_at") or created_at).strip()
     last_accessed_at = str(raw.get("last_accessed_at") or metadata.get("last_accessed_at") or "").strip()
     scope = _normalize_scope_id(str(raw.get("scope") or metadata.get("scope") or raw.get("user_id") or default_scope))
+    # 提取标题：优先显式 title 字段 → metadata.title → 空（由 _index_record 补）
+    title = str(raw.get("title") or metadata.get("title") or "").strip()
     record = MemoryRecord(
         id=memory_id,
         content=content,
+        title=title,
         layer=layer,
         category=category,
         importance=_bounded_float(raw.get("importance", metadata.get("importance")), default=DEFAULT_MEMORY_IMPORTANCE),

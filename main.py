@@ -8,7 +8,7 @@ from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import QEventLoop, QObject, QProcess, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QStyleFactory
 
@@ -62,6 +62,7 @@ from app.ui.subtitle_controller import (
     SPEECH_TYPING_INTERVAL_MS,
     normalize_subtitle_display_speed,
 )
+from app.ui.tray_menu import RESTART_EXIT_CODE
 from app.voice.tts_settings import TTSConfigError
 from app.voice.tts_bundle import (
     TTSBundleMigration,
@@ -798,4 +799,17 @@ def _start_deferred_startup(base_dir: Path, pet_window: PetWindow) -> None:
     )
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if exit_code == RESTART_EXIT_CODE:
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            arguments = [*sys.argv[1:]]
+        else:
+            program = sys.executable
+            arguments = [str(BASE_DIR / "main.py"), *sys.argv[1:]]
+        started, _pid = QProcess.startDetached(program, arguments, str(BASE_DIR))
+        if not started:
+            _write_startup_error("Restart", "无法启动新的 Sakura 进程。")
+            raise SystemExit(1)
+        raise SystemExit(0)
+    raise SystemExit(exit_code)

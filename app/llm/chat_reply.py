@@ -187,7 +187,7 @@ def _parse_segments(data: dict[str, Any]) -> tuple[list[ChatSegment], bool]:
     if text:
         tone = data.get("tone")
         translation = _clean_first_text(data, "zh", "chinese", "translation")
-        segment, has_language_issue = _build_segment(text, tone, translation, data.get("portrait"))
+        segment, has_language_issue = _build_segment(text, tone, translation, data.get("portrait"), suppress_tts=bool(data.get("suppress_tts", False)))
         return [segment], has_language_issue
 
     return [], False
@@ -204,16 +204,17 @@ def _parse_segment(item: Any) -> tuple[ChatSegment | None, bool]:
     if not text:
         return None, False
     translation = _clean_first_text(item, "zh", "chinese", "translation")
-    return _build_segment(text, item.get("tone"), translation, item.get("portrait"))
+    suppress_tts = bool(item.get("suppress_tts", False))
+    return _build_segment(text, item.get("tone"), translation, item.get("portrait"), suppress_tts=suppress_tts)
 
 
-def _build_segment(text: str, tone: Any, translation: str, portrait: Any) -> tuple[ChatSegment, bool]:
+def _build_segment(text: str, tone: Any, translation: str, portrait: Any, *, suppress_tts: bool = False) -> tuple[ChatSegment, bool]:
     text = text.strip()
     translation = translation.strip()
     # 只在 ja 明显是中文、zh 明显是日文时交换，避免误判“ 大丈夫 ”这类日语汉字句。
     if text and translation and _looks_chinese(text) and _looks_japanese(translation):
         text, translation = translation, text
-        return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait)), False
+        return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait), suppress_tts=suppress_tts), False
 
     if text and _has_obvious_chinese(text):
         fallback_translation = translation or text
@@ -230,7 +231,7 @@ def _build_segment(text: str, tone: Any, translation: str, portrait: Any) -> tup
 
     # 译文为空时用原文填充，避免 display_text(“zh”) 无内容可显示
     safe_translation = translation if translation else text
-    return ChatSegment(text, _clean_tone(tone), safe_translation, _clean_portrait(portrait)), False
+    return ChatSegment(text, _clean_tone(tone), safe_translation, _clean_portrait(portrait), suppress_tts=suppress_tts), False
 
 
 def _clean_tone(value: Any) -> str:
