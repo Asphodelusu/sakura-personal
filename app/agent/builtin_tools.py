@@ -8,11 +8,53 @@ from typing import Any
 
 from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
+from app.agent.memory_timeline import DEFAULT_TIMELINE_AFTER, DEFAULT_TIMELINE_BEFORE, build_timeline
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tools import Tool, ToolRegistry
 from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
+
+
+class IntimacyModeState:
+    """亲密模式共享状态：工具写入、路由读取。"""
+
+    _AUTO_EXIT_TURNS = 6
+
+    def __init__(self) -> None:
+        self.active: bool = False
+        self._turns_left: int = 0
+
+    def enter(self) -> None:
+        self.active = True
+        self._turns_left = self._AUTO_EXIT_TURNS
+
+    def exit(self) -> None:
+        self.active = False
+        self._turns_left = 0
+
+    def consume_turn(self) -> bool:
+        """每轮消耗一次；返回是否仍活跃。"""
+        if not self.active:
+            return False
+        self._turns_left -= 1
+        if self._turns_left <= 0:
+            self.active = False
+            return False
+        return True
+
+
+# 模块级单例，供 builtin_tools 和 turn_routing 共享
+intimacy_mode_state = IntimacyModeState()
+
+
+def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
+    on = arguments.get("on", False)
+    if on:
+        intimacy_mode_state.enter()
+    else:
+        intimacy_mode_state.exit()
+    return {"intimacy_mode": "on" if on else "off"}
 
 
 def create_builtin_tool_registry(
@@ -35,6 +77,22 @@ def create_builtin_tool_registry(
                 description="获取当前本机时间和时区。",
                 parameters={},
                 handler=lambda _arguments: get_current_time(),
+                group="core",
+            ),
+            Tool(
+                name="set_intimacy_mode",
+                description=(
+                    "会話が親密・性的な文脈に入った／抜けたと感じた時に、返答モードを切り替える。"
+                    "on=true で早い返答モードに、on=false で通常モードに戻す。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "on": {"type": "boolean", "description": "true で親密モードに入る、false で抜ける。"},
+                    },
+                    "required": ["on"],
+                },
+                handler=_handle_set_intimacy_mode,
                 group="core",
             ),
             Tool(
@@ -178,6 +236,9 @@ def create_builtin_tool_registry(
                 name="memory_search",
                 description=(
                     "搜索 Sakura 的长期记忆。需要跨会话信息、用户偏好、项目状态或过往约定时使用。"
+                    "mode='full'（默认）返回完整正文；"
+                    "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
+                    "token 消耗约 1/10，适合先概览再按需展开。"
                     "首次调用可能返回 status='loading'，这时直接告诉对方记忆系统正在初始化，不要重复调用。"
                 ),
                 parameters={
@@ -185,6 +246,7 @@ def create_builtin_tool_registry(
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词，可为空；为空时列出最近记忆。"},
                         "limit": {"type": "integer", "description": "最多返回多少条，默认 20。"},
+                        "mode": {"type": "string", "description": "full（默认）或 index。"},
                         "layer": {
                             "type": "string",
                             "description": "可选记忆层级：core_profile、semantic、episodic、procedural、session。",
@@ -194,6 +256,50 @@ def create_builtin_tool_registry(
                     },
                 },
                 handler=lambda arguments: memory.search_memory(arguments, wait=False),
+                group="core",
+            ),
+            Tool(
+                name="memory_detail",
+                description=(
+                    "按 memory_id 列表批量取回完整记忆内容。"
+                    "先用 memory_search(mode='index') 获取标题索引，"
+                    "再对感兴趣的条目调用本工具展开全文。"
+                    "ids 可以是逗号分隔的字符串或数组。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "string", "description": "记忆 id 列表，逗号分隔或直接传数组。"},
+                    },
+                    "required": ["ids"],
+                },
+                handler=lambda arguments: memory.get_memory_detail(arguments, wait=False),
+                group="core",
+            ),
+            Tool(
+                name="memory_timeline",
+                description=(
+                    "以某条记忆为锚点，查看它在时间线上的前后上下文。"
+                    "给定 memory_id，返回该条记忆及其之前/之后的邻近记忆。"
+                    "适合在 memory_search 找到感兴趣的条目后，"
+                    "了解「那段时间还发生了什么」。"
+                    "不支持常驻档案（core_profile）作为锚点。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "作为锚点的记忆 id。"},
+                        "before": {"type": "integer", "description": "返回锚点之前的条目数（默认 3）。"},
+                        "after": {"type": "integer", "description": "返回锚点之后的条目数（默认 3）。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: build_timeline(
+                    memory,
+                    str(arguments.get("memory_id") or "").strip(),
+                    before=_safe_int(arguments.get("before"), DEFAULT_TIMELINE_BEFORE),
+                    after=_safe_int(arguments.get("after"), DEFAULT_TIMELINE_AFTER),
+                ),
                 group="core",
             ),
             Tool(
@@ -391,6 +497,16 @@ def _required_text(arguments: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"缺少必填参数：{key}")
     return value.strip()
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """安全取整，None 或非数字返回默认值；显式传 0 有效。"""
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _now_iso() -> str:

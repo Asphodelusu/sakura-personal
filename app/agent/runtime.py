@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import time
 from datetime import datetime
@@ -89,6 +91,16 @@ from app.llm.prompts.types import (
     PromptSection,
 )
 
+_INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
+
+
+def _load_intimacy_guide() -> str:
+    try:
+        return _INTIMACY_GUIDE_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
     "missing_translation",
     "missing_segments",
@@ -143,6 +155,10 @@ class AgentRuntime:
         self._prompt_inspection_lock = Lock()
         self.model_vision_enabled = True
         self.autonomous_screen_observation_enabled = True
+        # 渐进记忆检索：在召回结果后追加标题索引 + 工具提示
+        # TODO: 目前仅 set_progressive_memory_enabled() 手动启用，未接入配置/UI 开关
+        self._progressive_memory = False
+        self._intimacy_guide = _load_intimacy_guide()
 
     @property
     def vision_api_client(self) -> OpenAICompatibleClient | None:
@@ -304,6 +320,10 @@ class AgentRuntime:
     def set_autonomous_screen_observation_enabled(self, enabled: bool) -> None:
         """允许模型在对话或主动事件中自主决定是否观察屏幕。"""
         self.autonomous_screen_observation_enabled = enabled
+
+    def set_progressive_memory_enabled(self, enabled: bool) -> None:
+        """启用渐进记忆检索：在召回结果后追加标题索引 + 工具提示。"""
+        self._progressive_memory = enabled
 
     def set_runtime_loop_settings(self, settings: RuntimeLoopSettings | None) -> None:
         """同步工具循环限制，后续对话从新设置开始生效。"""
@@ -771,8 +791,17 @@ class AgentRuntime:
                 if memory_needs_refresh:
                     if turn_state.recall_decision == "recall":
                         recall = self.memory_recall.recall(request)
-                        turn_memory_fragments = recall.fragments
+                        turn_memory_fragments = list(recall.fragments)
                         memory_status = recall.status
+                        # 渐进检索：追加以往记忆的标题索引 + 工具提示
+                        if self._progressive_memory:
+                            progressive = self._build_progressive_index_fragment(
+                                request.current_input,
+                                recall.fragments,
+                            )
+                            if progressive:
+                                turn_memory_fragments.append(progressive)
+                        turn_memory_fragments = tuple(turn_memory_fragments)
                     elif turn_state.recall_decision == "light":
                         # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
                         light_recall = self.memory_recall.recall(
@@ -1606,6 +1635,26 @@ class AgentRuntime:
         )
         return sections
 
+    def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
+        """构建亲密对话风格指南。模型自行判断是否激活。"""
+        guide = getattr(self, "_intimacy_guide", "")
+        if not guide:
+            return None
+        # Sakura 自身の内なる声として、自然な誘い方の参考
+        variants = [
+            "（したい気分になったら、こんなふうに声をかけていいんだよ）\n\n",
+            "（ね、そろそろ……いい？ って聞いてみても）\n\n",
+            "（今、君に触りたい——そう思ったときのための言葉）\n\n",
+            "（えっちな気分、隠さなくていいんだよ）\n\n",
+        ]
+        header = variants[hash(time.time()) % len(variants)]
+        return PromptSection(
+            section_id="persona.intimacy",
+            body=header + guide,
+            source="character",
+            sensitivity="private",
+        )
+
     def _static_persona_prompt(self) -> str:
         recipe = PromptRecipe("persona", self._persona_sections())
         return self._prompt_runtime().build(recipe).system_prompt
@@ -1702,6 +1751,9 @@ class AgentRuntime:
             PromptSection("tools.capabilities", capability_rules),
             PromptSection("tools.rules", tool_rules),
         ]
+        intimacy_section = self._build_intimacy_section()
+        if intimacy_section is not None:
+            sections.append(intimacy_section)
         return self._prompt_runtime().build(PromptRecipe("agent_tool_loop", sections), snapshot)
 
     def _build_tool_system_prompt(
@@ -1757,6 +1809,9 @@ class AgentRuntime:
             ),
             PromptSection("reply.patch", self._reply_protocol_patch_text()),
         ]
+        intimacy_section = self._build_intimacy_section()
+        if intimacy_section is not None:
+            sections.append(intimacy_section)
         return self._prompt_runtime().build(PromptRecipe("final_reply", sections), snapshot)
 
     def _build_final_reply_prompt(self) -> str:
@@ -1779,6 +1834,65 @@ class AgentRuntime:
 
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
         return self._build_event_reply_result(event_type).system_prompt
+
+    def _build_progressive_index_fragment(
+        self,
+        query: str,
+        excluded_fragments: tuple[ContextFragment, ...] = (),
+    ) -> ContextFragment | None:
+        """生成本轮相关的记忆标题索引 + 渐进检索工具提示。
+
+        excluded_fragments：本轮已作为全文召回注入的记忆片段，索引里跳过避免重复。
+        """
+        search = self.memory.search_memory(
+            {"query": query, "limit": 24, "mode": "index"},
+            wait=False,
+        )
+        index_memories = search.get("memories", [])
+        if not isinstance(index_memories, list) or not index_memories:
+            return None
+
+        # 已作为全文召回的记忆 id（fragment_id 形如 "memory.<id>"），索引里跳过，避免重复
+        excluded_ids = {
+            frag.fragment_id.split(".", 1)[1]
+            for frag in excluded_fragments
+            if frag.fragment_id.startswith("memory.")
+        }
+
+        index_lines: list[str] = []
+        for m in index_memories:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "")
+            if mid and mid in excluded_ids:
+                continue
+            title = str(m.get("title") or "")
+            approx = int(m.get("approx_tokens") or 0)
+            if not title:
+                continue
+            index_lines.append(f"- [{title}] (id: {mid}, 约 {approx} tokens)")
+
+        if not index_lines:
+            return None
+
+        hint = (
+            "【記憶の引き出し — まだ読んでいない記憶】\n"
+            + "\n".join(index_lines)
+            + "\n\n"
+            "気になることがあれば、memory_detail(ids=[\"...\"]) で全文を読むことができる。\n"
+            "前後の流れを知りたければ memory_timeline(memory_id=\"...\") で時間軸をたどれる。\n"
+            "もっと探したければ memory_search(mode=\"index\", query=\"...\") でさらに検索できる。"
+        )
+        return ContextFragment(
+            fragment_id="memory.progressive_index",
+            source="memory",
+            content=hint,
+            trust="trusted",
+            priority=70,
+            token_budget=800,
+            sensitivity="private",
+            cache_scope="turn",
+        )
 
     def _memory_context(self, messages: list[ChatMessage], *, mode: str) -> str:
         query = _latest_user_text(messages)

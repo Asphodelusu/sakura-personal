@@ -51,6 +51,7 @@ _PROCESS_ASSISTANT_PATTERNS = (
 class DigestLine:
     role: str
     content: str
+    channel: str = ""
 
 
 def clean_recent_dialogue(
@@ -87,7 +88,13 @@ def clean_recent_dialogue(
             continue
         if role == "assistant" and _is_process_assistant_text(content):
             continue
-        lines.append(DigestLine(role=role, content=content))
+        lines.append(
+            DigestLine(
+                role=role,
+                content=content,
+                channel=str(getattr(entry, "channel", "") or "").strip(),
+            )
+        )
     if not lines:
         return []
     return lines[-max(1, limit):]

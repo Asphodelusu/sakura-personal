@@ -14,6 +14,7 @@ from typing import Any
 
 from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
+from app.agent.memory_timeline import DEFAULT_TIMELINE_AFTER, DEFAULT_TIMELINE_BEFORE, build_timeline
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tools.registry import Tool
@@ -163,15 +164,64 @@ class BuiltinToolProvider:
             ),
             Tool(
                 name="memory_search",
-                description="搜索长期记忆。首次可能返回 status='loading'。",
+                description=(
+                    "搜索长期记忆。mode='full'（默认）返回完整正文；"
+                    "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
+                    "token 消耗约 1/10，适合先概览再按需展开。首次可能返回 status='loading'。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词。"},
                         "limit": {"type": "integer", "description": "返回上限。"},
+                        "mode": {"type": "string", "description": "full（默认）或 index。"},
                     },
                 },
                 handler=lambda args: self.memory.search_memory(args, wait=False),
+                group="memory",
+            ),
+            Tool(
+                name="memory_detail",
+                description=(
+                    "按 memory_id 列表批量取回完整记忆内容。"
+                    "先用 memory_search(mode='index') 获取标题索引，"
+                    "再对感兴趣的条目调用本工具展开全文。"
+                    "ids 可以是逗号分隔的字符串或数组。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "string", "description": "记忆 id 列表，逗号分隔或直接传数组。"},
+                    },
+                    "required": ["ids"],
+                },
+                handler=lambda args: self.memory.get_memory_detail(args, wait=False),
+                group="memory",
+            ),
+            Tool(
+                name="memory_timeline",
+                description=(
+                    "以某条记忆为锚点，查看它在时间线上的前后上下文。"
+                    "给定 memory_id，返回该条记忆及其之前/之后的邻近记忆。"
+                    "适合在 memory_search 找到感兴趣的条目后，"
+                    "了解「那段时间还发生了什么」。"
+                    "不支持常驻档案（core_profile）作为锚点。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "作为锚点的记忆 id。"},
+                        "before": {"type": "integer", "description": "返回锚点之前的条目数（默认 3）。"},
+                        "after": {"type": "integer", "description": "返回锚点之后的条目数（默认 3）。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda args: build_timeline(
+                    self.memory,
+                    str(args.get("memory_id") or "").strip(),
+                    before=_optional_timeline_count(args, "before", DEFAULT_TIMELINE_BEFORE),
+                    after=_optional_timeline_count(args, "after", DEFAULT_TIMELINE_AFTER),
+                ),
                 group="memory",
             ),
             Tool(
@@ -278,6 +328,17 @@ class TodoStore:
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def _optional_timeline_count(args: dict[str, Any], key: str, default: int) -> int:
+    """读取 timeline before/after 参数，显式传入 0 时不过滤为默认值。"""
+    value = args.get(key)
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:

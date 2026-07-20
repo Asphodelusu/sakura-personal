@@ -54,4 +54,6 @@ def build_session_state_fragment(
 
 def _render_line(line: DigestLine) -> str:
     speaker = "用户" if line.role == "user" else "Sakura"
+    if line.channel == "mobile":
+        speaker += "（手机）" if line.role == "user" else "（当时通过手机回复）"
     return f"- {speaker}：{line.content}"

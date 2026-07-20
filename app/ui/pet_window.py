@@ -98,7 +98,11 @@ from app.agent.runtime_events import (
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply_result
 from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
-from app.core.mobile_chat_bridge import MobileChatBridge, MobileChatBusyError
+from app.core.mobile_chat_bridge import (
+    MOBILE_CONTEXT_MARKER,
+    MobileChatBridge,
+    MobileChatBusyError,
+)
 from app.core.mobile_chat_worker import MobileChatWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log, summarize_messages
@@ -226,12 +230,14 @@ from app.ui import (
     crop_logical_region,
 )
 from app.ui.styles import pet_window_stylesheet
+from app.ui.tray_menu import RESTART_EXIT_CODE
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
     ThemeSettings,
     build_app_chrome_stylesheet,
     build_message_box_stylesheet,
     merge_theme_with_character,
+    theme_colors_to_mapping,
 )
 from app.voice import VoicePlaybackController
 
@@ -666,6 +672,9 @@ class PetWindow(QWidget):
         # ----
         self.interaction_sequence = 0
         self.active_interaction_id = ""
+        # 亲密模式自动续投
+        self._intimacy_continue_timer: QTimer | None = None
+        self._intimacy_continue_count: int = 0
         self.active_interaction_started_at: float | None = None
         self.active_interaction_last_at: float | None = None
         # UI 统一状态源：thinking/streaming/speaking/error 的唯一权威
@@ -2886,6 +2895,7 @@ class PetWindow(QWidget):
             on_show_history=self.show_history,
             on_show_runtime_log=self.show_runtime_log,
             on_show_settings=self.show_settings,
+            on_restart=lambda: QApplication.exit(RESTART_EXIT_CODE),
         )
 
     def _refresh_tray_menu(self) -> None:
@@ -3021,12 +3031,16 @@ class PetWindow(QWidget):
         self._update_reply_history_buttons()
         # 每完成一轮对话（含完整回复）累计一次，驱动自动记忆整理触发
         if outcome == "reply_completed":
-            self._record_completed_memory_turn()
+            # 续投不累计记忆整理轮次（用户未实际参与）
+            if not self._is_intimacy_continue_turn():
+                self._record_completed_memory_turn()
             # 说完话：开始气泡无操作自动隐藏倒计时。
             controller = getattr(self, "bubble_auto_hide", None)
             if controller is not None:
                 controller.notify_settled()
             # 说完话：40 秒后若无新对话，立绘退回默认（中性）表情。
+            # 亲密模式：说完话启动续投计时器
+            self._schedule_intimacy_continue()
             _PORTRAIT_IDLE_RESET_MS = 20_000
             existing_timer = getattr(self, "_portrait_reset_timer", None)
             if existing_timer is not None:
@@ -3132,6 +3146,9 @@ class PetWindow(QWidget):
             return "pending_screen_observation"
         if self.screen_observation_followup_in_progress:
             return "screen_observation_followup"
+        from app.agent.builtin_tools import intimacy_mode_state
+        if intimacy_mode_state.active:
+            return "intimacy_mode"
         if self.screen_observation_encode_thread is not None:
             return "screen_observation_encode"
         if self.active_interaction_id:
@@ -3242,6 +3259,79 @@ class PetWindow(QWidget):
         self._proactive_observer = None
         self._init_proactive_observer()
         self._start_proactive_observer()
+
+    # ------------------------------------------------------------------
+    # 亲密模式自动续投
+    # ------------------------------------------------------------------
+
+    _INTIMACY_CONTINUE_MAX = 5
+    _INTIMACY_CONTINUE_DELAY_MS = 15_000
+
+    def _schedule_intimacy_continue(self) -> None:
+        """亲密模式回复完成后，启动续投计时器。"""
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        if not intimacy_mode_state.active:
+            self._intimacy_was_active = False
+            return
+        # 亲密模式重新激活（从非活跃→活跃）时重置续投计数
+        if not getattr(self, "_intimacy_was_active", False):
+            self._intimacy_continue_count = 0
+            self._intimacy_was_active = True
+        if self._intimacy_continue_timer is None:
+            self._intimacy_continue_timer = QTimer(self)
+            self._intimacy_continue_timer.setSingleShot(True)
+            self._intimacy_continue_timer.timeout.connect(self._on_intimacy_continue_timer)
+        self._intimacy_continue_timer.start(self._INTIMACY_CONTINUE_DELAY_MS)
+
+    def _cancel_intimacy_continue(self) -> None:
+        if self._intimacy_continue_timer is not None:
+            self._intimacy_continue_timer.stop()
+        self._intimacy_continue_count = 0
+
+    def _is_intimacy_continue_turn(self) -> bool:
+        """判断当前轮次是否由续投触发（末条 user 消息为続けて）。"""
+        for msg in reversed(self.messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return msg.get("content") == "（続けて）"
+        return False
+
+    @Slot()
+    def _on_intimacy_continue_timer(self) -> None:
+        """计时器到期：检查条件，触发续投。"""
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        if not intimacy_mode_state.active:
+            return
+        if self._intimacy_continue_count >= self._INTIMACY_CONTINUE_MAX:
+            return
+        # TTS 还在播 → 等 2 秒再试（包括 active_interaction / subtitle 活跃一并重试）
+        if self.active_interaction_id:
+            self._intimacy_continue_timer.start(2000)
+            return
+        if self.worker_thread is not None:
+            self._intimacy_continue_timer.start(2000)
+            return
+        subtitle = getattr(self, "subtitle_controller", None)
+        if subtitle is not None and subtitle.is_reply_sequence_active():
+            self._intimacy_continue_timer.start(2000)
+            return
+        if self.speech_timer.isActive():
+            self._intimacy_continue_timer.start(2000)
+            return
+
+        # reaffirm：续投不消耗亲密模式轮数
+        intimacy_mode_state.enter()
+
+        self._intimacy_continue_count += 1
+        text = "（続けて）"
+        self._begin_interaction("intimacy_continue")
+
+        # 写入内存上下文（保持 user/assistant 交替），但不进持久化历史
+        self.messages.append({"role": "user", "content": text})
+        request_messages = trim_messages_for_model([*self.messages])
+
+        self._start_chat_worker(request_messages)
 
     # ------------------------------------------------------------------
     # Away mode detection — user explicitly says they're leaving
@@ -3534,6 +3624,7 @@ class PetWindow(QWidget):
     def send_message(self, source: str = "direct_call") -> None:
         if getattr(self, "startup_initializing", False):
             return
+        self._cancel_intimacy_continue()
         text = self.input_edit.text().strip()
         manual_observation = self.pending_manual_screen_observation
         self._log_interaction_stage(
@@ -5407,7 +5498,21 @@ class PetWindow(QWidget):
 
     @Slot(object)
     def _handle_mobile_chat_completed(self, payload: object) -> None:
-        pass
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("character_id") or "") != self.character_profile.id:
+            return
+        user_text = str(payload.get("user_text") or "").strip()
+        assistant_text = str(payload.get("assistant_text") or "").strip()
+        if user_text:
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": f"{MOBILE_CONTEXT_MARKER}\n{user_text}",
+                }
+            )
+        if assistant_text:
+            self.messages.append({"role": "assistant", "content": assistant_text})
 
     @Slot(object)
     def _enqueue_mobile_chat(self, request: object) -> None:

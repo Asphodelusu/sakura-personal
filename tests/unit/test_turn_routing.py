@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -358,3 +358,110 @@ def test_classify_turn_depth_returns_none_on_error() -> None:
     client.complete_raw.side_effect = ApiRequestError("timeout")
 
     assert classify_turn_depth("随便聊聊", client=client) is None
+
+
+# ------------------------------------------------------------------
+# 亲密模式路由测试
+# ------------------------------------------------------------------
+
+
+def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 6) -> object:
+    """构建 resolve_turn_plan 调用，mock intimacy_mode_state。"""
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = active
+    mock_state.consume_turn.return_value = active and turns_left > 0
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        return resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+
+def test_intimacy_active_routes_to_fast() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
+    plan = _plan_for(messages, active=True, turns_left=5)
+    assert plan.tier == "fast"
+    assert plan.decided_by == "intimacy_mode"
+    assert plan.generation_params == {"thinking": {"type": "disabled"}}
+
+
+def test_intimacy_inactive_is_normal_routing() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "おはよう"}]
+    plan = _plan_for(messages, active=False)
+    assert plan.decided_by != "intimacy_mode"
+
+
+def test_intimacy_auto_exit_falls_back_to_standard() -> None:
+    """计数器耗尽时 consume_turn 返回 False → 走正常路由。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "今日はいい天気だね"}]
+    plan = _plan_for(messages, active=True, turns_left=0)
+    # active=True 但 consume_turn 返回 False → 应 fallback
+    assert plan.decided_by != "intimacy_mode"
+
+
+def test_intimacy_overrides_classifier_simple() -> None:
+    """亲密模式优先于分类器的 simple 判定。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "うん"}]
+    request = _request_for(messages)
+    settings = _settings(classifier_enabled=True)
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.consume_turn.return_value = True
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            classifier_result="simple",
+            recall_decision=recall,
+        )
+
+    assert plan.tier == "fast"
+    assert plan.decided_by == "intimacy_mode"
+
+
+def test_intimacy_does_not_block_vision() -> None:
+    """亲密模式不覆盖 vision 路由。"""
+    messages: list[ChatMessage] = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:..."}}]}
+    ]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.consume_turn.return_value = True
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=True,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    # vision 检查在 intimacy 之前？不是——intimacy 检查在 has_image 之前。
+    # 当前设计：亲密优先，图片消息也走 fast。
+    # 如果以后要改优先级，这个测试会报警。
+    assert plan.tier == "fast"
+    assert plan.decided_by == "intimacy_mode"

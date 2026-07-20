@@ -9,11 +9,24 @@ from app.agent.tools.registry import ToolRegistry
 from app.config.character_loader import CharacterProfile, load_character_system_prompt
 from app.llm.api_client import ChatMessage, OpenAICompatibleClient
 from app.llm.context_trimming import trim_messages_for_model
+from app.plugins.models import PromptPatchContribution
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 
 
 MAX_MOBILE_HISTORY_MESSAGES = 24
 MOBILE_IMAGE_MARKER = "（手机端发送了一张图片）"
+MOBILE_HISTORY_CHANNEL = "mobile"
+MOBILE_CONTEXT_MARKER = "【通信记录：这条消息是对方通过手机网页端发送的】"
+MOBILE_CHANNEL_PATCH_ID = "sakura_mobile_channel"
+MOBILE_CHANNEL_PROMPT_PATCH = PromptPatchContribution(
+    patch_id=MOBILE_CHANNEL_PATCH_ID,
+    system_prompt_append=(
+        "【通信通道】你和对方现在正通过手机网页端聊天。"
+        "当前通道无法看到对方的电脑屏幕，也没有桌面工具可用。"
+        "请像平时一样以平等、自然的关系交流，语气可以更口语、更贴近即时消息；"
+        "不要假设对方正在查看电脑画面，也不要主动要求对方去看屏幕。"
+    ),
+)
 
 
 class MobileChatBusyError(RuntimeError):
@@ -49,7 +62,7 @@ class MobileChatBridge:
     def history(self, character_id: str, limit: int = 50) -> list[dict[str, str]]:
         with self._lock:
             session = self._session(character_id)
-            entries = session.history_store.load_recent(max(1, limit))
+            entries, _has_more = session.history_store.load_tail(max(1, limit))
         return [_history_entry_for_mobile(entry) for entry in entries]
 
     def chat(self, character_id: str, text: str, image_data_url: str = "") -> dict[str, Any]:
@@ -72,7 +85,11 @@ class MobileChatBridge:
             user_history_text = clean_text or "请看这张图片。"
             if clean_image:
                 user_history_text = f"{user_history_text}\n{MOBILE_IMAGE_MARKER}"
-            session.history_store.append("user", user_history_text)
+            session.history_store.append(
+                "user",
+                user_history_text,
+                channel=MOBILE_HISTORY_CHANNEL,
+            )
 
             messages = _messages_from_history(session.history_store.load())
             if not messages or messages[-1].get("role") != "user":
@@ -83,7 +100,7 @@ class MobileChatBridge:
 
             runtime = session.runtime
             runtime.api_client.update_settings(self._host.api_client.settings)
-            runtime.set_prompt_patches(self._host.agent_runtime.prompt_patches)
+            runtime.set_prompt_patches(self._mobile_prompt_patches())
             runtime.set_context_providers(self._context_providers(session.profile))
 
             memory_store = self._host.memory_store
@@ -102,6 +119,7 @@ class MobileChatBridge:
                     segment.translation,
                     segment.tone,
                     segment.portrait,
+                    channel=MOBILE_HISTORY_CHANNEL,
                 )
 
         self._notify_host_chat_completed(
@@ -144,7 +162,7 @@ class MobileChatBridge:
             tools=ToolRegistry([]),
             memory=memory_store,
             history_store=history_store,
-            prompt_patches=self._host.agent_runtime.prompt_patches,
+            prompt_patches=self._mobile_prompt_patches(),
             context_providers=self._context_providers(profile),
             runtime_loop_settings=self._host.agent_runtime.runtime_loop_settings,
             character_id=profile.id,
@@ -158,6 +176,16 @@ class MobileChatBridge:
         )
         self._sessions[profile.id] = session
         return session
+
+    def _mobile_prompt_patches(self) -> list[PromptPatchContribution]:
+        """桌面插件补丁 + 手机通道补丁；保证每轮同步时通道提示不被冲掉。"""
+        patches = [
+            patch
+            for patch in list(getattr(self._host.agent_runtime, "prompt_patches", []) or [])
+            if getattr(patch, "patch_id", "") != MOBILE_CHANNEL_PATCH_ID
+        ]
+        patches.append(MOBILE_CHANNEL_PROMPT_PATCH)
+        return patches
 
     def _context_providers(self, profile: CharacterProfile) -> list[Any]:
         provider_factory = getattr(self._host, "mobile_context_providers", None)
@@ -181,6 +209,8 @@ def _messages_from_history(entries: list[ChatHistoryEntry]) -> list[ChatMessage]
         content = entry.content.strip()
         if entry.role == "assistant" and entry.translation.strip():
             content = f"{content}\n中文翻译：{entry.translation.strip()}"
+        if entry.channel == MOBILE_HISTORY_CHANNEL and entry.role == "user":
+            content = f"{MOBILE_CONTEXT_MARKER}\n{content}"
         if content:
             messages.append({"role": entry.role, "content": content})
     return messages
