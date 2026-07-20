@@ -323,12 +323,12 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     padding: 4px 10px;
 }}
 #screenshotButton, #voiceButton {{
-    width: 36px;
-    height: 36px;
-    min-width: 36px;
-    max-width: 36px;
-    min-height: 36px;
-    max-height: 36px;
+    width: 38px;
+    height: 38px;
+    min-width: 38px;
+    max-width: 38px;
+    min-height: 38px;
+    max-height: 38px;
     padding: 0;
 }}
 #sendButton:hover, #screenshotButton:hover, #voiceButton:hover {{

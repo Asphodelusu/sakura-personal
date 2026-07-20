@@ -230,16 +230,103 @@
             <div class="setting-row">
               <label class="setting-row-text" for="enabled">
                 <span class="setting-title">启用主动屏幕感知</span>
-                <span class="setting-desc">自动聚焦当前窗口截图，并结合 UIA 读取可见文字；通过切屏检测、空闲检测和自适应定时器判断是否主动搭话。密码管理器等敏感窗口有内置黑名单会跳过截图（当前不可在设置中配置）。频率和冷却由 AI 自行调节。</span>
+                <span class="setting-desc">自动聚焦当前窗口截图，并结合界面文字判断是否主动搭话。关闭后下方参数仍会保存，但不会启动观察器。</span>
               </label>
               <span class="setting-toggle"><input id="enabled" type="checkbox" /></span>
             </div>
             <div class="setting-row">
+              <label class="setting-row-text" for="proactiveCooldownSeconds">
+                <span class="setting-title">发言冷却</span>
+                <span class="setting-desc">主动搭话成功后的最短间隔，避免连着打扰。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveCooldownSeconds" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveTimerSeconds">
+                <span class="setting-title">基础巡视间隔</span>
+                <span class="setting-desc">无其它触发时，观察器按此间隔巡视；实际节奏还会在自适应范围内浮动。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveTimerSeconds" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveAdaptiveMin">
+                <span class="setting-title">自适应最短间隔</span>
+                <span class="setting-desc">安静或少变化时，巡视间隔不会短于该值。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveAdaptiveMin" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveAdaptiveMax">
+                <span class="setting-title">自适应最长间隔</span>
+                <span class="setting-desc">长时间无触发时，巡视间隔不会长于该值。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveAdaptiveMax" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveIdleThreshold">
+                <span class="setting-title">空闲触发阈值</span>
+                <span class="setting-desc">键盘鼠标空闲达到该时长后，可触发一次温和搭话（仍受冷却约束）。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveIdleThreshold" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveMinSilence">
+                <span class="setting-title">对话后静默</span>
+                <span class="setting-desc">你刚说过话后，至少等待这么久才允许主动搭话。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveMinSilence" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveWindowSwitch">
+                <span class="setting-title">切窗触发</span>
+                <span class="setting-desc">前台应用切换并稳定后，允许触发一次观察。</span>
+              </label>
+              <span class="setting-toggle"><input id="proactiveWindowSwitch" type="checkbox" /></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveWindowSwitchCooldown">
+                <span class="setting-title">切窗冷却</span>
+                <span class="setting-desc">两次切窗触发之间的最短间隔。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveWindowSwitchCooldown" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveFocusSettle">
+                <span class="setting-title">切窗稳定延迟</span>
+                <span class="setting-desc">前台窗口保持不变达到该时长，才算一次有效切窗。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveFocusSettle" type="number" step="1" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveMaxEdge">
+                <span class="setting-title">截图最长边</span>
+                <span class="setting-desc">发给模型的截图会缩放到该最长边，影响清晰度与 token。</span>
+              </label>
+              <span class="field-unit"><input id="proactiveMaxEdge" type="number" step="1" /><span class="unit">px</span></span>
+            </div>
+            <div class="setting-row">
               <div class="setting-row-text">
                 <span class="setting-title">预计图像 token</span>
-                <span class="setting-desc">按聚焦窗口截图（最长边约 1920px）估算每张图像消耗的 token，实际随窗口大小浮动。</span>
+                <span class="setting-desc">按当前屏幕估算每张图像消耗；实际随窗口大小与最长边浮动。</span>
               </div>
               <p id="tokenEstimate" class="hint"></p>
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>隐私黑名单</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveBlockedProcesses">
+                <span class="setting-title">屏蔽进程</span>
+                <span class="setting-desc">每行一个 exe 名（如 bitwarden.exe）。命中时跳过截图与主动观察。</span>
+              </label>
+              <textarea id="proactiveBlockedProcesses" rows="5" spellcheck="false"></textarea>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="proactiveBlockedTitles">
+                <span class="setting-title">屏蔽标题关键词</span>
+                <span class="setting-desc">每行一个关键词；窗口标题包含即跳过（适合浏览器银行页等）。</span>
+              </label>
+              <textarea id="proactiveBlockedTitles" rows="4" spellcheck="false"></textarea>
             </div>
           </fieldset>
         </section>

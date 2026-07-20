@@ -1,3 +1,9 @@
+"""兼容旧导入路径 `app.agent.proactive_care`。
+
+主动看屏已由 ProactiveObserver 接管；本模块只做别名转发。
+新代码请用 `app.agent.screen_awareness`（开关）与 `app.perception.observer`（运行时）。
+"""
+
 from __future__ import annotations
 
 from app.agent.screen_awareness import (
@@ -16,7 +22,7 @@ from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
 )
 
-# 兼容旧导入路径；新代码请使用 app.agent.screen_awareness。
+# 以下别名仅兼容旧导入；数值本身属于已停用的 ScreenAwareness 批次定时路径。
 PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES = SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES
 PROACTIVE_DEFAULT_COOLDOWN_MINUTES = SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES
 PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT = SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT

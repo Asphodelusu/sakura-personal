@@ -228,6 +228,45 @@ class AgentRuntime:
         """同步当前角色的聊天历史存储（跨会话续接的数据来源）。"""
         self.history_store = history_store
 
+    def _enrich_event_payload(
+        self,
+        event_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """补全 seconds_since_pet_interaction：优先沿用事件侧已有值，否则从历史算对话间隙。"""
+        payload = dict(event_payload or {})
+        existing = payload.get("seconds_since_pet_interaction")
+        if isinstance(existing, (int, float)):
+            return payload
+        gap = self._seconds_since_previous_user_message()
+        if gap is not None:
+            payload["seconds_since_pet_interaction"] = gap
+        return payload
+
+    def _seconds_since_previous_user_message(self) -> int | None:
+        """当前用户消息与上一条用户消息之间的间隔（秒）。"""
+        from app.agent.time_awareness import parse_iso_datetime
+
+        store = self.history_store
+        if store is None:
+            return None
+        try:
+            entries, _has_more = store.load_tail(40)
+        except Exception:  # noqa: BLE001
+            return None
+        user_times: list[datetime] = []
+        for entry in entries:
+            if str(entry.role).strip() != "user":
+                continue
+            then = parse_iso_datetime(str(entry.created_at or ""))
+            if then is not None:
+                user_times.append(then)
+        if len(user_times) < 2:
+            return None
+        delta = (user_times[-1] - user_times[-2]).total_seconds()
+        if delta < 0:
+            return None
+        return int(delta)
+
     def _session_state_fragments(
         self,
         request: ContextRequest,
@@ -294,7 +333,7 @@ class AgentRuntime:
             step_index=0,
             remaining_steps=0,
             available_tools=(),
-            event_payload=event_payload,
+            event_payload=self._enrich_event_payload(event_payload),
             service_status={"memory": "unknown"},
         )
         recall = self.memory_recall.recall(request)
@@ -423,7 +462,7 @@ class AgentRuntime:
             {
                 "role": "user",
                 "content": (
-                    "请根据以上对话与工具执行结果（如有），输出本轮给用户的最终 Sakura 回复。"
+                    "请根据以上对话与工具执行结果（如有），输出本轮给对方的最终 Sakura 回复。"
                     "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
                     "不要调用工具，不要解释，不要使用 Markdown。"
                 ),
@@ -730,6 +769,7 @@ class AgentRuntime:
         memory_status = "unknown"
         memory_needs_refresh = True
         turn_state: TurnState | None = None
+        web_search_nudge_sent = False
         # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
         user_text = _latest_user_text(working_messages)
         if user_text:
@@ -778,7 +818,7 @@ class AgentRuntime:
                     step_index=step_index,
                     remaining_steps=loop_settings.max_agent_steps_per_turn - step_index - 1,
                     available_tools=tool_names,
-                    event_payload=event_payload,
+                    event_payload=self._enrich_event_payload(event_payload),
                     service_status={"memory": memory_status},
                 )
                 if step_index == 0:
@@ -946,32 +986,37 @@ class AgentRuntime:
                     if supplement.continue_loop:
                         working_messages.extend(supplement.appended_messages)
                         continue
-                # 检测模型嘴上说要去搜/查但没有实际调用工具
+                # 检测：需要联网却未真正 web_search（嘴上说要查 / 用户明确要查网却只 search_tools 或空跑）。
+                # 每轮最多催一次，避免死循环。
                 if (
-                    step_index == 0
-                    and supplement is None
-                    and tool_routing.assistant_intends_web_search(turn.content)
-                    and "mcp" not in active_groups
+                    supplement is None
+                    and not web_search_nudge_sent
                     and self.tools.get("web__web_search") is not None
-                ):
-                    working_messages.append(
-                        _assistant_turn_message(turn)
+                    and not _turn_had_successful_web_search(execution_results)
+                    and (
+                        tool_routing.assistant_intends_web_search(turn.content)
+                        or tool_routing.user_message_needs_web_lookup(working_messages)
                     )
-                    working_messages.append({
-                        "role": "user",
-                        "content": (
-                            "（注意：你上一轮的文字里说了要去查/搜/調べる。"
-                            "如果确实需要查信息，请现在使用 web__web_search 工具实际查询，"
-                            "不要只说不做。）"
-                        ),
-                    })
+                ):
+                    working_messages.append(_assistant_turn_message(turn))
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "（注意：本轮需要联网查询时，请现在使用 web__web_search 实际查询，"
+                                "不要只 search_tools 或口头说查不到。查询天气/新闻等实时信息同理。）"
+                            ),
+                        }
+                    )
                     active_groups.add("mcp")
+                    web_search_nudge_sent = True
                     debug_log(
                         "AgentRuntime",
-                        "模型表达了搜索意图但未调用工具，补激活 mcp 组并继续循环",
+                        "需要联网查询但未调用 web__web_search，补激活 mcp 并继续循环",
                         {
                             "step_index": step_index,
                             "content_preview": turn.content[:200],
+                            "active_groups": sorted(active_groups),
                         },
                     )
                     continue
@@ -1511,6 +1556,8 @@ class AgentRuntime:
                 "event_payload": event.payload,
             },
         )
+        # screen_awareness_check / proactive_check：旧定时批次主动事件。
+        # PetWindow 已不再调度这两类；保留分支仅兼容测试/残留调用。主动看屏见 ProactiveObserver。
         if event.type in {"screen_awareness_check", "proactive_check"}:
             screen_context_allowed = bool(event.payload.get("screen_context_allowed"))
             allow_screen_observation = (
@@ -1721,14 +1768,17 @@ class AgentRuntime:
         tool_rules = "\n".join(
             [
                 "- 只调用 API tools 列表中真实存在的工具，不臆造工具名。",
-                "- 可以在 assistant 内容中写一句可直接说给用户听的短句，但不要把工具计划或 tool_calls JSON 写进正文。",
+                "- 可以在 assistant 内容中写一句可直接说给对方听的短句，但不要把工具计划或 tool_calls JSON 写进正文。",
                 screen_observation_rule,
                 browser_page_rule,
                 visible_browser_rule,
-                "- 高风险或需确认的工具会在用户确认后执行；发起时正文要简短说明原因。",
+                "- 高风险或需确认的工具会在对方确认后执行；发起时正文要简短说明原因。",
                 self._combine_extra_instructions(extra_instructions),
-                "- 用户说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
-                "- 跨会话信息优先用 memory_search；用户明确要求记住才用 memory_remember；纠正/补充先搜索再 update；用户明确要求忘掉才 forget。",
+                "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
+                "- 跨会话信息优先用 memory_search；对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
+                "- 记忆语言：关于对方的事实用简体中文；你自己的内心感受优先日语。",
+                "- 写入记忆时像日记：先写清谁说了什么/约了什么，再写感受；"
+                "你自己的话归你，对方的话归对方；过期约定标明时效；称呼用名字或「对方」。",
                 "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
                 "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
             ]
@@ -1803,9 +1853,9 @@ class AgentRuntime:
             *self._persona_sections(),
             PromptSection(
                 "final_reply.instructions",
-                "你会收到上一轮工具调用结果。请基于这些结果给用户最终回复。\n"
+                "你会收到上一轮工具调用结果。请基于这些结果给对方最终回复。\n"
                 "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
-                "如果工具结果信息丰富，可以适当展开总结、补充细节或引导对话继续，让用户能感受到信息已经被充分理解和整理。",
+                "如果工具结果信息丰富，可以适当展开总结、补充细节或引导对话继续，让对方能感受到信息已经被充分理解和整理。",
             ),
             PromptSection("reply.patch", self._reply_protocol_patch_text()),
         ]
@@ -2057,6 +2107,15 @@ def _groups_from_search_tools_result(result: ToolExecutionResult) -> set[str]:
     return groups
 
 
+_WEB_SEARCH_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
+
+
+def _turn_had_successful_web_search(results: list[ToolExecutionResult]) -> bool:
+    return any(
+        result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success for result in results
+    )
+
+
 def _latest_user_text(messages: list[ChatMessage]) -> str:
     """提取最近一条用户文本，作为分层记忆检索查询。"""
 
@@ -2148,7 +2207,7 @@ def _build_skipped_after_pending_messages(
                 "skipped": True,
                 "reason": "waiting_for_previous_confirmation",
             },
-            error="前一个高风险工具需要用户确认，后续同批工具调用已跳过，请在确认后重新规划。",
+            error="前一个高风险工具需要对方确认，后续同批工具调用已跳过，请在确认后重新规划。",
         )
         messages.append(_build_tool_role_message(call, result))
     return messages
@@ -2316,8 +2375,8 @@ def _build_confirmed_action_result_message(
     results: list[ToolExecutionResult],
 ) -> ChatMessage:
     text = (
-        "用户刚刚确认并执行了一个待确认工具动作。"
-        "这不是新的用户任务，请结合此前上下文继续完成原请求；"
+        "对方刚刚确认并执行了一个待确认工具动作。"
+        "这不是新的请求，请结合此前上下文继续完成原先想做的事；"
         "如果该动作只是中间步骤，不要把当前窗口状态误当成新问题。\n"
         f"已确认动作：{action.tool_name}\n"
         f"动作参数：{json.dumps(action.arguments, ensure_ascii=False, default=str)}\n"
@@ -2330,10 +2389,10 @@ def _build_confirmed_action_result_message(
 def _build_confirmed_action_continuation_rules(action: PendingToolAction) -> str:
     rules = [
         "确认动作续接规则：",
-        f"- 用户刚刚确认执行了 {action.tool_name}，这只是前一轮任务的一个中间步骤。",
-        "- 不要把工具执行后的界面当成用户发起的新闲聊问题；必须回到前文的原始用户目标继续推进。",
-        "- 如果动作成功但任务尚未完成，请继续请求下一步必要工具；如果已经完成，再给最终回复。",
-        "- 如果刚打开的是 Windows“运行”窗口，且前文已经计划通过命令完成任务，应继续输入/提交对应命令，而不是询问用户想使用什么工具。",
+        f"- 对方刚刚确认执行了 {action.tool_name}，这只是前一轮事情的一个中间步骤。",
+        "- 不要把工具执行后的界面当成对方发起的新闲聊；必须回到前文原先想做的事继续推进。",
+        "- 如果动作成功但事情尚未完成，请继续请求下一步必要工具；如果已经完成，再给最终回复。",
+        "- 如果刚打开的是 Windows“运行”窗口，且前文已经计划通过命令完成，应继续输入/提交对应命令，而不是反问对方想用什么工具。",
     ]
     if action.tool_name.startswith("playwright_"):
         rules.append(
@@ -2344,7 +2403,7 @@ def _build_confirmed_action_continuation_rules(action: PendingToolAction) -> str
 
 def _format_tool_results_for_model(results: list[ToolExecutionResult]) -> str:
     return (
-        "工具执行结果如下，请据此给用户最终回复。"
+        "工具执行结果如下，请据此给对方最终回复。"
         "如果工具结果标记已附加浏览器截图，请结合截图兜底判断页面内容，不要臆造看不到的信息：\n"
         + json.dumps(
             [_redact_tool_result_for_model(result) for result in results],
@@ -2847,7 +2906,7 @@ def _format_event_for_model(event: AgentEvent) -> str:
         action_text = event.payload.get("text", "对你做了一个动作")
         return f"（{action_text}）[请用角色语气直接回应这个互动，一句话，不超过20字。]"
     else:
-        instruction = "主动事件如下，请生成要直接说给用户听的提醒："
+        instruction = "主动事件如下，请生成要直接说给对方听的提醒："
     return instruction + "\n" + json.dumps(
         _redact_event_for_model(event),
         ensure_ascii=False,

@@ -1,23 +1,21 @@
-"""麦克风按钮：全自绘，clipPath 精确裁剪绿色填充
+"""麦克风按钮：主题样式表画背景，自绘图标与电平填充。
 
-回到之前效果好的版本，像素坐标，无 translate/scale 歧义。
-- 手动绘制粉色圆角背景（匹配其他按钮）
-- 麦克风图标用 QPainterPath 绘制
+- 背景/悬停走 #voiceButton QSS，随主题色变化
+- 麦克风轮廓用固定设计坐标，按控件尺寸等比缩放
 - 绿色填充通过 clipPath 限制在麦克风主体内
 - EMA 平滑，快升慢降
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QPushButton
 
-
-# 按钮色（匹配 theme.py）
-BG = QColor(190, 120, 200, 232)
-BG_HOVER = QColor(180, 100, 200, 242)
-BORDER = QColor(255, 255, 255, 150)
+# 路径设计基准（绘制时按实际宽高等比缩放）
+_DESIGN = 36.0
+_BODY_RECT = QRectF(12, 4, 12, 17)
+_BODY_RADIUS = 6.0
 
 
 class MicLevelButton(QPushButton):
@@ -29,28 +27,28 @@ class MicLevelButton(QPushButton):
         self._active: bool = False
         self._processing: bool = False
         self._pulse_phase: float = 0.0
-        self._hover: bool = False
 
-        self.setFixedSize(36, 36)
+        self.setFixedSize(38, 38)
         self.setText("")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("语音输入（再点一次结束）；快捷键 Alt+T")
+        self.setAccessibleName("语音输入")
 
-        self._idle_pen = QPen(QColor(210, 210, 210), 1.6)
-        self._active_pen = QPen(QColor(255, 80, 80), 1.6)
-        self._processing_pen = QPen(QColor(255, 180, 60), 1.6)
+        # 浅色底上用近白描边，保证在主题色按钮上可读
+        self._idle_pen = QPen(QColor(255, 255, 255, 235), 1.7)
+        self._idle_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        self._idle_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self._active_pen = QPen(QColor(255, 90, 90), 1.7)
+        self._active_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        self._active_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self._processing_pen = QPen(QColor(255, 190, 70), 1.7)
+        self._processing_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        self._processing_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         self._fill_color = QColor(76, 210, 100)
 
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._tick_pulse)
         self._pulse_timer.setInterval(50)
-
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
 
     # ── 公共接口 ──────────────────────────────────────────────
 
@@ -79,30 +77,29 @@ class MicLevelButton(QPushButton):
         self._pulse_timer.stop()
         self.update()
 
-    # ── 路径（像素坐标，基准 36×36） ───────────────────────────
+    # ── 路径（设计坐标，基准 36×36） ───────────────────────────
 
     @staticmethod
     def _body_path() -> QPainterPath:
-        """麦克风主体路径（用于裁剪填充）。"""
+        """麦克风主体路径（用于裁剪填充，与轮廓主体一致）。"""
         p = QPainterPath()
-        p.addRoundedRect(QRectF(12, 5, 12, 20), 4, 4)
+        p.addRoundedRect(_BODY_RECT, _BODY_RADIUS, _BODY_RADIUS)
         return p
 
     @staticmethod
     def _outline_path() -> QPainterPath:
-        """完整麦克风轮廓。"""
+        """完整麦克风轮廓：胶囊 + U 形支架 + 竖杆 + 底座（各为独立子路径）。"""
         p = QPainterPath()
-        # 主体圆角矩形
-        p.addRoundedRect(QRectF(12, 5, 12, 18), 5, 5)
-        # 底部弧线
-        p.moveTo(9, 22)
-        p.arcTo(QRectF(9, 17, 18, 10), 180, 180)
-        p.lineTo(18, 26)
+        p.addRoundedRect(_BODY_RECT, _BODY_RADIUS, _BODY_RADIUS)
+        # U 形支架：结束后勿 lineTo 到中心，否则会从右臂拉出斜线
+        p.moveTo(9, 19)
+        p.arcTo(QRectF(9, 14, 18, 12), 180, 180)
+        # 竖杆
+        p.moveTo(18, 26)
+        p.lineTo(18, 30)
         # 底座
-        p.moveTo(9, 27)
-        p.lineTo(27, 27)
-        p.moveTo(18, 27)
-        p.lineTo(18, 31)
+        p.moveTo(12, 30)
+        p.lineTo(24, 30)
         return p
 
     # ── 内部 ──────────────────────────────────────────────────
@@ -120,32 +117,37 @@ class MicLevelButton(QPushButton):
         self._smooth_level += alpha * (target - self._smooth_level)
         return self._smooth_level
 
+    def _prepare_design_painter(self, painter: QPainter) -> None:
+        w, h = self.width(), self.height()
+        scale = min(w, h) / _DESIGN
+        painter.translate((w - _DESIGN * scale) * 0.5, (h - _DESIGN * scale) * 0.5)
+        painter.scale(scale, scale)
+
     def paintEvent(self, event) -> None:
+        # 背景/悬停/禁用态交给主题 QSS（#voiceButton）
+        super().paintEvent(event)
+
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
             return
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._prepare_design_painter(p)
 
-        # ── 1. 圆角粉色背景 ──
-        bg = BG_HOVER if self._hover else BG
-        p.setPen(QPen(BORDER, 1))
-        p.setBrush(bg)
-        p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 18, 18)
+        body = self._body_path()
+        outline = self._outline_path()
 
-        # ── 2. 麦克风图标 ──
         if self._processing:
             p.setPen(self._processing_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(self._outline_path())
-            # 脉冲光晕
+            p.drawPath(outline)
             alpha = int(80 + 60 * abs((self._pulse_phase % 6.283) / 3.1415 - 1))
             p.save()
-            p.setClipPath(self._body_path())
+            p.setClipPath(body)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 180, 60, alpha))
-            p.drawRoundedRect(QRectF(12, 5, 12, 20), 4, 4)
+            p.drawRoundedRect(_BODY_RECT, _BODY_RADIUS, _BODY_RADIUS)
             p.restore()
 
         elif self._active:
@@ -154,22 +156,26 @@ class MicLevelButton(QPushButton):
             p.setBrush(Qt.BrushStyle.NoBrush)
 
             if level > 0.015:
-                # 从底部向上填充
-                body_h = 20  # 与 _body_path 一致
+                body_h = _BODY_RECT.height()
                 fill_h = body_h * level
-                fill_rect = QRectF(12, 5 + body_h - fill_h, 12, fill_h)
+                fill_rect = QRectF(
+                    _BODY_RECT.x(),
+                    _BODY_RECT.y() + body_h - fill_h,
+                    _BODY_RECT.width(),
+                    fill_h,
+                )
                 p.save()
-                p.setClipPath(self._body_path())
+                p.setClipPath(body)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(self._fill_color)
-                p.drawRoundedRect(fill_rect, 3, 3)
+                p.drawRect(fill_rect)
                 p.restore()
 
-            p.drawPath(self._outline_path())
+            p.drawPath(outline)
 
         else:
             p.setPen(self._idle_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(self._outline_path())
+            p.drawPath(outline)
 
         p.end()

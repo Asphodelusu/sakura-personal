@@ -101,6 +101,7 @@ from app.config.settings_service import (
     BubbleSettings,
     DebugLogSettings,
     StartupSettings,
+    normalize_proactive_config_mapping,
 )
 from app.core.debug_log import debug_log
 from app.llm.api_client import ApiSettings
@@ -316,6 +317,8 @@ class TauriSettingsResult:
     system_extra: TauriSystemExtraResult = field(default_factory=TauriSystemExtraResult)
     memory_curation: MemoryCurationSettings = field(default_factory=MemoryCurationSettings)
     plugins: TauriPluginResult = field(default_factory=TauriPluginResult)
+    # ProactiveObserver 运行时配置；缺省空 dict 表示前端未提交（仅改 enabled 走 screen_awareness）。
+    proactive: dict[str, Any] = field(default_factory=dict)
 
 
 def _optional_tauri_path(value: object, base_dir: Path) -> Path | None:
@@ -481,6 +484,7 @@ def build_tauri_screen_awareness_request(
     parent_widget: QWidget | None = None,
     nonce: str | None = None,
 ) -> dict[str, Any]:
+    """构建设置页请求；screen_awareness 段里仅 enabled 仍驱动主动总开关（ProactiveObserver）。"""
     return build_tauri_settings_request(
         settings,
         mcp_settings=mcp_settings,
@@ -533,8 +537,12 @@ def build_tauri_settings_request(
     input_font_size: int = DEFAULT_INPUT_FONT_SIZE,
     button_font_size: int = DEFAULT_BUTTON_FONT_SIZE,
     onboarding: bool = False,
+    proactive_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_screen_awareness = screen_awareness_settings.normalized()
+    normalized_proactive = normalize_proactive_config_mapping(proactive_config)
+    # 以 screen_awareness.enabled 为总开关权威，写入 proactive 副本供前端编辑。
+    normalized_proactive["enabled"] = bool(normalized_screen_awareness.enabled)
     normalized_mcp = normalize_mcp_runtime_settings(mcp_settings or MCPRuntimeSettings())
     normalized_runtime_loop = normalize_runtime_loop_settings(runtime_loop_settings)
     normalized_subtitle = normalize_subtitle_display_speed(
@@ -557,6 +565,7 @@ def build_tauri_settings_request(
         "nonce": nonce or secrets.token_urlsafe(16),
         "onboarding": bool(onboarding),
         "screen_awareness": _screen_awareness_to_mapping(normalized_screen_awareness),
+        "proactive": normalized_proactive,
         "estimated_tokens_per_image": estimated_tokens,
         "mcp": _mcp_to_mapping(normalized_mcp),
         "runtime_loop": _runtime_loop_to_mapping(normalized_runtime_loop),
@@ -616,6 +625,15 @@ def build_tauri_settings_request(
             "check_interval_minutes": [1, 120],      # 保留兼容旧前端，实际由 observer 自适应
             "cooldown_minutes": [1, 120],
             "screen_context_batch_limit": [1, 20],
+            "proactive_timer_seconds": [60, 3600],
+            "proactive_cooldown_seconds": [30, 3600],
+            "proactive_min_silence_after_user": [0, 120],
+            "proactive_window_switch_cooldown": [5, 300],
+            "proactive_focus_settle_delay": [1, 120],
+            "proactive_idle_threshold_seconds": [60, 7200],
+            "proactive_max_edge": [640, 3840],
+            "proactive_adaptive_interval_min": [15, 600],
+            "proactive_adaptive_interval_max": [60, 7200],
             "max_agent_steps_per_turn": [
                 MIN_AGENT_STEPS_PER_TURN,
                 MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,
@@ -779,15 +797,22 @@ def parse_tauri_settings_payload(
         _required_int(ui, "reply_segment_pause_ms"),
     )
     api_result = _api_from_mapping_required(api)
+    screen_awareness = ScreenAwarenessSettings(
+        enabled=_required_bool(settings, "enabled"),
+        screen_context_enabled=_required_bool(settings, "screen_context_enabled"),
+        check_interval_minutes=settings.get("check_interval_minutes", 2),
+        cooldown_minutes=settings.get("cooldown_minutes", 10),
+        screen_context_batch_limit=settings.get("screen_context_batch_limit", 6),
+        screen_context_resolution=str(settings.get("screen_context_resolution", "fullscreen")),
+    ).normalized()
+    proactive_raw = raw.get("proactive")
+    if isinstance(proactive_raw, dict):
+        proactive = normalize_proactive_config_mapping(proactive_raw)
+        proactive["enabled"] = bool(screen_awareness.enabled)
+    else:
+        proactive = {}
     return TauriSettingsResult(
-        screen_awareness=ScreenAwarenessSettings(
-            enabled=_required_bool(settings, "enabled"),
-            screen_context_enabled=_required_bool(settings, "screen_context_enabled"),
-            check_interval_minutes=settings.get("check_interval_minutes", 2),
-            cooldown_minutes=settings.get("cooldown_minutes", 10),
-            screen_context_batch_limit=settings.get("screen_context_batch_limit", 6),
-            screen_context_resolution=str(settings.get("screen_context_resolution", "fullscreen")),
-        ).normalized(),
+        screen_awareness=screen_awareness,
         mcp=normalize_mcp_runtime_settings(
             MCPRuntimeSettings(windows_enabled=_required_bool(mcp, "windows_enabled"))
         ),
@@ -837,6 +862,7 @@ def parse_tauri_settings_payload(
         system_extra=_system_extra_from_mapping_required(system_extra),
         memory_curation=_memory_from_mapping_required(memory),
         plugins=_plugins_from_mapping_required(plugins),
+        proactive=proactive,
     )
 
 
@@ -1060,10 +1086,12 @@ class TauriSettingsProcess(QObject):
         button_font_size: int = DEFAULT_BUTTON_FONT_SIZE,
         onboarding: bool = False,
         persist_handler: Callable[[object, bool], bool] | None = None,
+        proactive_config: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(parent)
         self.base_dir = Path(base_dir)
         self.settings = settings
+        self.proactive_config = dict(proactive_config or {})
         self.mcp_settings = mcp_settings or MCPRuntimeSettings()
         self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
         self.debug_log_settings = debug_log_settings or DebugLogSettings()
@@ -1241,6 +1269,7 @@ class TauriSettingsProcess(QObject):
             plugin_settings_contributions=self.plugin_settings_contributions,
             model=self.model,
             parent_widget=self.parent_widget,
+            proactive_config=self.proactive_config,
         )
         request["resources"] = self.resource_tasks.snapshot()
         return request
@@ -1839,10 +1868,11 @@ def _restore_windows_for_pid(pid: int, *, force_foreground: bool = False) -> boo
 
 
 def _screen_awareness_to_mapping(settings: ScreenAwarenessSettings) -> dict[str, object]:
+    # enabled 仍作总开关同步到 proactive；其余字段仅兼容旧前端，运行时已不读。
     return {
         "enabled": bool(settings.enabled),
         "screen_context_enabled": bool(settings.screen_context_enabled),
-        "check_interval_minutes": int(settings.check_interval_minutes),           # 保留兼容旧前端
+        "check_interval_minutes": int(settings.check_interval_minutes),
         "cooldown_minutes": int(settings.cooldown_minutes),
         "screen_context_batch_limit": int(settings.screen_context_batch_limit),
         "screen_context_resolution": settings.screen_context_resolution,

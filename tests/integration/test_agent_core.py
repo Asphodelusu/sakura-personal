@@ -2425,7 +2425,7 @@ def test_visible_browser_request_blocks_background_search_and_continues_planning
                     '{"reply":{"segments":[{"ja":"検索するね。","zh":"我来搜索。","tone":"中性"}]},'
                     '"tool_calls":[{"name":"web__web_search","arguments":{"query":"二阶堂真红 百科"},"reason":"搜索百科"}]}'
                 )
-            assert "用户明确要求打开浏览器" in str(messages)
+            assert "对方明确要求打开浏览器" in str(messages)
             assert "playwright_navigate" in str(messages)
             return (
                 '{"reply":{"segments":[{"ja":"ブラウザで開くね。","zh":"我改用浏览器打开。","tone":"中性"}]},'
@@ -2838,7 +2838,7 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
 
     assert "observe_screen" in client.prompts[0]
     assert "主动获取上下文策略" in client.prompts[0]
-    assert "用户输入简短模糊" in client.prompts[0]
+    assert "对方话很短含糊" in client.prompts[0] or "对方话很短" in client.prompts[0]
     assert "不要重复截图" in client.prompts[0]
     assert [progress.reply.translation for progress in progress_replies] == ["我看看。"]
     assert result.actions

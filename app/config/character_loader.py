@@ -14,8 +14,9 @@ if TYPE_CHECKING:
 
 DEFAULT_CHARACTER_ID = "sakura"
 DEFAULT_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
-FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的桌宠陪伴人格。
-用户需要中文解释、开发或调试时，可以使用中文。"""
+FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的数字生命。
+对方是与你对等相处的人。
+对方需要中文解释、开发或调试时，可以使用中文。"""
 THEME_SOURCE_PACKAGE = "package"
 THEME_SOURCE_COMPAT_DEFAULT = "compat_default"
 CharacterThemeSource = Literal["package", "compat_default"]
@@ -76,6 +77,8 @@ class CharacterProfile:
     # 接话模板清单路径(可选,缺省即该角色 opt-out)。此处只解析路径不校验存在,
     # 文件缺失/非法由 manifest 加载方降级处理,不应让整个角色包加载失败。
     backchannel_manifest_path: Path | None = None
+    # 系统侧演出约束（可选）。与 card 分离：短规则靠前注入，不进叙事人格卡。
+    system_guards_path: Path | None = None
     reply_tones: list[str] = field(default_factory=lambda: [*DEFAULT_TONES])
     theme_settings: ThemeSettings | None = None
     theme_source: CharacterThemeSource = THEME_SOURCE_COMPAT_DEFAULT
@@ -229,23 +232,29 @@ class CharacterRegistry:
         return profiles
 
 
-def load_system_prompt(path: Path) -> str:
+def load_system_prompt(path: Path, *, system_guards_path: Path | None = None) -> str:
     if not path.exists():
-        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
+        card = FALLBACK_SYSTEM_PROMPT
+    else:
+        try:
+            card = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            card = FALLBACK_SYSTEM_PROMPT
+        if not card:
+            card = FALLBACK_SYSTEM_PROMPT
 
-    try:
-        content = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
+    guards = ""
+    if system_guards_path is not None and system_guards_path.exists():
+        try:
+            guards = system_guards_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            guards = ""
 
-    if not content:
-        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
-
-    return _append_desktop_context(content)
+    return with_desktop_pet_context(card, system_guards=guards)
 
 
 def load_character_system_prompt(profile: CharacterProfile) -> str:
-    return load_system_prompt(profile.card_path)
+    return load_system_prompt(profile.card_path, system_guards_path=profile.system_guards_path)
 
 
 def _load_profile(manifest_path: Path) -> CharacterProfile:
@@ -261,6 +270,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
     display_name = _required_text(raw_data, "display_name", manifest_path)
     initial_message = _optional_text(raw_data, "initial_message", "……起動した。用事があるなら、呼んで。")
     card_path = _resolve_required_file(package_dir, _required_text(raw_data, "card", manifest_path), "角色卡")
+    system_guards_path = _resolve_optional_system_guards(package_dir, raw_data.get("system_guards"))
 
     portrait_data = _required_dict(raw_data, "portrait", manifest_path)
     default_portrait = _resolve_required_file(
@@ -300,6 +310,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         emotion_portrait_map=emotion_portrait_map,
         voice=voice,
         backchannel_manifest_path=backchannel_manifest_path,
+        system_guards_path=system_guards_path,
         reply_tones=reply_tones,
         theme_settings=theme_settings,
         theme_source=theme_source,
@@ -611,6 +622,17 @@ def _resolve_package_path(package_dir: Path, path_text: str) -> Path:
     if path.is_absolute():
         return path
     return package_dir / path
+
+
+def _resolve_optional_system_guards(package_dir: Path, raw: Any) -> Path | None:
+    """解析可选演出约束文件；未配置时尝试默认 system_guards.md。"""
+    if isinstance(raw, str) and raw.strip():
+        path = _resolve_package_path(package_dir, raw)
+        if not path.exists():
+            raise CharacterConfigError(f"角色演出约束不存在：{path}")
+        return path
+    default_path = package_dir / "system_guards.md"
+    return default_path if default_path.exists() else None
 
 
 def _append_desktop_context(content: str) -> str:

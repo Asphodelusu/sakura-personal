@@ -31,7 +31,7 @@ def build_segmented_reply_instruction(
         "- 每段文本的语气标注在 tone 字段中，按情绪的真实走向逐句判断：情绪没有转折时，相邻句可以延续同一个 tone，"
         "不必每句都刻意换一个，那样反而显得情绪来回跳；只有当内容确实出现转折（比如从担心转到安心、从平静转到不满）时才换 tone。"
         "优先选择中性，除非文本明显带有其他语气。",
-        "- 无论你本轮是否调用工具，一旦决定直接回复用户，assistant 的 content 必须是合法 JSON segments，"
+        "- 无论你本轮是否调用工具，一旦决定直接回复对方，assistant 的 content 必须是合法 JSON segments，"
         "禁止纯文本、Markdown 或代码块。",
     ]
     if len(portraits) > 1:
@@ -58,7 +58,7 @@ def build_segmented_reply_instruction(
     if include_no_single_segment_rule:
         rules.extend(
             [
-                "- 用户问题包含多个要点、步骤、原因或较长说明时，按句子分段，让桌宠可以逐句显示和朗读。",
+                "- 对方的问题包含多个要点、步骤、原因或较长说明时，按句子分段，便于逐句显示和朗读。",
                 "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
             ]
         )
@@ -113,7 +113,7 @@ def build_proactive_check_reply_protocol(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
 ) -> str:
-    """构建主动屏幕感知事件专用回复协议。"""
+    """旧 screen_awareness_check / proactive_check 事件回复协议（主动已改走 ProactiveObserver）。"""
 
     return build_event_reply_protocol(
         reply_tones,
@@ -166,7 +166,7 @@ def build_proactive_check_tool_system_prefix(
     max_tool_calls_per_turn: int,
     extra_instructions: str = "",
 ) -> str:
-    """构建主动屏幕感知 tool-loop 的【静态系统提示前缀】。
+    """旧 screen_awareness_check tool-loop 静态前缀（主动已改走 ProactiveObserver）。
 
     不含记忆摘要、当前时间、循环步数等易变内容（这些由 build_runtime_context_text
     在消息数组末尾单独注入），使前缀在多步与多轮间保持稳定。
@@ -180,10 +180,10 @@ def build_proactive_check_tool_system_prefix(
                 None,
                 "\n\n".join(
                     [
-                        "你现在正在处理【主动屏幕感知事件】。这不是用户直接发来的请求，而是系统定时截图后触发的低打扰找话题。",
+                        "你现在正在处理【主动屏幕感知事件】。这不是对方直接发来的请求，而是系统定时截图后触发的低打扰找话题。",
                         "请用角色语气基于屏幕内容找话题：评论变化、接续任务、询问卡点、轻量协助或保持安静感。",
                         "请把 screen_contexts/visual_contexts 当作当前画面，把 recent_conversation 当作最近完整对话历史；"
-                        "结合两者判断用户正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
+                        "结合两者判断对方正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
                     ]
                 ),
             ),
@@ -197,8 +197,8 @@ def build_proactive_check_tool_system_prefix(
                         "当前 Agent 循环：",
                         "- 如果信息足够或已经完成，不要再发起 tool_calls。",
                         f"- 每步最多请求 {max_tool_calls_per_step} 个工具，整轮最多 {max_tool_calls_per_turn} 个工具。",
-                        "- 只读或低风险工具可补充上下文；改变外部状态先让主人决定。",
-                        "- 最终回复只说给用户听的屏幕相关自然搭话、提问、评论或轻量协助，不要提及内部事件或工具协议。",
+                        "- 只读或低风险工具可补充上下文；改变外部状态先征得对方同意。",
+                        "- 最终回复只说给对方听的屏幕相关自然搭话、提问、评论或轻量协助，不要提及内部事件或工具协议。",
                     ]
                 ),
             ),
@@ -219,7 +219,7 @@ def build_proactive_check_tool_system_prompt(
     max_tool_calls_per_turn: int,
     extra_instructions: str = "",
 ) -> str:
-    """构建主动屏幕感知 tool-loop 完整系统提示词（静态前缀 + 末尾运行时上下文）。
+    """旧 screen_awareness_check tool-loop 完整系统提示（主动已改走 ProactiveObserver）。
 
     新工具循环已改为分别取用 build_proactive_check_tool_system_prefix 与
     build_runtime_context_text，使前缀可缓存。本函数保留给历史调用点与既有测试。
@@ -255,7 +255,7 @@ def build_event_system_prompt(
 
     blocks: list[PromptBlock] = [
         PromptBlock(None, character_prompt.strip()),
-        PromptBlock(None, "你正在处理 Sakura 桌宠的主动事件。请用角色语气自然搭话、提问用户。"),
+        PromptBlock(None, "你正在处理 Sakura 的主动事件。请用角色语气自然搭话、向对方提问。"),
     ]
     if event_type in {"screen_awareness_check", "proactive_check"}:
         blocks.extend(
@@ -294,7 +294,7 @@ def build_proactive_tool_loop_rules() -> str:
         [
             PromptBlock(
                 None,
-                "- 这是主动屏幕感知事件，不是用户直接发来的请求；整体保持低打扰，用角色语气基于屏幕找话题。",
+                "- 这是主动屏幕感知事件，不是对方直接发来的请求；整体保持低打扰，用角色语气基于屏幕找话题。",
             ),
             proactive_core_rules_block(include_tool_rules=True),
         ]
@@ -323,7 +323,7 @@ def build_theme_color_system_prompt(character_name: str) -> str:
                 "\n".join(
                     [
                         "你是桌面宠物 UI 主题配色助手。",
-                        "请观察用户提供的角色默认立绘，为桌宠界面选择一组温和、可读、适合长期使用的主题色。",
+                        "请观察对方提供的角色默认立绘，为 Sakura 界面选择一组温和、可读、适合长期使用的主题色。",
                         f"角色名：{character_name.strip() or '当前角色'}",
                         "必须返回一整个 JSON 对象；禁止项目符号、Markdown、解释文字或颜色名称说明。",
                     ]
@@ -336,7 +336,7 @@ def build_theme_color_system_prompt(character_name: str) -> str:
                         "- 只返回 JSON，不要使用 Markdown 代码块，不要输出解释。",
                         "- JSON 字段必须且只能包含：primary_color、primary_hover_color、accent_color、text_color、secondary_text_color、muted_text_color、page_background_color、panel_background_color、input_background_color、bubble_background_color、border_color。",
                         "- 所有颜色必须是 #RRGGBB 格式。",
-                        "- page_background_color、panel_background_color、input_background_color、bubble_background_color 应偏浅，适合作为长时间使用的桌宠界面背景。",
+                        "- page_background_color、panel_background_color、input_background_color、bubble_background_color 应偏浅，适合作为长时间使用的界面背景。",
                         "- text_color、secondary_text_color、muted_text_color 必须在浅色背景上可读。",
                         "- primary_color 是主要按钮、角色名和选中态颜色；primary_hover_color 是按钮悬停色；accent_color 是强调色。",
                         '示例：{"primary_color":"#d55b91","primary_hover_color":"#bf3f7a","accent_color":"#b13e73","text_color":"#3d2b35","secondary_text_color":"#7a3656","muted_text_color":"#9b4f72","page_background_color":"#fff6fa","panel_background_color":"#ffe8f1","input_background_color":"#ffffff","bubble_background_color":"#ffe8f1","border_color":"#eeacc8"}',
@@ -359,7 +359,8 @@ def build_proactive_reply_examples() -> str:
     return proactive_reply_examples_block().body
 
 
-# 新命名导出；旧 proactive_* 名称保留给历史调用点。
+# 旧 ScreenAwareness / proactive_check 事件用的 prompt 别名。
+# 主动看屏已由 ProactiveObserver 接管；下列导出主要服务历史调用与测试，勿再当作现行主动入口。
 build_screen_awareness_check_reply_protocol = build_proactive_check_reply_protocol
 build_screen_awareness_check_tool_system_prompt = build_proactive_check_tool_system_prompt
 build_screen_awareness_check_tool_system_prefix = build_proactive_check_tool_system_prefix

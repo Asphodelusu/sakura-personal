@@ -265,7 +265,7 @@ class ThemeAiWorker(QObject):
                         "content": [
                             {
                                 "type": "text",
-                                "text": "请根据这张角色默认立绘生成 Sakura 桌宠 UI 主题配色。只返回完整 JSON 对象，不要输出 Markdown 或解释。",
+                                "text": "请根据这张角色默认立绘生成 Sakura UI 主题配色。只返回完整 JSON 对象，不要输出 Markdown 或解释。",
                             },
                             {
                                 "type": "image_url",

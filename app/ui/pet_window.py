@@ -155,8 +155,10 @@ from app.agent.screen_awareness import (
     is_night_quiet_period,
     night_quiet_interval_multiplier,
 )
-from app.perception import ProactiveObserver, ProactiveConfig, PrivacyGuard
+from app.perception import ProactiveObserver
+from app.perception.proactive_config import ProactiveConfig
 from app.perception.observer import ProactiveSpeakPayload
+from app.perception.privacy import privacy_guard_from_mapping
 from app.llm.local_client import is_routing_llm_client
 from app.agent.screen_observation import (
     CapturedScreenImage,
@@ -274,9 +276,11 @@ PROACTIVE_ASSISTANT_JUST_SPOKE_HINT = (
     "不要延续同一提醒、同一关心句式或同一屏幕评论。"
 )
 # 用户刚有过互动后的冷却：屏幕批次已凑齐也先不发，避免聊完立刻又主动搭话。
+# （「屏幕批次」属已停用的旧 ScreenAwareness 路径；主动看屏现由 ProactiveObserver 负责。）
 PROACTIVE_POST_INTERACTION_GRACE_SECONDS = 5
 # 对话刚结束后的记忆整理缓冲：等字幕/朗读收尾后再启动，避免边说话边整理。
 MEMORY_CURATION_POST_TURN_GRACE_MS = 45_000
+# --- 以下 SCREEN_AWARENESS_* / proactive_check 为旧定时批次主动感知遗留；运行时已不调度 ---
 SCREEN_AWARENESS_EVENT_TYPE = "screen_awareness_check"
 LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
@@ -693,6 +697,7 @@ class PetWindow(QWidget):
         self.reminder_timer.setInterval(REMINDER_CHECK_INTERVAL_MS)
         self.reminder_timer.timeout.connect(self._check_due_reminders)
         self._user_was_idle = False
+        # 旧 ScreenAwareness 轮询 timer：始终保持 stop（见 _sync_screen_awareness_timer）。
         self.screen_awareness_timer = QTimer(self)
         self.screen_awareness_timer.setInterval(SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS)
         self.screen_awareness_timer.timeout.connect(self._check_screen_awareness)
@@ -934,6 +939,7 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.tool_confirmation_panel)
         self.voice_button = MicLevelButton(self.input_bar)
         self.voice_button.setObjectName("voiceButton")
+        self.voice_button.setToolTip("语音输入（再点一次结束）；快捷键 Alt+T")
         self.voice_button.clicked.connect(self._handle_voice_button_clicked)
         self._voice_listening = False
         self._voice_finishing = False
@@ -1035,7 +1041,7 @@ class PetWindow(QWidget):
 
     @property
     def proactive_care_settings(self) -> Any:
-        """兼容旧属性；新代码请使用 screen_awareness_settings。"""
+        """兼容旧属性；等价于 screen_awareness_settings（旧批次逻辑已停用）。"""
         return self.screen_awareness_settings
 
     @proactive_care_settings.setter
@@ -1044,6 +1050,7 @@ class PetWindow(QWidget):
 
     @property
     def proactive_care_timer(self) -> QTimer:
+        """UNUSED：旧 ScreenAwareness QTimer 别名；timer 始终保持 stop。"""
         return self.screen_awareness_timer
 
     @proactive_care_timer.setter
@@ -3093,7 +3100,9 @@ class PetWindow(QWidget):
                 chat_api_key=getattr(chat_api, "api_key", ""),
                 chat_api_model=getattr(chat_api, "model", ""),
                 config=config,
-                privacy=PrivacyGuard(),
+                privacy=privacy_guard_from_mapping(
+                    proactive_cfg.get("privacy") if isinstance(proactive_cfg, dict) else None
+                ),
                 on_speak=self._on_proactive_speak,
                 on_evaluate=self._on_proactive_evaluate,
                 is_busy=self._is_proactive_observer_busy,
@@ -3610,6 +3619,22 @@ class PetWindow(QWidget):
         if text:
             self.input_edit.setText(text)
             self.send_message("voice_input")
+            return
+
+        # 空识别：轻提示，避免无反馈
+        previous = self.input_edit.placeholderText()
+        self.input_edit.setPlaceholderText("没有听清，请再说一次")
+        QTimer.singleShot(
+            2200,
+            lambda: self._restore_voice_placeholder(previous),
+        )
+
+    def _restore_voice_placeholder(self, previous: str) -> None:
+        if self.input_edit.placeholderText() != "没有听清，请再说一次":
+            return
+        self.input_edit.setPlaceholderText(
+            previous or self._normal_input_placeholder_text()
+        )
 
     def _suppress_bubble_hide(self, suppress: bool) -> None:
         controller = getattr(self, "bubble_auto_hide", None)
@@ -4032,6 +4057,10 @@ class PetWindow(QWidget):
         event: AgentEvent | None,
         reminder_id: str | None,
     ) -> bool:
+        """旧 screen_awareness_check 事件里模型调 observe_screen 时的 follow-up。
+
+        主动定时已停，正常不会再入队该类事件；对话内 observe_screen 走另一条路径。
+        """
         screen_action = _first_screen_observation_request(result)
         if screen_action is None:
             return False
@@ -4380,10 +4409,11 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_screen_awareness(self) -> None:
-        # 已由 ProactiveObserver 接管；旧 timer 路径保留仅作兼容，不再执行截图/主动会话。
+        # UNUSED：旧 ScreenAwareness 定时入口。已由 ProactiveObserver 接管；保留空实现防误连信号。
         return
 
     def _can_run_screen_awareness(self) -> bool:
+        """UNUSED：旧批次路径门控；主动看屏请用 ProactiveObserver / _is_proactive_observer_busy。"""
         if not self._screen_awareness_context_allowed():
             return False
         if (
@@ -4416,6 +4446,7 @@ class PetWindow(QWidget):
         return getattr(self, "proactive_care_settings")
 
     def _should_capture_screen_awareness_context(self, now: float) -> bool:
+        """UNUSED：旧「是否该再截一张攒批次」判断；ProactiveObserver 自管采样节奏。"""
         settings = self._current_screen_awareness_settings()
         check_interval_seconds = (
             settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
@@ -4447,6 +4478,7 @@ class PetWindow(QWidget):
         self._last_screen_hash = current_hash
 
     def _capture_screen_awareness_context(self, now: float) -> None:
+        """UNUSED：旧主动批次截图；勿再调用。对话侧看屏用 observe_screen / 框选截图。"""
         self.last_screen_awareness_context_at = now
         try:
             captured = capture_screen_image(self)
@@ -4470,6 +4502,7 @@ class PetWindow(QWidget):
         context_data: dict[str, Any],
         observation: ScreenObservation,
     ) -> None:
+        """UNUSED：旧批次截图编码完成回调；主动链路已不再入队此类 context。"""
         captured_at_monotonic = context_data.get("captured_at_monotonic")
         if not isinstance(captured_at_monotonic, (int, float)):
             captured_at_monotonic = time.perf_counter()
@@ -4558,6 +4591,7 @@ class PetWindow(QWidget):
         return AgentEvent(type=SCREEN_AWARENESS_EVENT_TYPE, payload=payload)
 
     def _screen_awareness_context_allowed(self) -> bool:
+        """旧批次「是否允许截图」；与 ProactiveObserver 总开关相关但批次逻辑本身已停用。"""
         return self._current_screen_awareness_settings().allows_screen_context()
 
     def _screen_awareness_encode_options(self) -> dict[str, Any]:
@@ -4567,12 +4601,13 @@ class PetWindow(QWidget):
         }
 
     def _sync_screen_awareness_timer(self) -> None:
-        # ProactiveObserver 已接管主动屏幕感知；旧 QTimer 一律停用，避免双通路并行截图。
+        # UNUSED 调度：强制停掉旧 QTimer，避免与 ProactiveObserver 双通路并行截图。
         self.screen_awareness_timer.stop()
         if not self._screen_awareness_context_allowed():
             self._clear_screen_awareness_context_batch("disabled")
 
     def _clear_screen_awareness_context_batch(self, reason: str) -> None:
+        """清空旧批次缓存（若仍有残留）；正常主动路径不再往里追加。"""
         had_batch = bool(self.screen_awareness_contexts)
         self.screen_awareness_contexts = []
         self.screen_awareness_context_batch_started_at = None
@@ -4583,10 +4618,11 @@ class PetWindow(QWidget):
 
     # 兼容旧方法名；新代码请使用 screen_awareness 命名。
     def _check_proactive_care(self) -> None:
-        # 已由 ProactiveObserver 接管；与 _check_screen_awareness 相同，不再执行旧截图批次逻辑。
+        # UNUSED：同 _check_screen_awareness，旧 proactive_care 定时入口。
         return
 
     def _can_run_proactive_care(self) -> bool:
+        """UNUSED：旧 proactive_care 门控别名。"""
         if not self._proactive_screen_context_allowed():
             return False
         if (
@@ -4613,6 +4649,7 @@ class PetWindow(QWidget):
         return True
 
     def _should_capture_proactive_screen_context(self, now: float) -> bool:
+        """UNUSED：`_should_capture_screen_awareness_context` 的旧别名。"""
         settings = PetWindow._current_screen_awareness_settings(self)
         check_interval_seconds = (
             settings.check_interval_minutes * 60 * night_quiet_interval_multiplier(datetime.now().hour)
@@ -4631,6 +4668,7 @@ class PetWindow(QWidget):
         )
 
     def _capture_proactive_screen_context(self, now: float) -> None:
+        """UNUSED：`_capture_screen_awareness_context` 的旧别名。"""
         self.last_proactive_screen_context_at = now
         try:
             captured = capture_screen_image(self)
@@ -4653,6 +4691,7 @@ class PetWindow(QWidget):
         context_data: dict[str, Any],
         observation: ScreenObservation,
     ) -> None:
+        """UNUSED：`_finish_screen_awareness_context` 的旧别名。"""
         captured_at_monotonic = context_data.get("captured_at_monotonic")
         if not isinstance(captured_at_monotonic, (int, float)):
             captured_at_monotonic = time.perf_counter()
@@ -5998,6 +6037,7 @@ class PetWindow(QWidget):
             tts_settings = self._default_tts_settings()
 
         screen_awareness_settings = self.settings_service.load_screen_awareness_settings()
+        proactive_config = self.settings_service.load_proactive_config()
 
         api_settings = getattr(self.api_client, "settings", None)
         api_profiles = self.settings_service.load_api_profiles()
@@ -6011,6 +6051,7 @@ class PetWindow(QWidget):
             parent=self,
             base_dir=self.base_dir,
             settings=screen_awareness_settings,
+            proactive_config=proactive_config,
             mcp_settings=self.settings_service.load_mcp_runtime_settings(),
             runtime_loop_settings=self.settings_service.load_runtime_loop_settings(),
             debug_log_settings=self.settings_service.load_debug_log_settings(),
@@ -6325,6 +6366,11 @@ class PetWindow(QWidget):
                 )
             if screen is not None:
                 self.settings_service.save_screen_awareness_settings(screen)
+            proactive_cfg = getattr(result, "proactive", None)
+            if isinstance(proactive_cfg, dict) and proactive_cfg:
+                if screen is not None:
+                    proactive_cfg = {**proactive_cfg, "enabled": bool(screen.enabled)}
+                self.settings_service.save_proactive_config(proactive_cfg)
             if mcp is not None:
                 self.settings_service.save_mcp_runtime_settings(mcp)
             if system_basic is not None and system_basic.debug_log is not None:
@@ -6425,8 +6471,8 @@ class PetWindow(QWidget):
             sync_screen_awareness_timer()
         else:
             self._sync_proactive_care_timer()
-        # 隐私页开关只改 proactive.enabled；若 API 未变则不会走客户端重建，需显式重启 Observer。
-        if screen is not None:
+        # 隐私页开关 / observer 数值变更后需显式重启 Observer。
+        if screen is not None or (isinstance(getattr(result, "proactive", None), dict) and result.proactive):
             self._restart_proactive_observer()
         discard_backchannel_audio_cache = getattr(
             self,

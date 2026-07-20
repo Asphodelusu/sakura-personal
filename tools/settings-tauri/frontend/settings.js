@@ -15,6 +15,18 @@ const fields = {
   controlPanelOffset: document.getElementById("controlPanelOffset"),
   inputBarOffset: document.getElementById("inputBarOffset"),
   enabled: document.getElementById("enabled"),
+  proactiveCooldownSeconds: document.getElementById("proactiveCooldownSeconds"),
+  proactiveTimerSeconds: document.getElementById("proactiveTimerSeconds"),
+  proactiveAdaptiveMin: document.getElementById("proactiveAdaptiveMin"),
+  proactiveAdaptiveMax: document.getElementById("proactiveAdaptiveMax"),
+  proactiveIdleThreshold: document.getElementById("proactiveIdleThreshold"),
+  proactiveMinSilence: document.getElementById("proactiveMinSilence"),
+  proactiveWindowSwitch: document.getElementById("proactiveWindowSwitch"),
+  proactiveWindowSwitchCooldown: document.getElementById("proactiveWindowSwitchCooldown"),
+  proactiveFocusSettle: document.getElementById("proactiveFocusSettle"),
+  proactiveMaxEdge: document.getElementById("proactiveMaxEdge"),
+  proactiveBlockedProcesses: document.getElementById("proactiveBlockedProcesses"),
+  proactiveBlockedTitles: document.getElementById("proactiveBlockedTitles"),
   windowsMcp: document.getElementById("windowsMcp"),
   agentSteps: document.getElementById("agentSteps"),
   toolCallsPerStep: document.getElementById("toolCallsPerStep"),
@@ -712,7 +724,7 @@ const pageMeta = {
   model: { title: "模型", subtitle: "功能模型分配与高级参数" },
   voice: { title: "语音", subtitle: "TTS 提供器与语音参数" },
   interaction: { title: "交互", subtitle: "字幕、气泡与快速接话" },
-  privacy: { title: "隐私", subtitle: "主动屏幕感知与截图预算" },
+  privacy: { title: "隐私", subtitle: "主动屏幕感知、频率与黑名单" },
   tools: { title: "工具", subtitle: "桌面控制与工具循环上限" },
   plugins: { title: "插件", subtitle: "启停状态、权限、来源与重启生效预览" },
   system: { title: "系统", subtitle: "启动、日志与排查工具" },
@@ -819,12 +831,44 @@ function initializeOnboarding() {
 
 function syncEnabledState() {
   const enabled = fields.enabled.checked;
+  const dependent = [
+    fields.proactiveCooldownSeconds,
+    fields.proactiveTimerSeconds,
+    fields.proactiveAdaptiveMin,
+    fields.proactiveAdaptiveMax,
+    fields.proactiveIdleThreshold,
+    fields.proactiveMinSilence,
+    fields.proactiveWindowSwitch,
+    fields.proactiveWindowSwitchCooldown,
+    fields.proactiveFocusSettle,
+    fields.proactiveMaxEdge,
+    fields.proactiveBlockedProcesses,
+    fields.proactiveBlockedTitles,
+  ];
+  dependent.forEach((el) => setControlDisabled(el, !enabled));
+  if (enabled) {
+    setControlDisabled(fields.proactiveWindowSwitchCooldown, !fields.proactiveWindowSwitch.checked);
+    setControlDisabled(fields.proactiveFocusSettle, !fields.proactiveWindowSwitch.checked);
+  }
+  updateScreenResolutionEstimate();
 }
 
 function updateScreenResolutionEstimate() {
   if (!request) return;
+  const maxEdge = Number(fields.proactiveMaxEdge?.value || request.proactive?.max_edge || 1920);
   fields.tokenEstimate.textContent =
-    `聚焦窗口截图（最长边约 1920px）：约 ${request.estimated_tokens_per_image?.toLocaleString("zh-CN") || "—"} token/张。`;
+    `聚焦窗口截图（最长边约 ${maxEdge}px）：约 ${request.estimated_tokens_per_image?.toLocaleString("zh-CN") || "—"} token/张。`;
+}
+
+function linesToList(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function listToLines(values) {
+  return Array.isArray(values) ? values.join("\n") : "";
 }
 
 function syncRuntimeLoopState() {
@@ -3958,6 +4002,32 @@ function collectScreenAwarenessSettings() {
   return { enabled, screen_context_enabled: enabled };
 }
 
+function collectProactiveSettings() {
+  const limits = request.limits || {};
+  const adaptiveMin = clampInt(fields.proactiveAdaptiveMin.value, limits.proactive_adaptive_interval_min || [15, 600]);
+  const adaptiveMax = Math.max(
+    adaptiveMin,
+    clampInt(fields.proactiveAdaptiveMax.value, limits.proactive_adaptive_interval_max || [60, 7200]),
+  );
+  return {
+    enabled: fields.enabled.checked,
+    timer_seconds: clampInt(fields.proactiveTimerSeconds.value, limits.proactive_timer_seconds || [60, 3600]),
+    cooldown_seconds: clampInt(fields.proactiveCooldownSeconds.value, limits.proactive_cooldown_seconds || [30, 3600]),
+    min_silence_after_user: clampInt(fields.proactiveMinSilence.value, limits.proactive_min_silence_after_user || [0, 120]),
+    window_switch_enabled: fields.proactiveWindowSwitch.checked,
+    window_switch_cooldown: clampInt(fields.proactiveWindowSwitchCooldown.value, limits.proactive_window_switch_cooldown || [5, 300]),
+    focus_settle_delay: clampInt(fields.proactiveFocusSettle.value, limits.proactive_focus_settle_delay || [1, 120]),
+    idle_threshold_seconds: clampInt(fields.proactiveIdleThreshold.value, limits.proactive_idle_threshold_seconds || [60, 7200]),
+    max_edge: clampInt(fields.proactiveMaxEdge.value, limits.proactive_max_edge || [640, 3840]),
+    adaptive_interval_min: adaptiveMin,
+    adaptive_interval_max: adaptiveMax,
+    privacy: {
+      blocked_processes: linesToList(fields.proactiveBlockedProcesses.value),
+      blocked_title_keywords: linesToList(fields.proactiveBlockedTitles.value),
+    },
+  };
+}
+
 function collectRuntimeLoopSettings() {
   const limits = request.limits;
   const perStep = clampInt(fields.toolCallsPerStep.value, limits.max_tool_calls_per_step);
@@ -4172,6 +4242,7 @@ function collectThemeSettings() {
 function collectSettings() {
   return {
     screen_awareness: collectScreenAwarenessSettings(),
+    proactive: collectProactiveSettings(),
     mcp: {
       windows_enabled: fields.windowsMcp.checked,
     },
@@ -4284,6 +4355,30 @@ async function load() {
 
   const settings = request.screen_awareness;
   fields.enabled.checked = settings.enabled && settings.screen_context_enabled;
+  const proactive = request.proactive || {};
+  const privacy = proactive.privacy || {};
+  setNumericBounds(fields.proactiveCooldownSeconds, request.limits.proactive_cooldown_seconds);
+  setNumericBounds(fields.proactiveTimerSeconds, request.limits.proactive_timer_seconds);
+  setNumericBounds(fields.proactiveAdaptiveMin, request.limits.proactive_adaptive_interval_min);
+  setNumericBounds(fields.proactiveAdaptiveMax, request.limits.proactive_adaptive_interval_max);
+  setNumericBounds(fields.proactiveIdleThreshold, request.limits.proactive_idle_threshold_seconds);
+  setNumericBounds(fields.proactiveMinSilence, request.limits.proactive_min_silence_after_user);
+  setNumericBounds(fields.proactiveWindowSwitchCooldown, request.limits.proactive_window_switch_cooldown);
+  setNumericBounds(fields.proactiveFocusSettle, request.limits.proactive_focus_settle_delay);
+  setNumericBounds(fields.proactiveMaxEdge, request.limits.proactive_max_edge);
+  fields.proactiveCooldownSeconds.value = proactive.cooldown_seconds ?? 600;
+  fields.proactiveTimerSeconds.value = proactive.timer_seconds ?? 480;
+  fields.proactiveAdaptiveMin.value = proactive.adaptive_interval_min ?? 45;
+  fields.proactiveAdaptiveMax.value = proactive.adaptive_interval_max ?? 1800;
+  fields.proactiveIdleThreshold.value = proactive.idle_threshold_seconds ?? 600;
+  fields.proactiveMinSilence.value = proactive.min_silence_after_user ?? 10;
+  fields.proactiveWindowSwitch.checked = proactive.window_switch_enabled !== false;
+  fields.proactiveWindowSwitchCooldown.value = proactive.window_switch_cooldown ?? 25;
+  fields.proactiveFocusSettle.value = proactive.focus_settle_delay ?? 15;
+  fields.proactiveMaxEdge.value = proactive.max_edge ?? 1920;
+  fields.proactiveBlockedProcesses.value = listToLines(privacy.blocked_processes);
+  fields.proactiveBlockedTitles.value = listToLines(privacy.blocked_title_keywords);
+  syncEnabledState();
   syncDesktopMcpControl(request.mcp);
   fields.windowsMcp.checked = request.mcp.windows_enabled;
   fields.agentSteps.value = request.runtime_loop.max_agent_steps_per_turn;
@@ -4392,6 +4487,9 @@ fields.ttsVoiceImportButton.addEventListener("click", importCharacterVoiceArchiv
 fields.characterExportButton.addEventListener("click", exportCharacterArchive);
 fields.characterEditorButton.addEventListener("click", launchCharacterStudio);
 fields.enabled.addEventListener("change", syncEnabledState);
+fields.proactiveWindowSwitch.addEventListener("change", syncEnabledState);
+fields.proactiveMaxEdge.addEventListener("change", updateScreenResolutionEstimate);
+fields.proactiveMaxEdge.addEventListener("input", updateScreenResolutionEstimate);
 fields.toolCallsPerStep.addEventListener("input", syncRuntimeLoopState);
 fields.addProviderButton.addEventListener("click", openAddProviderChooser);
 fields.onboardingCharacterStep.addEventListener("click", () => showOnboardingStep("character"));

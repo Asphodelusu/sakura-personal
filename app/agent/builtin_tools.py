@@ -130,7 +130,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="add_reminder",
-                description="创建一次性提醒。用户说“几分钟后/几秒后”这类相对时间时，必须优先使用 delay_seconds 或 delay_minutes，让程序计算触发时间；只有用户给出明确日期时间时才使用 trigger_at。repeat 第一版只支持 null 或省略。",
+                description="创建一次性提醒。对方说“几分钟后/几秒后”这类相对时间时，必须优先使用 delay_seconds 或 delay_minutes，让程序计算触发时间；只有对方给出明确日期时间时才使用 trigger_at。repeat 第一版只支持 null 或省略。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -206,7 +206,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="open_url",
-                description="打开 http 或 https 网页。该工具会离开聊天窗口，需要用户确认后才能执行。",
+                description="打开 http 或 https 网页。该工具会离开聊天窗口，需要对方确认后才能执行。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -220,7 +220,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="open_local_folder",
-                description="打开已存在的本地文件夹。该工具会访问桌面环境，需要用户确认后才能执行。",
+                description="打开已存在的本地文件夹。该工具会访问桌面环境，需要对方确认后才能执行。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -235,7 +235,7 @@ def create_builtin_tool_registry(
             Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。需要跨会话信息、用户偏好、项目状态或过往约定时使用。"
+                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
                     "mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
                     "token 消耗约 1/10，适合先概览再按需展开。"
@@ -305,13 +305,15 @@ def create_builtin_tool_registry(
             Tool(
                 name="memory_remember",
                 description=(
-                    "保存一条明确、长期有用的记忆。只在用户明确要求记住，或信息明显会长期帮助陪伴/协作时使用。"
-                    "不要保存密码、token、密钥、身份证、银行卡等敏感凭据。"
+                    "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
+                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
+                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "content": {"type": "string", "description": "要保存的长期记忆内容。"},
+                        "content": {"type": "string", "description": "要保存的长期记忆内容（对方侧事实优先简体中文）。"},
                         "layer": {
                             "type": "string",
                             "description": "可选记忆层级，默认 semantic；稳定偏好/协作规则用 procedural，当前任务用 session。",
@@ -329,7 +331,7 @@ def create_builtin_tool_registry(
                 name="memory_update",
                 description=(
                     "更新一条已存在的长期记忆。先用 memory_search 找到 memory_id；"
-                    "只在用户明确纠正、补充、合并旧记忆，或已有记忆明显过时时使用。"
+                    "只在对方明确纠正、补充、合并旧记忆，或已有记忆明显过时时使用。"
                     "不要写入密码、token、密钥、身份证、银行卡等敏感凭据。"
                 ),
                 parameters={
@@ -351,7 +353,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="memory_forget",
-                description="在用户明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
+                description="在对方明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -404,6 +406,204 @@ def create_builtin_tool_registry(
         Tool(
             name="list_tool_groups",
             description="列出 Sakura 当前可用工具组及数量，用于决定是否需要搜索并激活更多工具。",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=registry.list_tool_groups,
+            group="core",
+            risk="low",
+        )
+    )
+    return registry
+
+
+def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
+    """手机端工具表：记忆读写 + 本机时间；不含屏幕/桌面/需确认工具。
+
+    写入仍落到电脑端同一 MemoryStore，与桌面长期记忆共用。
+    """
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="get_current_time",
+                description="获取当前本机时间和时区。",
+                parameters={},
+                handler=lambda _arguments: get_current_time(),
+                group="core",
+            ),
+            Tool(
+                name="memory_search",
+                description=(
+                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
+                    "mode='full'（默认）返回完整正文；"
+                    "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
+                    "token 消耗约 1/10，适合先概览再按需展开。"
+                    "首次调用可能返回 status='loading'，这时直接告诉对方记忆系统正在初始化，不要重复调用。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词，可为空；为空时列出最近记忆。"},
+                        "limit": {"type": "integer", "description": "最多返回多少条，默认 20。"},
+                        "mode": {"type": "string", "description": "full（默认）或 index。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级：core_profile、semantic、episodic、procedural、session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类过滤。"},
+                        "scope": {"type": "string", "description": "可选角色/作用域，默认当前角色。"},
+                    },
+                },
+                handler=lambda arguments: memory.search_memory(arguments, wait=False),
+                group="core",
+            ),
+            Tool(
+                name="memory_detail",
+                description=(
+                    "按 memory_id 列表批量取回完整记忆内容。"
+                    "先用 memory_search(mode='index') 获取标题索引，"
+                    "再对感兴趣的条目调用本工具展开全文。"
+                    "ids 可以是逗号分隔的字符串或数组。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "string", "description": "记忆 id 列表，逗号分隔或直接传数组。"},
+                    },
+                    "required": ["ids"],
+                },
+                handler=lambda arguments: memory.get_memory_detail(arguments, wait=False),
+                group="core",
+            ),
+            Tool(
+                name="memory_timeline",
+                description=(
+                    "以某条记忆为锚点，查看它在时间线上的前后上下文。"
+                    "给定 memory_id，返回该条记忆及其之前/之后的邻近记忆。"
+                    "适合在 memory_search 找到感兴趣的条目后，"
+                    "了解「那段时间还发生了什么」。"
+                    "不支持常驻档案（core_profile）作为锚点。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "作为锚点的记忆 id。"},
+                        "before": {"type": "integer", "description": "返回锚点之前的条目数（默认 3）。"},
+                        "after": {"type": "integer", "description": "返回锚点之后的条目数（默认 3）。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: build_timeline(
+                    memory,
+                    str(arguments.get("memory_id") or "").strip(),
+                    before=_safe_int(arguments.get("before"), DEFAULT_TIMELINE_BEFORE),
+                    after=_safe_int(arguments.get("after"), DEFAULT_TIMELINE_AFTER),
+                ),
+                group="core",
+            ),
+            Tool(
+                name="memory_remember",
+                description=(
+                    "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
+                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
+                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "要保存的长期记忆内容（对方侧事实优先简体中文）。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级，默认 semantic；稳定偏好/协作规则用 procedural，当前任务用 session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类，如 preference/project/profile。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性，默认 0.5。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度，默认 0.75。"},
+                    },
+                    "required": ["content"],
+                },
+                handler=lambda arguments: memory.remember_memory(arguments, wait=False),
+                group="memory-write",
+            ),
+            Tool(
+                name="memory_update",
+                description=(
+                    "更新一条已存在的长期记忆。先用 memory_search 找到 memory_id；"
+                    "只在对方明确纠正、补充、合并旧记忆，或已有记忆明显过时时使用。"
+                    "不要写入密码、token、密钥、身份证、银行卡等敏感凭据。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                        "content": {"type": "string", "description": "更新后的完整长期记忆内容。"},
+                        "layer": {"type": "string", "description": "可选记忆层级。"},
+                        "category": {"type": "string", "description": "可选分类。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度。"},
+                    },
+                    "required": ["memory_id", "content"],
+                },
+                handler=lambda arguments: memory.update_memory(
+                    _memory_update_arguments(arguments), wait=False
+                ),
+                group="memory-write",
+            ),
+            Tool(
+                name="memory_forget",
+                description="在对方明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: memory.forget_memory(
+                    _memory_forget_arguments(arguments), wait=False
+                ),
+                group="memory-write",
+            ),
+            Tool(
+                name="memory_let_go",
+                description="放手一条记忆——不再想起，但不删除。用于「这件事我已经不想再记着了」的场合。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: memory.release_memory(
+                    {"id": arguments.get("memory_id") or arguments.get("id")},
+                    wait=False,
+                ),
+                group="memory-write",
+            ),
+        ]
+    )
+    registry.register(
+        Tool(
+            name="search_tools",
+            description=(
+                "搜索当前手机通道已安装但可能尚未暴露的工具。"
+                "手机端主要提供记忆读写；需要记住/更新/忘掉时若工具列表里没有，可先搜索 memory。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "要搜索的工具关键词或能力名称。"},
+                },
+                "required": ["keyword"],
+            },
+            handler=registry.search_tools,
+            group="core",
+            risk="low",
+        )
+    )
+    registry.register(
+        Tool(
+            name="list_tool_groups",
+            description="列出当前手机通道可用工具组及数量。",
             parameters={"type": "object", "properties": {}, "required": []},
             handler=registry.list_tool_groups,
             group="core",

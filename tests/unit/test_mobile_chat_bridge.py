@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from app.agent.builtin_tools import create_mobile_tool_registry
+from app.agent.memory import MemoryStore
+from app.agent.session_state_context import build_session_state_fragment
 from app.core.mobile_chat_bridge import (
     MOBILE_CHANNEL_PATCH_ID,
     MOBILE_CHANNEL_PROMPT_PATCH,
@@ -8,7 +11,6 @@ from app.core.mobile_chat_bridge import (
     MobileChatBridge,
     _messages_from_history,
 )
-from app.agent.session_state_context import build_session_state_fragment
 from app.plugins.models import PromptPatchContribution
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 
@@ -21,6 +23,38 @@ class _RuntimeStub:
 class _HostStub:
     def __init__(self, patches: list[PromptPatchContribution] | None = None) -> None:
         self.agent_runtime = _RuntimeStub(patches)
+
+
+def test_mobile_tool_registry_exposes_memory_write_not_desktop() -> None:
+    class FakeMem0:
+        def add(self, content, *, user_id, metadata, infer=False):
+            return {
+                "results": [
+                    {
+                        "id": "m1",
+                        "content": content,
+                        "memory": content,
+                        "metadata": metadata,
+                    }
+                ]
+            }
+
+    registry = create_mobile_tool_registry(MemoryStore(memory_client=FakeMem0()))
+    names = {tool.name for tool in registry.all()}
+    assert "memory_remember" in names
+    assert "memory_search" in names
+    assert "memory_update" in names
+    assert "memory_forget" in names
+    assert "open_url" not in names
+    assert "observe_screen" not in names
+    result = registry.execute("memory_remember", {"content": "对方喜欢抹茶"})
+    assert result.success
+    assert result.content["memory"]["metadata"]["source"] == "explicit"
+
+
+def test_mobile_channel_prompt_mentions_shared_memory() -> None:
+    assert "memory_remember" in MOBILE_CHANNEL_PROMPT_PATCH.system_prompt_append
+    assert "长期记忆与电脑端共用" in MOBILE_CHANNEL_PROMPT_PATCH.system_prompt_append
 
 
 def test_mobile_prompt_patches_append_channel_notice() -> None:
@@ -81,5 +115,5 @@ def test_desktop_session_context_preserves_mobile_provenance() -> None:
     fragment = build_session_state_fragment(entries)
 
     assert fragment is not None
-    assert "用户（手机）" in fragment.content
+    assert "对方（手机）" in fragment.content
     assert "Sakura（当时通过手机回复）" in fragment.content

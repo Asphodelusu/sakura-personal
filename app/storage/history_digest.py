@@ -52,6 +52,7 @@ class DigestLine:
     role: str
     content: str
     channel: str = ""
+    created_at: str = ""
 
 
 def clean_recent_dialogue(
@@ -93,6 +94,7 @@ def clean_recent_dialogue(
                 role=role,
                 content=content,
                 channel=str(getattr(entry, "channel", "") or "").strip(),
+                created_at=str(getattr(entry, "created_at", "") or "").strip(),
             )
         )
     if not lines:

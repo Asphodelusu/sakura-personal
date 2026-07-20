@@ -1,3 +1,15 @@
+"""旧「主动屏幕感知」配置与分辨率/token 估算工具。
+
+历史路径：定时截图攒批次 → 发 `screen_awareness_check` 事件 → 主模型找话题。
+现已由 `app.perception.observer.ProactiveObserver` 接管主动看屏搭话。
+
+仍在用：
+- `ScreenAwarenessSettings.enabled`：经 SettingsService 与 `proactive.enabled` 对齐的总开关。
+
+已不再驱动运行时（字段/常量保留兼容设置页与旧测试）：
+- 定时轮询、截图批次、分辨率档位、cooldown/interval 等旧批次逻辑。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,10 +50,14 @@ SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER = "[已抓取屏幕上下文]"
 
 @dataclass(frozen=True)
 class ScreenAwarenessSettings:
-    """主动屏幕感知配置；启用后会定期截图并让模型基于屏幕找话题。"""
+    """主动感知总开关的兼容载体（旧 ScreenAwareness 配置形）。
+
+    运行时真正生效的是 ProactiveObserver + `proactive` YAML。
+    除 `enabled` 外，interval / cooldown / batch / resolution 等字段不再被主动链路读取。
+    """
 
     enabled: bool = True
-    screen_context_enabled: bool = True
+    screen_context_enabled: bool = True  # 旧批次截图开关；Observer 路径不使用
     check_interval_minutes: int = SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES
     cooldown_minutes: int = SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES
     screen_context_batch_limit: int = SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT
@@ -74,7 +90,7 @@ class ScreenAwarenessSettings:
         )
 
     def allows_screen_context(self) -> bool:
-        """主动屏幕感知依赖截图；关闭屏幕上下文时整个功能停止。"""
+        """旧批次路径用的「是否允许截图」；主动看屏请看 ProactiveObserver / proactive.enabled。"""
         normalized = self.normalized()
         return normalized.enabled and normalized.screen_context_enabled
 

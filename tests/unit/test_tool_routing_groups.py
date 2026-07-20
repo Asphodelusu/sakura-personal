@@ -24,6 +24,23 @@ def test_infer_active_groups_stays_core_for_casual_chat() -> None:
     assert infer_active_tool_groups_from_messages(messages) == {"core"}
 
 
+def test_infer_active_groups_adds_mcp_for_weather_query() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "明天北平是什么天气？"}]
+    groups = infer_active_tool_groups_from_messages(messages)
+    assert "mcp" in groups
+
+
+def test_user_message_needs_web_lookup_for_weather_query() -> None:
+    from app.agent.tool_routing import user_message_needs_web_lookup
+
+    assert user_message_needs_web_lookup(
+        [{"role": "user", "content": "明天北平是什么天气？"}]
+    )
+    assert not user_message_needs_web_lookup(
+        [{"role": "user", "content": "今天天气真好呀"}]
+    )
+
+
 def test_infer_active_groups_adds_productivity_for_todo_keywords() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "帮我记一条待办"}]
     groups = infer_active_tool_groups_from_messages(messages)

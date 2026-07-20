@@ -67,6 +67,9 @@ _KEYWORD_TOOL_GROUP_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "搜索",
             "搜一下",
             "查一下",
+            "查下",
+            "查查",
+            "查询",
             "再查",
             "再搜",
             "查一遍",
@@ -82,6 +85,17 @@ _KEYWORD_TOOL_GROUP_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "fetch",
             "新闻",
             "web search",
+            # 查询意图的天气（勿加「天气」单字，避免「今天天气真好」误激活）
+            "什么天气",
+            "天气预报",
+            "查天气",
+            "看看天气",
+            "几度",
+            "气温",
+            "会下雨",
+            "下雨吗",
+            "下不下雨",
+            "weather",
         ),
     ),
 )
@@ -191,6 +205,19 @@ def user_requests_mcp_followup(text: str) -> bool:
     if any(marker.lower() in normalized for marker in _MCP_FOLLOWUP_MARKERS):
         return True
     return bool(re.search(r"[再又还].{0,6}[查搜]", normalized))
+
+
+def user_message_needs_web_lookup(messages: list[ChatMessage]) -> bool:
+    """用户本轮话术是否明显需要联网查询（天气/新闻/搜索等）。"""
+    text = (_latest_user_text(messages) or "").strip().lower()
+    if not text:
+        return False
+    for group, keywords in _KEYWORD_TOOL_GROUP_RULES:
+        if group != "mcp":
+            continue
+        if any(keyword.lower() in text for keyword in keywords):
+            return True
+    return False
 
 
 def user_requests_memory_remember(messages: list[ChatMessage]) -> bool:
@@ -333,9 +360,9 @@ def _execute_auto_browser_snapshot(tools: ToolRegistry, step_index: int) -> Tool
             success=False,
             content={
                 "auto_tool": BROWSER_SNAPSHOT_TOOL_NAME,
-                "reason": "自动页面文本读取需要用户确认，已跳过隐藏执行。",
+                "reason": "自动页面文本读取需要对方确认，已跳过隐藏执行。",
             },
-            error="自动页面文本读取需要用户确认，已跳过。",
+            error="自动页面文本读取需要对方确认，已跳过。",
         )
         debug_log("AgentRuntime", "自动浏览器页面文本读取需要确认，已跳过", result.to_dict())
         return result
@@ -552,7 +579,7 @@ def _build_visible_browser_web_tool_block_result(call: dict[str, Any]) -> ToolEx
         success=False,
         content={
             "blocked_tool": tool_name,
-            "reason": "用户明确要求打开浏览器或看到搜索过程，已阻止后台网页搜索/抓取工具。",
+            "reason": "对方明确要求打开浏览器或看到搜索过程，已阻止后台网页搜索/抓取工具。",
             "guidance": (
                 "请优先用 playwright_navigate 直接打开目标 URL，或用 playwright_search_web 搜索；"
                 "再按需用 playwright_get_text、playwright_screenshot、playwright_click、"
@@ -680,7 +707,7 @@ def _build_visible_browser_mode_rule(visible_browser_mode: bool) -> str:
     if not visible_browser_mode:
         return ""
     return (
-        "- 用户明确要求打开浏览器或看到搜索过程：后台 web__ 搜索/抓取工具已从可用工具中隐藏。"
+        "- 对方明确要求打开浏览器或看到搜索过程：后台 web__ 搜索/抓取工具已从可用工具中隐藏。"
         "必须优先用 playwright_navigate 直达目标 URL，或 playwright_search_web 打开可见搜索结果；"
         "能直达页面就不要先打开搜索首页再操作输入框；"
         "需要交互时再用 playwright_get_text/screenshot/click/fill 等工具完成可见浏览器流程。"
