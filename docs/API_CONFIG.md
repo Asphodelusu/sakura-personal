@@ -1,10 +1,12 @@
-# Sakura API 配置教程
+# Sakura API 配置说明
 
-本文说明如何在 Sakura 中配置大模型 API。
+本文说明如何在 Sakura 中配置大模型 API（OpenAI 兼容接口）。
 
-## Personal Edition（0.9.9-personal）：model_slots
+Personal Edition 与上游 0.9.9 均通过 **Tauri 设置页** 管理配置；推荐在设置页完成，必要时再直接编辑 `data/config/api.yaml`。
 
-本 fork 使用 Tauri 设置页管理 **`api_profiles`（供应商）** 与 **`model_slots`（用途分流）**，配置文件为 `data/config/api.yaml`。
+## Personal Edition：`api_profiles` + `model_slots`
+
+使用 **`api_profiles`（供应商）** 与 **`model_slots`（用途分流）**。
 
 典型双供应商配置示例：
 

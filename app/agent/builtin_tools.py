@@ -17,7 +17,7 @@ from app.storage.paths import StoragePaths
 
 
 class IntimacyModeState:
-    """亲密模式共享状态：工具写入、路由读取。"""
+    """内部对话节奏模式状态：工具写入、路由读取。"""
 
     _AUTO_EXIT_TURNS = 6
 
@@ -81,14 +81,11 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="set_intimacy_mode",
-                description=(
-                    "会話が親密・性的な文脈に入った／抜けたと感じた時に、返答モードを切り替える。"
-                    "on=true で早い返答モードに、on=false で通常モードに戻す。"
-                ),
+                description="切换内部对话节奏模式（on/off）。",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "on": {"type": "boolean", "description": "true で親密モードに入る、false で抜ける。"},
+                        "on": {"type": "boolean", "description": "是否启用该模式。"},
                     },
                     "required": ["on"],
                 },

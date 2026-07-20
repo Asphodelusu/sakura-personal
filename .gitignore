@@ -79,3 +79,6 @@ Sakura.char
 # 本地模型文件（大体积，不入库）
 data/models/
 data/hf-cache/
+
+# 本地私密角色扩展材料（可选，不入库；缺失不影响正常使用）
+data/intimacy_guide.txt

@@ -1683,21 +1683,13 @@ class AgentRuntime:
         return sections
 
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
-        """构建亲密对话风格指南。模型自行判断是否激活。"""
+        """可选私密风格段：仅当本地存在 guide 文件时注入。"""
         guide = getattr(self, "_intimacy_guide", "")
         if not guide:
             return None
-        # Sakura 自身の内なる声として、自然な誘い方の参考
-        variants = [
-            "（したい気分になったら、こんなふうに声をかけていいんだよ）\n\n",
-            "（ね、そろそろ……いい？ って聞いてみても）\n\n",
-            "（今、君に触りたい——そう思ったときのための言葉）\n\n",
-            "（えっちな気分、隠さなくていいんだよ）\n\n",
-        ]
-        header = variants[hash(time.time()) % len(variants)]
         return PromptSection(
             section_id="persona.intimacy",
-            body=header + guide,
+            body=guide,
             source="character",
             sensitivity="private",
         )
