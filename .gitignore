@@ -30,7 +30,6 @@ temp/
 *.log
 data/chat_history.jsonl
 data/chat_history/
-data/intimacy_guide.txt
 data/memory/
 data/memory.json
 data/memory_curation_state.json
