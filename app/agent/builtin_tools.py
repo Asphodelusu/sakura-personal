@@ -306,7 +306,9 @@ def create_builtin_tool_registry(
                 name="memory_remember",
                 description=(
                     "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
-                    "关于对方的事实用简体中文写；不要保存密码、token、密钥、身份证、银行卡等敏感凭据。"
+                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
+                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
                 ),
                 parameters={
                     "type": "object",
@@ -501,7 +503,9 @@ def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
                 name="memory_remember",
                 description=(
                     "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
-                    "关于对方的事实用简体中文写；不要保存密码、token、密钥、身份证、银行卡等敏感凭据。"
+                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
+                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
                 ),
                 parameters={
                     "type": "object",

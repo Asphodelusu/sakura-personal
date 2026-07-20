@@ -100,6 +100,8 @@ DEFAULT_MEMORY_LANGUAGE_INSTRUCTIONS = (
     "专有名词、代码、路径、ID、品牌名可保留原文。"
     "Sakura 自己的内心感受、心の記録式自语、对自己的反省：优先用自然的日语写。"
     "若对方用日语说了值得原样保留的重要原话，日语原文可保留。"
+    "写法像私人日记：先写清谁对谁说了什么或约了什么，再写自己的感受；"
+    "用对方告诉你的名字，或「对方」「他/她」来称呼。"
     "输出 JSON 结构不变，只改变 memory/text 字段的自然语言内容。"
 )
 
@@ -828,7 +830,12 @@ class MemoryStore:
         content = str(entry.get("content", "")).strip()
         if not content:
             return None
-        result: dict[str, Any] = {"id": f"mood:{self.scope_id}", "content": content, "metadata": {"layer": "mood"}}
+        result: dict[str, Any] = {
+            "id": f"mood:{self.scope_id}",
+            "content": content,
+            "updated_at": str(entry.get("updated_at", "")).strip(),
+            "metadata": {"layer": "mood"},
+        }
         history = entry.get("history", [])
         if isinstance(history, list) and history:
             result["history"] = [
@@ -1030,6 +1037,8 @@ class MemoryStore:
         不做向量搜索，仅读取本地持久化的 mood_state 和 core_profile 动态部分，
         与 card（静态角色定义）互补而不重叠。
         """
+        from app.agent.time_awareness import format_relative_age, seconds_since
+
         sections: list[str] = []
 
         # 心情（动态，不在 card 中）
@@ -1037,12 +1046,24 @@ class MemoryStore:
         if mood is not None:
             mood_content = _clip_text(str(mood.get("content") or ""), MOOD_CONTEXT_BUDGET)
             if mood_content:
-                sections.append(
-                    f"【今の気持ち】\n"
-                    f"{mood_content}\n"
-                    f"（这是你现在的心情，它会自然影响你的语气和节奏——高兴时轻快，"
-                    f"低落时句子更短更安静，害羞时停顿多。但它只是此刻感受的一部分，不是全部。）"
-                )
+                updated_at = str(mood.get("updated_at") or "").strip()
+                age = format_relative_age(updated_at)
+                age_seconds = seconds_since(updated_at)
+                age_note = f"（{age}写下）" if age else ""
+                # 超过约 3 小时：弱化「此刻刚写」的语感
+                if age_seconds is not None and age_seconds >= 3 * 3600:
+                    heading = "【不久前的心情】"
+                    influence = (
+                        "这是你不久前记下的心情，仍可能影响语气，但不必当成刚刚发生的事。"
+                    )
+                else:
+                    heading = "【今の気持ち】"
+                    influence = (
+                        "这是你现在的心情，它会自然影响你的语气和节奏——高兴时轻快，"
+                        "低落时句子更短更安静，害羞时停顿多。但它只是此刻感受的一部分，不是全部。"
+                    )
+                body = f"{mood_content}{age_note}" if age_note else mood_content
+                sections.append(f"{heading}\n{body}\n（{influence}）")
 
         # 关系快照（与 curator 约定同一套章节名；旧标题作回退）
         cp = self.core_profile()
@@ -2748,12 +2769,21 @@ def _format_memory_section(
     *,
     budget: int,
 ) -> str:
+    from app.agent.time_awareness import annotate_with_relative_age, memory_event_timestamp
+
+    now = datetime.now().astimezone()
     lines: list[str] = []
     used = 0
     for memory in memories:
         content = str(memory.get("content") or "").strip()
         if not content:
             continue
+        content = annotate_with_relative_age(
+            content,
+            memory_event_timestamp(memory),
+            now=now,
+            expired=memory_record_is_expired(memory, now=now),
+        )
         category = str(memory.get("category") or "").strip()
         confidence = _bounded_float(memory.get("confidence"), default=DEFAULT_MEMORY_CONFIDENCE)
         prefix = f"- [{category}]" if category else "-"

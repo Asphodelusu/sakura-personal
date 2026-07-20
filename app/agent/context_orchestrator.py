@@ -16,6 +16,9 @@ from app.llm.prompts.types import (
 from app.plugins.models import ContextProviderContribution
 
 
+from app.agent.time_awareness import format_local_time_context
+
+
 MAX_CONTEXT_INPUT_CHARS = 4000
 MAX_CONTEXT_RECENT_MESSAGES = 8
 MAX_CONTEXT_MESSAGE_CHARS = 1000
@@ -84,10 +87,13 @@ def _builtin_fragments(request: ContextRequest) -> list[ContextFragment]:
         ContextFragment(
             fragment_id="runtime.time",
             source="runtime",
-            content=f"当前本地时间：{request.current_time}",
+            content=format_local_time_context(
+                request.current_time,
+                seconds_since_interaction=request.seconds_since_pet_interaction,
+            ),
             trust="trusted",
             priority=100,
-            token_budget=128,
+            token_budget=192,
             sensitivity="public",
             cache_scope="step",
             required=True,

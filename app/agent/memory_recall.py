@@ -183,7 +183,7 @@ class MemoryRecallService:
                 source="memory",
                 # 不再逐条加「与本轮相关的长期记忆：」前缀——source=memory 属性已表明
                 # 来源，让每条都带同样的开场白只会显得像检索结果堆砌，也白费 token。
-                content=memory["content"],
+                content=_annotate_recalled_memory_content(memory, now=now),
                 trust="trusted" if memory["source"] == "explicit" else "untrusted",
                 priority=80 if memory["source"] == "explicit" else 70,
                 freshness=memory["updated_at"],
@@ -194,6 +194,19 @@ class MemoryRecallService:
             for index, memory in enumerate(selected)
         )
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
+
+
+def _annotate_recalled_memory_content(memory: dict[str, Any], *, now: datetime) -> str:
+    from app.agent.memory import memory_record_is_expired
+    from app.agent.time_awareness import annotate_with_relative_age, memory_event_timestamp
+
+    content = str(memory.get("content") or "").strip()
+    return annotate_with_relative_age(
+        content,
+        memory_event_timestamp(memory),
+        now=now,
+        expired=memory_record_is_expired(memory, now=now),
+    )
 
 
 def _build_memory_query(request: ContextRequest) -> str:
@@ -280,6 +293,12 @@ def _select_memories(
                 "score": score,
                 "source": source,
                 "updated_at": updated_at,
+                "created_at": created_at,
+                "event_time": str(metadata.get("event_time") or "").strip(),
+                "valid_until": str(
+                    raw.get("valid_until") or metadata.get("valid_until") or ""
+                ).strip(),
+                "metadata": metadata,
                 "importance": importance,
                 "decay_weight": decay_weight,
             }
@@ -382,6 +401,12 @@ def _select_due_commitment_memories(
                 "score": 0.72,
                 "source": source,
                 "updated_at": updated_at,
+                "created_at": str(raw.get("created_at") or metadata.get("created_at") or "").strip(),
+                "event_time": event_time,
+                "valid_until": str(
+                    raw.get("valid_until") or metadata.get("valid_until") or ""
+                ).strip(),
+                "metadata": metadata,
                 "importance": _extract_importance(metadata, source),
                 "decay_weight": DUE_COMMITMENT_DECAY_BOOST,
             }

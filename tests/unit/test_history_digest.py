@@ -82,7 +82,7 @@ class TestBuildSessionStateFragment:
         assert fragment.trust == "untrusted"
         assert "最近会话状态" in fragment.content
         assert "继续执行计划" in fragment.content
-        assert "用户：" in fragment.content
+        assert "对方：" in fragment.content
         assert "Sakura：" in fragment.content
 
     def test_skips_when_live_window_deep(self) -> None:

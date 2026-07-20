@@ -13,6 +13,7 @@ def test_memory_language_instructions_are_bilingual() -> None:
     assert "日语" in text
     assert "对方" in text
     assert "自己的内心" in text or "心の記録" in text
+    assert "日记" in text
 
 
 def test_curator_prompt_uses_unified_core_profile_sections() -> None:
@@ -24,10 +25,20 @@ def test_curator_prompt_uses_unified_core_profile_sections() -> None:
     assert "あなたについて知っていること" not in text
 
 
+def test_curator_prompt_requires_fact_discipline() -> None:
+    text = _SELF_CURATION_TASK_PROMPT
+    assert "谁对谁说了什么" in text
+    assert "你自己的话归你" in text
+    assert "心の記録" in text
+    assert "绝不能" not in text
+    assert "不要用「主人」" not in text
+
+
 def test_reflector_prompt_follows_bilingual_policy() -> None:
     text = _REFLECTION_SYSTEM_PROMPT
     assert "简体中文" in text
     assert "日语" in text
+    assert "不要用「主人」" not in text
 
 
 def test_remember_memory_defaults_source_to_explicit(tmp_path) -> None:

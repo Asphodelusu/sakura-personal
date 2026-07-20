@@ -200,32 +200,15 @@ def _humanize_event(event: RuntimeEvent) -> str:
 
 
 def _format_duration(seconds: float) -> str:
-    seconds = int(seconds)
-    if seconds < 60:
-        return f"{seconds} 秒"
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} 分钟"
-    hours = minutes // 60
-    remaining_minutes = minutes % 60
-    if remaining_minutes:
-        return f"{hours} 小时 {remaining_minutes} 分钟"
-    return f"{hours} 小时"
+    from app.agent.time_awareness import format_duration_zh
+
+    return format_duration_zh(seconds)
 
 
 def _seconds_since(iso_timestamp: str) -> int | None:
-    """计算距给定 ISO 时间戳的秒数；解析失败或为未来时间则返回 None。"""
-    try:
-        then = datetime.fromisoformat(iso_timestamp)
-    except (TypeError, ValueError):
-        return None
-    now = datetime.now().astimezone()
-    if then.tzinfo is None:
-        then = then.astimezone()
-    delta = (now - then).total_seconds()
-    if delta < 0:
-        return None
-    return int(delta)
+    from app.agent.time_awareness import seconds_since
+
+    return seconds_since(iso_timestamp)
 
 
 class RuntimeEventLog:

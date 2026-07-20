@@ -228,6 +228,45 @@ class AgentRuntime:
         """同步当前角色的聊天历史存储（跨会话续接的数据来源）。"""
         self.history_store = history_store
 
+    def _enrich_event_payload(
+        self,
+        event_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """补全 seconds_since_pet_interaction：优先沿用事件侧已有值，否则从历史算对话间隙。"""
+        payload = dict(event_payload or {})
+        existing = payload.get("seconds_since_pet_interaction")
+        if isinstance(existing, (int, float)):
+            return payload
+        gap = self._seconds_since_previous_user_message()
+        if gap is not None:
+            payload["seconds_since_pet_interaction"] = gap
+        return payload
+
+    def _seconds_since_previous_user_message(self) -> int | None:
+        """当前用户消息与上一条用户消息之间的间隔（秒）。"""
+        from app.agent.time_awareness import parse_iso_datetime
+
+        store = self.history_store
+        if store is None:
+            return None
+        try:
+            entries, _has_more = store.load_tail(40)
+        except Exception:  # noqa: BLE001
+            return None
+        user_times: list[datetime] = []
+        for entry in entries:
+            if str(entry.role).strip() != "user":
+                continue
+            then = parse_iso_datetime(str(entry.created_at or ""))
+            if then is not None:
+                user_times.append(then)
+        if len(user_times) < 2:
+            return None
+        delta = (user_times[-1] - user_times[-2]).total_seconds()
+        if delta < 0:
+            return None
+        return int(delta)
+
     def _session_state_fragments(
         self,
         request: ContextRequest,
@@ -294,7 +333,7 @@ class AgentRuntime:
             step_index=0,
             remaining_steps=0,
             available_tools=(),
-            event_payload=event_payload,
+            event_payload=self._enrich_event_payload(event_payload),
             service_status={"memory": "unknown"},
         )
         recall = self.memory_recall.recall(request)
@@ -779,7 +818,7 @@ class AgentRuntime:
                     step_index=step_index,
                     remaining_steps=loop_settings.max_agent_steps_per_turn - step_index - 1,
                     available_tools=tool_names,
-                    event_payload=event_payload,
+                    event_payload=self._enrich_event_payload(event_payload),
                     service_status={"memory": memory_status},
                 )
                 if step_index == 0:
@@ -1738,6 +1777,8 @@ class AgentRuntime:
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
                 "- 跨会话信息优先用 memory_search；对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
                 "- 记忆语言：关于对方的事实用简体中文；你自己的内心感受优先日语。",
+                "- 写入记忆时像日记：先写清谁说了什么/约了什么，再写感受；"
+                "你自己的话归你，对方的话归对方；过期约定标明时效；称呼用名字或「对方」。",
                 "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
                 "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
             ]

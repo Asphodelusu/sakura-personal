@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from app.agent.time_awareness import format_relative_age
 from app.llm.prompts.runtime import estimate_prompt_tokens
 from app.llm.prompts.types import ContextFragment
 from app.storage.chat_history import ChatHistoryEntry
@@ -56,4 +57,7 @@ def _render_line(line: DigestLine) -> str:
     speaker = "对方" if line.role == "user" else "Sakura"
     if line.channel == "mobile":
         speaker += "（手机）" if line.role == "user" else "（当时通过手机回复）"
+    age = format_relative_age(line.created_at)
+    if age:
+        return f"- （{age}）{speaker}：{line.content}"
     return f"- {speaker}：{line.content}"
