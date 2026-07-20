@@ -144,6 +144,7 @@ class AppContext:
 
     @property
     def screen_awareness_settings(self) -> ScreenAwarenessSettings:
+        """兼容载体：仅 enabled 与 proactive 对齐；旧批次字段无运行时意义。"""
         return self.features.screen_awareness_settings
 
     @property

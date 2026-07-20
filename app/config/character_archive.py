@@ -264,6 +264,11 @@ def export_character_archive(profile: CharacterProfile, output_path: Path, *, in
             source=profile.theme_source,
         ),
     }
+    if profile.system_guards_path is not None:
+        character_manifest["system_guards"] = archive_path_for_resource(
+            profile.system_guards_path,
+            "system_guards",
+        )
     if include_voice and profile.voice is not None:
         character_manifest["voice"] = {
             "gpt_model": archive_path_for_resource(profile.voice.gpt_model_path, "voice/models"),
@@ -493,6 +498,12 @@ def _normalized_import_character_data(
     if tones:
         normalized["reply"] = {"tones": tones}
 
+    guards_raw = character_data.get("system_guards")
+    if isinstance(guards_raw, str) and guards_raw.strip():
+        normalized["system_guards"] = _package_path_text(
+            _archive_resource_path(guards_raw, "character.system_guards")
+        )
+
     voice_data = character_data.get("voice")
     if voice_data is not None:
         normalized["voice"] = _normalized_voice(voice_data)
@@ -618,6 +629,9 @@ def _validate_referenced_files(package_dir: Path, character_data: dict[str, Any]
         ("角色卡", character_data["card"]),
         ("默认立绘", character_data["portrait"]["default"]),
     ]
+    guards = character_data.get("system_guards")
+    if isinstance(guards, str) and guards.strip():
+        paths.append(("演出约束", guards))
     for label, path_text in character_data["portrait"].get("expressions", {}).items():
         paths.append((f"{label} 表情立绘", path_text))
     voice_data = character_data.get("voice")
@@ -696,6 +710,11 @@ def _package_character_data(character_manifest: dict[str, Any]) -> dict[str, Any
         "reply": character_manifest.get("reply", {}),
         "theme": character_manifest.get("theme", {}),
     }
+    guards_raw = character_manifest.get("system_guards")
+    if isinstance(guards_raw, str) and guards_raw.strip():
+        package_data["system_guards"] = _package_path_text(
+            _archive_resource_path(guards_raw, "character.system_guards")
+        )
     voice_data = character_manifest.get("voice")
     if isinstance(voice_data, dict):
         package_data["voice"] = _package_voice_data(voice_data)

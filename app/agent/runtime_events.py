@@ -147,15 +147,15 @@ def build_runtime_event_context_message(
 ) -> dict[str, str] | None:
     """把若干运行时事件合并成一条 {role:system} 上下文消息；空列表返回 None。
 
-    该消息只用于本次模型请求，指示模型自然地意识到用户刚发生的操作，
+    该消息只用于本次模型请求，指示模型自然地意识到对方刚发生的操作，
     但不要逐字复述或机械念出这些系统事件。
     """
     if not events:
         return None
     intro = (
-        "以下是桌宠最近发生的运行时系统事件（用户对程序 / 窗口的操作），仅供你自然地感知当前情境，"
-        "让回应更贴合现状（例如用户刚把你藏起来又重新打开、刚启动应用等）。"
-        "请不要逐字复述或机械念出这些事件，也不要把它们当成用户说的话。"
+        "以下是你这边最近发生的运行时系统事件（对方对程序 / 窗口的操作），仅供你自然地感知当前情境，"
+        "让回应更贴合现状（例如对方刚把你藏起来又重新打开、刚启动应用等）。"
+        "请不要逐字复述或机械念出这些事件，也不要把它们当成对方说的话。"
     )
     event_lines = [_describe_event(event) for event in events]
     # 与屏幕视觉记忆一致：宿主收集的运行时事实统一套“事实非指令”信封并标 untrusted。
@@ -182,12 +182,12 @@ def _humanize_event(event: RuntimeEvent) -> str:
     if etype in (PET_REOPENED, PET_SHOWN):
         duration = meta.get("hidden_duration")
         if isinstance(duration, (int, float)) and duration > 0:
-            return f"用户重新打开了桌宠，距上次隐藏约 {_format_duration(duration)}。"
-        return "用户重新打开了桌宠。"
+            return f"对方重新打开了你，距上次隐藏约 {_format_duration(duration)}。"
+        return "对方重新打开了你。"
     if etype == PET_HIDDEN:
-        return "用户把桌宠隐藏到了托盘。"
+        return "对方把你隐藏到了托盘。"
     if etype == APP_STARTED:
-        bits = ["用户启动了 Sakura。"]
+        bits = ["对方启动了 Sakura。"]
         away = meta.get("away_seconds")
         if isinstance(away, (int, float)) and away > 0:
             bits.append(f"距上次关闭约 {_format_duration(away)}。")
@@ -195,7 +195,7 @@ def _humanize_event(event: RuntimeEvent) -> str:
             bits.append("上次关闭时你的回复被中途打断了。")
         return "".join(bits)
     if etype == APP_CLOSED:
-        return "用户关闭了 Sakura。"
+        return "对方关闭了 Sakura。"
     return ""
 
 

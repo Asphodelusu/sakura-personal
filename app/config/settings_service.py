@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_settings
 from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
@@ -10,6 +10,11 @@ from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, 
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
 from app.llm.local_client import LocalLlmSettings
+from app.perception.proactive_config import ProactiveConfig
+from app.perception.privacy import (
+    DEFAULT_BLOCKED_PROCESSES,
+    DEFAULT_BLOCKED_TITLE_KEYWORDS,
+)
 from app.storage.paths import StoragePaths
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
 from app.agent.screen_awareness import (
@@ -561,15 +566,16 @@ class AppSettingsService:
         save_yaml_mapping(self.system_config_path, data)
 
     def load_screen_awareness_settings(self) -> ScreenAwarenessSettings:
-        """已合并到 ProactiveObserver；从 proactive 配置读取 enabled 状态。
+        """兼容接口：只同步主动总开关到 ScreenAwarenessSettings.enabled。
 
+        主动看屏已由 ProactiveObserver（`proactive` 配置）接管。
         若尚未写入 proactive.enabled，则回退到旧 screen_awareness.enabled，避免迁移后误开。
+        interval / cooldown / batch / resolution 等旧字段固定返回默认值，不再读写 YAML。
         """
         enabled = self._resolve_proactive_enabled(default=True)
-        # observer 接管了旧系统；仅 enabled 字段有效，其余返回默认值（不再使用）
         return ScreenAwarenessSettings(
             enabled=enabled,
-            screen_context_enabled=True,  # observer 不需要单独的 context 开关
+            screen_context_enabled=True,  # 旧字段；Observer 不单独使用
             check_interval_minutes=SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
             cooldown_minutes=SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
             screen_context_batch_limit=SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
@@ -577,7 +583,7 @@ class AppSettingsService:
         )
 
     def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
-        """已合并到 ProactiveObserver；写入 proactive.enabled。"""
+        """兼容接口：仅把 settings.enabled 写入 proactive.enabled；旧批次字段忽略。"""
         normalized = settings.normalized()
         data = load_yaml_mapping(self.system_config_path)
         proactive = data.get("proactive", {})
@@ -588,7 +594,7 @@ class AppSettingsService:
         save_yaml_mapping(self.system_config_path, data)
 
     def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
-        """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""
+        """已弃用别名；等价于 load_screen_awareness_settings（且旧批次逻辑未启用）。"""
         return self.load_screen_awareness_settings()
 
     def load_proactive_config(self) -> dict[str, Any]:
@@ -597,7 +603,19 @@ class AppSettingsService:
         result = dict(proactive) if isinstance(proactive, dict) else {}
         if "enabled" not in result:
             result["enabled"] = self._resolve_proactive_enabled(default=True)
-        return result
+        return normalize_proactive_config_mapping(result)
+
+    def save_proactive_config(self, config: Mapping[str, Any] | None) -> None:
+        """写入 proactive 段（合并规范化后的字段，保留未知键）。"""
+        normalized = normalize_proactive_config_mapping(config)
+        data = load_yaml_mapping(self.system_config_path)
+        existing = data.get("proactive", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        merged.update(normalized)
+        data["proactive"] = merged
+        save_yaml_mapping(self.system_config_path, data)
 
     def _resolve_proactive_enabled(self, *, default: bool) -> bool:
         """优先 proactive.enabled，其次旧 screen_awareness.enabled。"""
@@ -610,7 +628,7 @@ class AppSettingsService:
         return default
 
     def save_proactive_care_settings(self, settings: ScreenAwarenessSettings) -> None:
-        """兼容旧调用点；新代码请使用 save_screen_awareness_settings。"""
+        """已弃用别名；等价于 save_screen_awareness_settings。"""
         self.save_screen_awareness_settings(settings)
 
     def load_bubble_settings(self) -> BubbleSettings:
@@ -805,6 +823,49 @@ def _float_value(value: Any, default: float) -> float:
         return float(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def normalize_proactive_config_mapping(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """把设置页 / YAML 的 proactive 段规整为可写入、可注入 Observer 的字典。"""
+    source = dict(raw) if isinstance(raw, Mapping) else {}
+    cfg = ProactiveConfig.from_dict(source)
+    privacy_raw = source.get("privacy")
+    if isinstance(privacy_raw, dict):
+        processes = _dedupe(privacy_raw.get("blocked_processes"))
+        keywords = _dedupe(privacy_raw.get("blocked_title_keywords"))
+        # 缺键 → 默认黑名单；显式空列表 → 保持清空
+        if "blocked_processes" not in privacy_raw:
+            processes = list(DEFAULT_BLOCKED_PROCESSES)
+        if "blocked_title_keywords" not in privacy_raw:
+            keywords = list(DEFAULT_BLOCKED_TITLE_KEYWORDS)
+    else:
+        processes = list(DEFAULT_BLOCKED_PROCESSES)
+        keywords = list(DEFAULT_BLOCKED_TITLE_KEYWORDS)
+    return {
+        "enabled": bool(cfg.enabled),
+        "timer_seconds": float(cfg.timer_seconds),
+        "cooldown_seconds": float(cfg.cooldown_seconds),
+        "min_silence_after_user": float(cfg.min_silence_after_user),
+        "window_switch_enabled": bool(cfg.window_switch_enabled),
+        "window_switch_cooldown": float(cfg.window_switch_cooldown),
+        "focus_settle_delay": float(cfg.focus_settle_delay),
+        "idle_threshold_seconds": float(cfg.idle_threshold_seconds),
+        "poll_interval": float(cfg.poll_interval),
+        "content_check_interval": float(cfg.content_check_interval),
+        "content_min_chars": int(cfg.content_min_chars),
+        "game_ocr_enabled": bool(cfg.game_ocr_enabled),
+        "max_edge": int(cfg.max_edge),
+        "request_timeout": float(cfg.request_timeout),
+        "eval_temperature": float(cfg.eval_temperature),
+        "max_tokens": int(cfg.max_tokens),
+        "adaptive_interval_min": float(cfg.adaptive_interval_min),
+        "adaptive_interval_max": float(cfg.adaptive_interval_max),
+        "away_max_seconds": float(cfg.away_max_seconds),
+        "privacy": {
+            "blocked_processes": processes,
+            "blocked_title_keywords": keywords,
+        },
+    }
 
 
 def _optional_float(value: Any, *, minimum: float, maximum: float) -> float | None:

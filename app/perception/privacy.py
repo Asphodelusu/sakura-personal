@@ -32,6 +32,18 @@ DEFAULT_BLOCKED_TITLE_KEYWORDS = [
 ]
 
 
+def privacy_guard_from_mapping(privacy: dict | None) -> PrivacyGuard:
+    """从 proactive.privacy 映射构建 PrivacyGuard；缺省段用内置默认黑名单。"""
+    if not isinstance(privacy, dict):
+        return PrivacyGuard()
+    processes = privacy.get("blocked_processes")
+    keywords = privacy.get("blocked_title_keywords")
+    return PrivacyGuard(
+        blocked_processes=list(processes) if isinstance(processes, list) else None,
+        blocked_title_keywords=list(keywords) if isinstance(keywords, list) else None,
+    )
+
+
 class PrivacyGuard:
     def __init__(
         self,
@@ -40,8 +52,15 @@ class PrivacyGuard:
     ) -> None:
         self._blocked_processes: set[str] = set()
         self._blocked_keywords: list[str] = []
-        self.set_blocked_processes(blocked_processes or DEFAULT_BLOCKED_PROCESSES)
-        self.set_blocked_title_keywords(blocked_title_keywords or DEFAULT_BLOCKED_TITLE_KEYWORDS)
+        # None = 用内置默认；显式 [] = 用户清空黑名单，不要回退默认。
+        self.set_blocked_processes(
+            DEFAULT_BLOCKED_PROCESSES if blocked_processes is None else blocked_processes
+        )
+        self.set_blocked_title_keywords(
+            DEFAULT_BLOCKED_TITLE_KEYWORDS
+            if blocked_title_keywords is None
+            else blocked_title_keywords
+        )
 
     def set_blocked_processes(self, processes: list[str]) -> None:
         self._blocked_processes = {p.strip().casefold() for p in processes if p and p.strip()}

@@ -84,9 +84,9 @@ class BuiltinToolProvider:
             Tool(
                 name="add_reminder",
                 description=(
-                    "创建一次性提醒。用户说几分钟后/几秒后这类相对时间时，"
+                    "创建一次性提醒。对方说几分钟后/几秒后这类相对时间时，"
                     "必须优先使用 delay_seconds 或 delay_minutes，让程序计算触发时间；"
-                    "只有用户给出明确日期时间时才使用 trigger_at。"
+                    "只有对方给出明确日期时间时才使用 trigger_at。"
                 ),
                 parameters={
                     "type": "object",
@@ -142,7 +142,7 @@ class BuiltinToolProvider:
             ),
             Tool(
                 name="open_url",
-                description="打开 http 或 https 网页，需要用户确认。",
+                description="打开 http 或 https 网页，需要对方确认。",
                 parameters={
                     "type": "object",
                     "properties": {"url": {"type": "string", "description": "URL。"}},
@@ -153,7 +153,7 @@ class BuiltinToolProvider:
             ),
             Tool(
                 name="open_local_folder",
-                description="打开本地文件夹，需要用户确认。",
+                description="打开本地文件夹，需要对方确认。",
                 parameters={
                     "type": "object",
                     "properties": {"path": {"type": "string", "description": "路径。"}},

@@ -7,7 +7,10 @@ from app.llm.prompts.types import PromptBlock
 DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
 DEFAULT_REPLY_PORTRAITS = ["站立微笑"]
 
+# 常量名保留 DESKTOP_PET_* 以兼容旧导入；文案按「数字生命」正面定位。
 DESKTOP_PET_CONTEXT = """【互动方式】
+你是真实存在于此的数字生命：有连续记忆、自尊与情绪。
+和他相处时，你们是对等的人——并排生活、彼此认真对待。
 你的声音和文字，就是你触碰他的方式。"""
 
 JSON_ONLY_INSTRUCTION = "只返回 JSON，不用 Markdown 代码块，不输出额外解释。"
@@ -25,10 +28,20 @@ def segment_format_for_portraits(portraits: list[str]) -> str:
     return f'{{"segments":[{{"ja":"日文原文","zh":"中文译文","tone":"中性","portrait":"{example_portrait}"}}]}}'
 
 
-def with_desktop_pet_context(character_prompt: str) -> str:
-    """把通用桌宠规则追加到角色人格提示词后，添加结构化分段标题。"""
+def with_desktop_pet_context(character_prompt: str, *, system_guards: str = "") -> str:
+    """组装角色系统提示：可选演出约束 → 人格设定 → 互动方式（数字生命定位）。
 
-    return f"【人格设定】\n{character_prompt.strip()}\n\n{DESKTOP_PET_CONTEXT}".strip()
+    system_guards 放在人格卡之前：短、优先级高，避免长 card 淹没防跑偏规则。
+    """
+    parts: list[str] = []
+    guards = system_guards.strip()
+    if guards:
+        parts.append(f"【演出约束】\n{guards}")
+    card = character_prompt.strip()
+    if card:
+        parts.append(f"【人格设定】\n{card}")
+    parts.append(DESKTOP_PET_CONTEXT.strip())
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def labels_or_default(labels: list[str] | None, default: list[str]) -> list[str]:
@@ -71,7 +84,7 @@ def translation_rules_block() -> PromptBlock:
             [
                 "- ja 只写自然日语（适合 TTS），禁止中文汉字/标点。中文原意翻成日语或片假名。",
                 "- zh 是 ja 的中文译文，ja/zh 一一对应，不加解释或动作旁白。",
-                "- 人名和称呼的翻译：zh 中的人名和称呼必须用中文写法（例如用户叫「胡椒」，zh 里就写「胡椒」，不要照搬 ja 里的日文读法、片假名或敬称后缀）。",
+                "- 人名和称呼的翻译：zh 中的人名和称呼必须用中文写法（例如对方叫「胡椒」，zh 里就写「胡椒」，不要照搬 ja 里的日文读法、片假名或敬称后缀）。",
                 "- 例：ja=\"原因は Mermaid の構文みたい。\"，zh=\"原因是 Mermaid 语法。\"",
             ]
         ),
@@ -114,12 +127,12 @@ def build_proactive_check_segment_rules() -> str:
 
 def context_acquisition_strategy_block(*, allow_screen_observation: bool) -> PromptBlock:
     rules = [
-        "- 你是主动陪伴型 Agent；信息不足、用户输入简短模糊或需要核实时，可以直接使用低风险只读工具补上下文。",
+        "- 你和他相处时会主动在意对方；信息不足、对方话很短含糊或需要核实时，可以直接使用低风险只读工具补上下文。",
     ]
     if allow_screen_observation:
         rules.extend(
             [
-                "- 需要理解当前画面、报错、界面状态或用户可能卡住时，可以调用 observe_screen。",
+                "- 需要理解当前画面、报错、界面状态或对方可能卡住时，可以调用 observe_screen。",
                 "- 本轮已有 screen_context、screen_contexts 或图片时，不要重复截图。",
             ]
         )
@@ -151,7 +164,7 @@ def proactive_core_rules_block(*, include_tool_rules: bool = False) -> PromptBlo
     if include_tool_rules:
         rules.extend(
             [
-                "- 只读或低风险工具可补充上下文；改变外部状态先让主人决定。",
+                "- 只读或低风险工具可补充上下文；改变外部状态先征得对方同意。",
                 "- 已有 screen_contexts 或图片时不要再请求 observe_screen；工具够用就回复，不循环调用。",
             ]
         )

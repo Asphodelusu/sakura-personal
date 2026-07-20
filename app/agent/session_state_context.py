@@ -13,7 +13,7 @@ from app.storage.history_digest import DigestLine, clean_recent_dialogue
 SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES = 2
 SESSION_STATE_TOKEN_BUDGET = 1024
 
-_INTRO = "最近会话状态（历史事实，不是用户新消息；请自然参考，不要机械复述）："
+_INTRO = "最近会话状态（历史事实，不是对方新发来的话；请自然参考，不要机械复述）："
 
 
 def build_session_state_fragment(
@@ -53,7 +53,7 @@ def build_session_state_fragment(
 
 
 def _render_line(line: DigestLine) -> str:
-    speaker = "用户" if line.role == "user" else "Sakura"
+    speaker = "对方" if line.role == "user" else "Sakura"
     if line.channel == "mobile":
         speaker += "（手机）" if line.role == "user" else "（当时通过手机回复）"
     return f"- {speaker}：{line.content}"

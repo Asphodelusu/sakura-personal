@@ -4,8 +4,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from app.agent.builtin_tools import create_mobile_tool_registry
 from app.agent.runtime import AgentRuntime
-from app.agent.tools.registry import ToolRegistry
 from app.config.character_loader import CharacterProfile, load_character_system_prompt
 from app.llm.api_client import ChatMessage, OpenAICompatibleClient
 from app.llm.context_trimming import trim_messages_for_model
@@ -22,7 +22,9 @@ MOBILE_CHANNEL_PROMPT_PATCH = PromptPatchContribution(
     patch_id=MOBILE_CHANNEL_PATCH_ID,
     system_prompt_append=(
         "【通信通道】你和对方现在正通过手机网页端聊天。"
-        "当前通道无法看到对方的电脑屏幕，也没有桌面工具可用。"
+        "当前通道无法看到对方的电脑屏幕，也没有桌面控制类工具。"
+        "长期记忆与电脑端共用：需要跨会话信息时用 memory_search；"
+        "对方明确要求记住/纠正/忘掉时，用 memory_remember、memory_update、memory_forget 写入电脑上的记忆。"
         "请像平时一样以平等、自然的关系交流，语气可以更口语、更贴近即时消息；"
         "不要假设对方正在查看电脑画面，也不要主动要求对方去看屏幕。"
     ),
@@ -147,6 +149,7 @@ class MobileChatBridge:
             raise ValueError("手机端只能使用桌面当前角色。")
         session = self._sessions.get(clean_id)
         if session is not None:
+            self._ensure_mobile_memory_tools(session)
             return session
 
         profile = self._host.character_registry.get(clean_id)
@@ -157,9 +160,8 @@ class MobileChatBridge:
             system_prompt=load_character_system_prompt(profile),
             reply_tones=profile.reply_tones,
             reply_portraits=profile.portrait_choices,
-            # Mobile has no confirmation UI yet. Do not advertise host tools
-            # and leave a user stranded with a pending high-risk action.
-            tools=ToolRegistry([]),
+            # 记忆读写走电脑端同一 MemoryStore；不含桌面控制/屏幕/需确认工具。
+            tools=create_mobile_tool_registry(memory_store),
             memory=memory_store,
             history_store=history_store,
             prompt_patches=self._mobile_prompt_patches(),
@@ -176,6 +178,12 @@ class MobileChatBridge:
         )
         self._sessions[profile.id] = session
         return session
+
+    def _ensure_mobile_memory_tools(self, session: _MobileCharacterSession) -> None:
+        """升级仍使用空工具表的旧手机 session，挂上记忆读写。"""
+        if session.runtime.tools.get("memory_remember") is not None:
+            return
+        session.runtime.tools = create_mobile_tool_registry(self._host.memory_store)
 
     def _mobile_prompt_patches(self) -> list[PromptPatchContribution]:
         """桌面插件补丁 + 手机通道补丁；保证每轮同步时通道提示不被冲掉。"""

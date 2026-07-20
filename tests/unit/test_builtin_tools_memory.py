@@ -44,16 +44,19 @@ def test_builtin_memory_update_accepts_new_content_alias() -> None:
         __import__("pathlib").Path("test_builtin_memory_update_alias"),
         memory=MemoryStore(memory_client=fake),
     )
-    remember_result = registry.execute("memory_remember", {"content": "主人喜欢热咖啡"})
-    memory_id = remember_result.content["memory"]["id"]
+    remember_result = registry.execute("memory_remember", {"content": "对方喜欢热咖啡"})
+    assert remember_result.success
+    memory = remember_result.content["memory"]
+    assert memory["metadata"]["source"] == "explicit"
+    memory_id = memory["id"]
 
     update_result = registry.execute(
         "memory_update",
         {
             "memory_id": memory_id,
-            "new_content": "主人喜欢低糖热咖啡",
+            "new_content": "对方喜欢低糖热咖啡",
         },
     )
 
     assert update_result.success
-    assert update_result.content["memory"]["content"] == "主人喜欢低糖热咖啡"
+    assert update_result.content["memory"]["content"] == "对方喜欢低糖热咖啡"

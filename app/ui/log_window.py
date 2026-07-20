@@ -95,7 +95,7 @@ _DETAIL_PRIORITY_KEYS = (
 _MAX_DETAIL_SUMMARY_ITEMS = 3
 _MAX_DETAIL_SUMMARY_VALUE_CHARS = 36
 _CATEGORY_DISPLAY_LABELS = {
-    "ScreenAwareness": "屏幕感知",
+    "ScreenAwareness": "屏幕感知",  # 旧批次路径；现行主动看屏日志在 ProactiveObserver
     "ProactiveObserver": "主动观察",
     "Memory": "记忆",
     "AgentRuntime": "Agent",

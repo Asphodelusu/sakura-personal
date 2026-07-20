@@ -93,6 +93,7 @@ _PROGRAM_GUI_CATEGORIES = frozenset({
     "ProactiveObserver",
 })
 _CATEGORY_MESSAGE_ALLOWLIST: dict[str, frozenset[str]] = {
+    # 旧 ScreenAwareness 批次日志；主动已改走 ProactiveObserver，下列条目多半只在残留/清理路径出现。
     "ScreenAwareness": frozenset({
         "主动屏幕上下文批次已附加",
         "主动屏幕上下文批次已清空",
