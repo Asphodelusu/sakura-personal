@@ -1,8 +1,11 @@
 # Sakura 安装与配置指南
 
-> **Personal Edition / 源码用户：** 请先看根目录 [README.md](../README.md) 的「快速开始（Windows CMD）」——本 fork 使用 `.venv` + `run.bat`，**不要**按下文安装 `runtime/` 或运行 `install.bat` / `start.bat`。  
-> API 配置见 [API_CONFIG.md](API_CONFIG.md)；macOS 专项见 [MACOS_SETUP.md](MACOS_SETUP.md)。  
-> 下文主要保留上游 **Release 完整包** 的安装说明，并补充角色包来源。
+> **Personal Edition（源码）优先：**  
+> 请按根目录 [README.md](../README.md) 的「快速开始」操作（`.venv` + `run.bat`）。  
+> **不要**按本文安装 `runtime/`，也不要运行上游的 `install.bat` / `start.bat`。  
+> API 配置见 [API_CONFIG.md](API_CONFIG.md)；macOS 见 [MACOS_SETUP.md](MACOS_SETUP.md)。
+>
+> 下文面向上游 **Release 完整包**（含预置 `runtime/`）用户；Personal Edition 仅可参考其中的角色包下载与首次配置截图说明。
 
 ---
 
