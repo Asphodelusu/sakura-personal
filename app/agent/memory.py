@@ -96,12 +96,13 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 DEFAULT_MEMORY_LANGUAGE_INSTRUCTIONS = (
     "Sakura 的长期记忆按两侧语言记录，不要一律强翻成同一种语言。"
-    "关于对方的事实、偏好、约定、协作规则与近况：用自然的简体中文写（便于检索）；"
+    "关于他（对方）的事实、偏好、约定、协作规则与近况：用自然的简体中文写（便于检索）；"
     "专有名词、代码、路径、ID、品牌名可保留原文。"
     "Sakura 自己的内心感受、心の記録式自语、对自己的反省：优先用自然的日语写。"
-    "若对方用日语说了值得原样保留的重要原话，日语原文可保留。"
-    "写法像私人日记：先写清谁对谁说了什么或约了什么，再写自己的感受；"
-    "用对方告诉你的名字，或「对方」「他/她」来称呼。"
+    "若他用日语说了值得原样保留的重要原话，日语原文可保留。"
+    "写法像私人日记，主语固定：「我」=Sakura自己，「他」=对方；"
+    "先写清谁对谁说了什么或约了什么，再写自己的感受；"
+    "已知名字时可用名字代替「他」，但「我」永远是 Sakura。"
     "输出 JSON 结构不变，只改变 memory/text 字段的自然语言内容。"
 )
 
@@ -2508,6 +2509,17 @@ def memory_record_is_expired(record: dict[str, Any], *, now: datetime | None = N
         if expires_at <= now:
             return True
     return False
+
+
+def memory_record_is_reflection(record: dict[str, Any]) -> bool:
+    """是否为独处反思（元认知），不应与情节/事实同等对待。"""
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    source = str(record.get("source") or metadata.get("source") or "").strip().lower()
+    category = str(record.get("category") or metadata.get("category") or "").strip().lower()
+    kind = str(
+        record.get("memory_kind") or metadata.get("memory_kind") or ""
+    ).strip().lower()
+    return source == "reflection" or category == "reflection" or kind == "reflection"
 
 
 def _memory_is_released(record: dict[str, Any]) -> bool:

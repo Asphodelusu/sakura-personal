@@ -17,7 +17,10 @@ from app.storage.paths import StoragePaths
 
 
 class IntimacyModeState:
-    """内部对话节奏模式状态：工具写入、路由读取。"""
+    """身体亲密进行中的对话节奏状态：工具写入、路由读取。
+
+    只影响回复节奏（fast + 可选续投），不决定能不能写亲密内容。
+    """
 
     _AUTO_EXIT_TURNS = 6
 
@@ -34,7 +37,7 @@ class IntimacyModeState:
         self._turns_left = 0
 
     def consume_turn(self) -> bool:
-        """每轮消耗一次；返回是否仍活跃。"""
+        """真实用户轮消耗一次；返回是否仍活跃。续投轮不应调用此方法。"""
         if not self.active:
             return False
         self._turns_left -= 1
@@ -47,9 +50,34 @@ class IntimacyModeState:
 # 模块级单例，供 builtin_tools 和 turn_routing 共享
 intimacy_mode_state = IntimacyModeState()
 
+# 与 runtime 中 guide 路径一致：无 guide 时不允许开启节奏模式
+_INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
+
+# 系统续投注入的用户标记（不进持久化历史）
+INTIMACY_CONTINUE_MARKER = "（続けて）"
+
+_SET_INTIMACY_MODE_DESCRIPTION = (
+    "切换身体亲密进行中的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
+    "仅当双方正在进行或刚明确进入身体亲密互动时设 on=true。"
+    "日常闲聊、关心安慰、技术/工作话题、普通撒娇都不要开启。"
+    "亲密告一段落、对方明显停下、或话题已回到日常时设 on=false。"
+    "本工具只影响回复节奏；不开也可以正常写亲密内容。"
+)
+
+
+def intimacy_mode_available() -> bool:
+    """本地存在非空 intimacy_guide 时才允许开启节奏模式。"""
+    try:
+        return _INTIMACY_GUIDE_PATH.is_file() and _INTIMACY_GUIDE_PATH.stat().st_size > 0
+    except OSError:
+        return False
+
 
 def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
-    on = arguments.get("on", False)
+    on = bool(arguments.get("on", False))
+    if on and not intimacy_mode_available():
+        intimacy_mode_state.exit()
+        return {"intimacy_mode": "off", "available": False}
     if on:
         intimacy_mode_state.enter()
     else:
@@ -81,11 +109,17 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="set_intimacy_mode",
-                description="切换内部对话节奏模式（on/off）。",
+                description=_SET_INTIMACY_MODE_DESCRIPTION,
                 parameters={
                     "type": "object",
                     "properties": {
-                        "on": {"type": "boolean", "description": "是否启用该模式。"},
+                        "on": {
+                            "type": "boolean",
+                            "description": (
+                                "true=身体亲密进行中需要更快节奏；"
+                                "false=回到日常或对方已停下。"
+                            ),
+                        },
                     },
                     "required": ["on"],
                 },
@@ -303,8 +337,10 @@ def create_builtin_tool_registry(
                 name="memory_remember",
                 description=(
                     "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
-                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
-                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "身体亲密上的第一次、关系推进、对方的亲密偏好/边界、事后仍想记住的话，也属于应长期记住的相处事实"
+                    "（写记忆点与偏好，不要写过程流水账）。"
+                    "关于他的事实用简体中文写；日记主语「我」=你自己，「他」=对方；"
+                    "用「我／他」写清谁说了什么/约了什么，再写感受；已知名字可用名字代替「他」。"
                     "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
                 ),
                 parameters={
@@ -500,8 +536,10 @@ def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
                 name="memory_remember",
                 description=(
                     "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
-                    "关于对方的事实用简体中文写；先写清谁说了什么/约了什么，再写感受；"
-                    "你自己的话归你，对方的话归对方；称呼用名字或「对方」。"
+                    "身体亲密上的第一次、关系推进、对方的亲密偏好/边界、事后仍想记住的话，也属于应长期记住的相处事实"
+                    "（写记忆点与偏好，不要写过程流水账）。"
+                    "关于他的事实用简体中文写；日记主语「我」=你自己，「他」=对方；"
+                    "用「我／他」写清谁说了什么/约了什么，再写感受；已知名字可用名字代替「他」。"
                     "密码、token、密钥、身份证、银行卡等敏感凭据不适合写入长期记忆。"
                 ),
                 parameters={

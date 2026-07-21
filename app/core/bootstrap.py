@@ -181,6 +181,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         llm_clients.memory_curation,
         memory_store,
         system_prompt=system_prompt,
+        character_name=character_profile.display_name,
     )
     screen_awareness_settings = settings_service.load_screen_awareness_settings()
 

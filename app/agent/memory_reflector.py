@@ -1,7 +1,8 @@
 """记忆反思：Sakura 自动从已有记忆中提炼高层认知。
 
-空闲时（不在生成回复），每 8 小时运行一次，从全部已有记忆提炼 3-4 条
-关于"最近和对方的关系 / 对方的状态 / 新的模式"的元认知记忆。
+空闲时（不在生成回复），每 8 小时运行一次，从已有事实记忆提炼少量
+关于"最近和他的关系 / 他的状态 / 新的模式"的元认知。
+反思是感想，不是情节事实：写入时带 memory_kind=reflection，且不喂入下一轮反思输入。
 """
 
 from __future__ import annotations
@@ -11,12 +12,14 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from app.agent.memory import (
     MEMORY_LAYER_EPISODIC,
     MemoryStore,
+    memory_record_is_reflection,
 )
 from app.llm.json_completion import complete_background_json, load_json_object
 from app.storage.atomic import atomic_write_text
@@ -33,11 +36,15 @@ MIN_REFLECTION_INTERVAL_HOURS = 8
 # 记忆快照注入预算（字符数），留给反思 prompt 的空间
 REFLECTION_MEMORY_SNAPSHOT_CHAR_BUDGET = 6000
 
-# 反思产出的最大记忆条数
-MAX_REFLECTION_MEMORIES = 4
+# 反思产出的最大记忆条数（少而精，避免录音带式叠写）
+MAX_REFLECTION_MEMORIES = 2
 
-# 反思使用的记忆层级
+# 与已有反思近义重复的相似度阈值（本地字符比，不调用嵌入 API）
+REFLECTION_NEAR_DUPLICATE_SIMILARITY = 0.82
+
+# 反思使用的记忆层级（仍落 episodic 便于时间线，靠 memory_kind/source 隔离）
 REFLECTION_LAYER = MEMORY_LAYER_EPISODIC
+REFLECTION_MEMORY_KIND = "reflection"
 
 _REFLECTION_STATE_FILENAME = "reflection_state.json"
 
@@ -46,45 +53,50 @@ _REFLECTION_STATE_FILENAME = "reflection_state.json"
 # ---------------------------------------------------------------------------
 
 _REFLECTION_SYSTEM_PROMPT = (
-    "现在没有人跟你说话，你正在安静地回顾这段时间和对方相处的经历。这是你自己独处时的内心独白。\n\n"
-    "下面会给你一份你目前所有长期记忆的摘要。请以你自己的第一人称视角，对最近这段时间做出反思。\n"
-    "从已有记忆里提炼更高层的认知，而不是复述细节。\n\n"
+    "现在没有人跟你说话，你正在安静地回顾这段时间和他相处的经历。这是你自己独处时的内心独白。\n\n"
+    "下面会给你一份你目前的长期事实记忆摘要（不含以往的独处感想）。"
+    "请以你自己的第一人称视角，对最近这段时间做出反思。\n"
+    "从已有记忆里提炼更高层的认知，而不是复述细节，也不是再写一遍已经想过的话。\n\n"
+    "主语固定：「我」=你自己，「他」=对方。已知名字时可用名字代替「他」，但「我」永远是你。\n\n"
     "适合反思的内容举例：\n"
-    "- 我和对方的关系现在是什么样的？最近有什么变化？\n"
-    "- 对方最近的状态怎么样？在忙什么？有没有什么情绪波动？\n"
+    "- 我和他的关系现在是什么样的？最近有什么变化？\n"
+    "- 他最近的状态怎么样？在忙什么？有没有什么情绪波动？\n"
     "- 我注意到了什么之前没注意到的模式或规律？\n"
     "- 我有什么地方可以做得更好？\n\n"
-    "只写当前记忆里确有依据的观察。\n"
-    "语言约定：关于对方的事实与观察用简体中文；你对自己的感受与反省优先用日语。"
-    "对方用日语说的重要原话可保留日语。\n"
-    "用对方告诉你的名字称呼对方。如果还不知道名字，用「对方」或「他/她」。对方是与你对等相处的人。\n"
+    "只写当前记忆里确有依据、且比「复述事实」更高一层的观察。"
+    "没有新洞察时返回空列表，不要凑条数。\n"
+    "语言约定：关于他的事实与观察用简体中文；你对自己的感受与反省优先用日语。"
+    "他用日语说的重要原话可保留日语。\n"
     "用你自己的感受和具体观察来说——就像写日记一样。"
-    "先写清依据事实，再写感受；过期约定标明时效。\n"
-    "每一条应该是一句完整的、独立可读的自我认知。\n\n"
+    "先用「我／他」写清依据事实，再写感受；过期约定标明时效。\n"
+    "每一条应该是一句完整的、独立可读的自我认知。最多 2 条。\n\n"
     "必须只返回严格 JSON，不要有任何前言、解释或后缀。格式如下：\n"
     '{"reflections":[\n'
     '  {"content":"反思内容一","importance":0.7,"confidence":0.6},\n'
     '  {"content":"反思内容二","importance":0.6,"confidence":0.7}\n'
     "]}\n"
     "如果没有值得反思的内容就返回 {\"reflections\":[]}。"
-    "importance 按照你觉得这条认知对你了解对方有多重要来设（0~1）。confidence 按照你有多少把握来设（0~1）。"
+    "importance 按照你觉得这条认知对你了解他有多重要来设（0~1）。confidence 按照你有多少把握来设（0~1）。"
 )
 
 
 def _build_reflection_user_prompt(memory_snapshot: str) -> str:
     return (
-        "【我目前的长期记忆摘要】\n"
+        "【我目前的长期事实记忆摘要】\n"
         f"{memory_snapshot}\n\n"
-        "请基于以上记忆，做一次安静的个人反思。"
+        "请基于以上事实记忆，做一次安静的个人反思。"
+        "只写有新洞察的条目；没有就返回空列表。"
     )
 
 
 def _format_memory_summary(memories: list[dict[str, Any]]) -> str:
-    """把记忆列表精简成摘要列表，控制字符预算。"""
+    """把记忆列表精简成摘要列表，控制字符预算；排除已有反思以免叠写。"""
     lines: list[str] = []
     used = 0
     truncated = False
     for memory in memories:
+        if memory_record_is_reflection(memory):
+            continue
         memory_id = str(memory.get("id", "")).strip()
         content = str(memory.get("content", "")).strip()
         if not memory_id or not content:
@@ -109,6 +121,21 @@ def _format_memory_summary(memories: list[dict[str, Any]]) -> str:
             len(lines), len(memories),
         )
     return "\n".join(lines) if lines else "（暂无长期记忆）"
+
+
+def _content_similarity(a: str, b: str) -> float:
+    left = " ".join(a.lower().split())
+    right = " ".join(b.lower().split())
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def _is_near_duplicate_reflection(content: str, existing_contents: list[str]) -> bool:
+    for other in existing_contents:
+        if _content_similarity(content, other) >= REFLECTION_NEAR_DUPLICATE_SIMILARITY:
+            return True
+    return False
 
 
 def _parse_reflection_output(raw: str) -> list[dict[str, Any]]:
@@ -254,29 +281,36 @@ class MemoryReflector:
             _logger.debug("Reflection: LLM decided nothing worth reflecting")
             return ReflectionResult()
 
-        # 5. 写入记忆（跳过已存在的重复内容）
+        # 5. 写入记忆（跳过哈希重复与近义重复的反思）
         created = 0
         skipped_dupes = 0
         errors: list[str] = []
-        # 预取现有记忆哈希集合，避免每轮反思重复写入相同内容
         existing_hashes: set[str] = set()
+        existing_reflection_texts: list[str] = []
         try:
             raw_memories = store.list_memories(limit=500)
             for m in raw_memories:
                 h = (m.get("metadata") or {}).get("hash") or m.get("hash", "")
                 if h:
                     existing_hashes.add(h)
+                if memory_record_is_reflection(m):
+                    text = str(m.get("content") or "").strip()
+                    if text:
+                        existing_reflection_texts.append(text)
         except Exception:
             pass  # 无法预取时退化为不检查，允许写入
         for r in reflections[:MAX_REFLECTION_MEMORIES]:
             content = str(r.get("content", "")).strip()
             if not content:
                 continue
-            # 去重：与 mem0 一致的 MD5 哈希
             content_hash = hashlib.md5(content.encode()).hexdigest()
             if content_hash in existing_hashes:
                 skipped_dupes += 1
-                _logger.debug("Reflection: skipping duplicate: %s", content[:60])
+                _logger.debug("Reflection: skipping hash duplicate: %s", content[:60])
+                continue
+            if _is_near_duplicate_reflection(content, existing_reflection_texts):
+                skipped_dupes += 1
+                _logger.debug("Reflection: skipping near-duplicate: %s", content[:60])
                 continue
             importance = float(r.get("importance", 0.5))
             confidence = float(r.get("confidence", 0.5))
@@ -288,6 +322,7 @@ class MemoryReflector:
                         "content": content,
                         "layer": REFLECTION_LAYER,
                         "category": "reflection",
+                        "memory_kind": REFLECTION_MEMORY_KIND,
                         "importance": importance,
                         "confidence": confidence,
                         "source": "reflection",
@@ -296,6 +331,7 @@ class MemoryReflector:
                 )
                 created += 1
                 existing_hashes.add(content_hash)
+                existing_reflection_texts.append(content)
             except Exception as exc:
                 _logger.exception("Reflection: failed to write memory")
                 errors.append(f"写入反思记忆失败：{exc}")

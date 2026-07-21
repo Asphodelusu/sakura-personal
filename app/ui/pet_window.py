@@ -3273,8 +3273,9 @@ class PetWindow(QWidget):
     # 亲密模式自动续投
     # ------------------------------------------------------------------
 
-    _INTIMACY_CONTINUE_MAX = 5
-    _INTIMACY_CONTINUE_DELAY_MS = 15_000
+    # 续投偏克制：误开时少刷屏；真亲密可由模型再次 on=true 刷新寿命
+    _INTIMACY_CONTINUE_MAX = 3
+    _INTIMACY_CONTINUE_DELAY_MS = 20_000
 
     def _schedule_intimacy_continue(self) -> None:
         """亲密模式回复完成后，启动续投计时器。"""
@@ -3300,15 +3301,17 @@ class PetWindow(QWidget):
 
     def _is_intimacy_continue_turn(self) -> bool:
         """判断当前轮次是否由续投触发（末条 user 消息为続けて）。"""
+        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+
         for msg in reversed(self.messages):
             if isinstance(msg, dict) and msg.get("role") == "user":
-                return msg.get("content") == "（続けて）"
+                return msg.get("content") == INTIMACY_CONTINUE_MARKER
         return False
 
     @Slot()
     def _on_intimacy_continue_timer(self) -> None:
         """计时器到期：检查条件，触发续投。"""
-        from app.agent.builtin_tools import intimacy_mode_state
+        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER, intimacy_mode_state
 
         if not intimacy_mode_state.active:
             return
@@ -3329,11 +3332,9 @@ class PetWindow(QWidget):
             self._intimacy_continue_timer.start(2000)
             return
 
-        # reaffirm：续投不消耗亲密模式轮数
-        intimacy_mode_state.enter()
-
+        # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
         self._intimacy_continue_count += 1
-        text = "（続けて）"
+        text = INTIMACY_CONTINUE_MARKER
         self._begin_interaction("intimacy_continue")
 
         # 写入内存上下文（保持 user/assistant 交替），但不进持久化历史
@@ -5111,6 +5112,7 @@ class PetWindow(QWidget):
         return (
             self.worker_thread is not None
             or getattr(self, "reflection_worker", None) is not None
+            or self.memory_curation_thread is not None
             or bool(self.active_event_type)
             or self.active_reminder_id is not None
         )
@@ -5239,6 +5241,7 @@ class PetWindow(QWidget):
             return False
         return (
             self.memory_curation_thread is None
+            and getattr(self, "reflection_worker", None) is None
             and self.pending_tool_action is None
             and self.pending_screen_observation_messages is None
             and self.pending_screen_observation_event is None
@@ -5273,6 +5276,7 @@ class PetWindow(QWidget):
         worker_curator = self.memory_curator.snapshot(
             memory_store=self.memory_store.scoped(self.character_profile.id),
             system_prompt=self.system_prompt,
+            character_name=self.character_profile.display_name,
         )
         worker = MemoryCurationWorker(worker_curator, entries)
         self.resource_manager.spawn_qt_worker(
@@ -7472,6 +7476,7 @@ class PetWindow(QWidget):
         self.character_profile = profile
         self.system_prompt = load_character_system_prompt(profile)
         self.memory_curator.set_system_prompt(self.system_prompt)
+        self.memory_curator.set_character_name(profile.display_name)
         self.memory_store.set_scope(profile.id)
         self.agent_runtime.update_character(
             self.system_prompt,
