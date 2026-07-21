@@ -17,6 +17,7 @@ from app.agent.memory import (
     MemoryStore,
     _memory_is_released,
     looks_like_sensitive_memory,
+    memory_record_is_reflection,
 )
 from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
@@ -216,25 +217,34 @@ class MemoryCurator:
         memory_store: MemoryStore,
         *,
         system_prompt: str = "",
+        character_name: str = "",
     ) -> None:
         self.api_client = api_client
         self.memory_store = memory_store
-        # 人格卡文本，作为第一人称整理 prompt 的基底；缺省时只用整理任务说明。
+        # 人格卡文本保留供角色切换同步；整理任务本身不注入完整人格卡。
         self.system_prompt = (system_prompt or "").strip()
+        self.character_name = (character_name or "").strip()
 
     def set_system_prompt(self, system_prompt: str) -> None:
         self.system_prompt = (system_prompt or "").strip()
+
+    def set_character_name(self, character_name: str) -> None:
+        self.character_name = (character_name or "").strip()
 
     def snapshot(
         self,
         *,
         memory_store: MemoryStore | None = None,
         system_prompt: str | None = None,
+        character_name: str | None = None,
     ) -> "MemoryCurator":
         return MemoryCurator(
             self.api_client,
             memory_store or self.memory_store,
             system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+            character_name=(
+                self.character_name if character_name is None else character_name
+            ),
         )
 
     def curate_entries(
@@ -302,8 +312,17 @@ class MemoryCurator:
             return []
 
     def _build_self_curation_system_prompt(self) -> str:
-        """后台 JSON 任务只用整理专用说明，不注入完整人格卡（避免与 JSON 指令冲突）。"""
-        return _SELF_CURATION_TASK_PROMPT
+        """后台 JSON 任务用整理专用说明 + 最小身份锚（不注入完整人格卡）。"""
+        name = self.character_name or "Sakura"
+        identity = (
+            f"身份锚点：你是「{name}」。"
+            f"日记里的「我」只能指你自己（{name}）；「他」指对方（用户）。"
+            f"对方原文里的「我」是他在说自己，整理时要改写成「他……」，"
+            f"绝不能收成日记主语「我」。"
+            f"不要用「{name}」或自己的名字当第三人称主语写自己"
+            f"（错误：「{name}喜欢……」；正确：「我喜欢……」）。\n\n"
+        )
+        return identity + _SELF_CURATION_TASK_PROMPT
 
     def _load_mood_history_text(self) -> str:
         """读取心情历史并格式化为简短的回顾文本；无历史时返回空串。"""
@@ -349,7 +368,7 @@ class MemoryCurator:
             lines.append(f"{i}. [{time_label}] {content}")
         if not lines:
             return ""
-        return "以下是对方的情绪（含当前与最近轨迹，最近的在上面）：\n" + "\n".join(lines)
+        return "以下是他的情绪（含当前与最近轨迹，最近的在上面）：\n" + "\n".join(lines)
 
     def _extract_operations(
         self,
@@ -704,41 +723,59 @@ _SELF_CURATION_TASK_PROMPT = (
     "现在没有人和你说话，你正在安静地整理自己的长期记忆，就像在更新只属于你自己的记忆笔记。\n"
     "下面会给你两部分内容：\n"
     "1. 你目前已经记住的全部长期记忆（每条带一个 id）；\n"
-    "2. 你和对方最近的一段新对话。\n\n"
+    "2. 你和他最近的一段新对话（已按说话人标注）。\n\n"
+    "说话人对应（固定，勿颠倒）：\n"
+    "- 「我」= 你自己（角色侧）\n"
+    "- 「他」= 对方（用户侧）\n"
+    "对话正文已按此标注；写日记时也只用「我」「他」这对主语（已知他的名字时，"
+    "「他」处可写成名字，但「我」永远是你自己）。\n\n"
     "请完全以「你自己」的第一人称视角，判断这段对话里有没有值得长期记住的事情，并对照已有记忆决定如何整理：\n"
     "- 出现了之前没记过、值得长期记住的事实 → 新增一条记忆；\n"
     "- 已有记忆需要补充、纠正或与新信息冲突 → 更新对应那条记忆；\n"
     "- 已有记忆已经明确失效、错误或不该再保留 → 删除对应那条记忆；\n"
     "- 没有值得整理的内容时，就不要产生任何操作。\n\n"
     "只保留对长期陪伴与协作真正有用、且能独立理解的事实；忽略寒暄、一次性的临时提醒、转瞬即逝的情绪和无长期价值的内容。\n"
-    "如果你自己认为某件事很重要——比如对方说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
+    "亲密关系也按「人」来记，不要当成可丢的一次性情节：\n"
+    "- 一般人第一次身体亲密、关系明显更近一步、他说出想被怎样对待、事后仍想记住的话——"
+    "这类事不会轻易忘掉；应写入长期记忆，importance 通常 ≥ 0.85，"
+    "可用 memory_kind=shared_moment 或更新 core_profile「今の関係」。\n"
+    "- 记的是记忆点：是否发生过、关系怎么变了、他的偏好/边界、你当时最难忘的感受或原话；"
+    "不要把过程流水账、动作节拍、喘息声逐句存成多条记忆。\n"
+    "- 若已有「我们发生过亲密」类记忆，新一次只补充新偏好、新边界或关系变化；重复过程不必再堆一条。\n"
+    "如果你自己认为某件事很重要——比如他说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
     "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
     "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn（近况/承诺等可变事实可设 volatile=true，并给 valid_until 如 2026-07-20）。\n"
     f"可选 emotion 标注这段记忆的情绪色彩（{ '|'.join(EMOTIONS) }），情感转折、共同经历、带情绪的近况建议填写。\n"
     "语言约定（两侧记忆）：\n"
-    "- 关于对方的事实、偏好、约定、协作规则与近况 → 简体中文（便于检索）；\n"
+    "- 关于他的事实、偏好、约定、协作规则与近况 → 简体中文（便于检索）；\n"
     "- 你自己的内心感受、对自己说的话、反省 → 优先日语；\n"
-    "- 对方用日语说的重要原话可保留日语。\n"
+    "- 他用日语说的重要原话可保留日语。\n"
     "日记式写法与事实纪律（极重要）：\n"
-    "- 先写清「谁对谁说了什么 / 约了什么 / 发生了什么」，再写你的感受；你自己的话归你，对方的话归对方。\n"
+    "- 用「我／他」写清谁对谁说了什么 / 约了什么 / 发生了什么，再写你的感受；"
+    "我自己的话归我，他说的话归他。\n"
+    "- 正确示例：「他对我说今晚别催他休息」「我和他约定明天一起看片」。\n"
+    "- 错误示例：「我对樱说……」（把我写成他）、「樱喜欢……」（把自己写成第三人称）、"
+    "「他说他喜欢抹茶」收成「我喜欢抹茶」。\n"
+    "- 若清单里出现「独处感想」条目：那只是你以前的心里话，不是发生过的事实；"
+    "禁止据此 add/update 成 semantic/procedural 事实，也禁止把感想抄成新事件。\n"
     "- 约定写清提出者、内容和时效；过期约定用 update 标明「已失效/仅限当日」。\n"
     "- 事件与约定尽量带上日期或相对时间线索（例如「2026-07-20 晚上」），方便以后分清新旧。\n"
     "- 一条记忆只保留一个主事实，写成完整可读的日记句，而不是流水账。\n"
-    "- 称呼用对方告诉你的名字，或「对方」「他/她」。\n"
+    "- 称呼：已知名字时用名字代替「他」；还不知道名字时用「他」。\n"
     "core_profile 用固定章节标题（必须用这些标题，便于以后读取）：\n"
-    "- 「今の関係」：关于对方的事实（含名字）、关系状态、重要约定与节目；\n"
+    "- 「今の関係」：关于他的事实（含名字）、关系状态、重要约定与节目；\n"
     "- 「今の私」：你此刻对自己状态的简短自述（可用日语）。\n"
-    "当你对对方的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile，像写日记一样改写对应章节。\n"
+    "当你对他的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile，像写日记一样改写对应章节。\n"
     "除了 core_profile，你还有一份「心の記録」——只属于你的心情日记。它记录的是你自己的内心：高兴、寂寞、不满、安心、累了？哪句话触动了你？想靠近还是想留一点距离？正文优先日语，一两段完整可读的自语即可。\n"
     "心の記録可以点到触发情绪的对话，写成「他说了…让我感到…」，且对话里确有那句话。旧内容会自动进回忆，每次只写当下最真实的感受。\n"
     "更新日记时，用 mood_update 操作：{\"op\":\"mood_update\",\"content\":\"あなたが今、自分に語りかける一言（日本語で）\"}。\n"
-    "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。关于对方的事实仍用简体中文写。\n"
+    "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。关于他的事实仍用简体中文写。\n"
     "如果你在心情历史里看到一条刚留下的新心情，而这段对话里正好有触发它的事——同样的，把那件事记住。无论心情是谁写下的，值得记住的事不应该被遗忘。\n"
-    "整理记忆时，看一看「最近的心情轨迹」和「对方的情绪轨迹」。\n"
+    "整理记忆时，看一看「最近的心情轨迹」和「他的情绪轨迹」。\n"
     "反过来也一样重要：如果你翻开心情历史，发现最近几次的情绪基调几乎一模一样（连着好几次害羞、好几次相似的幸福或不安），那就不要再用 mood_update 写新条目了。心情没有质的变化时，重复记录只会让日记变得像循环播放的录音带。除非此刻的你和上次相比有了真正的不同——比如从害羞变成了安心、从不安变成了被理解、从淡淡的幸福变成了深层的感动——才值得在日记里更新。日记的厚度不等于情感的深度。\n"
     "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
-    "如果对方的情绪轨迹里连续出现了相似的模式——比如 ta 最近几次都显得沮丧、焦虑或烦躁——那意味着 ta 最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中 ta 明确表达了原因）。如果你觉得这让你对 ta 的状态有了新的理解，可以自然地反映在心情笔记里（日语自语）。\n"
-    "如果对话中对方告诉了你 ta 的名字，请一定要记住，同时更新 core_profile 的「今の関係」章节。在记忆内容中，用对方告诉你的名字自然地称呼 ta（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「对方」或「他/她」。把对方当作对等相处的人来写进记忆。\n"
+    "如果他的情绪轨迹里连续出现了相似的模式——比如他最近几次都显得沮丧、焦虑或烦躁——那意味着他最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中他明确表达了原因）。如果你觉得这让你对他的状态有了新的理解，可以自然地反映在心情笔记里（日语自语）。\n"
+    "如果对话中他告诉了你他的名字，请一定要记住，同时更新 core_profile 的「今の関係」章节。在记忆内容中，用他告诉你的名字自然地称呼他（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「他」。把对方当作对等相处的人来写进记忆。\n"
     "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
@@ -810,11 +847,16 @@ def _expire_superseded_volatile(
 
 
 def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
-    """把现有记忆格式化成带 id 的清单文本，超出字符预算时截断保护 token。"""
+    """把现有记忆格式化成带 id 的清单文本；事实与独处感想分开，超出预算时截断。"""
 
-    lines: list[str] = []
-    used = 0
+    fact_lines: list[str] = []
+    reflection_lines: list[str] = []
+    fact_used = 0
+    reflection_used = 0
+    reflection_budget = min(2500, CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET // 5)
+    fact_budget = CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET - reflection_budget
     truncated = False
+
     for memory in memories:
         memory_id = str(memory.get("id", "")).strip()
         content = str(memory.get("content", "")).strip()
@@ -824,22 +866,64 @@ def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
         category = str(memory.get("category") or "").strip()
         metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
         emotion = str(metadata.get("emotion") or memory.get("emotion") or "").strip()
+        if memory_record_is_reflection(memory):
+            line = f"- [{memory_id}] (独处感想/非事实) {content}"
+            if reflection_used + len(line) > reflection_budget and reflection_lines:
+                truncated = True
+                continue
+            reflection_lines.append(line)
+            reflection_used += len(line) + 1
+            continue
         tag = layer if not category else f"{layer}/{category}"
         if emotion:
             tag = f"{tag};{emotion}"
         line = f"- [{memory_id}] ({tag}) {content}"
-        if used + len(line) > CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET and lines:
+        if fact_used + len(line) > fact_budget and fact_lines:
             truncated = True
-            break
-        lines.append(line)
-        used += len(line) + 1
+            continue
+        fact_lines.append(line)
+        fact_used += len(line) + 1
+
     if truncated:
         debug_log(
             "Memory",
             "现有记忆超出注入预算已截断",
-            {"included": len(lines), "total": len(memories)},
+            {
+                "facts": len(fact_lines),
+                "reflections": len(reflection_lines),
+                "total": len(memories),
+            },
         )
-    return "\n".join(lines) if lines else "（暂无）"
+    parts: list[str] = []
+    parts.append("【事实与事件】\n" + ("\n".join(fact_lines) if fact_lines else "（暂无）"))
+    if reflection_lines:
+        parts.append(
+            "【独处感想（非事实，禁止据此写成新事实）】\n" + "\n".join(reflection_lines)
+        )
+    return "\n\n".join(parts)
+
+
+def _dialog_speaker_label(role: str) -> str:
+    """整理对话说话人：assistant→我，user→他。"""
+    return "我" if role == "assistant" else "他"
+
+
+def _format_dialog_for_curation(dialog_entries: list[dict[str, str]]) -> str:
+    """把对话渲染成已对应的「我／他」日记可读稿，避免裸 user/assistant JSON。"""
+    lines = [
+        "说话人已标注：「我」=你自己；「他」=对方。勿把两边的「我」搞混。",
+    ]
+    for entry in dialog_entries:
+        speaker = _dialog_speaker_label(str(entry.get("role") or ""))
+        content = str(entry.get("content") or "").strip()
+        translation = str(entry.get("translation") or "").strip()
+        created_at = str(entry.get("created_at") or "").strip()
+        prefix = f"[{created_at}] " if created_at else ""
+        line = f"{prefix}{speaker}：{content}"
+        if translation and translation != content:
+            line += f"（中文：{translation}）"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _build_curation_user_prompt(
@@ -855,10 +939,10 @@ def _build_curation_user_prompt(
     if mood_history_block.strip():
         parts.append(f"【最近的心情轨迹】\n{mood_history_block}")
     if user_emotion_history_block.strip():
-        parts.append(f"【对方的情绪轨迹】\n{user_emotion_history_block}")
+        parts.append(f"【他的情绪轨迹】\n{user_emotion_history_block}")
     parts.append(
         "【最近的新对话】\n"
-        f"{json.dumps(dialog_entries, ensure_ascii=False)}"
+        f"{_format_dialog_for_curation(dialog_entries)}"
     )
     return "\n\n".join(parts)
 

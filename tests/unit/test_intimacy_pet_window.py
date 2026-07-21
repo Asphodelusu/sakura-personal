@@ -22,9 +22,11 @@ class TestIsIntimacyContinueTurn:
     @staticmethod
     def _is_intimacy_continue_turn(messages: list[dict]) -> bool:
         """内联拷贝自 PetWindow._is_intimacy_continue_turn，保持同步。"""
+        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+
         for msg in reversed(messages):
             if isinstance(msg, dict) and msg.get("role") == "user":
-                return msg.get("content") == "（続けて）"
+                return msg.get("content") == INTIMACY_CONTINUE_MARKER
         return False
 
     def test_continue_turn_detected(self) -> None:
@@ -89,6 +91,23 @@ class TestMemoryTurnSkip:
             and "_record_completed_memory_turn" in _pet_window_source_content()
         )
         assert src_check, "记忆轮次应被 _is_intimacy_continue_turn 守卫"
+
+
+class TestContinueDoesNotResetLifetime:
+    """续投不得再调用 enter() 重置自动退出计数。"""
+
+    def test_continue_handler_does_not_reenter(self) -> None:
+        assert not _pet_window_source_contains("intimacy_mode_state.enter()"), (
+            "续投计时器不应再调用 enter()，否则会拖长误开寿命"
+        )
+        assert _pet_window_source_contains("INTIMACY_CONTINUE_MARKER"), (
+            "续投标记应使用共享常量 INTIMACY_CONTINUE_MARKER"
+        )
+
+    def test_continue_max_is_conservative(self) -> None:
+        assert _pet_window_source_contains("_INTIMACY_CONTINUE_MAX = 3"), (
+            "续投次数应偏克制，降低误开刷屏"
+        )
 
 
 def _pet_window_source_content() -> str:

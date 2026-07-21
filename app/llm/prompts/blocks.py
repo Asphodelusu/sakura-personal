@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.llm.prompts.render import render_blocks
 from app.llm.prompts.types import PromptBlock
 
@@ -42,6 +44,84 @@ def with_desktop_pet_context(character_prompt: str, *, system_guards: str = "") 
     if card:
         parts.append(f"【人格设定】\n{card}")
     parts.append(DESKTOP_PET_CONTEXT.strip())
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+_INTIMACY_FOCUS_OVERLAY = """【当下专注】
+此刻注意力在眼前的触感、气息与对方的反应上。
+保留你是谁、你们是什么关系就够了；日常习惯、兴趣清单、长篇设定不必主动展开，也不要突然切回日常旁白或复述人设。"""
+
+# 亲密模式只留人格卡前段身份锚；完整 card 约 10KB，兴奋时不需要整份。
+_INTIMACY_PERSONA_CHAR_BUDGET = 720
+
+
+def _split_labeled_prompt_sections(text: str) -> list[tuple[str | None, str]]:
+    """按【标题】切开系统提示；无标题的前缀 title=None。"""
+    pattern = re.compile(r"【([^】]+)】")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [(None, text.strip())] if text.strip() else []
+    sections: list[tuple[str | None, str]] = []
+    first = matches[0]
+    leading = text[: first.start()].strip()
+    if leading:
+        sections.append((None, leading))
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        sections.append((match.group(1).strip(), body))
+    return sections
+
+
+def _trim_keep_start(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rstrip()
+    # 尽量在段落边界收束，避免半句设定
+    for sep in ("\n\n", "\n", "。", "；", "，"):
+        pos = cut.rfind(sep)
+        if pos >= max_chars // 2:
+            cut = cut[: pos + len(sep)].rstrip()
+            break
+    return f"{cut}\n…（亲密中从简）"
+
+
+def soften_character_card_for_intimacy(
+    system_prompt: str,
+    *,
+    max_persona_chars: int = _INTIMACY_PERSONA_CHAR_BUDGET,
+) -> str:
+    """亲密模式弱化人格卡：保留演出约束与短身份锚，压缩日常人设细节。"""
+    text = system_prompt.strip()
+    if not text:
+        return _INTIMACY_FOCUS_OVERLAY
+    parts: list[str] = []
+    for title, body in _split_labeled_prompt_sections(text):
+        if title == "人格设定":
+            trimmed = _trim_keep_start(body, max_persona_chars)
+            if trimmed:
+                parts.append(f"【人格设定】\n{trimmed}")
+            continue
+        if title == "演出约束":
+            if body:
+                parts.append(f"【演出约束】\n{body}")
+            continue
+        if title == "互动方式":
+            if body:
+                parts.append(f"【互动方式】\n{body}")
+            continue
+        if title is None:
+            trimmed = _trim_keep_start(body, max_persona_chars)
+            if trimmed:
+                parts.append(trimmed)
+            continue
+        # 未知分段：偏长则截断，避免再塞回大段设定
+        trimmed = _trim_keep_start(body, max_persona_chars) if len(body) > max_persona_chars else body
+        if trimmed:
+            parts.append(f"【{title}】\n{trimmed}")
+    parts.append(_INTIMACY_FOCUS_OVERLAY)
     return "\n\n".join(part for part in parts if part).strip()
 
 

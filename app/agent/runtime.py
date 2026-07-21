@@ -828,8 +828,16 @@ class AgentRuntime:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
+                intimacy_focus = self._intimacy_focus_active()
                 if memory_needs_refresh:
-                    if turn_state.recall_decision == "recall":
+                    if intimacy_focus:
+                        # 亲密模式：轻量语义召回（当下亲密相关记忆可进；不做全量/渐进索引）
+                        light_recall = self.memory_recall.recall(
+                            request, light_mode=True,
+                        )
+                        turn_memory_fragments = tuple(light_recall.fragments)
+                        memory_status = "intimacy_light"
+                    elif turn_state.recall_decision == "recall":
                         recall = self.memory_recall.recall(request)
                         turn_memory_fragments = list(recall.fragments)
                         memory_status = recall.status
@@ -891,6 +899,14 @@ class AgentRuntime:
                             else "deferred"
                         )
                     memory_needs_refresh = False
+                    request = replace(request, service_status={"memory": memory_status})
+                # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
+                if intimacy_focus and memory_status != "intimacy_light":
+                    light_recall = self.memory_recall.recall(
+                        request, light_mode=True,
+                    )
+                    turn_memory_fragments = tuple(light_recall.fragments)
+                    memory_status = "intimacy_light"
                     request = replace(request, service_status={"memory": memory_status})
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
@@ -1662,34 +1678,61 @@ class AgentRuntime:
             sanitize_reply_tones(parsed.reply, self.reply_tones)
         )
 
-    def _persona_sections(self) -> list[PromptSection]:
+    def _persona_sections(self, *, intimacy_focus: bool = False) -> list[PromptSection]:
+        persona_body = self.system_prompt.strip()
+        if intimacy_focus and persona_body:
+            from app.llm.prompts.blocks import soften_character_card_for_intimacy
+
+            persona_body = soften_character_card_for_intimacy(persona_body)
         sections = [
             PromptSection(
                 section_id="persona.character",
-                body=self.system_prompt.strip(),
+                body=persona_body,
                 source="character",
                 sensitivity="private",
             )
         ]
-        sections.extend(
-            PromptSection(
-                section_id=f"plugin_patch.{patch.patch_id}",
-                body=patch.system_prompt_append.strip(),
-                source=f"plugin:{patch.patch_id}",
+        # 亲密专注当下：跳过插件往人格前缀塞的长补充，避免再把注意力拉回日常设定
+        if not intimacy_focus:
+            sections.extend(
+                PromptSection(
+                    section_id=f"plugin_patch.{patch.patch_id}",
+                    body=patch.system_prompt_append.strip(),
+                    source=f"plugin:{patch.patch_id}",
+                )
+                for patch in getattr(self, "prompt_patches", [])
+                if patch.system_prompt_append.strip()
             )
-            for patch in getattr(self, "prompt_patches", [])
-            if patch.system_prompt_append.strip()
-        )
         return sections
 
+    def _intimacy_focus_active(self) -> bool:
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        return bool(intimacy_mode_state.active)
+
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
-        """可选私密风格段：仅当本地存在 guide 文件时注入。"""
+        """可选私密风格段：仅亲密节奏模式开启且本地有 guide 时注入。
+
+        非亲密模式下不把 H 参考正文塞进 prompt；何时开启仍靠工具描述。
+        同轮内先调用 set_intimacy_mode(on=true) 后，后续工具步/终稿会再看到本段。
+        """
         guide = getattr(self, "_intimacy_guide", "")
         if not guide:
             return None
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        if not intimacy_mode_state.active:
+            return None
+        # guide 管怎么写；此处只提醒何时关掉节奏模式。
+        rhythm_hint = (
+            "\n\n# 节奏工具\n"
+            "当前已开启亲密节奏模式。"
+            "亲密告一段落、对方停下、或话题回到日常时，调用 set_intimacy_mode(on=false)。"
+            "日常闲聊、关心安慰、技术/工作话题不要保持开启。"
+        )
         return PromptSection(
             section_id="persona.intimacy",
-            body=guide,
+            body=f"{guide}{rhythm_hint}",
             source="character",
             sensitivity="private",
         )
@@ -1768,15 +1811,16 @@ class AgentRuntime:
                 self._combine_extra_instructions(extra_instructions),
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
                 "- 跨会话信息优先用 memory_search；对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
-                "- 记忆语言：关于对方的事实用简体中文；你自己的内心感受优先日语。",
-                "- 写入记忆时像日记：先写清谁说了什么/约了什么，再写感受；"
-                "你自己的话归你，对方的话归对方；过期约定标明时效；称呼用名字或「对方」。",
+                "- 记忆语言：关于他的事实用简体中文；你自己的内心感受优先日语。"
+                "- 写入记忆时像日记：主语「我」=你自己，「他」=对方；"
+                "用「我／他」写清谁说了什么/约了什么，再写感受；"
+                "过期约定标明时效；已知名字可用名字代替「他」。",
                 "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
                 "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
             ]
         )
         sections = [
-            *self._persona_sections(),
+            *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
             PromptSection(
                 "agent.identity",
                 "她手边有一些可以实际使用的工具（如查看屏幕、搜索网页、设置提醒、记住事情）。"
@@ -1842,7 +1886,7 @@ class AgentRuntime:
 
     def _build_final_reply_result(self, snapshot: ContextSnapshot | None = None):
         sections = [
-            *self._persona_sections(),
+            *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
             PromptSection(
                 "final_reply.instructions",
                 "你会收到上一轮工具调用结果。请基于这些结果给对方最终回复。\n"

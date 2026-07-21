@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from app.agent.memory import MemoryStore, _bounded_float
+from app.agent.memory import MemoryStore, memory_record_is_reflection, _bounded_float
 from app.agent.persona_state import (
     PersonaState,
     emotion_congruence_factor,
@@ -255,6 +255,12 @@ def _select_memories(
             continue
         dedupe_key = " ".join(content.lower().split())
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        # 自动召回不注入独处反思：感想≠事实，避免被当成经历说出口。
+        # 主动 memory_search 仍可查到（不经此过滤）。
+        if memory_record_is_reflection(raw) or memory_record_is_reflection(
+            {"metadata": metadata, "source": raw.get("source"), "category": raw.get("category")}
+        ):
+            continue
         if dedupe_key in seen or _is_memory_expired(raw, metadata, now):
             continue
         score = _optional_score(raw.get("score"))

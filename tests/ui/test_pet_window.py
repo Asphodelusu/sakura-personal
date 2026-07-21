@@ -94,12 +94,15 @@ def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
         def set_system_prompt(self, system_prompt: str) -> None:
             events.append(("curator_prompt", system_prompt))
 
+        def set_character_name(self, character_name: str) -> None:
+            events.append(("curator_name", character_name))
+
     class MemoryStoreStub:
         def set_scope(self, scope: str) -> None:
             events.append(("memory_scope", scope))
 
     class AgentRuntimeStub:
-        def update_character(self, system_prompt, reply_tones, portrait_choices):  # type: ignore[no-untyped-def]
+        def update_character(self, system_prompt, reply_tones, portrait_choices, **_kwargs):  # type: ignore[no-untyped-def]
             events.append(("runtime_character", (system_prompt, reply_tones, portrait_choices)))
 
         def set_history_store(self, history_store):  # type: ignore[no-untyped-def]
@@ -184,6 +187,7 @@ def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
 
     assert window.system_prompt == "新角色人格卡"
     assert ("curator_prompt", "新角色人格卡") in events
+    assert ("curator_name", "New Character") in events
     assert ("memory_scope", "new-character") in events
     assert (
         "runtime_character",
@@ -199,6 +203,7 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
 
     class ProfileStub:
         id = "old-character"
+        display_name = "Sakura"
 
     class ScopedStoreStub:
         def __init__(self, scope_id: str) -> None:
@@ -217,15 +222,23 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
             self.scope_id = scope_id
 
     class CuratorStub:
-        def __init__(self, *, system_prompt: str, memory_store) -> None:  # type: ignore[no-untyped-def]
+        def __init__(self, *, system_prompt: str, memory_store, character_name: str = ""):  # type: ignore[no-untyped-def]
             self.system_prompt = system_prompt
             self.memory_store = memory_store
+            self.character_name = character_name
 
-        def snapshot(self, *, memory_store, system_prompt):  # type: ignore[no-untyped-def]
-            return CuratorStub(system_prompt=system_prompt, memory_store=memory_store)
+        def snapshot(self, *, memory_store, system_prompt, character_name=""):  # type: ignore[no-untyped-def]
+            return CuratorStub(
+                system_prompt=system_prompt,
+                memory_store=memory_store,
+                character_name=character_name,
+            )
 
         def set_system_prompt(self, system_prompt: str) -> None:
             self.system_prompt = system_prompt
+
+        def set_character_name(self, character_name: str) -> None:
+            self.character_name = character_name
 
     class WorkerStub:
         finished = object()
@@ -260,6 +273,12 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
     memory_store = MemoryStoreStub()
     window = MinimalWindow()
     window.memory_curation_thread = None
+    window.last_user_activity_at = 0.0
+    window.memory_curation_settings = type(
+        "Settings",
+        (),
+        {"normalized": lambda self: type("N", (), {"idle_minutes": 12})()},
+    )()
     window.memory_curator = CuratorStub(
         system_prompt="旧角色人格卡",
         memory_store=memory_store,

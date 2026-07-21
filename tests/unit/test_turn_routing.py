@@ -409,6 +409,61 @@ def test_intimacy_auto_exit_falls_back_to_standard() -> None:
     assert plan.decided_by != "intimacy_mode"
 
 
+def test_intimacy_continue_skips_consume_turn() -> None:
+    """系统续投标记不扣减自动退出计数。"""
+    from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+
+    messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.consume_turn.return_value = True
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    assert plan.tier == "fast"
+    assert plan.decided_by == "intimacy_mode"
+    mock_state.consume_turn.assert_not_called()
+
+
+def test_intimacy_user_turn_still_consumes() -> None:
+    """真实用户轮仍会调用 consume_turn。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.consume_turn.return_value = True
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    assert plan.decided_by == "intimacy_mode"
+    mock_state.consume_turn.assert_called_once()
+
+
 def test_intimacy_overrides_classifier_simple() -> None:
     """亲密模式优先于分类器的 simple 判定。"""
     messages: list[ChatMessage] = [{"role": "user", "content": "うん"}]
