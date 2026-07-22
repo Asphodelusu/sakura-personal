@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import threading
 from dataclasses import dataclass
@@ -8,7 +7,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from app.agent.memory import MemoryStore, memory_record_is_reflection, _bounded_float
+from app.agent.memory import (
+    MemoryStore,
+    memory_record_is_meta_reflection,
+    memory_record_is_reflection,
+    _bounded_float,
+)
 from app.agent.persona_state import (
     PersonaState,
     emotion_congruence_factor,
@@ -29,10 +33,11 @@ DEFAULT_MEMORY_DECAY_LAMBDA = 0.1
 # source=explicit（用户明确要求记住）的记忆自动提至此 importance
 EXPLICIT_MEMORY_IMPORTANCE = 0.95
 # 回忆强化：被 memory_search 命中后衰减计时重置
-_ACCESS_TRACKER_LOCK = threading.Lock()
-_ACCESS_TRACKER_PATH: Path | None = None
-_ACCESS_TRACKER_CACHE: dict[str, str] = {}
-_ACCESS_TRACKER_DIRTY: bool = False
+# SQLite 持久化实现见 app/agent/access_tracker.py；这里只保留一个懒加载的
+# 单例（同一 base_dir 只需要一个 AccessTracker 实例），初始化本身不涉及锁竞争
+# 热路径，用简单的模块级锁保护"要不要新建实例"这一步就够了。
+_ACCESS_TRACKER_INIT_LOCK = threading.Lock()
+_ACCESS_TRACKER: Any | None = None
 # 约定/纪念日：event_time 落在今天或明天时主动浮现（不占满检索名额）
 MAX_DUE_COMMITMENT_RECALLS = 2
 DUE_COMMITMENT_DECAY_BOOST = 1.28
@@ -41,66 +46,46 @@ COLD_ARCHIVE_IDLE_DAYS = 45
 COLD_ARCHIVE_IMPORTANCE_MAX = 0.38
 COLD_ARCHIVE_DECAY_FLOOR = 0.52
 EXEMPT_COLD_ARCHIVE_KINDS = frozenset({"commitment", "emotional_turn", "core_profile"})
+# 独处反思：自动召回降权弱注入（非硬过滤），每轮最多 1 条，避免抢事实位。
+# 这是刻意的策略性硬降权（"感想不能顶事实"），因此独立于下面的软因子加权，
+# 不参与 _combine_soft_factors 的连续混合。
+REFLECTION_AUTO_RECALL_SCORE_FACTOR = 0.3
+MAX_REFLECTION_IN_AUTO_RECALL = 1
+# 二阶元反思（对多条一阶反思的再提炼）比一次性感想更接近稳定认知，
+# 降权比一阶反思轻很多，且有独立的每轮上限、不与一阶反思共享名额。
+META_REFLECTION_AUTO_RECALL_SCORE_FACTOR = 0.75
+MAX_META_REFLECTION_IN_AUTO_RECALL = 1
+
+# 软修正因子的合成权重：冷归档 / 情绪一致性 / 临别提权都是"连续、温和"的修正，
+# 用 1 + Σ w_i*(factor_i - 1) 的加权效应量相加合成一个乘数，而不是逐个连乘。
+# 连乘（f1*f2*f3）会让多个温和的同向偏离互相放大（如 0.85*0.9*0.95≈0.73，
+# 比任何单个因子都更极端）；加权效应量相加则只保留每个因子"自己那部分"贡献，
+# 总偏离幅度不会明显超过其中最极端的那个因子。权重之和不要求恰好为 1，
+# 但保持在 1 附近可以让"多个因子同时轻微利好/不利"时的整体幅度符合直觉。
+_COLD_ARCHIVE_FACTOR_WEIGHT = 0.55
+_EMOTION_CONGRUENCE_FACTOR_WEIGHT = 0.35
+_VOLATILE_BOOST_FACTOR_WEIGHT = 0.55
 
 
-def _set_access_tracker_path(path: Path) -> None:
-    global _ACCESS_TRACKER_PATH
-    _ACCESS_TRACKER_PATH = path
+def _get_access_tracker(base_dir: Path | None) -> Any | None:
+    """懒加载同一 base_dir 对应的 AccessTracker 单例；失败时退化为不追踪。"""
+    global _ACCESS_TRACKER
+    if base_dir is None:
+        return None
+    if _ACCESS_TRACKER is not None:
+        return _ACCESS_TRACKER
+    with _ACCESS_TRACKER_INIT_LOCK:
+        if _ACCESS_TRACKER is None:
+            from app.agent.access_tracker import AccessTracker
+            from app.storage.paths import StoragePaths
 
-
-def _load_access_tracker() -> dict[str, str]:
-    global _ACCESS_TRACKER_DIRTY
-    if _ACCESS_TRACKER_PATH is None or not _ACCESS_TRACKER_PATH.exists():
-        return {}
-    try:
-        with _ACCESS_TRACKER_LOCK:
-            data = json.loads(_ACCESS_TRACKER_PATH.read_text(encoding="utf-8"))
-            _ACCESS_TRACKER_CACHE = data if isinstance(data, dict) else {}
-            _ACCESS_TRACKER_DIRTY = False
-        return dict(_ACCESS_TRACKER_CACHE)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _record_memory_accessed(memory_ids: list[str]) -> None:
-    """批量记录记忆被访问时间，延迟落盘。"""
-    global _ACCESS_TRACKER_DIRTY
-    if _ACCESS_TRACKER_PATH is None or not memory_ids:
-        return
-    now_iso = datetime.now().astimezone().isoformat()
-    with _ACCESS_TRACKER_LOCK:
-        for mid in memory_ids:
-            mid = str(mid).strip()
-            if mid:
-                _ACCESS_TRACKER_CACHE[mid] = now_iso
-        _ACCESS_TRACKER_DIRTY = True
-
-
-def _flush_access_tracker() -> None:
-    """落盘访问记录。"""
-    global _ACCESS_TRACKER_DIRTY
-    if _ACCESS_TRACKER_PATH is None or not _ACCESS_TRACKER_DIRTY:
-        return
-    with _ACCESS_TRACKER_LOCK:
-        if not _ACCESS_TRACKER_DIRTY:
-            return
-        try:
-            _ACCESS_TRACKER_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _ACCESS_TRACKER_PATH.write_text(
-                json.dumps(_ACCESS_TRACKER_CACHE, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            _ACCESS_TRACKER_DIRTY = False
-        except OSError:
-            pass
-
-
-def _get_last_accessed(memory_id: str) -> str:
-    """返回记忆最后一次被访问的 ISO 时间，未追踪则返回空。"""
-    if _ACCESS_TRACKER_PATH is None:
-        return ""
-    with _ACCESS_TRACKER_LOCK:
-        return _ACCESS_TRACKER_CACHE.get(str(memory_id).strip(), "")
+            try:
+                _ACCESS_TRACKER = AccessTracker(
+                    StoragePaths(base_dir).memory_access_tracker_db()
+                )
+            except Exception:
+                return None
+        return _ACCESS_TRACKER
 
 
 @dataclass(frozen=True)
@@ -129,12 +114,7 @@ class MemoryRecallService:
         if not query:
             return MemoryRecallResult(query="")
 
-        # 初始化访问追踪文件路径
-        if _ACCESS_TRACKER_PATH is None and self.memory.base_dir is not None:
-            _set_access_tracker_path(
-                self.memory.base_dir / "data" / "memory" / "access_tracker.json"
-            )
-        _load_access_tracker()
+        access_tracker = _get_access_tracker(self.memory.base_dir)
 
         limit = DEFAULT_MEMORY_RECALL_CANDIDATES
         if light_mode:
@@ -162,6 +142,15 @@ class MemoryRecallService:
         if expanded:
             memories = _deduplicate_memories(memories + expanded)
 
+        # 回忆强化：只批量点查本轮候选（通常 <=15 条），不管历史累计追踪了多少条，
+        # 与旧的"整份 JSON 读入内存"相比，开销只与本轮候选数成正比。
+        last_accessed_map: dict[str, str] = {}
+        if access_tracker is not None:
+            candidate_ids = [str(m.get("id") or "").strip() for m in memories]
+            candidate_ids = [mid for mid in candidate_ids if mid]
+            if candidate_ids:
+                last_accessed_map = access_tracker.get_last_accessed_bulk(candidate_ids)
+
         select_limit = 2 if light_mode else self.limit
         selected = _select_memories(
             memories,
@@ -169,13 +158,14 @@ class MemoryRecallService:
             select_limit,
             now=now,
             persona=persona,
+            last_accessed_map=last_accessed_map,
         )
         selected = _merge_due_commitments(selected, due_commitments, self.limit)
 
-        # 回忆强化：记录被选中的记忆（被检索到即算访问）
+        # 回忆强化：记录被选中的记忆（被检索到即算访问），只 UPSERT 这几条
         hit_ids = [m["id"] for m in selected if m.get("id")]
-        _record_memory_accessed(hit_ids)
-        _flush_access_tracker()
+        if access_tracker is not None and hit_ids:
+            access_tracker.record_accessed(hit_ids, when=now.isoformat())
 
         fragments = tuple(
             ContextFragment(
@@ -185,9 +175,9 @@ class MemoryRecallService:
                 # 来源，让每条都带同样的开场白只会显得像检索结果堆砌，也白费 token。
                 content=_annotate_recalled_memory_content(memory, now=now),
                 trust="trusted" if memory["source"] == "explicit" else "untrusted",
-                priority=80 if memory["source"] == "explicit" else 70,
+                priority=_recall_fragment_priority(memory),
                 freshness=memory["updated_at"],
-                token_budget=512,
+                token_budget=_recall_fragment_token_budget(memory),
                 sensitivity="private",
                 cache_scope="turn",
             )
@@ -201,12 +191,36 @@ def _annotate_recalled_memory_content(memory: dict[str, Any], *, now: datetime) 
     from app.agent.time_awareness import annotate_with_relative_age, memory_event_timestamp
 
     content = str(memory.get("content") or "").strip()
-    return annotate_with_relative_age(
+    annotated = annotate_with_relative_age(
         content,
         memory_event_timestamp(memory),
         now=now,
         expired=memory_record_is_expired(memory, now=now),
     )
+    if memory.get("is_meta_reflection"):
+        # 二阶元反思：多条独处感想沉淀出的稳定认知，比一次性感想更接近"性格"，
+        # 但仍不是可复述的具体经历，标注区别于一阶反思。
+        return f"（长期认知，非具体经历）{annotated}"
+    if memory_record_is_reflection(memory):
+        # 弱注入时标明非事实，可影响语气，但不要当经历说出口
+        return f"（独处感想，可影响语气）{annotated}"
+    return annotated
+
+
+def _recall_fragment_priority(memory: dict[str, Any]) -> int:
+    if memory.get("is_meta_reflection"):
+        return 55
+    if memory.get("is_reflection"):
+        return 45
+    return 80 if memory["source"] == "explicit" else 70
+
+
+def _recall_fragment_token_budget(memory: dict[str, Any]) -> int:
+    if memory.get("is_meta_reflection"):
+        return 320
+    if memory.get("is_reflection"):
+        return 280
+    return 512
 
 
 def _build_memory_query(request: ContextRequest) -> str:
@@ -243,6 +257,7 @@ def _select_memories(
     *,
     now: datetime | None = None,
     persona: PersonaState | None = None,
+    last_accessed_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -255,12 +270,12 @@ def _select_memories(
             continue
         dedupe_key = " ".join(content.lower().split())
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        # 自动召回不注入独处反思：感想≠事实，避免被当成经历说出口。
-        # 主动 memory_search 仍可查到（不经此过滤）。
-        if memory_record_is_reflection(raw) or memory_record_is_reflection(
+        is_reflection = memory_record_is_reflection(raw) or memory_record_is_reflection(
             {"metadata": metadata, "source": raw.get("source"), "category": raw.get("category")}
-        ):
-            continue
+        )
+        is_meta_reflection = memory_record_is_meta_reflection(raw) or memory_record_is_meta_reflection(
+            {"metadata": metadata, "category": raw.get("category")}
+        )
         if dedupe_key in seen or _is_memory_expired(raw, metadata, now):
             continue
         score = _optional_score(raw.get("score"))
@@ -273,25 +288,32 @@ def _select_memories(
         memory_kind = str(metadata.get("memory_kind") or "").strip().lower()
         # 回忆强化：最近被 search 过的记忆，用访问时间代替更新时间算衰减
         memory_id = str(raw.get("id") or raw.get("memory_id") or "").strip()
-        last_accessed = _get_last_accessed(memory_id)
+        last_accessed = (last_accessed_map or {}).get(memory_id, "")
         effective_ts = last_accessed or updated_at or created_at
         days = _days_since(effective_ts, now)
         decay_weight = _compute_decay_weight(importance, days)
         # volatile 并非"易变应淡出"——它是 expire_memory 设的"临别提权"标记。
         # 即将过期的记忆在消失前需要最后一次露脸机会，让 LLM 能基于它产生替代记忆。
-        # 因此这里对 volatile 记忆给予 12% 权重加成，而非衰减。
-        if metadata.get("volatile") is True:
-            decay_weight = min(1.0, decay_weight * 1.12)
-        decay_weight = min(
-            1.0,
-            decay_weight * _compute_cold_archive_factor(importance, days, memory_kind),
-        )
+        # 因此这里对 volatile 记忆给予权重加成，而非衰减。
+        volatile_factor = 1.12 if metadata.get("volatile") is True else 1.0
+        cold_archive_factor = _compute_cold_archive_factor(importance, days, memory_kind)
         memory_emotion = str(metadata.get("emotion") or "").strip()
+        emotion_factor = 1.0
         if persona is not None and memory_emotion:
-            decay_weight = min(
-                1.0,
-                decay_weight * emotion_congruence_factor(persona.active_emotion(), memory_emotion),
-            )
+            emotion_factor = emotion_congruence_factor(persona.active_emotion(), memory_emotion)
+        # 三个"软"因子按加权效应量合成，避免连乘时互相放大（见函数说明）。
+        soft_multiplier = _combine_soft_factors(
+            (cold_archive_factor, _COLD_ARCHIVE_FACTOR_WEIGHT),
+            (emotion_factor, _EMOTION_CONGRUENCE_FACTOR_WEIGHT),
+            (volatile_factor, _VOLATILE_BOOST_FACTOR_WEIGHT),
+        )
+        decay_weight = min(1.0, max(0.0, decay_weight * soft_multiplier))
+        # 反思类的降权是策略性硬门（"感想不能顶事实"），不是几何/时间修正，
+        # 因此始终保持独立的显式连乘，不纳入上面的软因子合成。
+        if is_meta_reflection:
+            decay_weight *= META_REFLECTION_AUTO_RECALL_SCORE_FACTOR
+        elif is_reflection:
+            decay_weight *= REFLECTION_AUTO_RECALL_SCORE_FACTOR
         normalized.append(
             {
                 "id": memory_id,
@@ -307,6 +329,8 @@ def _select_memories(
                 "metadata": metadata,
                 "importance": importance,
                 "decay_weight": decay_weight,
+                "is_reflection": is_reflection,
+                "is_meta_reflection": is_meta_reflection,
             }
         )
         seen.add(dedupe_key)
@@ -318,7 +342,22 @@ def _select_memories(
             item["updated_at"],
         )
     )
-    return normalized[:limit]
+    selected: list[dict[str, Any]] = []
+    reflection_count = 0
+    meta_reflection_count = 0
+    for item in normalized:
+        if item.get("is_meta_reflection"):
+            if meta_reflection_count >= MAX_META_REFLECTION_IN_AUTO_RECALL:
+                continue
+            meta_reflection_count += 1
+        elif item.get("is_reflection"):
+            if reflection_count >= MAX_REFLECTION_IN_AUTO_RECALL:
+                continue
+            reflection_count += 1
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _optional_score(value: Any) -> float | None:
@@ -360,6 +399,19 @@ def _compute_decay_weight(importance: float, days: float, lmbda: float = DEFAULT
     """重要性加权时间衰减：importance=1.0 永不衰减，importance=0.2 快速衰减。"""
     decay = math.exp(-lmbda * days)
     return importance + (1.0 - importance) * decay
+
+
+def _combine_soft_factors(*factors_with_weights: tuple[float, float]) -> float:
+    """把多个"软"修正因子（各自以 1.0 为中性值）按加权效应量合成一个乘数。
+
+    见模块顶部关于 _COLD_ARCHIVE_FACTOR_WEIGHT 等权重的说明：这里用
+    1 + Σ w_i*(f_i - 1) 而非连乘，避免多个温和的同向偏离互相放大。
+    结果裁剪到 [0, ∞)，调用方仍需自行 clamp 到期望的上限（如 1.0）。
+    """
+    total = 1.0
+    for factor, weight in factors_with_weights:
+        total += weight * (factor - 1.0)
+    return max(0.0, total)
 
 
 def _compute_cold_archive_factor(importance: float, idle_days: float, memory_kind: str) -> float:
@@ -491,54 +543,60 @@ def _is_expired(value: Any, now: datetime) -> bool:
         expires_at = expires_at.replace(tzinfo=now.tzinfo)
     return expires_at <= now
 
+# 从实体索引点查到的记忆没有语义相似度分数（不是靠向量搜索命中的），
+# 给一个固定的中性分数：高于去噪阈值、能进入候选池排序，但不与真正的语义
+# 高分命中抢排位——它们是"关联到同一个人/物"的补充线索，不是本轮主查询本身命中的。
+_ENTITY_HOP_SYNTHETIC_SCORE = 0.5
+
+
 def _expand_by_entities(
     memories: list[dict[str, Any]],
     memory_store: Any,
     threshold: float,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """从已检索记忆中提取专有名词，追加相关记忆（多跳召回）。
+    """从已检索记忆中提取专有名词，按持久实体索引追加相关记忆（多跳召回）。
 
-    例如：搜「最好的朋友」→ 命中「ソフィア是挚友」→
-    提取「ソフィア」→ 追加搜索 → 命中「ソフィア会帮我翻译」。
+    例如：搜「最好的朋友」→ 命中「ソフィア是挚友」→ 提取「ソフィア」→
+    查实体索引 → 命中「ソフィア会帮我翻译」这条记忆的 id → 按 id 直接取回全文。
+
+    相比"再发一次语义搜索"：这里的实体→记忆 id 关联在记忆写入/整理时就已经
+    持久化好了（见 app/agent/entity_index.py），查询时只是一次本地索引点查
+    + 按 id 批量取回，不需要重新计算 embedding，也不会每轮都对同一实体
+    重复做一次全量语义搜索。
     """
-    import re
-    entities: set[str] = set()
-    # 日文/中文专有名词模式：片假名连续、汉字名（2-4字）、英文名
-    entity_patterns = [
-        r"[\u30a0-\u30ff]{2,}",           # 片假名（ソフィア、カシマ）
-        r"[\u4e00-\u9fff]{2,4}(?:くん|さん|ちゃん|先生|先輩)?",  # 汉字名+敬称
-        r"[A-Z][a-z]+(?:\s[A-Z][a-z]+)?",  # 英文名
-    ]
-    for mem in memories[:5]:  # 只从前5条中提取
-        content = str(mem.get("content") or "")
-        for pat in entity_patterns:
-            for match in re.finditer(pat, content):
-                entity = match.group().rstrip("くんさんちゃん先生先輩")
-                if len(entity) >= 2 and entity not in ("私", "僕", "俺", "彼", "彼女"):
-                    entities.add(entity)
+    from app.agent.entity_index import extract_entities
 
+    entities: set[str] = set()
+    for mem in memories[:5]:  # 只从前5条中提取
+        entities |= extract_entities(str(mem.get("content") or ""))
     if not entities:
         return []
 
-    # 用提取到的实体做第二轮搜索
-    entity_query = " ".join(sorted(entities)[:3])  # 最多3个实体
+    existing_ids = {str(m.get("id", "")) for m in memories}
     try:
-        response = memory_store.search_memory(
-            {"query": entity_query, "limit": limit},
-            wait=False,
+        hop_ids = memory_store.lookup_entity_memory_ids(
+            entities, exclude_ids=existing_ids, limit=limit
         )
+    except Exception:
+        return []
+    if not hop_ids:
+        return []
+
+    try:
+        response = memory_store.get_memory_detail({"ids": hop_ids}, wait=False)
     except Exception:
         return []
     extra = response.get("memories", [])
     if not isinstance(extra, list):
         return []
-    # 过滤掉已经有的和低分的
-    existing_ids = {str(m.get("id", "")) for m in memories}
+
     result = []
     for m in extra:
         if str(m.get("id", "")) in existing_ids:
             continue
+        if m.get("score") is None:
+            m = {**m, "score": _ENTITY_HOP_SYNTHETIC_SCORE}
         score = _bounded_float(m.get("score"), default=0.0)
         if score >= threshold:
             result.append(m)

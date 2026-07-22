@@ -67,7 +67,9 @@ from app.agent.memory_curation_worker import MemoryCurationWorker
 from app.agent.memory_reflector import (
     MemoryReflector,
     ReflectionStateStore,
+    mark_meta_reflection_done,
     mark_reflection_done,
+    meta_reflection_should_run,
     reflection_should_run,
 )
 from app.agent.runtime_limits import RuntimeLoopSettings
@@ -3157,7 +3159,8 @@ class PetWindow(QWidget):
             return "screen_observation_followup"
         from app.agent.builtin_tools import intimacy_mode_state
         if intimacy_mode_state.active:
-            return "intimacy_mode"
+            # 日志对外用中性标签，避免命令行/GUI 出现敏感语义
+            return "rhythm_focus"
         if self.screen_observation_encode_thread is not None:
             return "screen_observation_encode"
         if self.active_interaction_id:
@@ -3335,7 +3338,7 @@ class PetWindow(QWidget):
         # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
         self._intimacy_continue_count += 1
         text = INTIMACY_CONTINUE_MARKER
-        self._begin_interaction("intimacy_continue")
+        self._begin_interaction("rhythm_continue")
 
         # 写入内存上下文（保持 user/assistant 交替），但不进持久化历史
         self.messages.append({"role": "user", "content": text})
@@ -5138,6 +5141,28 @@ class PetWindow(QWidget):
             def run(self) -> None:
                 try:
                     result = self.reflector.reflect(memory_store=self.store)
+                    if not result.errors:
+                        # 元反思是一阶反思之外的额外产出：即便这里出问题，也不应该
+                        # 掩盖已经成功的一阶反思结果，因此单独 try/except。
+                        try:
+                            should_run, source_count = meta_reflection_should_run(
+                                self.state_store, self.store
+                            )
+                            if should_run:
+                                meta_result = self.reflector.reflect_meta(memory_store=self.store)
+                                result = ReflectionResult(
+                                    memories_created=result.memories_created,
+                                    skipped_dupes=result.skipped_dupes,
+                                    empty=result.empty,
+                                    errors=result.errors,
+                                    meta_ran=True,
+                                    meta_source_count=source_count,
+                                    meta_created=meta_result.memories_created,
+                                    meta_skipped_dupes=meta_result.skipped_dupes,
+                                    meta_errors=meta_result.errors,
+                                )
+                        except Exception:
+                            pass  # 元反思失败不影响一阶反思结果的上报
                     self.finished.emit(result)
                 except Exception as e:
                     self.failed.emit(str(e))
@@ -5166,18 +5191,53 @@ class PetWindow(QWidget):
         if isinstance(result, ReflectionResult):
             m_created = result.memories_created
             m_errors = len(result.errors)
+            m_skipped = result.skipped_dupes
+            m_empty = result.empty
         else:
             m_created = 0
             m_errors = 0
+            m_skipped = 0
+            m_empty = True
         debug_log(
             "Memory",
             "记忆反思完成",
-            {"memories_created": m_created, "errors": m_errors},
+            {
+                "memories_created": m_created,
+                "skipped_dupes": m_skipped,
+                "empty": m_empty,
+                "errors": m_errors,
+            },
         )
         if m_errors == 0:
-            mark_reflection_done(self.reflection_state_store, m_created)
+            mark_reflection_done(
+                self.reflection_state_store,
+                m_created,
+                skipped_dupes=m_skipped,
+                empty=m_empty,
+            )
         else:
             debug_log("Memory", "记忆反思有错误，不更新 last_reflection_at，下次重试", {"errors": m_errors})
+
+        if isinstance(result, ReflectionResult) and result.meta_ran:
+            debug_log(
+                "Memory",
+                "二阶元反思完成",
+                {
+                    "source_count": result.meta_source_count,
+                    "created": result.meta_created,
+                    "skipped_dupes": result.meta_skipped_dupes,
+                    "errors": len(result.meta_errors),
+                },
+            )
+            if not result.meta_errors:
+                mark_meta_reflection_done(
+                    self.reflection_state_store,
+                    result.meta_source_count,
+                    result.meta_created,
+                    skipped_dupes=result.meta_skipped_dupes,
+                )
+            else:
+                debug_log("Memory", "元反思有错误，不更新触发计数，下次重试", {"errors": result.meta_errors})
 
     @Slot(str)
     def _handle_reflection_failed(self, message: str) -> None:

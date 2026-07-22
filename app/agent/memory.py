@@ -398,6 +398,8 @@ class MemoryStore:
     _closed: bool = field(default=False, init=False, repr=False)
     _thread_group: ThreadGroupResource = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _entity_index: Any | None = field(default=None, init=False, repr=False)
+    _entity_index_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.base_dir = _resolve_base_dir(self.base_dir)
@@ -490,6 +492,102 @@ class MemoryStore:
             self._status_message = "长期记忆系统已关闭。"
         self._thread_group.stop(MEMORY_STORE_EXIT_THREAD_WAIT_MS)
         _close_memory_client(old_memory)
+        with self._entity_index_lock:
+            if self._entity_index is not None:
+                self._entity_index.close()
+                self._entity_index = None
+
+    # ---- 实体索引：多跳召回用的轻量持久倒排索引（见 app/agent/entity_index.py） ----
+
+    def _get_entity_index(self) -> Any | None:
+        if self.base_dir is None:
+            return None
+        with self._entity_index_lock:
+            if self._entity_index is None:
+                from app.agent.entity_index import EntityIndex
+                from app.storage.paths import StoragePaths
+
+                try:
+                    self._entity_index = EntityIndex(
+                        StoragePaths(self.base_dir).memory_entity_index_db()
+                    )
+                except Exception:
+                    logger.exception("实体索引初始化失败，多跳召回将退化为无实体扩展")
+                    return None
+            return self._entity_index
+
+    def _index_memory_entities(self, memory: dict[str, Any] | None) -> None:
+        """记忆写入/更新成功后调用：把内容里的实体登记进持久索引。
+
+        索引失败不应影响记忆本身的写入结果，因此这里吞掉所有异常。
+        """
+        if not isinstance(memory, dict):
+            return
+        memory_id = str(memory.get("id") or "").strip()
+        content = str(memory.get("content") or memory.get("memory") or "").strip()
+        if not memory_id or not content:
+            return
+        index = self._get_entity_index()
+        if index is None:
+            return
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        updated_at = str(memory.get("updated_at") or metadata.get("updated_at") or _now_iso())
+        try:
+            index.index_memory(memory_id, content, updated_at=updated_at)
+        except Exception:
+            logger.exception("实体索引写入失败：memory_id=%s", memory_id)
+
+    def _remove_memory_entities(self, memory_id: str) -> None:
+        index = self._get_entity_index()
+        if index is None:
+            return
+        try:
+            index.remove_memory(memory_id)
+        except Exception:
+            logger.exception("实体索引删除失败：memory_id=%s", memory_id)
+
+    def lookup_entity_memory_ids(
+        self,
+        entities: Any,
+        *,
+        exclude_ids: Any = (),
+        limit: int = 20,
+    ) -> list[str]:
+        """按实体查涉及到的记忆 id，供多跳召回直接点查（不发起新的语义搜索）。"""
+        index = self._get_entity_index()
+        if index is None:
+            return []
+        try:
+            return index.lookup_memory_ids(entities, exclude_ids=exclude_ids, limit=limit)
+        except Exception:
+            logger.exception("实体索引查询失败")
+            return []
+
+    def ensure_entity_index_backfilled(self, memories: list[dict[str, Any]]) -> None:
+        """用已有记忆一次性回填实体索引（供旧记忆补建索引，只在首次调用时真正执行）。
+
+        调用方通常是已经在做全量记忆扫描的路径（如整理/反思），复用其已经取到
+        的记忆列表，不为此再单独发起一次全量读取。
+        """
+        index = self._get_entity_index()
+        if index is None or index.is_backfilled():
+            return
+        try:
+            for memory in memories:
+                if not isinstance(memory, dict):
+                    continue
+                memory_id = str(memory.get("id") or "").strip()
+                content = str(memory.get("content") or memory.get("memory") or "").strip()
+                if not memory_id or not content:
+                    continue
+                metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+                updated_at = str(
+                    memory.get("updated_at") or metadata.get("updated_at") or _now_iso()
+                )
+                index.index_memory(memory_id, content, updated_at=updated_at)
+            index.mark_backfilled()
+        except Exception:
+            logger.exception("实体索引回填失败")
 
     def is_ready(self) -> bool:
         """返回长期记忆运行时是否已经可直接使用。"""
@@ -1360,6 +1458,7 @@ class MemoryStore:
             "metadata": metadata,
         }
         memory = _normalize_memory_record(memory, default_scope=self.scope_id) or memory
+        self._index_memory_entities(memory)
         return {"memory": memory, "ok": True}
 
     def remember_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
@@ -1410,6 +1509,7 @@ class MemoryStore:
             memory = self.set_core_profile(content, metadata)
             mem.delete(memory_id)
             self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
+            self._remove_memory_entities(memory_id)
             return {"memory": memory, "ok": True, "converted_from": previous}
         try:
             mem = self._get_memory(wait=wait)
@@ -1437,6 +1537,7 @@ class MemoryStore:
             "metadata": metadata,
         }
         memory = _normalize_memory_record(memory, default_scope=self.scope_id) or memory
+        self._index_memory_entities(memory)
         return {"memory": memory, "ok": True}
 
     def expire_memory(
@@ -1521,6 +1622,7 @@ class MemoryStore:
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
         already_missing = _delete_memory_idempotently(mem, memory_id)
         cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
+        self._remove_memory_entities(memory_id)
         memory = previous or {"id": memory_id, "content": ""}
         return {"memory": memory, "curation_cache_reset": cache_reset, "already_missing": already_missing}
 
@@ -1541,6 +1643,7 @@ class MemoryStore:
         previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
         already_missing = _delete_memory_idempotently(mem, memory_id)
         cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
+        self._remove_memory_entities(memory_id)
         forgotten = previous or {"id": memory_id, "content": ""}
         return {
             "forgotten": forgotten,
@@ -1881,6 +1984,10 @@ class ScopedMemoryStore(MemoryStore):
         """视图不拥有底层 mem0 运行时，关闭由 owner 负责。"""
 
         return None
+
+    def _get_entity_index(self) -> Any | None:
+        """实体索引只在 owner 上懒加载一次；scoped 视图没有自己的锁/字段，必须转发。"""
+        return self._owner._get_entity_index()
 
     def _get_memory(self, *, wait: bool = True) -> Any | None:
         return self._owner._get_memory(wait=wait)
@@ -2512,14 +2619,28 @@ def memory_record_is_expired(record: dict[str, Any], *, now: datetime | None = N
 
 
 def memory_record_is_reflection(record: dict[str, Any]) -> bool:
-    """是否为独处反思（元认知），不应与情节/事实同等对待。"""
+    """是否为独处反思（元认知，含二阶元反思），不应与情节/事实同等对待。"""
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     source = str(record.get("source") or metadata.get("source") or "").strip().lower()
     category = str(record.get("category") or metadata.get("category") or "").strip().lower()
     kind = str(
         record.get("memory_kind") or metadata.get("memory_kind") or ""
     ).strip().lower()
-    return source == "reflection" or category == "reflection" or kind == "reflection"
+    return (
+        source == "reflection"
+        or category == "reflection"
+        or kind in {"reflection", "meta_reflection"}
+    )
+
+
+def memory_record_is_meta_reflection(record: dict[str, Any]) -> bool:
+    """是否为二阶元反思（对多条一阶反思的再提炼，更接近稳定认知而非一次性感想）。"""
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    kind = str(
+        record.get("memory_kind") or metadata.get("memory_kind") or ""
+    ).strip().lower()
+    category = str(record.get("category") or metadata.get("category") or "").strip().lower()
+    return kind == "meta_reflection" or category == "meta_reflection"
 
 
 def _memory_is_released(record: dict[str, Any]) -> bool:

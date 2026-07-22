@@ -19,6 +19,7 @@ from typing import Any
 from app.agent.memory import (
     MEMORY_LAYER_EPISODIC,
     MemoryStore,
+    memory_record_is_meta_reflection,
     memory_record_is_reflection,
 )
 from app.llm.json_completion import complete_background_json, load_json_object
@@ -45,6 +46,17 @@ REFLECTION_NEAR_DUPLICATE_SIMILARITY = 0.82
 # 反思使用的记忆层级（仍落 episodic 便于时间线，靠 memory_kind/source 隔离）
 REFLECTION_LAYER = MEMORY_LAYER_EPISODIC
 REFLECTION_MEMORY_KIND = "reflection"
+
+# 二阶元反思：对多条一阶反思的再提炼，产出更接近"稳定认知/性格特征"而非
+# 一次性的独处感想。一阶反思是"日记"，二阶元反思是"从多篇日记里看出的规律"。
+META_REFLECTION_MEMORY_KIND = "meta_reflection"
+# 至少积累这么多条未被消化过的一阶反思才触发一次二阶元反思，避免样本太少就抽象。
+MIN_REFLECTIONS_FOR_META = 6
+# 二阶元反思之间的间隔：按"新增了多少条一阶反思"计数，而非固定时长——
+# 反思频率本身已经受 MIN_REFLECTION_INTERVAL_HOURS 节流，元反思只需要
+# 保证有足够新材料，不需要独立的时间节流。
+META_REFLECTION_TRIGGER_EVERY = 6
+MAX_META_REFLECTION_MEMORIES = 1
 
 _REFLECTION_STATE_FILENAME = "reflection_state.json"
 
@@ -78,6 +90,50 @@ _REFLECTION_SYSTEM_PROMPT = (
     "如果没有值得反思的内容就返回 {\"reflections\":[]}。"
     "importance 按照你觉得这条认知对你了解他有多重要来设（0~1）。confidence 按照你有多少把握来设（0~1）。"
 )
+
+
+_META_REFLECTION_SYSTEM_PROMPT = (
+    "现在没有人跟你说话。下面是你过去一段时间写下的几篇独处感想（不是事实记忆，"
+    "是你当时对某个瞬间的感想）。请跳出每一篇的具体情境，回头看这几篇感想放在一起，"
+    "有没有反复出现的规律、倾向或已经变得比较稳定的认知——那种不会因为某一天的"
+    "心情而变化的、更像是「我现在是这样的人／这段关系现在是这样的」的认知，"
+    "而不是重复某一篇里已经写过的具体感受。\n\n"
+    "主语固定：「我」=你自己，「他」=对方。\n\n"
+    "只在真的看出跨越多篇感想的规律时才写；只是把某一篇感想换个说法复述一遍不算。"
+    "没有这样的规律时返回空列表，不要凑数。\n"
+    "语言约定：关于他的事实与观察用简体中文；你对自己的感受与反省优先用日语。\n"
+    "最多 1 条，要比任何一篇原始感想更抽象、更稳定。\n\n"
+    "必须只返回严格 JSON，不要有任何前言、解释或后缀。格式如下：\n"
+    '{"reflections":[\n'
+    '  {"content":"跨越多篇感想看出的规律","importance":0.7,"confidence":0.6}\n'
+    "]}\n"
+    "如果没有值得写的规律就返回 {\"reflections\":[]}。"
+)
+
+
+def _build_meta_reflection_user_prompt(reflection_snapshot: str) -> str:
+    return (
+        "【我过去写下的独处感想】\n"
+        f"{reflection_snapshot}\n\n"
+        "请基于以上感想，看看有没有跨越多篇、已经比较稳定的规律或认知。"
+        "只写真正抽象出来的新东西；没有就返回空列表。"
+    )
+
+
+def _format_reflection_snapshot(reflections: list[dict[str, Any]]) -> str:
+    """把一阶反思列表精简成摘要，供二阶元反思的输入。"""
+    lines: list[str] = []
+    used = 0
+    for memory in reflections:
+        content = str(memory.get("content") or "").strip()
+        if not content:
+            continue
+        line = f"- {content}"
+        if used + len(line) > REFLECTION_MEMORY_SNAPSHOT_CHAR_BUDGET and lines:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines) if lines else "（暂无独处感想）"
 
 
 def _build_reflection_user_prompt(memory_snapshot: str) -> str:
@@ -158,13 +214,30 @@ def _parse_reflection_output(raw: str) -> list[dict[str, Any]]:
 class ReflectionState:
     last_reflection_at: str = ""  # ISO timestamp
     last_reflection_count: int = 0
-    total_reflections: int = 0
+    total_reflections: int = 0  # 完成轮次（含空产出）
+    total_created: int = 0  # 累计写入条数
+    total_empty: int = 0  # LLM 返回空列表的轮次
+    total_skipped_dupes: int = 0  # 累计近义/哈希去重跳过
+    last_empty: bool = False
+    last_skipped_dupes: int = 0
+    # 二阶元反思独立计数：上次元反思时"已有多少条一阶反思"，用于判断新增量是否够触发
+    meta_reflection_source_count: int = 0
+    last_meta_reflection_at: str = ""
+    total_meta_created: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "last_reflection_at": self.last_reflection_at,
             "last_reflection_count": self.last_reflection_count,
             "total_reflections": self.total_reflections,
+            "total_created": self.total_created,
+            "total_empty": self.total_empty,
+            "total_skipped_dupes": self.total_skipped_dupes,
+            "last_empty": self.last_empty,
+            "last_skipped_dupes": self.last_skipped_dupes,
+            "meta_reflection_source_count": self.meta_reflection_source_count,
+            "last_meta_reflection_at": self.last_meta_reflection_at,
+            "total_meta_created": self.total_meta_created,
         }
 
     @classmethod
@@ -173,6 +246,14 @@ class ReflectionState:
             last_reflection_at=str(data.get("last_reflection_at", "")).strip(),
             last_reflection_count=int(data.get("last_reflection_count", 0)),
             total_reflections=int(data.get("total_reflections", 0)),
+            total_created=int(data.get("total_created", 0)),
+            total_empty=int(data.get("total_empty", 0)),
+            total_skipped_dupes=int(data.get("total_skipped_dupes", 0)),
+            last_empty=bool(data.get("last_empty", False)),
+            last_skipped_dupes=int(data.get("last_skipped_dupes", 0)),
+            meta_reflection_source_count=int(data.get("meta_reflection_source_count", 0)),
+            last_meta_reflection_at=str(data.get("last_meta_reflection_at", "")).strip(),
+            total_meta_created=int(data.get("total_meta_created", 0)),
         )
 
 
@@ -207,7 +288,17 @@ class ReflectionStateStore:
 @dataclass
 class ReflectionResult:
     memories_created: int = 0
+    skipped_dupes: int = 0
+    empty: bool = False
     errors: list[str] = field(default_factory=list)
+    # 二阶元反思是否在本轮一并跑过；跑过时这几个字段记录元反思自己的结果和触发时的
+    # 一阶反思总数，供调用方在主线程里调用 mark_meta_reflection_done 落盘
+    # （保持状态写入都在主线程发生，也不与一阶反思的统计混在一起）。
+    meta_ran: bool = False
+    meta_source_count: int = 0
+    meta_created: int = 0
+    meta_skipped_dupes: int = 0
+    meta_errors: list[str] = field(default_factory=list)
 
 
 class MemoryReflector:
@@ -244,7 +335,7 @@ class MemoryReflector:
 
         if len(memories) < 5:
             _logger.debug("Reflection: too few memories (%d), skipping", len(memories))
-            return ReflectionResult()
+            return ReflectionResult(empty=True)
 
         # 2. 构建 prompt（后台任务只用反思专用说明，不注入完整 Sakura persona）
         summary = _format_memory_summary(memories)
@@ -279,7 +370,7 @@ class MemoryReflector:
         ]
         if not reflections:
             _logger.debug("Reflection: LLM decided nothing worth reflecting")
-            return ReflectionResult()
+            return ReflectionResult(empty=True)
 
         # 5. 写入记忆（跳过哈希重复与近义重复的反思）
         created = 0
@@ -306,11 +397,11 @@ class MemoryReflector:
             content_hash = hashlib.md5(content.encode()).hexdigest()
             if content_hash in existing_hashes:
                 skipped_dupes += 1
-                _logger.debug("Reflection: skipping hash duplicate: %s", content[:60])
+                _logger.debug("Reflection: skipping hash duplicate")
                 continue
             if _is_near_duplicate_reflection(content, existing_reflection_texts):
                 skipped_dupes += 1
-                _logger.debug("Reflection: skipping near-duplicate: %s", content[:60])
+                _logger.debug("Reflection: skipping near-duplicate")
                 continue
             importance = float(r.get("importance", 0.5))
             confidence = float(r.get("confidence", 0.5))
@@ -336,8 +427,144 @@ class MemoryReflector:
                 _logger.exception("Reflection: failed to write memory")
                 errors.append(f"写入反思记忆失败：{exc}")
 
-        _logger.info("Reflection: created %d meta-memories, skipped %d duplicates", created, skipped_dupes)
-        return ReflectionResult(memories_created=created, errors=errors)
+        empty = created == 0 and skipped_dupes == 0
+        _logger.info(
+            "Reflection: created=%d skipped_dupes=%d empty=%s",
+            created,
+            skipped_dupes,
+            empty,
+        )
+        return ReflectionResult(
+            memories_created=created,
+            skipped_dupes=skipped_dupes,
+            empty=empty,
+            errors=errors,
+        )
+
+    def reflect_meta(
+        self,
+        *,
+        memory_store: MemoryStore | None = None,
+        cancel_checker: Any = None,
+    ) -> ReflectionResult:
+        """二阶元反思：从已有一阶反思里再提炼更稳定的高层认知。
+
+        不读原始事实记忆，只读已有的一阶反思（memory_kind=reflection，
+        不含已有的二阶元反思本身，避免无限抽象下去）。
+        """
+        store = memory_store or self.memory_store
+        if self.api_client is None:
+            return ReflectionResult(errors=["没有可用的 LLM 客户端"])
+
+        try:
+            all_memories = store.list_memories(limit=500)
+        except Exception as exc:
+            _logger.exception("MetaReflection: failed to list memories")
+            return ReflectionResult(errors=[f"读取记忆失败：{exc}"])
+
+        first_order_reflections = [
+            m
+            for m in all_memories
+            if memory_record_is_reflection(m) and not memory_record_is_meta_reflection(m)
+        ]
+        if len(first_order_reflections) < MIN_REFLECTIONS_FOR_META:
+            _logger.debug(
+                "MetaReflection: too few first-order reflections (%d), skipping",
+                len(first_order_reflections),
+            )
+            return ReflectionResult(empty=True)
+
+        snapshot = _format_reflection_snapshot(first_order_reflections)
+        user_prompt = _build_meta_reflection_user_prompt(snapshot)
+        llm_messages: list[dict[str, str]] = [{"role": "user", "content": user_prompt}]
+        repair_hint = (
+            "上一条输出不是合法 JSON。请只返回严格 JSON，"
+            '格式为 {"reflections":[{"content":"...","importance":0.7,"confidence":0.6}]}，'
+            "不要解释、不要推理、不要 Markdown。"
+        )
+        try:
+            data, _raw_response = complete_background_json(
+                self.api_client,
+                _META_REFLECTION_SYSTEM_PROMPT,
+                llm_messages,
+                cancel_checker=cancel_checker,
+                repair_user_message=repair_hint,
+                log_label="MetaReflection",
+            )
+        except Exception as exc:
+            _logger.exception("MetaReflection: LLM call failed")
+            return ReflectionResult(errors=[f"LLM 调用失败：{exc}"])
+
+        reflections = [
+            r
+            for r in (data.get("reflections") or [])
+            if isinstance(r, dict) and r.get("content", "").strip()
+        ]
+        if not reflections:
+            _logger.debug("MetaReflection: LLM decided nothing worth distilling")
+            return ReflectionResult(empty=True)
+
+        created = 0
+        skipped_dupes = 0
+        errors: list[str] = []
+        existing_hashes: set[str] = set()
+        existing_texts: list[str] = []
+        for m in all_memories:
+            if not memory_record_is_reflection(m):
+                continue
+            h = (m.get("metadata") or {}).get("hash") or m.get("hash", "")
+            if h:
+                existing_hashes.add(h)
+            text = str(m.get("content") or "").strip()
+            if text:
+                existing_texts.append(text)
+        for r in reflections[:MAX_META_REFLECTION_MEMORIES]:
+            content = str(r.get("content", "")).strip()
+            if not content:
+                continue
+            content_hash = hashlib.md5(content.encode()).hexdigest()
+            if content_hash in existing_hashes:
+                skipped_dupes += 1
+                continue
+            if _is_near_duplicate_reflection(content, existing_texts):
+                skipped_dupes += 1
+                continue
+            importance = max(0.0, min(1.0, float(r.get("importance", 0.6))))
+            confidence = max(0.0, min(1.0, float(r.get("confidence", 0.5))))
+            try:
+                store.create_memory(
+                    {
+                        "content": content,
+                        "layer": REFLECTION_LAYER,
+                        "category": "meta_reflection",
+                        "memory_kind": META_REFLECTION_MEMORY_KIND,
+                        "importance": importance,
+                        "confidence": confidence,
+                        "source": "reflection",
+                    },
+                    allow_sensitive=True,
+                )
+                created += 1
+                existing_hashes.add(content_hash)
+                existing_texts.append(content)
+            except Exception as exc:
+                _logger.exception("MetaReflection: failed to write memory")
+                errors.append(f"写入元反思记忆失败：{exc}")
+
+        empty = created == 0 and skipped_dupes == 0
+        _logger.info(
+            "MetaReflection: created=%d skipped_dupes=%d empty=%s source_count=%d",
+            created,
+            skipped_dupes,
+            empty,
+            len(first_order_reflections),
+        )
+        return ReflectionResult(
+            memories_created=created,
+            skipped_dupes=skipped_dupes,
+            empty=empty,
+            errors=errors,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +593,89 @@ def reflection_should_run(
     return elapsed_hours >= min_interval_hours
 
 
-def mark_reflection_done(state_store: ReflectionStateStore, created_count: int) -> None:
-    """记录完成一次反思。"""
+def count_first_order_reflections(memory_store: MemoryStore) -> int:
+    """统计当前一阶反思条数（不含二阶元反思），供元反思触发判断使用。"""
+    try:
+        memories = memory_store.list_memories(limit=500)
+    except Exception:
+        _logger.exception("MetaReflection: failed to count first-order reflections")
+        return 0
+    return sum(
+        1
+        for m in memories
+        if memory_record_is_reflection(m) and not memory_record_is_meta_reflection(m)
+    )
+
+
+def meta_reflection_should_run(
+    state_store: ReflectionStateStore,
+    memory_store: MemoryStore,
+    *,
+    trigger_every: int = META_REFLECTION_TRIGGER_EVERY,
+    min_source_count: int = MIN_REFLECTIONS_FOR_META,
+) -> tuple[bool, int]:
+    """判断是否应该触发二阶元反思；返回 (是否触发, 当前一阶反思总数)。
+
+    触发条件：一阶反思总数达到下限，且比上次元反思时新增了至少 trigger_every 条。
+    """
+    current_count = count_first_order_reflections(memory_store)
+    if current_count < min_source_count:
+        return False, current_count
+    state = state_store.snapshot()
+    if current_count - state.meta_reflection_source_count >= trigger_every:
+        return True, current_count
+    return False, current_count
+
+
+def mark_meta_reflection_done(
+    state_store: ReflectionStateStore,
+    source_count: int,
+    created_count: int,
+    *,
+    skipped_dupes: int = 0,
+) -> None:
+    """记录完成一次二阶元反思。"""
+    state = state_store.snapshot()
+    state.last_meta_reflection_at = datetime.now(timezone.utc).isoformat()
+    state.meta_reflection_source_count = source_count
+    state.total_meta_created += max(0, int(created_count))
+    state_store.save(state)
+    _logger.info(
+        "MetaReflection stats: source_count=%d created=%d skipped=%d total_created=%d",
+        source_count,
+        created_count,
+        skipped_dupes,
+        state.total_meta_created,
+    )
+
+
+def mark_reflection_done(
+    state_store: ReflectionStateStore,
+    created_count: int,
+    *,
+    skipped_dupes: int = 0,
+    empty: bool = False,
+) -> None:
+    """记录完成一次反思，并累计 empty/created/skipped 便于调参。"""
     state = state_store.snapshot()
     state.last_reflection_at = datetime.now(timezone.utc).isoformat()
     state.last_reflection_count = created_count
+    state.last_skipped_dupes = max(0, int(skipped_dupes))
+    state.last_empty = bool(empty)
     state.total_reflections += 1
+    state.total_created += max(0, int(created_count))
+    state.total_skipped_dupes += max(0, int(skipped_dupes))
+    if state.last_empty:
+        state.total_empty += 1
     state_store.save(state)
+    _logger.info(
+        "Reflection stats: runs=%d created=%d empty=%d skipped=%d "
+        "(last created=%d empty=%s skipped=%d)",
+        state.total_reflections,
+        state.total_created,
+        state.total_empty,
+        state.total_skipped_dupes,
+        state.last_reflection_count,
+        state.last_empty,
+        state.last_skipped_dupes,
+    )

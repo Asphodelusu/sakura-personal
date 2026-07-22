@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.agent.memory import memory_record_is_reflection
+from app.agent.memory import memory_record_is_meta_reflection, memory_record_is_reflection
 from app.agent.memory_curator import _format_existing_memories
 from app.agent.memory_recall import _select_memories
 from app.agent.memory_reflector import (
+    MAX_META_REFLECTION_MEMORIES,
     MAX_REFLECTION_MEMORIES,
+    MIN_REFLECTIONS_FOR_META,
     MemoryReflector,
+    ReflectionStateStore,
     _format_memory_summary,
     _is_near_duplicate_reflection,
     _parse_reflection_output,
+    count_first_order_reflections,
+    mark_meta_reflection_done,
+    meta_reflection_should_run,
 )
 
 
@@ -92,7 +98,8 @@ def test_reflector_skips_near_duplicate_against_existing() -> None:
     assert store.created == []
 
 
-def test_auto_recall_skips_reflections() -> None:
+def test_auto_recall_downweights_reflections() -> None:
+    """反思可弱注入，但降权后不应抢过事实记忆；每轮最多 1 条反思。"""
     selected = _select_memories(
         [
             {
@@ -115,11 +122,51 @@ def test_auto_recall_skips_reflections() -> None:
                     "memory_kind": "reflection",
                 },
             },
+            {
+                "id": "r2",
+                "content": "我觉得自己有点太在意他了",
+                "score": 0.98,
+                "source": "reflection",
+                "category": "reflection",
+                "metadata": {
+                    "importance": 0.85,
+                    "source": "reflection",
+                    "category": "reflection",
+                    "memory_kind": "reflection",
+                },
+            },
         ],
         threshold=0.3,
         limit=5,
     )
-    assert [m["id"] for m in selected] == ["f1"]
+    ids = [m["id"] for m in selected]
+    assert ids[0] == "f1"
+    assert "r1" in ids or "r2" in ids
+    assert sum(1 for m in selected if m.get("is_reflection")) == 1
+
+
+def test_auto_recall_can_include_lone_reflection() -> None:
+    selected = _select_memories(
+        [
+            {
+                "id": "r1",
+                "content": "我意识到他最近压力很大",
+                "score": 0.85,
+                "source": "reflection",
+                "category": "reflection",
+                "metadata": {
+                    "source": "reflection",
+                    "category": "reflection",
+                    "memory_kind": "reflection",
+                    "importance": 0.8,
+                },
+            },
+        ],
+        threshold=0.3,
+        limit=5,
+    )
+    assert [m["id"] for m in selected] == ["r1"]
+    assert selected[0]["is_reflection"] is True
 
 
 def test_curator_formats_reflections_as_non_facts() -> None:
@@ -141,6 +188,87 @@ def test_curator_formats_reflections_as_non_facts() -> None:
     assert memory_record_is_reflection(
         {"source": "reflection", "category": "reflection"}
     )
+
+
+def _first_order_reflection(idx: int) -> dict[str, Any]:
+    return {
+        "id": f"r{idx}",
+        "content": f"我意识到我很在意他今天有没有吃饭 {idx}",
+        "layer": "episodic",
+        "category": "reflection",
+        "source": "reflection",
+        "metadata": {"memory_kind": "reflection"},
+    }
+
+
+def test_max_meta_reflection_memories_is_small() -> None:
+    assert MAX_META_REFLECTION_MEMORIES <= 1
+
+
+def test_count_first_order_reflections_excludes_meta() -> None:
+    store = _FakeMemoryStore(
+        [_first_order_reflection(i) for i in range(3)]
+        + [
+            {
+                "id": "meta1",
+                "content": "我好像一直很在意他吃没吃饭，这已经是个规律了",
+                "layer": "episodic",
+                "category": "meta_reflection",
+                "source": "reflection",
+                "metadata": {"memory_kind": "meta_reflection"},
+            }
+        ]
+    )
+    assert count_first_order_reflections(store) == 3  # type: ignore[arg-type]
+
+
+def test_meta_reflection_should_run_requires_minimum_source_count(tmp_path: Any) -> None:
+    state_store = ReflectionStateStore(tmp_path)
+    store = _FakeMemoryStore(
+        [_first_order_reflection(i) for i in range(MIN_REFLECTIONS_FOR_META - 1)]
+    )
+    should_run, count = meta_reflection_should_run(state_store, store)  # type: ignore[arg-type]
+    assert should_run is False
+    assert count == MIN_REFLECTIONS_FOR_META - 1
+
+
+def test_meta_reflection_should_run_once_enough_new_reflections(tmp_path: Any) -> None:
+    state_store = ReflectionStateStore(tmp_path)
+    store = _FakeMemoryStore(
+        [_first_order_reflection(i) for i in range(MIN_REFLECTIONS_FOR_META)]
+    )
+    should_run, count = meta_reflection_should_run(state_store, store)  # type: ignore[arg-type]
+    assert should_run is True
+    assert count == MIN_REFLECTIONS_FOR_META
+
+    mark_meta_reflection_done(state_store, count, 1)
+    # 刚消化完，还没有新增材料，不应该马上又触发
+    should_run_again, _ = meta_reflection_should_run(state_store, store)  # type: ignore[arg-type]
+    assert should_run_again is False
+
+
+def test_reflect_meta_writes_meta_reflection_kind() -> None:
+    store = _FakeMemoryStore([_first_order_reflection(i) for i in range(MIN_REFLECTIONS_FOR_META)])
+    api = _RecordingApiClient(
+        '{"reflections":[{"content":"我一直很在意他有没有按时吃饭，这已经成了习惯","importance":0.7,"confidence":0.6}]}'
+    )
+    reflector = MemoryReflector(api, store)  # type: ignore[arg-type]
+    result = reflector.reflect_meta(memory_store=store)  # type: ignore[arg-type]
+    assert result.memories_created == 1
+    assert store.created[0]["memory_kind"] == "meta_reflection"
+    assert store.created[0]["category"] == "meta_reflection"
+    assert memory_record_is_meta_reflection(store.created[0])
+    assert memory_record_is_reflection(store.created[0])
+
+
+def test_reflect_meta_skips_when_not_enough_first_order_reflections() -> None:
+    store = _FakeMemoryStore([_first_order_reflection(i) for i in range(MIN_REFLECTIONS_FOR_META - 1)])
+    api = _RecordingApiClient('{"reflections":[{"content":"不该被写入"}]}')
+    reflector = MemoryReflector(api, store)  # type: ignore[arg-type]
+    result = reflector.reflect_meta(memory_store=store)  # type: ignore[arg-type]
+    assert result.memories_created == 0
+    assert result.empty is True
+    assert store.created == []
 
 
 class _FakeMemoryStore:

@@ -109,15 +109,17 @@ def test_gui_log_native_tool_reply_with_empty_tool_calls_shows_as_text() -> None
     assert records[0].message == "收到回复：文本"
 
 
-def test_gui_log_plain_request_label_has_no_tool_marker() -> None:
-    record_debug_log_for_gui("API", "准备发送聊天补全请求", {"model": "gemini"})
-    record_debug_log_for_gui("API", "模型原始文本返回", {"content": "hello"})
+def test_gui_log_records_memory_reflection_finished() -> None:
+    record_debug_log_for_gui(
+        "Memory",
+        "记忆反思完成",
+        {"memories_created": 1, "skipped_dupes": 0, "empty": False, "errors": 0},
+    )
 
     records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_PROGRAM)
-    assert [(r.level, r.message) for r in records] == [
-        ("info", "发送请求"),
-        ("info", "收到回复：文本"),
-    ]
+    assert len(records) == 1
+    assert records[0].message == "记忆反思完成"
+    assert "memories_created" in records[0].detail
 
 
 def test_gui_log_keeps_key_tts_software_events() -> None:

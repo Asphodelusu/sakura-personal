@@ -391,14 +391,14 @@ def test_intimacy_active_routes_to_fast() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
     plan = _plan_for(messages, active=True, turns_left=5)
     assert plan.tier == "fast"
-    assert plan.decided_by == "intimacy_mode"
+    assert plan.decided_by == "rhythm_focus"
     assert plan.generation_params == {"thinking": {"type": "disabled"}}
 
 
 def test_intimacy_inactive_is_normal_routing() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "おはよう"}]
     plan = _plan_for(messages, active=False)
-    assert plan.decided_by != "intimacy_mode"
+    assert plan.decided_by != "rhythm_focus"
 
 
 def test_intimacy_auto_exit_falls_back_to_standard() -> None:
@@ -406,7 +406,7 @@ def test_intimacy_auto_exit_falls_back_to_standard() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "今日はいい天気だね"}]
     plan = _plan_for(messages, active=True, turns_left=0)
     # active=True 但 consume_turn 返回 False → 应 fallback
-    assert plan.decided_by != "intimacy_mode"
+    assert plan.decided_by != "rhythm_focus"
 
 
 def test_intimacy_continue_skips_consume_turn() -> None:
@@ -434,7 +434,7 @@ def test_intimacy_continue_skips_consume_turn() -> None:
         )
 
     assert plan.tier == "fast"
-    assert plan.decided_by == "intimacy_mode"
+    assert plan.decided_by == "rhythm_focus"
     mock_state.consume_turn.assert_not_called()
 
 
@@ -460,7 +460,7 @@ def test_intimacy_user_turn_still_consumes() -> None:
             recall_decision=recall,
         )
 
-    assert plan.decided_by == "intimacy_mode"
+    assert plan.decided_by == "rhythm_focus"
     mock_state.consume_turn.assert_called_once()
 
 
@@ -488,7 +488,7 @@ def test_intimacy_overrides_classifier_simple() -> None:
         )
 
     assert plan.tier == "fast"
-    assert plan.decided_by == "intimacy_mode"
+    assert plan.decided_by == "rhythm_focus"
 
 
 def test_intimacy_does_not_block_vision() -> None:
@@ -519,4 +519,4 @@ def test_intimacy_does_not_block_vision() -> None:
     # 当前设计：亲密优先，图片消息也走 fast。
     # 如果以后要改优先级，这个测试会报警。
     assert plan.tier == "fast"
-    assert plan.decided_by == "intimacy_mode"
+    assert plan.decided_by == "rhythm_focus"

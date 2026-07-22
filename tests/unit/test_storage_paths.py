@@ -110,6 +110,8 @@ class TestStoragePathsSnapshot:
         assert self.paths.memory_store() == self.data / "memory.json"
         assert self.paths.memory_core_profiles() == self.data / "memory" / "core_profiles.json"
         assert self.paths.memory_curation_state() == self.data / "memory_curation_state.json"
+        assert self.paths.memory_entity_index_db() == self.data / "memory" / "entity_index.db"
+        assert self.paths.memory_access_tracker_db() == self.data / "memory" / "access_tracker.db"
         assert self.paths.reminders_store() == self.data / "reminders.json"
         assert self.paths.tasks_store() == self.data / "tasks.json"
         assert self.paths.notes_dir == self.data / "notes"

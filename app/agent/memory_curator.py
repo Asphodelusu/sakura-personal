@@ -304,12 +304,19 @@ class MemoryCurator:
 
         try:
             all_memories = self.memory_store.list_memories(limit=CURATION_MEMORY_SNAPSHOT_LIMIT)
-            return [m for m in all_memories if not _memory_is_released(m)]
+            existing = [m for m in all_memories if not _memory_is_released(m)]
         except OperationCancelled:
             raise
         except Exception as exc:  # 记忆读取失败不应中断整理，退化为只新增。
             debug_log("Memory", "记忆整理读取现有记忆失败", {"error": str(exc)})
             return []
+        # 复用这次已经取到的全量记忆顺手回填实体索引（只在从未回填过时真正执行一次），
+        # 不为此单独发起一次全量读取。
+        try:
+            self.memory_store.ensure_entity_index_backfilled(existing)
+        except Exception as exc:
+            debug_log("Memory", "实体索引回填失败", {"error": str(exc)})
+        return existing
 
     def _build_self_curation_system_prompt(self) -> str:
         """后台 JSON 任务用整理专用说明 + 最小身份锚（不注入完整人格卡）。"""
@@ -465,6 +472,20 @@ class MemoryCurator:
                 if looks_like_sensitive_memory(content):
                     debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
                     ignored += 1
+                    continue
+                if looks_like_third_person_self(content, self.character_name):
+                    debug_log(
+                        "Memory",
+                        "跳过疑似主语错位记忆候选",
+                        {
+                            "op": action,
+                            "layer": layer,
+                            "character_name": self.character_name,
+                            "content_chars": len(content),
+                        },
+                    )
+                    ignored += 1
+                    event_counts["SKIP_SPEAKER"] = event_counts.get("SKIP_SPEAKER", 0) + 1
                     continue
                 if operations_per_layer.get(layer, 0) >= MAX_CURATION_OPERATIONS_PER_LAYER:
                     debug_log("Memory", "跳过超出单层写入上限的记忆候选", {"layer": layer})
@@ -787,6 +808,23 @@ _SELF_CURATION_TASK_PROMPT = (
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
 )
+
+
+def looks_like_third_person_self(content: str, character_name: str) -> bool:
+    """轻量检测：是否把自己写成第三人称主语（prompt 锚失效时的代码兜底）。
+
+    只拦高置信错位，例如「樱喜欢…」「我对樱说…」；不拦名字作宾语的正常句。
+    """
+    name = (character_name or "").strip()
+    if not name or not content.strip():
+        return False
+    escaped = re.escape(name)
+    patterns = (
+        rf"(?:^|[\n。！？；;])\s*{escaped}(?:喜欢|觉得|感到|认为|想|会|说)",
+        rf"我对{escaped}说",
+        rf"(?:^|[\n。！？；;])\s*{escaped}对(?:他|她|对方)说",
+    )
+    return any(re.search(pattern, content) for pattern in patterns)
 
 
 def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any]) -> dict[str, Any]:

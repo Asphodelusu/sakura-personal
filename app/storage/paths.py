@@ -120,6 +120,12 @@ class StoragePaths:
     def memory_revisions(self) -> Path:
         return self.memory_dir / "memory_revisions.json"
 
+    def memory_entity_index_db(self) -> Path:
+        return self.memory_dir / "entity_index.db"
+
+    def memory_access_tracker_db(self) -> Path:
+        return self.memory_dir / "access_tracker.db"
+
     def memory_curation_state(self) -> Path:
         return self._data / "memory_curation_state.json"
 
