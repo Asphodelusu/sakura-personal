@@ -92,7 +92,8 @@ def test_reflector_skips_near_duplicate_against_existing() -> None:
     assert store.created == []
 
 
-def test_auto_recall_skips_reflections() -> None:
+def test_auto_recall_downweights_reflections() -> None:
+    """反思可弱注入，但降权后不应抢过事实记忆；每轮最多 1 条反思。"""
     selected = _select_memories(
         [
             {
@@ -115,11 +116,51 @@ def test_auto_recall_skips_reflections() -> None:
                     "memory_kind": "reflection",
                 },
             },
+            {
+                "id": "r2",
+                "content": "我觉得自己有点太在意他了",
+                "score": 0.98,
+                "source": "reflection",
+                "category": "reflection",
+                "metadata": {
+                    "importance": 0.85,
+                    "source": "reflection",
+                    "category": "reflection",
+                    "memory_kind": "reflection",
+                },
+            },
         ],
         threshold=0.3,
         limit=5,
     )
-    assert [m["id"] for m in selected] == ["f1"]
+    ids = [m["id"] for m in selected]
+    assert ids[0] == "f1"
+    assert "r1" in ids or "r2" in ids
+    assert sum(1 for m in selected if m.get("is_reflection")) == 1
+
+
+def test_auto_recall_can_include_lone_reflection() -> None:
+    selected = _select_memories(
+        [
+            {
+                "id": "r1",
+                "content": "我意识到他最近压力很大",
+                "score": 0.85,
+                "source": "reflection",
+                "category": "reflection",
+                "metadata": {
+                    "source": "reflection",
+                    "category": "reflection",
+                    "memory_kind": "reflection",
+                    "importance": 0.8,
+                },
+            },
+        ],
+        threshold=0.3,
+        limit=5,
+    )
+    assert [m["id"] for m in selected] == ["r1"]
+    assert selected[0]["is_reflection"] is True
 
 
 def test_curator_formats_reflections_as_non_facts() -> None:

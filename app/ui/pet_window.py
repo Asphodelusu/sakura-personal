@@ -3157,7 +3157,8 @@ class PetWindow(QWidget):
             return "screen_observation_followup"
         from app.agent.builtin_tools import intimacy_mode_state
         if intimacy_mode_state.active:
-            return "intimacy_mode"
+            # 日志对外用中性标签，避免命令行/GUI 出现敏感语义
+            return "rhythm_focus"
         if self.screen_observation_encode_thread is not None:
             return "screen_observation_encode"
         if self.active_interaction_id:
@@ -3335,7 +3336,7 @@ class PetWindow(QWidget):
         # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
         self._intimacy_continue_count += 1
         text = INTIMACY_CONTINUE_MARKER
-        self._begin_interaction("intimacy_continue")
+        self._begin_interaction("rhythm_continue")
 
         # 写入内存上下文（保持 user/assistant 交替），但不进持久化历史
         self.messages.append({"role": "user", "content": text})
@@ -5166,16 +5167,30 @@ class PetWindow(QWidget):
         if isinstance(result, ReflectionResult):
             m_created = result.memories_created
             m_errors = len(result.errors)
+            m_skipped = result.skipped_dupes
+            m_empty = result.empty
         else:
             m_created = 0
             m_errors = 0
+            m_skipped = 0
+            m_empty = True
         debug_log(
             "Memory",
             "记忆反思完成",
-            {"memories_created": m_created, "errors": m_errors},
+            {
+                "memories_created": m_created,
+                "skipped_dupes": m_skipped,
+                "empty": m_empty,
+                "errors": m_errors,
+            },
         )
         if m_errors == 0:
-            mark_reflection_done(self.reflection_state_store, m_created)
+            mark_reflection_done(
+                self.reflection_state_store,
+                m_created,
+                skipped_dupes=m_skipped,
+                empty=m_empty,
+            )
         else:
             debug_log("Memory", "记忆反思有错误，不更新 last_reflection_at，下次重试", {"errors": m_errors})
 

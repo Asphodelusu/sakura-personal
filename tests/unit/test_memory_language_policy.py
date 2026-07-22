@@ -47,6 +47,16 @@ def test_curator_prompt_treats_intimacy_as_memorable() -> None:
     assert "今の関係" in text
 
 
+def test_looks_like_third_person_self_detects_common_slips() -> None:
+    from app.agent.memory_curator import looks_like_third_person_self
+
+    assert looks_like_third_person_self("樱喜欢抹茶", "樱") is True
+    assert looks_like_third_person_self("我对樱说今晚早点休息", "樱") is True
+    assert looks_like_third_person_self("他叫我樱", "樱") is False
+    assert looks_like_third_person_self("他喜欢抹茶", "樱") is False
+    assert looks_like_third_person_self("我喜欢和他待着", "樱") is False
+
+
 def test_curator_identity_anchor_maps_speakers(tmp_path) -> None:
     store = MemoryStore(base_dir=tmp_path, memory_client=object())
     curator = MemoryCurator(

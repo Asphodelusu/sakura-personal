@@ -836,7 +836,7 @@ class AgentRuntime:
                             request, light_mode=True,
                         )
                         turn_memory_fragments = tuple(light_recall.fragments)
-                        memory_status = "intimacy_light"
+                        memory_status = "rhythm_light"
                     elif turn_state.recall_decision == "recall":
                         recall = self.memory_recall.recall(request)
                         turn_memory_fragments = list(recall.fragments)
@@ -901,12 +901,12 @@ class AgentRuntime:
                     memory_needs_refresh = False
                     request = replace(request, service_status={"memory": memory_status})
                 # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
-                if intimacy_focus and memory_status != "intimacy_light":
+                if intimacy_focus and memory_status != "rhythm_light":
                     light_recall = self.memory_recall.recall(
                         request, light_mode=True,
                     )
                     turn_memory_fragments = tuple(light_recall.fragments)
-                    memory_status = "intimacy_light"
+                    memory_status = "rhythm_light"
                     request = replace(request, service_status={"memory": memory_status})
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,

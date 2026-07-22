@@ -158,13 +158,23 @@ def _parse_reflection_output(raw: str) -> list[dict[str, Any]]:
 class ReflectionState:
     last_reflection_at: str = ""  # ISO timestamp
     last_reflection_count: int = 0
-    total_reflections: int = 0
+    total_reflections: int = 0  # 完成轮次（含空产出）
+    total_created: int = 0  # 累计写入条数
+    total_empty: int = 0  # LLM 返回空列表的轮次
+    total_skipped_dupes: int = 0  # 累计近义/哈希去重跳过
+    last_empty: bool = False
+    last_skipped_dupes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "last_reflection_at": self.last_reflection_at,
             "last_reflection_count": self.last_reflection_count,
             "total_reflections": self.total_reflections,
+            "total_created": self.total_created,
+            "total_empty": self.total_empty,
+            "total_skipped_dupes": self.total_skipped_dupes,
+            "last_empty": self.last_empty,
+            "last_skipped_dupes": self.last_skipped_dupes,
         }
 
     @classmethod
@@ -173,6 +183,11 @@ class ReflectionState:
             last_reflection_at=str(data.get("last_reflection_at", "")).strip(),
             last_reflection_count=int(data.get("last_reflection_count", 0)),
             total_reflections=int(data.get("total_reflections", 0)),
+            total_created=int(data.get("total_created", 0)),
+            total_empty=int(data.get("total_empty", 0)),
+            total_skipped_dupes=int(data.get("total_skipped_dupes", 0)),
+            last_empty=bool(data.get("last_empty", False)),
+            last_skipped_dupes=int(data.get("last_skipped_dupes", 0)),
         )
 
 
@@ -207,6 +222,8 @@ class ReflectionStateStore:
 @dataclass
 class ReflectionResult:
     memories_created: int = 0
+    skipped_dupes: int = 0
+    empty: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -244,7 +261,7 @@ class MemoryReflector:
 
         if len(memories) < 5:
             _logger.debug("Reflection: too few memories (%d), skipping", len(memories))
-            return ReflectionResult()
+            return ReflectionResult(empty=True)
 
         # 2. 构建 prompt（后台任务只用反思专用说明，不注入完整 Sakura persona）
         summary = _format_memory_summary(memories)
@@ -279,7 +296,7 @@ class MemoryReflector:
         ]
         if not reflections:
             _logger.debug("Reflection: LLM decided nothing worth reflecting")
-            return ReflectionResult()
+            return ReflectionResult(empty=True)
 
         # 5. 写入记忆（跳过哈希重复与近义重复的反思）
         created = 0
@@ -306,11 +323,11 @@ class MemoryReflector:
             content_hash = hashlib.md5(content.encode()).hexdigest()
             if content_hash in existing_hashes:
                 skipped_dupes += 1
-                _logger.debug("Reflection: skipping hash duplicate: %s", content[:60])
+                _logger.debug("Reflection: skipping hash duplicate")
                 continue
             if _is_near_duplicate_reflection(content, existing_reflection_texts):
                 skipped_dupes += 1
-                _logger.debug("Reflection: skipping near-duplicate: %s", content[:60])
+                _logger.debug("Reflection: skipping near-duplicate")
                 continue
             importance = float(r.get("importance", 0.5))
             confidence = float(r.get("confidence", 0.5))
@@ -336,8 +353,19 @@ class MemoryReflector:
                 _logger.exception("Reflection: failed to write memory")
                 errors.append(f"写入反思记忆失败：{exc}")
 
-        _logger.info("Reflection: created %d meta-memories, skipped %d duplicates", created, skipped_dupes)
-        return ReflectionResult(memories_created=created, errors=errors)
+        empty = created == 0 and skipped_dupes == 0
+        _logger.info(
+            "Reflection: created=%d skipped_dupes=%d empty=%s",
+            created,
+            skipped_dupes,
+            empty,
+        )
+        return ReflectionResult(
+            memories_created=created,
+            skipped_dupes=skipped_dupes,
+            empty=empty,
+            errors=errors,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +394,33 @@ def reflection_should_run(
     return elapsed_hours >= min_interval_hours
 
 
-def mark_reflection_done(state_store: ReflectionStateStore, created_count: int) -> None:
-    """记录完成一次反思。"""
+def mark_reflection_done(
+    state_store: ReflectionStateStore,
+    created_count: int,
+    *,
+    skipped_dupes: int = 0,
+    empty: bool = False,
+) -> None:
+    """记录完成一次反思，并累计 empty/created/skipped 便于调参。"""
     state = state_store.snapshot()
     state.last_reflection_at = datetime.now(timezone.utc).isoformat()
     state.last_reflection_count = created_count
+    state.last_skipped_dupes = max(0, int(skipped_dupes))
+    state.last_empty = bool(empty)
     state.total_reflections += 1
+    state.total_created += max(0, int(created_count))
+    state.total_skipped_dupes += max(0, int(skipped_dupes))
+    if state.last_empty:
+        state.total_empty += 1
     state_store.save(state)
+    _logger.info(
+        "Reflection stats: runs=%d created=%d empty=%d skipped=%d "
+        "(last created=%d empty=%s skipped=%d)",
+        state.total_reflections,
+        state.total_created,
+        state.total_empty,
+        state.total_skipped_dupes,
+        state.last_reflection_count,
+        state.last_empty,
+        state.last_skipped_dupes,
+    )

@@ -68,6 +68,7 @@ _PROGRAM_MESSAGE_LABELS = {
     ("ScreenAwareness", "主动屏幕上下文获取失败"): "截图失败",
     ("ScreenAwareness", "主动屏幕上下文编码失败"): "截图编码失败",
     ("Memory", "触发记忆反思"): "触发记忆整理",
+    ("Memory", "记忆反思完成"): "记忆反思完成",
     ("Memory", "记忆反思失败"): "记忆整理失败",
     ("Memory", "第一人称记忆整理抽取完成"): "记忆整理抽取完成",
     ("Memory", "长期记忆状态变化"): "记忆系统状态变化",
@@ -104,6 +105,7 @@ _CATEGORY_MESSAGE_ALLOWLIST: dict[str, frozenset[str]] = {
     }),
     "Memory": frozenset({
         "触发记忆反思",
+        "记忆反思完成",
         "记忆反思失败",
         "第一人称记忆整理抽取完成",
         "长期记忆状态变化",

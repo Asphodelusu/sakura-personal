@@ -72,8 +72,8 @@ class TestObserverBusyGate:
         assert _pet_window_source_contains("intimacy_mode_state"), (
             "_proactive_observer_busy_reason 应导入并检查 intimacy_mode_state"
         )
-        assert _pet_window_source_contains('"intimacy_mode"'), (
-            "_proactive_observer_busy_reason 应在 active 时返回 'intimacy_mode'"
+        assert _pet_window_source_contains('"rhythm_focus"'), (
+            "_proactive_observer_busy_reason 应在 active 时返回中性标签 'rhythm_focus'"
         )
 
 

@@ -466,6 +466,20 @@ class MemoryCurator:
                     debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
                     ignored += 1
                     continue
+                if looks_like_third_person_self(content, self.character_name):
+                    debug_log(
+                        "Memory",
+                        "跳过疑似主语错位记忆候选",
+                        {
+                            "op": action,
+                            "layer": layer,
+                            "character_name": self.character_name,
+                            "content_chars": len(content),
+                        },
+                    )
+                    ignored += 1
+                    event_counts["SKIP_SPEAKER"] = event_counts.get("SKIP_SPEAKER", 0) + 1
+                    continue
                 if operations_per_layer.get(layer, 0) >= MAX_CURATION_OPERATIONS_PER_LAYER:
                     debug_log("Memory", "跳过超出单层写入上限的记忆候选", {"layer": layer})
                     ignored += 1
@@ -787,6 +801,23 @@ _SELF_CURATION_TASK_PROMPT = (
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
 )
+
+
+def looks_like_third_person_self(content: str, character_name: str) -> bool:
+    """轻量检测：是否把自己写成第三人称主语（prompt 锚失效时的代码兜底）。
+
+    只拦高置信错位，例如「樱喜欢…」「我对樱说…」；不拦名字作宾语的正常句。
+    """
+    name = (character_name or "").strip()
+    if not name or not content.strip():
+        return False
+    escaped = re.escape(name)
+    patterns = (
+        rf"(?:^|[\n。！？；;])\s*{escaped}(?:喜欢|觉得|感到|认为|想|会|说)",
+        rf"我对{escaped}说",
+        rf"(?:^|[\n。！？；;])\s*{escaped}对(?:他|她|对方)说",
+    )
+    return any(re.search(pattern, content) for pattern in patterns)
 
 
 def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any]) -> dict[str, Any]:

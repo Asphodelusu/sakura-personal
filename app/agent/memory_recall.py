@@ -41,6 +41,9 @@ COLD_ARCHIVE_IDLE_DAYS = 45
 COLD_ARCHIVE_IMPORTANCE_MAX = 0.38
 COLD_ARCHIVE_DECAY_FLOOR = 0.52
 EXEMPT_COLD_ARCHIVE_KINDS = frozenset({"commitment", "emotional_turn", "core_profile"})
+# 独处反思：自动召回降权弱注入（非硬过滤），每轮最多 1 条，避免抢事实位。
+REFLECTION_AUTO_RECALL_SCORE_FACTOR = 0.3
+MAX_REFLECTION_IN_AUTO_RECALL = 1
 
 
 def _set_access_tracker_path(path: Path) -> None:
@@ -185,9 +188,13 @@ class MemoryRecallService:
                 # 来源，让每条都带同样的开场白只会显得像检索结果堆砌，也白费 token。
                 content=_annotate_recalled_memory_content(memory, now=now),
                 trust="trusted" if memory["source"] == "explicit" else "untrusted",
-                priority=80 if memory["source"] == "explicit" else 70,
+                priority=(
+                    45
+                    if memory.get("is_reflection")
+                    else (80 if memory["source"] == "explicit" else 70)
+                ),
                 freshness=memory["updated_at"],
-                token_budget=512,
+                token_budget=280 if memory.get("is_reflection") else 512,
                 sensitivity="private",
                 cache_scope="turn",
             )
@@ -201,12 +208,16 @@ def _annotate_recalled_memory_content(memory: dict[str, Any], *, now: datetime) 
     from app.agent.time_awareness import annotate_with_relative_age, memory_event_timestamp
 
     content = str(memory.get("content") or "").strip()
-    return annotate_with_relative_age(
+    annotated = annotate_with_relative_age(
         content,
         memory_event_timestamp(memory),
         now=now,
         expired=memory_record_is_expired(memory, now=now),
     )
+    if memory_record_is_reflection(memory):
+        # 弱注入时标明非事实，可影响语气，但不要当经历说出口
+        return f"（独处感想，可影响语气）{annotated}"
+    return annotated
 
 
 def _build_memory_query(request: ContextRequest) -> str:
@@ -255,12 +266,9 @@ def _select_memories(
             continue
         dedupe_key = " ".join(content.lower().split())
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        # 自动召回不注入独处反思：感想≠事实，避免被当成经历说出口。
-        # 主动 memory_search 仍可查到（不经此过滤）。
-        if memory_record_is_reflection(raw) or memory_record_is_reflection(
+        is_reflection = memory_record_is_reflection(raw) or memory_record_is_reflection(
             {"metadata": metadata, "source": raw.get("source"), "category": raw.get("category")}
-        ):
-            continue
+        )
         if dedupe_key in seen or _is_memory_expired(raw, metadata, now):
             continue
         score = _optional_score(raw.get("score"))
@@ -292,6 +300,8 @@ def _select_memories(
                 1.0,
                 decay_weight * emotion_congruence_factor(persona.active_emotion(), memory_emotion),
             )
+        if is_reflection:
+            decay_weight *= REFLECTION_AUTO_RECALL_SCORE_FACTOR
         normalized.append(
             {
                 "id": memory_id,
@@ -307,6 +317,7 @@ def _select_memories(
                 "metadata": metadata,
                 "importance": importance,
                 "decay_weight": decay_weight,
+                "is_reflection": is_reflection,
             }
         )
         seen.add(dedupe_key)
@@ -318,7 +329,17 @@ def _select_memories(
             item["updated_at"],
         )
     )
-    return normalized[:limit]
+    selected: list[dict[str, Any]] = []
+    reflection_count = 0
+    for item in normalized:
+        if item.get("is_reflection"):
+            if reflection_count >= MAX_REFLECTION_IN_AUTO_RECALL:
+                continue
+            reflection_count += 1
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _optional_score(value: Any) -> float | None:

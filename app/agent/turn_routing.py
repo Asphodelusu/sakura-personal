@@ -229,9 +229,9 @@ def resolve_turn_plan(
     if intimacy_mode_state.active:
         latest = (_latest_user_text(messages) or "").strip()
         if latest == INTIMACY_CONTINUE_MARKER:
-            return _fast_plan(recall_decision=recall, decided_by="intimacy_mode")
+            return _fast_plan(recall_decision=recall, decided_by="rhythm_focus")
         if intimacy_mode_state.consume_turn():
-            return _fast_plan(recall_decision=recall, decided_by="intimacy_mode")
+            return _fast_plan(recall_decision=recall, decided_by="rhythm_focus")
         # counter exhausted → auto-exit（consume_turn 内已 active=False）
 
     has_image = messages_contain_image(messages)

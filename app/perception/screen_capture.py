@@ -11,7 +11,6 @@ import io
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-import mss
 from loguru import logger
 from PIL import Image
 
@@ -38,6 +37,8 @@ class ScreenCapture:
         self.window_only = window_only
 
     def grab(self, monitor_index: int | None = None) -> ScreenObservation:
+        import mss
+
         idx = monitor_index if monitor_index is not None else self.monitor_index
 
         # Window-only mode: capture just the foreground window rect
