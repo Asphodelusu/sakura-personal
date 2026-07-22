@@ -304,12 +304,19 @@ class MemoryCurator:
 
         try:
             all_memories = self.memory_store.list_memories(limit=CURATION_MEMORY_SNAPSHOT_LIMIT)
-            return [m for m in all_memories if not _memory_is_released(m)]
+            existing = [m for m in all_memories if not _memory_is_released(m)]
         except OperationCancelled:
             raise
         except Exception as exc:  # 记忆读取失败不应中断整理，退化为只新增。
             debug_log("Memory", "记忆整理读取现有记忆失败", {"error": str(exc)})
             return []
+        # 复用这次已经取到的全量记忆顺手回填实体索引（只在从未回填过时真正执行一次），
+        # 不为此单独发起一次全量读取。
+        try:
+            self.memory_store.ensure_entity_index_backfilled(existing)
+        except Exception as exc:
+            debug_log("Memory", "实体索引回填失败", {"error": str(exc)})
+        return existing
 
     def _build_self_curation_system_prompt(self) -> str:
         """后台 JSON 任务用整理专用说明 + 最小身份锚（不注入完整人格卡）。"""
