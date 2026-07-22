@@ -5,7 +5,8 @@
 > **不要**按本文安装 `runtime/`，也不要运行上游的 `install.bat` / `start.bat`。  
 > API 配置见 [API_CONFIG.md](API_CONFIG.md)；macOS 见 [MACOS_SETUP.md](MACOS_SETUP.md)。
 >
-> 下文面向上游 **Release 完整包**（含预置 `runtime/`）用户；Personal Edition 仅可参考其中的角色包下载与首次配置截图说明。
+> 下文面向上游 **Release 完整包**（含预置 `runtime/`）用户；Personal Edition 仅可参考其中的角色包下载与首次配置说明。  
+> 上游公开页常同时出现「稳定包 0.9.8」与「开发版 0.9.9-dev」——以下文件名以 Releases 实际附件为准，不必与本仓库 `VERSION` 对齐。
 
 ---
 

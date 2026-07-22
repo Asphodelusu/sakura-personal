@@ -3201,16 +3201,22 @@ class PetWindow(QWidget):
 
     @Slot(str, bool)
     def _record_proactive_evaluate(self, reason: str, should_speak: bool) -> None:
-        """在主线程写入 "[看了一下屏幕]" 到聊天历史。"""
+        """记录一次 Observer 评估结果。
+
+        Observer 自身的"看了多少次屏幕"由内部 `_obs_history`（有限队列）+
+        `situational_summary`（单条滚动摘要，带 TTL）承载，不依赖持久化聊天历史。
+        这里只在真正开口（should_speak=True）时补一条系统记录，方便回看"为什么说了这句话"；
+        未发言的评估仅进调试日志，避免频繁评估把聊天历史刷满系统噪音记录。
+        """
         try:
-            status = "发言" if should_speak else "未发言"
-            mark = f"[看了一下屏幕] {status}"
-            if reason:
-                mark += f"：{reason}"
-            self._record_history("system", mark)
+            if should_speak:
+                mark = "[看了一下屏幕] 发言"
+                if reason:
+                    mark += f"：{reason}"
+                self._record_history("system", mark)
             debug_log(
                 "ProactiveObserver",
-                "评估结果已写入历史",
+                "评估结果",
                 {"should_speak": should_speak, "reason": reason[:120]},
             )
         except Exception as exc:
