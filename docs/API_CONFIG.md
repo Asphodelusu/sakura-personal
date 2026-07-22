@@ -2,7 +2,8 @@
 
 本文说明如何在 Sakura 中配置大模型 API（OpenAI 兼容接口）。
 
-Personal Edition 与上游 0.9.9 均通过 **Tauri 设置页** 管理配置；推荐在设置页完成，必要时再直接编辑 `data/config/api.yaml`。
+Personal Edition 与上游 `0.9.9-dev` 均通过 **Tauri 设置页** 管理配置；推荐在设置页完成，必要时再直接编辑 `data/config/api.yaml`。
+主动屏幕观察的 Vision 调用走 **`vision_chat`** 槽（见本仓库 `ProactiveObserver`），请单独配置支持识图的模型。
 
 ## Personal Edition：`api_profiles` + `model_slots`
 

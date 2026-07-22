@@ -42,9 +42,10 @@ self.messages（内存,append-only,只存"干净文本"）
 两个要点：
 - **工具调用/结果不进 `self.messages`**：它们只活在 runtime 内部的 `working_messages`，一轮只留下最终 `reply.text`。
   好处是对话窗口干净；代价是第 N 轮模型看不到第 1 轮工具返回了什么（除非被写进回复文本或长期记忆）。
-- **持久层 `chat_history.jsonl` 是 append-only JSONL**（`app/storage/chat_history.py:33`），
-  与 Claude Code 的 transcript 模型同源。会话窗口（`self.messages`）每次启动为空，跨会话靠
-  记忆召回 + `session_state` digest 续接（见 `app/agent/session_state_context.py`）。
+- **持久层聊天历史现为 SQLite**（`app/storage/chat_history.py`；首次启动可从旧 JSONL 自动迁移）。
+  会话窗口（`self.messages`）每次启动为空，跨会话靠记忆召回 + `session_state` digest 续接
+  （见 `app/agent/session_state_context.py`）。上游 [Rvosy/Sakura](https://github.com/Rvosy/Sakura)
+  当前仍使用 JSONL 实现。
 
 ### 1.2 静态 / 动态分层（与缓存相关）
 

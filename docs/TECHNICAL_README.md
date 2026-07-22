@@ -1,6 +1,10 @@
-# Sakura 技术讲解 README
+# Sakura 技术讲解 README（Personal Edition）
 
-本文面向想深入了解 Sakura 架构、运行链路、配置方式或二次开发的用户。只想安装和使用桌宠的话，看 [主 README](../README.md) 即可。
+本文面向想深入了解 **本仓库** 架构、运行链路、配置方式或二次开发的用户。
+只想安装和使用桌宠的话，看根目录 [README.md](../README.md)。
+
+> 上游 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) 也有同名技术文档，但双方模块已分叉（例如主动感知、聊天历史存储）。
+> 请以本文件与根 README「事实对照」为准，不要直接套用上游文档里的 `screen_awareness.check_interval_minutes` 等旧键当运行时真相。
 
 ## 设计思路
 
@@ -60,12 +64,18 @@ flowchart LR
 │   │   ├── session_state_context.py     # 最近会话续接上下文
 │   │   ├── memory.py / memory_recall.py # 分层长期记忆与相关召回
 │   │   ├── memory_curator.py            # 自动记忆整理
+│   │   ├── memory_reflector.py          # 空闲反思 / 二阶元反思
+│   │   ├── memory_timeline.py           # 记忆时间线辅助
+│   │   ├── entity_index.py              # 轻量实体→记忆索引（SQLite）
+│   │   ├── access_tracker.py            # 记忆访问时间跟踪（SQLite）
+│   │   ├── persona_state.py             # 连续 valence-arousal 情绪亲和
+│   │   ├── turn_routing.py              # 回合路由（含亲密模式节奏等）
 │   │   ├── runtime.py                  # AgentRuntime（决策/工具循环）
 │   │   ├── runtime_limits.py           # 可配置工具循环限制
-│   │   ├── screen_awareness.py         # 主动屏幕感知策略
+│   │   ├── screen_awareness.py         # 主动屏幕感知总开关兼容壳（真正运行时见 app/perception/）
 │   │   ├── screen_tools.py             # 屏幕观察工具
 │   │   ├── screen_observation.py       # 屏幕观察入口
-│   │   ├── proactive_care.py           # 主动关怀
+│   │   ├── proactive_care.py           # 主动关怀旧路径别名兼容壳（已停用，转发到 screen_awareness）
 │   │   ├── tool_policy.py              # 工具路由策略
 │   │   ├── tool_routing.py             # 浏览器/屏幕工具路由纯函数
 │   │   ├── tools/                      # 统一工具注册系统
@@ -100,6 +110,13 @@ flowchart LR
 │   │   ├── context_trimming.py         # 上下文修剪
 │   │   ├── prompt_templates.py         # 提示词模板
 │   │   └── prompts/                    # 提示词块/渲染
+│   ├── perception/                     # 主动屏幕感知运行时
+│   │   ├── observer.py                 # ProactiveObserver：截图/UIA→VLM独白→LLM决定是否搭话
+│   │   ├── proactive_config.py         # ProactiveObserver 运行时配置（ProactiveConfig）
+│   │   ├── privacy.py                  # PrivacyGuard：进程名/标题黑名单拦截
+│   │   ├── screen_capture.py           # mss 截图 + 缩放 + dHash 去重
+│   │   ├── screen_reader.py            # UIA 读取前台窗口文字（免 OCR）
+│   │   └── win32.py                    # 前台窗口/进程名/系统空闲时间
 │   ├── plugins/                        # 插件系统（原生）
 │   │   ├── models.py                   # PluginManifest / PluginSpec / Contribution
 │   │   ├── base.py                     # PluginBase / PluginContext
@@ -108,61 +125,48 @@ flowchart LR
 │   │   ├── events.py / services.py      # 事件与受限服务门面
 │   │   └── manager.py                  # PluginManager
 │   ├── renderers/                       # 可扩展角色渲染器
+│   ├── stt/                            # 语音输入（SenseVoice / VAD）
 │   ├── storage/                        # 存储层
 │   │   ├── paths.py                    # StoragePaths 统一路径
-│   │   ├── chat_history.py             # 聊天历史（JSONL）
+│   │   ├── chat_history.py             # 聊天历史（SQLite，首次启动自动迁移旧 JSONL）
 │   │   └── visual_observation.py       # 视觉观察记录（JSONL）
 │   ├── ui/                             # UI 组件
 │   │   ├── pet_window.py               # 桌宠主窗口
 │   │   ├── tauri_settings.py           # Tauri 设置桥接
-│   │   └── settings/                   # 设置页后台 Worker（Tauri 复用）
+│   │   ├── settings/                   # 设置页后台 Worker（Tauri 复用）
 │   │   ├── history_window.py           # 历史回看
-│   │   ├── portrait_controller.py      # 立绘控制器
-│   │   ├── subtitle_controller.py      # 字幕控制器
-│   │   ├── tool_confirmation_panel.py  # 工具确认面板
-│   │   ├── portrait_utils.py           # 立绘工具函数
 │   │   └── ...（其余 UI 组件）
-│   └── voice/                          # 语音
-│       ├── tts.py / tts_settings.py     # Provider 与配置
-│       ├── tts_service.py               # 服务监管
-│       ├── tts_synthesis.py             # 合成队列
-│       └── tts_playback.py              # 播放端点
+│   └── voice/                          # TTS（GPT-SoVITS 等）
 ├── plugins/                            # 本地插件
-│   └── playwright_browser/             # Playwright 浏览器插件
-├── characters/sakura/                  # 角色资源
+│   ├── playwright_browser/             # Playwright 浏览器插件
+│   └── sakura_mobile/                  # 手机网页端（可选）
+├── characters/                         # 角色资源（完整 .char 需从上游 Release 获取）
 ├── assets/backchannels/                # 角色接话清单与开发说明
 ├── data/                               # 本地数据
 │   ├── config/                         # YAML 配置（api.yaml / system_config.yaml 等）
-│   ├── chat_history/                   # 聊天记录
-│   ├── memory/                         # 长期记忆
+│   ├── chat_history/                   # 聊天记录（SQLite）
+│   ├── memory/                         # 长期记忆 / 实体索引 / 访问跟踪
 │   └── visual_observations/            # 视觉观察记录
 ├── tests/                              # pytest 测试
-│   ├── unit/                           # 单元测试（配置 / LLM / 工具 / 运行时等）
-│   ├── integration/                    # 集成测试（AgentRuntime / ChatPipeline 等）
-│   └── ui/                             # UI 测试
 ├── docs/                               # 文档
-│   ├── TECHNICAL_README.md             # 技术讲解 README
-│   └── SAKURA_PLUGIN_SDK.md            # 插件开发指南
-├── tools/studio_tauri/                 # Tauri 角色工坊宿主
-├── tools/studio/                       # 兼容入口（转发至 studio_tauri）
+├── tools/settings-tauri/               # Tauri 设置页
+├── tools/studio-tauri/                 # Tauri 角色工坊
+├── tools/studio/                       # 兼容入口（转发至 Tauri 工坊）
 ├── tools/cleanup.py                    # 安全清理工具（默认 dry-run）
 └── tools/mcp/                          # MCP Server 运行时
 ```
 
 ## 运行与测试
 
-项目在 Release 完整包（或从 Release 下载 `runtime-*.zip` 后解压到根目录）时，根目录会包含 `runtime/`，Windows 可用 `./runtime/python.exe` 运行；从源码开发时也可以使用任意 Python 3.10+ 虚拟环境。
+Personal Edition 推荐源码 + `.venv`，入口为根目录 `run.bat`（见 [README.md](../README.md)）。
+上游 Release 完整包则使用预置 `runtime/` 与 `install.bat` / `start.bat`。
 
-启动应用：
-
-```powershell
-python main.py
-```
-
-运行全部测试：
+启动应用（源码）：
 
 ```powershell
-python -m pytest
+.\run.bat
+# 或
+.\.venv\Scripts\python.exe main.py
 ```
 
 运行单元测试：
@@ -187,9 +191,10 @@ python -m pytest tests/unit
 | `api.yaml: tts.gpt_sovits.tts_config_path` | 自定义 GPT-SoVITS 推理配置 | 空 |
 | `system_config.yaml: ui.subtitle_language` | 气泡语言 `ja`/`zh` | `zh` |
 | `system_config.yaml: ui.portrait_scale_percent` | 立绘缩放 | `100` |
-| `system_config.yaml: screen_awareness.enabled` | 主动屏幕感知 | `true` |
-| `system_config.yaml: screen_awareness.check_interval_minutes` | 检查间隔 | `20` |
-| `system_config.yaml: screen_awareness.cooldown_minutes` | 发言冷却 | `10` |
+| `system_config.yaml: proactive.enabled` | 主动屏幕感知总开关（`screen_awareness.enabled` 为旧兼容字段） | `true` |
+| `system_config.yaml: proactive.timer_seconds` | 基础巡视间隔（会被 VLM 建议的自适应间隔覆盖） | `480` |
+| `system_config.yaml: proactive.cooldown_seconds` | 发言冷却 | `600` |
+| `system_config.yaml: proactive.privacy.blocked_processes/blocked_title_keywords` | 隐私黑名单（进程名/标题关键词），也可在设置页「隐私」页编辑 | 见 `app/perception/privacy.py` |
 | `system_config.yaml: tool_loop.*` | Agent 步数和工具调用上限 | `4 / 3 / 8` |
 | `system_config.yaml: backchannel.enabled` | 本地快速接话 | `false` |
 | `system_config.yaml: memory_curation.enabled` | 自动记忆整理 | `true` |
