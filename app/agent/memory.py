@@ -400,6 +400,8 @@ class MemoryStore:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _entity_index: Any | None = field(default=None, init=False, repr=False)
     _entity_index_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # 上一轮回复 tone 映射出的 Sakura 情绪（按角色 scope），供记忆召回亲和加权。
+    _sakura_reply_emotions: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.base_dir = _resolve_base_dir(self.base_dir)
@@ -1064,6 +1066,17 @@ class MemoryStore:
                 history = history[:5]
         data[self.scope_id] = {"content": emotion, "updated_at": now, "history": history}
         self._save_user_emotion_state(data)
+
+    def record_sakura_reply_emotion(self, tone: str) -> None:
+        """根据本轮回复 tone 记录 Sakura 当下情绪，供下一轮召回亲和使用。"""
+        from app.agent.persona_state import tone_to_emotion
+
+        emotion = tone_to_emotion(tone)
+        self._sakura_reply_emotions[self.scope_id] = emotion
+
+    def sakura_reply_emotion(self) -> str:
+        """上一轮回复映射出的情绪标签；无记录时返回空串。"""
+        return str(self._sakura_reply_emotions.get(self.scope_id) or "").strip()
 
     def _load_user_emotion_state(self) -> dict[str, Any]:
         path = StoragePaths(self.base_dir).memory_user_emotion_state()
@@ -2003,6 +2016,15 @@ class ScopedMemoryStore(MemoryStore):
 
     def _save_mood_state(self, data: dict[str, Any]) -> None:
         self._owner._save_mood_state(data)
+
+    def record_sakura_reply_emotion(self, tone: str) -> None:
+        from app.agent.persona_state import tone_to_emotion
+
+        emotion = tone_to_emotion(tone)
+        self._owner._sakura_reply_emotions[self.scope_id] = emotion
+
+    def sakura_reply_emotion(self) -> str:
+        return str(self._owner._sakura_reply_emotions.get(self.scope_id) or "").strip()
 
     def _loading_response(self) -> dict[str, Any]:
         return self._owner._loading_response()

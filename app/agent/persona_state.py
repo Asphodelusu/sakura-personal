@@ -65,15 +65,58 @@ def normalize_emotion(value: str | None) -> str:
     return text if text in EMOTIONS else DEFAULT_EMOTION
 
 
+# 角色 reply.tones（中文演出标签）→ EMOTIONS（离散情绪）映射。
+# tone 是给 TTS/立绘用的演出词，和记忆召回用的英文情绪标签是两套命名；
+# 模型每段选的 tone 比「对心情日记再打一次词典分」更贴近她刚才实际怎么说话。
+_TONE_TO_EMOTION: dict[str, str] = {
+    "中性": "neutral",
+    "不满": "frustrated",
+    "害羞": "embarrassed",
+    "请求": "tender",
+    "困惑": "confused",
+    "惊讶": "playful",
+    "开心": "happy",
+    "高兴": "happy",
+    "难过": "sad",
+    "自信": "determined",
+    "温柔": "tender",
+    "生气": "angry",
+    "担心": "anxious",
+    "安抚": "warm",
+    "撒娇": "tender",
+    "兴奋": "playful",
+}
+
+
+def tone_to_emotion(tone: str | None) -> str:
+    """把回复 tone 映射到 EMOTIONS；未知或空 → neutral。"""
+    raw = str(tone or "").strip()
+    if not raw:
+        return DEFAULT_EMOTION
+    lowered = raw.casefold()
+    if lowered in EMOTIONS:
+        return lowered
+    mapped = _TONE_TO_EMOTION.get(raw)
+    if mapped is not None:
+        return normalize_emotion(mapped)
+    return DEFAULT_EMOTION
+
+
 def resolve_persona_state(
     *,
     dialogue_text: str,
     mood_content: str = "",
+    sakura_reply_emotion: str = "",
     scorer: EmotionScorer | None = None,
 ) -> PersonaState:
     scorer = scorer or EmotionScorer()
     user = scorer.best(dialogue_text) or DEFAULT_EMOTION
-    sakura = scorer.best(mood_content) or DEFAULT_EMOTION
+    # 优先用上一轮回复 tone 映射出的情绪；没有可靠信号时再对心情日记打分。
+    reply_emotion = normalize_emotion(sakura_reply_emotion) if sakura_reply_emotion else DEFAULT_EMOTION
+    if reply_emotion != DEFAULT_EMOTION:
+        sakura = reply_emotion
+    else:
+        sakura = scorer.best(mood_content) or DEFAULT_EMOTION
     return PersonaState(
         user_emotion=normalize_emotion(user),
         sakura_mood_emotion=normalize_emotion(sakura),

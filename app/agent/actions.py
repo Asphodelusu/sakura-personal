@@ -162,4 +162,3 @@ class AgentResult:
     reply: ChatReply
     actions: list[AgentAction] = field(default_factory=list)
     _debug: dict[str, Any] | None = field(default=None)
-    mood_update: str | None = field(default=None)

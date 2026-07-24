@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import re
 
-from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER, intimacy_mode_state
+from app.agent.builtin_tools import (
+    INTIMACY_CONTINUE_MARKER,
+    intimacy_mode_state,
+    user_signals_intimacy_end,
+    user_signals_intimacy_exit_confirm,
+    user_signals_intimacy_keep_going,
+)
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -223,16 +229,37 @@ def resolve_turn_plan(
     if not settings.enabled:
         return _standard_plan(recall_decision=recall, decided_by="disabled")
 
-    # —— 亲密节奏模式：模型自启 set_intimacy_mode 后走 fast 回复 ——
-    # 真实用户轮扣减自动退出计数；系统续投（続けて）不扣、也不重置计数。
-    # 模型显式 on=false，或用户轮耗尽后自动解除。
+    # —— 亲密节奏模式 ——
+    # 用户回话刷新 8 轮；续投才扣次；结束类话先待确认，确认后才退出。
     if intimacy_mode_state.active:
         latest = (_latest_user_text(messages) or "").strip()
+        intimacy_mode_state.note_user_text(latest)
         if latest == INTIMACY_CONTINUE_MARKER:
-            return _fast_plan(recall_decision=recall, decided_by="rhythm_focus")
-        if intimacy_mode_state.consume_turn():
-            return _fast_plan(recall_decision=recall, decided_by="rhythm_focus")
-        # counter exhausted → auto-exit（consume_turn 内已 active=False）
+            # 待确认结束时不静默续投抢话，留给对方回答
+            if intimacy_mode_state.pending_exit_confirm:
+                return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
+            if intimacy_mode_state.consume_turn():
+                return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
+            # 静默续投耗尽 → 自动退出（needs_reentry_hint 已置位）
+        elif intimacy_mode_state.pending_exit_confirm:
+            if user_signals_intimacy_keep_going(latest):
+                intimacy_mode_state.clear_exit_confirm()
+                intimacy_mode_state.refresh_user_reply()
+                return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
+            if user_signals_intimacy_exit_confirm(latest):
+                intimacy_mode_state.exit()
+                # 本轮起走正常路由，便于收尾
+            else:
+                # 尚未说清：保持待确认，让 Sakura 再问一句
+                intimacy_mode_state.refresh_user_reply()
+                return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
+        elif user_signals_intimacy_end(latest):
+            intimacy_mode_state.request_exit_confirm()
+            intimacy_mode_state.refresh_user_reply()
+            return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
+        else:
+            intimacy_mode_state.refresh_user_reply()
+            return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
 
     has_image = messages_contain_image(messages)
     if proactive_mode:
@@ -302,6 +329,22 @@ def _fast_plan(
         tier="fast",
         modality="text",
         client_key="chat_fast",
+        generation_params={"thinking": {"type": "disabled"}},
+        recall_decision=recall_decision,
+        decided_by=decided_by,
+    )
+
+
+def _intimacy_plan(
+    *,
+    recall_decision: RecallDecision,
+    decided_by: str,
+) -> TurnPlan:
+    """亲密节奏：主对话模型（如 pro）+ 强制非思考；tier 仍为 fast 以跳过接话等待。"""
+    return TurnPlan(
+        tier="fast",
+        modality="text",
+        client_key="chat",
         generation_params={"thinking": {"type": "disabled"}},
         recall_decision=recall_decision,
         decided_by=decided_by,
