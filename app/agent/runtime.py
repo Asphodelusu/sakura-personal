@@ -667,14 +667,23 @@ class AgentRuntime:
             parsed.needs_retry,
             parsed.repaired,
             parsed.reason,
-            parsed.mood,
         )
 
     def _normalize_reply(self, reply: ChatReply) -> ChatReply:
         profile = self.character_profile
-        if profile is None:
-            return reply
-        return normalize_reply_portraits(reply, profile)
+        normalized = reply if profile is None else normalize_reply_portraits(reply, profile)
+        self._record_reply_emotion(normalized)
+        return normalized
+
+    def _record_reply_emotion(self, reply: ChatReply) -> None:
+        """把本轮主语气映射为离散情绪，供下一轮记忆召回亲和使用。"""
+        try:
+            tone = (reply.tone or "").strip()
+            if not tone or self.memory is None:
+                return
+            self.memory.record_sakura_reply_emotion(tone)
+        except Exception:
+            pass
 
     def _build_final_reply_repair_instruction(self) -> str:
         portraits = [name.strip() for name in self.reply_portraits if str(name).strip()]
@@ -1074,7 +1083,6 @@ class AgentRuntime:
                         turn_state=turn_state,
                     ),
                     actions=emitted_actions,
-                    mood_update=parsed.mood,
                 )
 
             _emit_progress_from_content(
@@ -1711,31 +1719,57 @@ class AgentRuntime:
         return bool(intimacy_mode_state.active)
 
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
-        """可选私密风格段：仅亲密节奏模式开启且本地有 guide 时注入。
+        """亲密节奏相关提示段。
 
-        非亲密模式下不把 H 参考正文塞进 prompt；何时开启仍靠工具描述。
-        同轮内先调用 set_intimacy_mode(on=true) 后，后续工具步/终稿会再看到本段。
+        - 开启中：注入本地 guide + 何时关闭的提醒
+        - 刚因轮次耗尽自动关闭：注入短提示，要求互动仍在继续时再次 on=true
+          （不注入 H guide 正文）
         """
         guide = getattr(self, "_intimacy_guide", "")
-        if not guide:
-            return None
         from app.agent.builtin_tools import intimacy_mode_state
 
-        if not intimacy_mode_state.active:
-            return None
-        # guide 管怎么写；此处只提醒何时关掉节奏模式。
-        rhythm_hint = (
-            "\n\n# 节奏工具\n"
-            "当前已开启亲密节奏模式。"
-            "亲密告一段落、对方停下、或话题回到日常时，调用 set_intimacy_mode(on=false)。"
-            "日常闲聊、关心安慰、技术/工作话题不要保持开启。"
-        )
-        return PromptSection(
-            section_id="persona.intimacy",
-            body=f"{guide}{rhythm_hint}",
-            source="character",
-            sensitivity="private",
-        )
+        if intimacy_mode_state.active:
+            if not guide:
+                return None
+            if intimacy_mode_state.pending_exit_confirm:
+                rhythm_hint = (
+                    "\n\n# 节奏工具\n"
+                    "当前已开启亲密节奏模式，对方似乎想结束。"
+                    "先用一两句轻声确认是否现在停（不要冷冰冰盘问）。"
+                    "对方点头确认或再说结束 → 再调用 set_intimacy_mode(on=false)；"
+                    "对方说继续/还要 → 保持开启，不要关闭。"
+                    "在确认前不要擅自 on=false，也不要继续强推亲密进程。"
+                )
+            else:
+                rhythm_hint = (
+                    "\n\n# 节奏工具\n"
+                    "当前已开启亲密节奏模式。"
+                    "若对方说出「结束」「停下」「到此为止」「やめよう」等，"
+                    "先轻声确认是否真的停，不要立刻 set_intimacy_mode(on=false)；"
+                    "等对方点头确认后再关闭。"
+                    "不要仅因气氛变缓或短暂沉默而关闭。"
+                )
+            return PromptSection(
+                section_id="persona.intimacy",
+                body=f"{guide}{rhythm_hint}",
+                source="character",
+                sensitivity="private",
+            )
+
+        if intimacy_mode_state.needs_reentry_hint:
+            return PromptSection(
+                section_id="persona.intimacy_reentry",
+                body=(
+                    "# 节奏工具\n"
+                    "亲密节奏模式已因长时间无用户回话、静默续投耗尽而自动关闭，不会自动恢复。"
+                    "若双方仍在进行或刚刚再次进入身体亲密互动，"
+                    "请立刻调用 set_intimacy_mode(on=true) 重新开启；"
+                    "对方已明确结束或话题已回到日常则不要开启。"
+                ),
+                source="character",
+                sensitivity="private",
+            )
+        return None
 
     def _static_persona_prompt(self) -> str:
         recipe = PromptRecipe("persona", self._persona_sections())

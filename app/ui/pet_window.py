@@ -3282,8 +3282,9 @@ class PetWindow(QWidget):
     # 亲密模式自动续投
     # ------------------------------------------------------------------
 
-    # 续投偏克制：误开时少刷屏；真亲密可由模型再次 on=true 刷新寿命
-    _INTIMACY_CONTINUE_MAX = 3
+    # 用户沉默时最多续投轮数；与 IntimacyModeState._AUTO_EXIT_TURNS 对齐，
+    # 续投会扣节奏存活，扣尽后自动退出亲密节奏。
+    _INTIMACY_CONTINUE_MAX = 8
     _INTIMACY_CONTINUE_DELAY_MS = 20_000
 
     def _schedule_intimacy_continue(self) -> None:
@@ -3292,6 +3293,9 @@ class PetWindow(QWidget):
 
         if not intimacy_mode_state.active:
             self._intimacy_was_active = False
+            return
+        # 等待对方确认是否结束时，不静默续投抢话
+        if intimacy_mode_state.pending_exit_confirm:
             return
         # 亲密模式重新激活（从非活跃→活跃）时重置续投计数
         if not getattr(self, "_intimacy_was_active", False):
@@ -3323,6 +3327,8 @@ class PetWindow(QWidget):
         from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER, intimacy_mode_state
 
         if not intimacy_mode_state.active:
+            return
+        if intimacy_mode_state.pending_exit_confirm:
             return
         if self._intimacy_continue_count >= self._INTIMACY_CONTINUE_MAX:
             return

@@ -84,7 +84,6 @@ class ChatReplyParseResult:
     needs_retry: bool = False
     repaired: bool = False
     reason: str = ""
-    mood: str | None = None
 
 
 def parse_chat_reply(content: str) -> ChatReply:
@@ -111,10 +110,6 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
 
     if isinstance(data, dict):
         segments, has_language_issue = _parse_segments(data)
-        mood_text: str | None = None
-        raw_mood = data.get("mood")
-        if isinstance(raw_mood, str) and raw_mood.strip():
-            mood_text = raw_mood.strip()
         if segments:
             return ChatReplyParseResult(
                 ChatReply(segments),
@@ -122,7 +117,6 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
                 needs_retry=has_language_issue,
                 repaired=repaired,
                 reason="language_issue" if has_language_issue else "",
-                mood=mood_text,
             )
 
     return ChatReplyParseResult(

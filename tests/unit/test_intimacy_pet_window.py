@@ -105,8 +105,11 @@ class TestContinueDoesNotResetLifetime:
         )
 
     def test_continue_max_is_conservative(self) -> None:
-        assert _pet_window_source_contains("_INTIMACY_CONTINUE_MAX = 3"), (
-            "续投次数应偏克制，降低误开刷屏"
+        assert _pet_window_source_contains("_INTIMACY_CONTINUE_MAX = 8"), (
+            "静默续投上限应与节奏存活轮次对齐为 8"
+        )
+        assert _pet_window_source_contains("pending_exit_confirm"), (
+            "待确认结束时应暂停静默续投"
         )
 
 

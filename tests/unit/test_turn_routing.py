@@ -365,7 +365,7 @@ def test_classify_turn_depth_returns_none_on_error() -> None:
 # ------------------------------------------------------------------
 
 
-def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 6) -> object:
+def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 8) -> object:
     """构建 resolve_turn_plan 调用，mock intimacy_mode_state。"""
     request = _request_for(messages)
     settings = _settings()
@@ -373,6 +373,9 @@ def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 6)
 
     mock_state = MagicMock()
     mock_state.active = active
+    mock_state.pending_exit_confirm = False
+    mock_state.needs_reentry_hint = False
+    mock_state.latest_user_text = ""
     mock_state.consume_turn.return_value = active and turns_left > 0
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -387,10 +390,11 @@ def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 6)
         )
 
 
-def test_intimacy_active_routes_to_fast() -> None:
+def test_intimacy_active_routes_to_chat_non_thinking() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
     plan = _plan_for(messages, active=True, turns_left=5)
     assert plan.tier == "fast"
+    assert plan.client_key == "chat"
     assert plan.decided_by == "rhythm_focus"
     assert plan.generation_params == {"thinking": {"type": "disabled"}}
 
@@ -401,16 +405,102 @@ def test_intimacy_inactive_is_normal_routing() -> None:
     assert plan.decided_by != "rhythm_focus"
 
 
-def test_intimacy_auto_exit_falls_back_to_standard() -> None:
-    """计数器耗尽时 consume_turn 返回 False → 走正常路由。"""
-    messages: list[ChatMessage] = [{"role": "user", "content": "今日はいい天気だね"}]
+def test_intimacy_continue_exhausted_falls_back() -> None:
+    """续投耗尽时 consume_turn 返回 False → 走正常路由。"""
+    from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+
+    messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
     plan = _plan_for(messages, active=True, turns_left=0)
-    # active=True 但 consume_turn 返回 False → 应 fallback
     assert plan.decided_by != "rhythm_focus"
 
 
-def test_intimacy_continue_skips_consume_turn() -> None:
-    """系统续投标记不扣减自动退出计数。"""
+def test_intimacy_user_end_requests_confirm() -> None:
+    """用户说结束 → 待确认，仍走亲密路由，不立刻 exit。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "好了，结束吧"}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.pending_exit_confirm = False
+    mock_state.needs_reentry_hint = False
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    mock_state.request_exit_confirm.assert_called_once()
+    mock_state.exit.assert_not_called()
+    mock_state.refresh_user_reply.assert_called_once()
+    assert plan.decided_by == "rhythm_focus"
+
+
+def test_intimacy_pending_confirm_then_yes_exits() -> None:
+    """待确认后用户点头 → exit。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "嗯"}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.pending_exit_confirm = True
+    mock_state.needs_reentry_hint = False
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    mock_state.exit.assert_called_once()
+    assert plan.decided_by != "rhythm_focus"
+
+
+def test_intimacy_pending_confirm_then_keep_clears() -> None:
+    """待确认后用户说继续 → 取消待确认，保持亲密路由。"""
+    messages: list[ChatMessage] = [{"role": "user", "content": "继续"}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.pending_exit_confirm = True
+    mock_state.needs_reentry_hint = False
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    mock_state.clear_exit_confirm.assert_called_once()
+    mock_state.exit.assert_not_called()
+    mock_state.refresh_user_reply.assert_called_once()
+    assert plan.decided_by == "rhythm_focus"
+
+
+def test_intimacy_continue_consumes_not_refresh() -> None:
+    """系统续投扣轮次，不刷新。"""
     from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
 
     messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
@@ -420,6 +510,7 @@ def test_intimacy_continue_skips_consume_turn() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
+    mock_state.pending_exit_confirm = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -434,12 +525,15 @@ def test_intimacy_continue_skips_consume_turn() -> None:
         )
 
     assert plan.tier == "fast"
+    assert plan.client_key == "chat"
     assert plan.decided_by == "rhythm_focus"
-    mock_state.consume_turn.assert_not_called()
+    assert plan.generation_params == {"thinking": {"type": "disabled"}}
+    mock_state.consume_turn.assert_called_once()
+    mock_state.refresh_user_reply.assert_not_called()
 
 
-def test_intimacy_user_turn_still_consumes() -> None:
-    """真实用户轮仍会调用 consume_turn。"""
+def test_intimacy_user_turn_refreshes() -> None:
+    """真实用户轮刷新存活，不扣轮次。"""
     messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
     request = _request_for(messages)
     settings = _settings()
@@ -447,6 +541,7 @@ def test_intimacy_user_turn_still_consumes() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
+    mock_state.pending_exit_confirm = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -461,7 +556,8 @@ def test_intimacy_user_turn_still_consumes() -> None:
         )
 
     assert plan.decided_by == "rhythm_focus"
-    mock_state.consume_turn.assert_called_once()
+    mock_state.refresh_user_reply.assert_called_once()
+    mock_state.consume_turn.assert_not_called()
 
 
 def test_intimacy_overrides_classifier_simple() -> None:
@@ -473,6 +569,7 @@ def test_intimacy_overrides_classifier_simple() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
+    mock_state.pending_exit_confirm = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -488,6 +585,7 @@ def test_intimacy_overrides_classifier_simple() -> None:
         )
 
     assert plan.tier == "fast"
+    assert plan.client_key == "chat"
     assert plan.decided_by == "rhythm_focus"
 
 
@@ -502,6 +600,7 @@ def test_intimacy_does_not_block_vision() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
+    mock_state.pending_exit_confirm = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -516,7 +615,8 @@ def test_intimacy_does_not_block_vision() -> None:
         )
 
     # vision 检查在 intimacy 之前？不是——intimacy 检查在 has_image 之前。
-    # 当前设计：亲密优先，图片消息也走 fast。
+    # 当前设计：亲密优先，图片消息也走亲密节奏（主对话槽 + 非思考）。
     # 如果以后要改优先级，这个测试会报警。
     assert plan.tier == "fast"
+    assert plan.client_key == "chat"
     assert plan.decided_by == "rhythm_focus"

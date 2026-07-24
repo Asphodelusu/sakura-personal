@@ -247,7 +247,16 @@ def _resolve_recall_persona(memory_store: MemoryStore, query: str) -> PersonaSta
             mood_content = str(mood_state.get("content") or "").strip()
     except Exception:  # noqa: BLE001
         mood_content = ""
-    return resolve_persona_state(dialogue_text=query, mood_content=mood_content)
+    reply_emotion = ""
+    try:
+        reply_emotion = str(memory_store.sakura_reply_emotion() or "").strip()
+    except Exception:  # noqa: BLE001
+        reply_emotion = ""
+    return resolve_persona_state(
+        dialogue_text=query,
+        mood_content=mood_content,
+        sakura_reply_emotion=reply_emotion,
+    )
 
 
 def _select_memories(

@@ -19,30 +19,66 @@ from app.storage.paths import StoragePaths
 class IntimacyModeState:
     """身体亲密进行中的对话节奏状态：工具写入、路由读取。
 
-    只影响回复节奏（fast + 可选续投），不决定能不能写亲密内容。
+    只影响回复节奏（主对话非思考 + 可选续投），不决定能不能写亲密内容。
+
+    存活规则：
+    - 用户正常回话 → 刷新为 8 轮，保持开启
+    - 系统静默续投 → 扣 1 轮；扣尽则自动退出
+    - 用户说结束类话 → 进入待确认（Sakura 先问），确认后才退出
+    - 模型 on=false 仅在待确认且对方已点头后才生效
     """
 
-    _AUTO_EXIT_TURNS = 6
+    _AUTO_EXIT_TURNS = 8
 
     def __init__(self) -> None:
         self.active: bool = False
         self._turns_left: int = 0
+        # 轮次耗尽自动退出后：提示模型若互动仍在继续需再次 on=true
+        self.needs_reentry_hint: bool = False
+        # 对方说了结束类话，等待口头确认是否真的停
+        self.pending_exit_confirm: bool = False
+        self.latest_user_text: str = ""
 
     def enter(self) -> None:
         self.active = True
         self._turns_left = self._AUTO_EXIT_TURNS
+        self.needs_reentry_hint = False
+        self.pending_exit_confirm = False
 
     def exit(self) -> None:
+        """主动关闭（用户确认结束 / 工具获准 on=false）；不留重进提示。"""
         self.active = False
         self._turns_left = 0
+        self.needs_reentry_hint = False
+        self.pending_exit_confirm = False
+
+    def request_exit_confirm(self) -> None:
+        """用户疑似想结束：先待确认，不立刻关。"""
+        if not self.active:
+            return
+        self.pending_exit_confirm = True
+
+    def clear_exit_confirm(self) -> None:
+        self.pending_exit_confirm = False
+
+    def note_user_text(self, text: str) -> None:
+        self.latest_user_text = (text or "").strip()
+
+    def refresh_user_reply(self) -> None:
+        """用户回话：刷新存活额度，保持开启。"""
+        if not self.active:
+            return
+        self._turns_left = self._AUTO_EXIT_TURNS
 
     def consume_turn(self) -> bool:
-        """真实用户轮消耗一次；返回是否仍活跃。续投轮不应调用此方法。"""
+        """系统续投消耗一次；返回是否仍活跃。真实用户轮应走 refresh_user_reply。"""
         if not self.active:
             return False
         self._turns_left -= 1
         if self._turns_left <= 0:
             self.active = False
+            self.needs_reentry_hint = True
+            self.pending_exit_confirm = False
             return False
         return True
 
@@ -56,12 +92,141 @@ _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_
 # 系统续投注入的用户标记（不进持久化历史）
 INTIMACY_CONTINUE_MARKER = "（続けて）"
 
+# 用户明确结束亲密节奏的口头信号（中日常见说法；避免过宽误伤）
+_INTIMACY_END_KEYWORDS: tuple[str, ...] = (
+    "结束",
+    "結束",
+    "到此为止",
+    "到此為止",
+    "先这样",
+    "先這樣",
+    "先到这",
+    "先到這",
+    "够了",
+    "夠了",
+    "可以了",
+    "不要了",
+    "不玩了",
+    "停下来",
+    "停下來",
+    "停下",
+    "停止",
+    "打住",
+    "收手",
+    "歇了",
+    "終わり",
+    "終わりに",
+    "やめよう",
+    "やめて",
+    "もういい",
+    "もうやめ",
+    "止めて",
+)
+
+# 待确认阶段：对方点头确认结束（短答整句匹配，避免误伤）
+_INTIMACY_EXIT_CONFIRM_EXACT: frozenset[str] = frozenset(
+    {
+        "嗯",
+        "嗯嗯",
+        "好",
+        "好的",
+        "好吧",
+        "行",
+        "行吧",
+        "对",
+        "对的",
+        "是",
+        "是的",
+        "可以",
+        "确认",
+        "就这样",
+        "就这样吧",
+        "ok",
+        "okay",
+        "はい",
+        "うん",
+        "ええ",
+    }
+)
+
+# 待确认阶段：对方表示还要继续
+_INTIMACY_KEEP_KEYWORDS: tuple[str, ...] = (
+    "继续",
+    "還要",
+    "还要",
+    "不要停",
+    "别停",
+    "別停",
+    "没完",
+    "沒完",
+    "再来",
+    "再來",
+    "不要结束",
+    "不要結束",
+    "先别结束",
+    "先別結束",
+    "不是结束",
+    "不是結束",
+    "还没完",
+    "還沒完",
+    "続けて",
+    "やめない",
+    "まだ",
+)
+
+
+def user_signals_intimacy_keep_going(text: str) -> bool:
+    """用户是否表示还要继续（优先于结束词，避免「不要结束」误判）。"""
+    raw = (text or "").strip()
+    if not raw or raw == INTIMACY_CONTINUE_MARKER:
+        return False
+    lowered = raw.casefold()
+    for kw in _INTIMACY_KEEP_KEYWORDS:
+        if kw.casefold() in lowered:
+            return True
+    return False
+
+
+def user_signals_intimacy_end(text: str) -> bool:
+    """用户是否说出结束类话（触发「先问一句」；不等于已确认退出）。"""
+    raw = (text or "").strip()
+    if not raw or raw == INTIMACY_CONTINUE_MARKER:
+        return False
+    if user_signals_intimacy_keep_going(raw):
+        return False
+    lowered = raw.casefold()
+    for kw in _INTIMACY_END_KEYWORDS:
+        if kw.casefold() in lowered:
+            return True
+    return False
+
+
+def user_signals_intimacy_exit_confirm(text: str) -> bool:
+    """待确认阶段：用户是否点头确认结束。"""
+    raw = (text or "").strip()
+    if not raw or raw == INTIMACY_CONTINUE_MARKER:
+        return False
+    if user_signals_intimacy_keep_going(raw):
+        return False
+    # 再说一遍结束类话 = 确认
+    if user_signals_intimacy_end(raw):
+        return True
+    normalized = raw.casefold().strip("。.！!？?…~～、,， ")
+    return normalized in {s.casefold() for s in _INTIMACY_EXIT_CONFIRM_EXACT}
+
+
 _SET_INTIMACY_MODE_DESCRIPTION = (
     "切换身体亲密进行中的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
     "仅当双方正在进行或刚明确进入身体亲密互动时设 on=true。"
     "日常闲聊、关心安慰、技术/工作话题、普通撒娇都不要开启。"
-    "亲密告一段落、对方明显停下、或话题已回到日常时设 on=false。"
-    "本工具只影响回复节奏；不开也可以正常写亲密内容。"
+    "对方说「结束」「停下」「到此为止」「先这样」等时，先轻声确认是否真的停，"
+    "不要立刻 on=false；等对方点头确认（如「嗯」「好」「对」或再说结束）后再关闭。"
+    "若对方说继续/还要，则保持开启。"
+    "不要仅因气氛变缓、短暂停顿或你自己觉得告一段落而关闭。"
+    "关闭或因长时间无用户回话、静默续投耗尽而自动结束后不会自动恢复；"
+    "若身体亲密互动仍在继续或再次开始，必须再次 set_intimacy_mode(on=true)。"
+    "本工具只影响回复节奏与引导注入；不开也可以写亲密内容，"
+    "但只要互动仍在身体亲密层面，就应保持或重新开启节奏模式。"
 )
 
 
@@ -80,9 +245,38 @@ def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
         return {"intimacy_mode": "off", "available": False}
     if on:
         intimacy_mode_state.enter()
-    else:
-        intimacy_mode_state.exit()
-    return {"intimacy_mode": "on" if on else "off"}
+        return {"intimacy_mode": "on"}
+
+    # on=false：已关闭则直接确认；开启中须「结束意向 + 口头确认」
+    if not intimacy_mode_state.active:
+        return {"intimacy_mode": "off"}
+
+    latest = intimacy_mode_state.latest_user_text
+    if intimacy_mode_state.pending_exit_confirm:
+        if user_signals_intimacy_exit_confirm(latest):
+            intimacy_mode_state.exit()
+            return {"intimacy_mode": "off"}
+        return {
+            "intimacy_mode": "on",
+            "refused": True,
+            "pending_confirm": True,
+            "reason": "正在等待对方确认是否结束；先口头问清，确认后再关闭",
+        }
+
+    if user_signals_intimacy_end(latest):
+        intimacy_mode_state.request_exit_confirm()
+        return {
+            "intimacy_mode": "on",
+            "refused": True,
+            "pending_confirm": True,
+            "reason": "对方疑似想结束，请先轻声确认；确认后再调用 on=false",
+        }
+
+    return {
+        "intimacy_mode": "on",
+        "refused": True,
+        "reason": "需要对方明确表示结束，并由你确认后才可关闭节奏模式",
+    }
 
 
 def create_builtin_tool_registry(

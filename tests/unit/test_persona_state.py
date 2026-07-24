@@ -66,3 +66,26 @@ def test_compassion_bias_does_not_apply_to_high_valence_current() -> None:
     assert happy_to_warm_affinity > 0.0
     assert sad_to_warm_affinity > 0.0
     assert happy_to_warm_affinity != sad_to_warm_affinity
+
+
+def test_tone_to_emotion_maps_common_reply_tones() -> None:
+    from app.agent.persona_state import tone_to_emotion
+
+    assert tone_to_emotion("中性") == "neutral"
+    assert tone_to_emotion("害羞") == "embarrassed"
+    assert tone_to_emotion("不满") == "frustrated"
+    assert tone_to_emotion("开心") == "happy"
+    assert tone_to_emotion("happy") == "happy"
+    assert tone_to_emotion("未知语气") == "neutral"
+    assert tone_to_emotion("") == "neutral"
+
+
+def test_resolve_persona_prefers_reply_emotion_over_mood_scoring() -> None:
+    from app.agent.persona_state import resolve_persona_state
+
+    state = resolve_persona_state(
+        dialogue_text="今天天气不错",
+        mood_content="今日、とても悲しい気持ちだ。",
+        sakura_reply_emotion="embarrassed",
+    )
+    assert state.sakura_mood_emotion == "embarrassed"
