@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -16,8 +16,13 @@ from app.agent.memory import (
     MEMORY_LAYERS,
     MemoryStore,
     _memory_is_released,
+    collect_commitments_for_expiry_review,
+    commitment_event_time,
     looks_like_sensitive_memory,
+    mark_commitments_expiry_reviewed,
+    memory_kind_of,
     memory_record_is_reflection,
+    sweep_stale_commitments,
 )
 from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
@@ -46,6 +51,9 @@ MIN_AUTO_WRITE_CONFIDENCE = 0.55
 CURATION_DUPLICATE_SIMILARITY = 0.92
 CURATION_MERGE_SIMILARITY = 0.78
 MAX_CURATION_OPERATIONS_PER_LAYER = 20
+# recent_status 未给 valid_until 时的默认时效（天）
+DEFAULT_RECENT_STATUS_TTL_DAYS = 14
+MAX_EXPIRY_REVIEW_COMMITMENTS = 5
 
 
 @dataclass(frozen=True)
@@ -259,11 +267,23 @@ class MemoryCurator:
         if not _entries_for_model(entries):
             return MemoryCurationResult(processed_entries=len(entries))
 
+        # 整理前先确定性关掉过期约定，并收集待一次性复盘的条目。
+        just_expired: list[dict[str, Any]] = []
+        try:
+            sweep_stale_commitments(self.memory_store)
+            just_expired = collect_commitments_for_expiry_review(
+                self.memory_store,
+                limit=MAX_EXPIRY_REVIEW_COMMITMENTS,
+            )
+        except Exception:  # noqa: BLE001
+            just_expired = []
+
         created = 0
         updated = 0
         archived = 0
         ignored = 0
         event_counts: dict[str, int] = {}
+        review_injected = False
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -272,10 +292,15 @@ class MemoryCurator:
             # 每个 chunk 整理前重新拉取全量记忆，确保前一段写入的记忆能被后一段对照，避免重复。
             existing = self._load_existing_memories()
             check_cancelled(cancel_checker)
+            review_block = ""
+            if just_expired and not review_injected:
+                review_block = _format_just_expired_commitments(just_expired)
+                review_injected = True
             operations = self._extract_operations(
                 dialog_entries,
                 existing,
                 cancel_checker=cancel_checker,
+                just_expired_commitments_block=review_block,
             )
             check_cancelled(cancel_checker)
             counts = self._apply_operations(operations, existing)
@@ -284,6 +309,13 @@ class MemoryCurator:
             archived += counts["archived"]
             ignored += counts["ignored"]
             _merge_event_counts(event_counts, counts["event_counts"])
+        if just_expired and review_injected:
+            try:
+                marked = mark_commitments_expiry_reviewed(self.memory_store, just_expired)
+                if marked:
+                    event_counts["EXPIRY_REVIEWED"] = marked
+            except Exception:  # noqa: BLE001
+                pass
         return MemoryCurationResult(
             created=created,
             updated=updated,
@@ -383,6 +415,7 @@ class MemoryCurator:
         existing: list[dict[str, Any]],
         *,
         cancel_checker: CancelChecker | None = None,
+        just_expired_commitments_block: str = "",
     ) -> list[dict[str, Any]]:
         """让模型以第一人称对照已有记忆，产出整理操作；解析失败时视为无操作。"""
 
@@ -394,6 +427,7 @@ class MemoryCurator:
             dialog_entries,
             mood_history_block=mood_history_block,
             user_emotion_history_block=user_emotion_history_block,
+            just_expired_commitments_block=just_expired_commitments_block,
         )
         llm_messages = [{"role": "user", "content": user_prompt}]
         repair_hint = (
@@ -472,6 +506,17 @@ class MemoryCurator:
                 if looks_like_sensitive_memory(content):
                     debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
                     ignored += 1
+                    continue
+                if _commitment_missing_event_time(operation, existing, action=action, memory_id=memory_id):
+                    debug_log(
+                        "Memory",
+                        "跳过缺少 event_time 的约定",
+                        {"op": action, "id": memory_id},
+                    )
+                    ignored += 1
+                    event_counts["SKIP_COMMITMENT_NO_EVENT_TIME"] = (
+                        event_counts.get("SKIP_COMMITMENT_NO_EVENT_TIME", 0) + 1
+                    )
                     continue
                 if looks_like_third_person_self(content, self.character_name):
                     debug_log(
@@ -765,7 +810,15 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 若已有「我们发生过亲密」类记忆，新一次只补充新偏好、新边界或关系变化；重复过程不必再堆一条。\n"
     "如果你自己认为某件事很重要——比如他说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
     "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
-    "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn（近况/承诺等可变事实可设 volatile=true，并给 valid_until 如 2026-07-20）。\n"
+    "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn。\n"
+    "memory_kind=recent_status（近况）必须视为可变事实：请设 volatile=true，并尽量给 valid_until；"
+    f"若未给 valid_until，系统会默认约 {DEFAULT_RECENT_STATUS_TTL_DAYS} 天后失效。\n"
+    "memory_kind=commitment 时必须同时填写 event_time（ISO 日期或日期时间，如 2026-07-20 或 2026-07-20T22:00:00+08:00），"
+    "写清约定兑现/到期日；缺少 event_time 的约定会被系统拒绝写入。"
+    "一次性约定（今晚十点休息、明天一起看片）到期后系统会自动标失效；纪念日类也要写具体日期。\n"
+    "若提示里出现「刚过期的约定」清单：对照最近对话判断是否兑现；"
+    "能判断时用 add 写一条 episodic（layer=episodic），写清约定内容与结果（做到了/没做到/说不清），"
+    "不要再把原约定当现行事实，也不要重复 update 原约定正文。对话完全无关则可跳过。\n"
     f"可选 emotion 标注这段记忆的情绪色彩（{ '|'.join(EMOTIONS) }），情感转折、共同经历、带情绪的近况建议填写。\n"
     "语言约定（两侧记忆）：\n"
     "- 关于他的事实、偏好、约定、协作规则与近况 → 简体中文（便于检索）；\n"
@@ -779,7 +832,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "「他说他喜欢抹茶」收成「我喜欢抹茶」。\n"
     "- 若清单里出现「独处感想」条目：那只是你以前的心里话，不是发生过的事实；"
     "禁止据此 add/update 成 semantic/procedural 事实，也禁止把感想抄成新事件。\n"
-    "- 约定写清提出者、内容和时效；过期约定用 update 标明「已失效/仅限当日」。\n"
+    "- 约定写清提出者、内容和时效；commitment 必须带 event_time；过期约定用 update 标明「已失效/仅限当日」，或交给系统按 event_time 自动标失效。\n"
     "- 事件与约定尽量带上日期或相对时间线索（例如「2026-07-20 晚上」），方便以后分清新旧。\n"
     "- 一条记忆只保留一个主事实，写成完整可读的日记句，而不是流水账。\n"
     "- 称呼：已知名字时用名字代替「他」；还不知道名字时用「他」。\n"
@@ -801,6 +854,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
     "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"content\":\"我和他约定今晚十点休息\"},\n"
     "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
     "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
     "  {\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}\n"
@@ -832,9 +886,18 @@ def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any])
     memory_kind = str(operation.get("memory_kind") or "").strip()
     if memory_kind:
         payload["memory_kind"] = memory_kind
-    if operation.get("volatile") is True or str(operation.get("volatile")).lower() == "true":
+    kind_lower = memory_kind.lower()
+    if (
+        operation.get("volatile") is True
+        or str(operation.get("volatile")).lower() == "true"
+        or kind_lower == "recent_status"
+    ):
         payload["volatile"] = True
     valid_until = str(operation.get("valid_until") or "").strip()
+    if not valid_until and kind_lower == "recent_status":
+        valid_until = (
+            datetime.now().astimezone() + timedelta(days=DEFAULT_RECENT_STATUS_TTL_DAYS)
+        ).isoformat()
     if valid_until:
         payload["valid_until"] = valid_until
     event_time = str(operation.get("event_time") or "").strip()
@@ -847,7 +910,34 @@ def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any])
 
 
 def _operation_is_volatile(operation: dict[str, Any]) -> bool:
-    return operation.get("volatile") is True or str(operation.get("volatile")).lower() == "true"
+    if operation.get("volatile") is True or str(operation.get("volatile")).lower() == "true":
+        return True
+    return str(operation.get("memory_kind") or "").strip().lower() == "recent_status"
+
+
+def _commitment_missing_event_time(
+    operation: dict[str, Any],
+    existing: list[dict[str, Any]],
+    *,
+    action: str,
+    memory_id: str,
+) -> bool:
+    """commitment 写入必须能落到 event_time（操作自带，或 update 时沿用旧值）。"""
+    kind = str(operation.get("memory_kind") or "").strip().lower()
+    if kind != "commitment":
+        return False
+    if str(operation.get("event_time") or "").strip():
+        return False
+    if action != "update" or not memory_id:
+        return True
+    for memory in existing:
+        if str(memory.get("id") or "").strip() != memory_id:
+            continue
+        if memory_kind_of(memory) == "commitment" and commitment_event_time(memory):
+            return False
+        # 把普通记忆改成 commitment 时也必须带 event_time
+        return True
+    return True
 
 
 def _expire_superseded_volatile(
@@ -871,10 +961,13 @@ def _expire_superseded_volatile(
         if not memory_id or memory_id in exclude_ids:
             continue
         metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
-        if metadata.get("volatile") is not True:
+        old_kind = str(
+            metadata.get("memory_kind") or memory.get("memory_kind") or "recent_status"
+        ).strip().lower() or "recent_status"
+        old_volatile = metadata.get("volatile") is True or old_kind == "recent_status"
+        if not old_volatile:
             continue
-        old_kind = str(metadata.get("memory_kind") or "recent_status").strip() or "recent_status"
-        if old_kind != new_kind:
+        if old_kind != new_kind.lower():
             continue
         if _memory_similarity(new_content, str(memory.get("content") or "")) < CURATION_MERGE_SIMILARITY:
             continue
@@ -882,6 +975,25 @@ def _expire_superseded_volatile(
             metadata["valid_until"] = now_iso
             expired += 1
     return expired
+
+
+def _format_just_expired_commitments(memories: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for memory in memories:
+        memory_id = str(memory.get("id") or memory.get("memory_id") or "").strip()
+        content = str(memory.get("content") or memory.get("memory") or "").strip()
+        if not memory_id or not content:
+            continue
+        event_time = commitment_event_time(memory)
+        suffix = f"（到期：{event_time}）" if event_time else ""
+        lines.append(f"- [{memory_id}] {content}{suffix}")
+    if not lines:
+        return ""
+    return (
+        "系统已把下列约定标为失效。请对照【最近的新对话】做一次性回顾："
+        "能判断兑现结果时，add 一条 episodic 写清约定与结果；无关则可跳过。\n"
+        + "\n".join(lines)
+    )
 
 
 def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
@@ -970,6 +1082,7 @@ def _build_curation_user_prompt(
     *,
     mood_history_block: str = "",
     user_emotion_history_block: str = "",
+    just_expired_commitments_block: str = "",
 ) -> str:
     parts = [
         "【我目前的长期记忆】\n" f"{existing_block}",
@@ -978,6 +1091,8 @@ def _build_curation_user_prompt(
         parts.append(f"【最近的心情轨迹】\n{mood_history_block}")
     if user_emotion_history_block.strip():
         parts.append(f"【他的情绪轨迹】\n{user_emotion_history_block}")
+    if just_expired_commitments_block.strip():
+        parts.append(f"【刚过期的约定（一次性回顾）】\n{just_expired_commitments_block}")
     parts.append(
         "【最近的新对话】\n"
         f"{_format_dialog_for_curation(dialog_entries)}"

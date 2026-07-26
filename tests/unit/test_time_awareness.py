@@ -12,10 +12,18 @@ from app.agent.time_awareness import (
     format_duration_zh,
     format_local_time_context,
     format_relative_age,
+    parse_memory_event_date,
 )
 from app.llm.api_client import ChatMessage
 from app.storage.chat_history import ChatHistoryEntry
 from app.storage.history_digest import DigestLine
+
+
+def test_parse_memory_event_date_accepts_iso_and_date_only() -> None:
+    now = datetime(2026, 7, 20, 22, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    assert parse_memory_event_date("2026-07-20", now=now).isoformat() == "2026-07-20"
+    assert parse_memory_event_date("2026-07-19T22:00:00+08:00", now=now).isoformat() == "2026-07-19"
+    assert parse_memory_event_date("not-a-date", now=now) is None
 
 
 def test_format_relative_age_buckets() -> None:
@@ -59,9 +67,17 @@ def test_annotate_memory_with_age_and_expired() -> None:
         (now - timedelta(days=8)).isoformat(),
         now=now,
         expired=True,
+        expired_label="已过期的约定",
     )
     assert "已过期的约定" in expired
     assert "约1周前" in expired
+    generic = annotate_with_relative_age(
+        "旧近况",
+        (now - timedelta(days=8)).isoformat(),
+        now=now,
+        expired=True,
+    )
+    assert "已失效" in generic
 
 
 def test_runtime_time_fragment_includes_gap() -> None:

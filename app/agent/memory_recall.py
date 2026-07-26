@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.agent.memory import (
     MemoryStore,
+    memory_kind_of,
     memory_record_is_meta_reflection,
     memory_record_is_reflection,
     _bounded_float,
@@ -28,6 +30,14 @@ DEFAULT_MEMORY_RECALL_CANDIDATES = 10
 # 与按分排序，既挡住明显无关项，又能让最相关的少量记忆进入上下文。
 DEFAULT_MEMORY_RELEVANCE_THRESHOLD = 0.3
 MAX_MEMORY_QUERY_CHARS = 4000
+
+# 用户在问旧事时，才允许把已失效记忆召回进上下文（默认只取「当前为真」）。
+_PAST_LOOKING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(上次|昨天|前天|之前|早些时候|刚才我们|还记得|记不记得|记得吗|"
+        r"以前|从前|那次|那回|那段时间|旧事|当时|那会儿|约定过|约好过|说过吗)"
+    ),
+)
 # 时间衰减半衰期（天），≈ln(2)/λ。λ=0.1 时半衰期约 7 天。
 DEFAULT_MEMORY_DECAY_LAMBDA = 0.1
 # source=explicit（用户明确要求记住）的记忆自动提至此 importance
@@ -120,9 +130,14 @@ class MemoryRecallService:
         if light_mode:
             limit = 3  # 轻量模式只取少量候选
 
+        include_expired = _query_looks_past(query)
         try:
             response = self.memory.search_memory(
-                {"query": query, "limit": limit},
+                {
+                    "query": query,
+                    "limit": limit,
+                    "include_expired": include_expired,
+                },
                 wait=False,
             )
         except Exception:  # noqa: BLE001 - 记忆故障不得阻断普通聊天
@@ -138,7 +153,13 @@ class MemoryRecallService:
         persona = _resolve_recall_persona(self.memory, query)
         due_commitments = _select_due_commitment_memories(self.memory, now=now)
         # 实体扩展：从首轮结果中提取专有名词，追加相关记忆
-        expanded = _expand_by_entities(memories, self.memory, self.threshold, self.limit)
+        expanded = _expand_by_entities(
+            memories,
+            self.memory,
+            self.threshold,
+            self.limit,
+            include_expired=include_expired,
+        )
         if expanded:
             memories = _deduplicate_memories(memories + expanded)
 
@@ -159,6 +180,7 @@ class MemoryRecallService:
             now=now,
             persona=persona,
             last_accessed_map=last_accessed_map,
+            include_expired=include_expired,
         )
         selected = _merge_due_commitments(selected, due_commitments, self.limit)
 
@@ -191,11 +213,20 @@ def _annotate_recalled_memory_content(memory: dict[str, Any], *, now: datetime) 
     from app.agent.time_awareness import annotate_with_relative_age, memory_event_timestamp
 
     content = str(memory.get("content") or "").strip()
+    expired = memory_record_is_expired(memory, now=now)
+    kind = memory_kind_of(memory)
+    if expired and kind == "commitment":
+        expired_label = "已过期的约定"
+    elif expired and kind == "recent_status":
+        expired_label = "已失效的近况"
+    else:
+        expired_label = "已失效"
     annotated = annotate_with_relative_age(
         content,
         memory_event_timestamp(memory),
         now=now,
-        expired=memory_record_is_expired(memory, now=now),
+        expired=expired,
+        expired_label=expired_label,
     )
     if memory.get("is_meta_reflection"):
         # 二阶元反思：多条独处感想沉淀出的稳定认知，比一次性感想更接近"性格"，
@@ -259,6 +290,14 @@ def _resolve_recall_persona(memory_store: MemoryStore, query: str) -> PersonaSta
     )
 
 
+def _query_looks_past(query: str) -> bool:
+    """用户是否在显式追问旧事/过往约定——此时才放行已失效记忆。"""
+    text = (query or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _PAST_LOOKING_PATTERNS)
+
+
 def _select_memories(
     memories: list[Any],
     threshold: float,
@@ -267,6 +306,7 @@ def _select_memories(
     now: datetime | None = None,
     persona: PersonaState | None = None,
     last_accessed_map: dict[str, str] | None = None,
+    include_expired: bool = False,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -285,7 +325,9 @@ def _select_memories(
         is_meta_reflection = memory_record_is_meta_reflection(raw) or memory_record_is_meta_reflection(
             {"metadata": metadata, "category": raw.get("category")}
         )
-        if dedupe_key in seen or _is_memory_expired(raw, metadata, now):
+        if dedupe_key in seen:
+            continue
+        if not include_expired and _is_memory_expired(raw, metadata, now):
             continue
         score = _optional_score(raw.get("score"))
         if score is not None and score < threshold:
@@ -441,6 +483,17 @@ def _select_due_commitment_memories(
     limit: int = MAX_DUE_COMMITMENT_RECALLS,
 ) -> list[dict[str, Any]]:
     """扫描约定/纪念日，今天或明天到点的条目主动浮现。"""
+    from app.agent.memory import (
+        commitment_event_time,
+        memory_kind_of,
+        sweep_stale_commitments,
+    )
+
+    # 先关掉已过期日的约定，避免语义检索仍把旧约定当现行事实捞起。
+    try:
+        sweep_stale_commitments(memory_store, now=now)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         scope_memories = memory_store.list_scope_memories(limit=200, wait=False)
     except Exception:  # noqa: BLE001
@@ -450,10 +503,9 @@ def _select_due_commitment_memories(
         if not isinstance(raw, dict):
             continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        memory_kind = str(metadata.get("memory_kind") or "").strip().lower()
-        if memory_kind != "commitment":
+        if memory_kind_of(raw) != "commitment":
             continue
-        event_time = str(metadata.get("event_time") or raw.get("event_time") or "").strip()
+        event_time = commitment_event_time(raw)
         if not event_time or not _commitment_is_due(event_time, now):
             continue
         content = str(raw.get("content") or raw.get("memory") or "").strip()
@@ -509,30 +561,13 @@ def _merge_due_commitments(
 
 
 def _commitment_is_due(event_time: str, now: datetime) -> bool:
-    event_date = _parse_event_date(event_time, now)
+    from app.agent.time_awareness import parse_memory_event_date
+
+    event_date = parse_memory_event_date(event_time, now=now)
     if event_date is None:
         return False
     today = now.date()
     return event_date == today or event_date == today + timedelta(days=1)
-
-
-def _parse_event_date(event_time: str, now: datetime) -> date | None:
-    text = event_time.strip()
-    if not text:
-        return None
-    for candidate in (text, text.replace("Z", "+00:00")):
-        try:
-            parsed = datetime.fromisoformat(candidate)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=now.tzinfo)
-            return parsed.date()
-        except ValueError:
-            pass
-        try:
-            return date.fromisoformat(candidate[:10])
-        except ValueError:
-            continue
-    return None
 
 
 def _is_memory_expired(raw: dict[str, Any], metadata: dict[str, Any], now: datetime) -> bool:
@@ -563,6 +598,8 @@ def _expand_by_entities(
     memory_store: Any,
     threshold: float,
     limit: int,
+    *,
+    include_expired: bool = False,
 ) -> list[dict[str, Any]]:
     """从已检索记忆中提取专有名词，按持久实体索引追加相关记忆（多跳召回）。
 
@@ -593,7 +630,10 @@ def _expand_by_entities(
         return []
 
     try:
-        response = memory_store.get_memory_detail({"ids": hop_ids}, wait=False)
+        response = memory_store.get_memory_detail(
+            {"ids": hop_ids, "include_expired": include_expired},
+            wait=False,
+        )
     except Exception:
         return []
     extra = response.get("memories", [])
