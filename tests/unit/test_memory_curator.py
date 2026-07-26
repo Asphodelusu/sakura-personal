@@ -8,7 +8,9 @@ import uuid
 
 import pytest
 
-from app.agent.memory import MemoryStore
+from datetime import datetime, timedelta, timezone
+
+from app.agent.memory import MemoryStore, commitment_is_stale, sweep_stale_commitments
 from app.agent.memory_curator import (
     DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
     MemoryCurationSettings,
@@ -106,6 +108,142 @@ def test_scoped_memory_store_keeps_scope_after_parent_switch() -> None:
             "infer": False,
         }
     ]
+
+
+def test_commitment_is_stale_only_after_event_day() -> None:
+    now = datetime(2026, 7, 27, 1, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    past = {
+        "id": "c1",
+        "content": "约定今晚十点休息",
+        "metadata": {"memory_kind": "commitment", "event_time": "2026-07-24T22:00:00+08:00"},
+    }
+    today = {
+        "id": "c2",
+        "content": "约定今天见面",
+        "metadata": {"memory_kind": "commitment", "event_time": "2026-07-27"},
+    }
+    habit = {
+        "id": "h1",
+        "content": "他习惯早睡",
+        "metadata": {"memory_kind": "habit_pattern", "event_time": "2026-07-01"},
+    }
+    assert commitment_is_stale(past, now=now) is True
+    assert commitment_is_stale(today, now=now) is False
+    assert commitment_is_stale(habit, now=now) is False
+
+
+def test_sweep_stale_commitments_marks_valid_until() -> None:
+    now = datetime(2026, 7, 27, 1, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    store = FakeMemoryStore(
+        existing=[
+            {
+                "id": "c1",
+                "content": "约定今晚十点休息",
+                "metadata": {
+                    "memory_kind": "commitment",
+                    "event_time": "2026-07-24T22:00:00+08:00",
+                },
+            },
+            {
+                "id": "c2",
+                "content": "约定明天看片",
+                "metadata": {"memory_kind": "commitment", "event_time": "2026-07-28"},
+            },
+        ]
+    )
+    swept = sweep_stale_commitments(store, now=now)
+    assert len(swept) == 1
+    assert swept[0]["id"] == "c1"
+    assert store.expired == ["c1"]
+    assert store.existing[0]["metadata"]["valid_until"]
+    assert "valid_until" not in store.existing[1]["metadata"] or not store.existing[1][
+        "metadata"
+    ].get("valid_until")
+
+
+def test_curator_rejects_commitment_without_event_time() -> None:
+    store = FakeMemoryStore()
+    operations = (
+        '{"operations":['
+        '{"op":"add","memory_kind":"commitment","content":"我和他约定早点睡","confidence":0.9}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "今晚早点睡吧")])
+
+    assert result.created == 0
+    assert result.ignored == 1
+    assert store.created == []
+    assert result.event_counts.get("SKIP_COMMITMENT_NO_EVENT_TIME") == 1
+
+
+def test_curator_accepts_commitment_with_event_time() -> None:
+    store = FakeMemoryStore()
+    operations = (
+        '{"operations":['
+        '{"op":"add","memory_kind":"commitment","event_time":"2026-07-27T22:00:00+08:00",'
+        '"content":"我和他约定今晚十点休息","confidence":0.9}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "今晚十点休息")])
+
+    assert result.created == 1
+    assert store.created[0]["memory_kind"] == "commitment"
+    assert store.created[0]["event_time"] == "2026-07-27T22:00:00+08:00"
+
+
+def test_curator_defaults_ttl_for_recent_status() -> None:
+    store = FakeMemoryStore()
+    operations = (
+        '{"operations":['
+        '{"op":"add","memory_kind":"recent_status","content":"他这周在赶项目","confidence":0.9}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "这周在赶项目")])
+
+    assert result.created == 1
+    assert store.created[0]["memory_kind"] == "recent_status"
+    assert store.created[0]["volatile"] is True
+    assert store.created[0]["valid_until"]
+
+
+def test_curator_injects_just_expired_commitments_once() -> None:
+    store = FakeMemoryStore(
+        existing=[
+            {
+                "id": "c1",
+                "content": "我和他约定今晚十点休息",
+                "metadata": {
+                    "memory_kind": "commitment",
+                    "event_time": "2026-07-24T22:00:00+08:00",
+                },
+            }
+        ]
+    )
+    api = FakeCurationApiClient(['{"operations":[]}'])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "今天还好")])
+
+    user_content = str(api.calls[0]["messages"][0]["content"])
+    assert "刚过期的约定" in user_content
+    assert "今晚十点休息" in user_content
+    assert store.expiry_reviewed == ["c1"]
+    assert result.event_counts.get("EXPIRY_REVIEWED") == 1
+
+    api2 = FakeCurationApiClient(['{"operations":[]}'])
+    curator2 = MemoryCurator(api2, store)
+    curator2.curate_entries([_entry("user", "再整理一次")])
+    user_content2 = str(api2.calls[0]["messages"][0]["content"])
+    assert "刚过期的约定" not in user_content2
 
 
 def test_curator_updates_and_deletes_existing_memories() -> None:
@@ -428,9 +566,55 @@ class FakeMemoryStore:
         self.created: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
+        self.expired: list[str] = []
+        self.expiry_reviewed: list[str] = []
 
     def list_memories(self, *, limit: int) -> list[dict[str, Any]]:
-        return list(self.existing)
+        return list(self.existing)[: max(1, int(limit))]
+
+    def list_scope_memories(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        limit: int = 200,
+        wait: bool = False,
+        include_released: bool = False,
+        include_expired: bool = False,
+    ):
+        from app.agent.memory import memory_record_is_expired
+
+        items = list(self.existing)
+        if not include_expired:
+            items = [m for m in items if not memory_record_is_expired(m)]
+        return items[: max(1, int(limit))]
+
+    def expire_memory(self, memory_id: str, *, valid_until: str | None = None, wait: bool = True) -> bool:  # type: ignore[no-untyped-def]
+        memory_id = str(memory_id).strip()
+        for memory in self.existing:
+            if str(memory.get("id") or "").strip() != memory_id:
+                continue
+            metadata = memory.setdefault("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+                memory["metadata"] = metadata
+            metadata["valid_until"] = valid_until or "2026-01-01T00:00:00+08:00"
+            metadata["volatile"] = True
+            self.expired.append(memory_id)
+            return True
+        return False
+
+    def mark_expiry_reviewed(self, memory_id: str, *, wait: bool = True) -> bool:  # type: ignore[no-untyped-def]
+        memory_id = str(memory_id).strip()
+        for memory in self.existing:
+            if str(memory.get("id") or "").strip() != memory_id:
+                continue
+            metadata = memory.setdefault("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+                memory["metadata"] = metadata
+            metadata["expiry_reviewed"] = True
+            self.expiry_reviewed.append(memory_id)
+            return True
+        return False
 
     def create_memory(self, arguments, *, allow_sensitive=False, wait=True):  # type: ignore[no-untyped-def]
         self.created.append(dict(arguments))

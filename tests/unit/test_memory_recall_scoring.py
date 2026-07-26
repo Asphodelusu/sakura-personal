@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from app.agent.memory_recall import (
     MAX_META_REFLECTION_IN_AUTO_RECALL,
     MAX_REFLECTION_IN_AUTO_RECALL,
     META_REFLECTION_AUTO_RECALL_SCORE_FACTOR,
     REFLECTION_AUTO_RECALL_SCORE_FACTOR,
     _combine_soft_factors,
+    _query_looks_past,
     _select_memories,
 )
 
@@ -136,3 +139,35 @@ def test_meta_reflection_still_ranks_below_facts_with_similar_score() -> None:
     )
     ids = [m["id"] for m in selected]
     assert ids[0] == "f1"
+
+
+def test_query_looks_past_detects_old_affair_phrases() -> None:
+    assert _query_looks_past("还记得我们上次的约定吗") is True
+    assert _query_looks_past("那次约好早点睡后来怎样了") is True
+    assert _query_looks_past("今天天气怎么样") is False
+
+
+def test_select_memories_hides_expired_unless_past_looking() -> None:
+    now = datetime(2026, 7, 27, 12, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    expired = {
+        "id": "c1",
+        "content": "约定今晚十点休息",
+        "score": 0.9,
+        "source": "self_curation",
+        "metadata": {
+            "memory_kind": "commitment",
+            "importance": 0.8,
+            "valid_until": (now - timedelta(days=1)).isoformat(),
+        },
+    }
+    current = {
+        "id": "f1",
+        "content": "他喜欢抹茶",
+        "score": 0.8,
+        "source": "self_curation",
+        "metadata": {"importance": 0.7},
+    }
+    hidden = _select_memories([expired, current], 0.3, 5, now=now, include_expired=False)
+    assert [m["id"] for m in hidden] == ["f1"]
+    shown = _select_memories([expired, current], 0.3, 5, now=now, include_expired=True)
+    assert {m["id"] for m in shown} == {"c1", "f1"}

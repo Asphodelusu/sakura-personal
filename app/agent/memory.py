@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from app.agent.persona_state import normalize_emotion
 from app.backchannel.emotion import EmotionScorer
 from app.backchannel.models import DEFAULT_EMOTION
+from app.core.debug_log import debug_log
 from app.core.resource_manager import (
     ResourceRegistry,
     ThreadGroupResource,
@@ -1208,9 +1209,16 @@ class MemoryStore:
         scope = _normalize_scope_id(_optional_text(arguments, "scope") or self.scope_id)
         core_profile = self.core_profile() if scope == self.scope_id else None
         if mode_value == "index":
-            return self._search_index(query=query, limit=limit, layer_filter=layer_filter,
-                                      category_filter=category_filter, scope=scope,
-                                      core_profile=core_profile, wait=wait)
+            return self._search_index(
+                query=query,
+                limit=limit,
+                layer_filter=layer_filter,
+                category_filter=category_filter,
+                scope=scope,
+                core_profile=core_profile,
+                wait=wait,
+                include_expired=bool(arguments.get("include_expired")),
+            )
         if layer_filter == MEMORY_LAYER_CORE_PROFILE:
             memories = []
             if (
@@ -1260,13 +1268,14 @@ class MemoryStore:
                 self._mark_runtime_failed(error)
                 return self._failed_response(error)
             raise
+        include_expired = bool(arguments.get("include_expired"))
         memories = _normalize_memory_results(raw, default_scope=scope)
         if core_profile is not None and _memory_matches_query(core_profile, query):
             memories.insert(0, core_profile)
         memories = [
             memory
             for memory in memories
-            if not memory_record_is_expired(memory)
+            if (include_expired or not memory_record_is_expired(memory))
             and not _memory_is_released(memory)
             and _memory_matches_filters(
                 memory,
@@ -1309,6 +1318,7 @@ class MemoryStore:
 
         过滤已释放（released）、已过期（expired）及非本 scope
         的记忆——与索引模式的过滤语义保持一致。
+        传入 include_expired=True 时可取回已失效条目（回顾旧事）。
         """
         memory_ids: list[str] = []
         raw_ids = arguments.get("ids") or arguments.get("memory_ids") or []
@@ -1318,6 +1328,7 @@ class MemoryStore:
             memory_ids = [str(i).strip() for i in raw_ids if str(i).strip()]
         if not memory_ids:
             return {"memories": [], "count": 0}
+        include_expired = bool(arguments.get("include_expired"))
         try:
             mem = self._get_memory(wait=wait)
         except RuntimeError as exc:
@@ -1343,7 +1354,7 @@ class MemoryStore:
             # 与 search/index 过滤语义对齐：已释放、已过期、跨 scope 跳过
             if _memory_is_released(memory):
                 continue
-            if memory_record_is_expired(memory):
+            if not include_expired and memory_record_is_expired(memory):
                 continue
             mem_scope = str(memory.get("scope") or "").strip()
             if mem_scope and mem_scope != self.scope_id:
@@ -1363,6 +1374,7 @@ class MemoryStore:
         scope: str,
         core_profile: dict[str, Any] | None,
         wait: bool,
+        include_expired: bool = False,
     ) -> dict[str, Any]:
         """search_memory 的索引模式：只返回元信息（id / title / layer /
         created_at / importance / approx_tokens），不含完整正文。
@@ -1415,7 +1427,7 @@ class MemoryStore:
         memories = [
             memory
             for memory in memories
-            if not memory_record_is_expired(memory)
+            if (include_expired or not memory_record_is_expired(memory))
             and not _memory_is_released(memory)
             and _memory_matches_filters(
                 memory,
@@ -1600,12 +1612,18 @@ class MemoryStore:
         return True
 
     def list_scope_memories(
-        self, *, limit: int = 200, wait: bool = False, include_released: bool = False,
+        self,
+        *,
+        limit: int = 200,
+        wait: bool = False,
+        include_released: bool = False,
+        include_expired: bool = False,
     ) -> list[dict[str, Any]]:
         """列出当前角色记忆（供整理/到点召回等后台逻辑使用）。
 
         include_released=False 时自动过滤已放手记忆，
         与 search_memory / build_memory_context 的默认行为一致。
+        include_expired=True 时保留已过 valid_until 的条目（回顾旧事用）。
         """
         capped = max(1, min(500, int(limit)))
         try:
@@ -1621,10 +1639,46 @@ class MemoryStore:
         except Exception:
             return []
         memories = _normalize_memory_results(raw, default_scope=self.scope_id)
-        memories = [memory for memory in memories if not memory_record_is_expired(memory)]
+        if not include_expired:
+            memories = [memory for memory in memories if not memory_record_is_expired(memory)]
         if not include_released:
             memories = [m for m in memories if not _memory_is_released(m)]
         return memories
+
+    def mark_expiry_reviewed(self, memory_id: str, *, wait: bool = True) -> bool:
+        """标记约定已做过一次「刚过期回顾」，避免整理时反复追问。"""
+        memory_id = str(memory_id).strip()
+        if not memory_id or _is_core_profile_id(memory_id):
+            return False
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError:
+            if wait:
+                raise
+            return False
+        if mem is None:
+            return False
+        previous = _normalize_memory_record(mem.get(memory_id), default_scope=self.scope_id)
+        if not previous:
+            return False
+        content = str(previous.get("content") or previous.get("memory") or "").strip()
+        if not content:
+            return False
+        metadata = _memory_metadata(
+            {
+                "layer": previous.get("layer"),
+                "category": previous.get("category"),
+                "importance": previous.get("importance"),
+                "confidence": previous.get("confidence"),
+                "source": previous.get("source"),
+            },
+            scope_id=self.scope_id,
+            existing=previous,
+            updated_at=_now_iso(),
+        )
+        metadata["expiry_reviewed"] = True
+        mem.update(memory_id, content, metadata=metadata)
+        return True
 
     def delete_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
@@ -2638,6 +2692,155 @@ def memory_record_is_expired(record: dict[str, Any], *, now: datetime | None = N
         if expires_at <= now:
             return True
     return False
+
+
+def commitment_event_time(record: dict[str, Any]) -> str:
+    """取出 commitment 的 event_time（根字段或 metadata）。"""
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return str(record.get("event_time") or metadata.get("event_time") or "").strip()
+
+
+def memory_kind_of(record: dict[str, Any]) -> str:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return str(record.get("memory_kind") or metadata.get("memory_kind") or "").strip().lower()
+
+
+def commitment_is_stale(record: dict[str, Any], *, now: datetime | None = None) -> bool:
+    """约定是否已过期日：memory_kind=commitment 且 event_time 日期早于今天。
+
+    尚在「今天/明天」到点窗口内的不算 stale；已有 valid_until 且已失效的由
+    memory_record_is_expired 负责，本函数不再重复判断。
+    """
+    now = now or datetime.now().astimezone()
+    if memory_kind_of(record) != "commitment":
+        return False
+    if memory_record_is_expired(record, now=now):
+        return False
+    from app.agent.time_awareness import parse_memory_event_date
+
+    event_date = parse_memory_event_date(commitment_event_time(record), now=now)
+    if event_date is None:
+        return False
+    return event_date < now.date()
+
+
+def sweep_stale_commitments(
+    memory_store: "MemoryStore",
+    *,
+    now: datetime | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """把 event_time 已过的 commitment 自动标记 valid_until（不删正文）。
+
+    确定性巡检：不依赖整理模型是否记得去 update。
+    返回本轮成功标记的记忆快照（供整理时一次性复盘）。
+    """
+    now = now or datetime.now().astimezone()
+    list_fn = getattr(memory_store, "list_scope_memories", None)
+    expire_fn = getattr(memory_store, "expire_memory", None)
+    if not callable(list_fn) or not callable(expire_fn):
+        return []
+    try:
+        memories = list_fn(limit=limit, wait=False)
+    except Exception:  # noqa: BLE001
+        return []
+    swept: list[dict[str, Any]] = []
+    for raw in memories:
+        if not isinstance(raw, dict) or not commitment_is_stale(raw, now=now):
+            continue
+        memory_id = str(raw.get("id") or raw.get("memory_id") or "").strip()
+        if not memory_id:
+            continue
+        try:
+            ok = expire_fn(memory_id, valid_until=now.isoformat())
+        except Exception:  # noqa: BLE001
+            continue
+        if ok:
+            snapshot = dict(raw)
+            metadata = dict(snapshot.get("metadata") or {}) if isinstance(snapshot.get("metadata"), dict) else {}
+            metadata["valid_until"] = now.isoformat()
+            metadata["volatile"] = True
+            snapshot["metadata"] = metadata
+            swept.append(snapshot)
+    if swept:
+        debug_log(
+            "Memory",
+            "过期约定巡检完成",
+            {"expired_count": len(swept)},
+        )
+    return swept
+
+
+def collect_commitments_for_expiry_review(
+    memory_store: "MemoryStore",
+    *,
+    now: datetime | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """收集尚未做过「刚过期回顾」的失效约定（含本轮刚 sweep 的）。
+
+    优先用 list_memories（含过期）；没有则退回 list_scope_memories(include_expired)。
+    """
+    now = now or datetime.now().astimezone()
+    memories: list[dict[str, Any]] = []
+    list_all = getattr(memory_store, "list_memories", None)
+    list_scope = getattr(memory_store, "list_scope_memories", None)
+    try:
+        if callable(list_all):
+            memories = list_all(limit=300)
+        elif callable(list_scope):
+            memories = list_scope(limit=300, wait=False, include_expired=True)
+    except Exception:  # noqa: BLE001
+        return []
+    candidates: list[dict[str, Any]] = []
+    for raw in memories:
+        if not isinstance(raw, dict):
+            continue
+        if memory_kind_of(raw) != "commitment":
+            continue
+        if not memory_record_is_expired(raw, now=now):
+            continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        if metadata.get("expiry_reviewed") is True:
+            continue
+        content = str(raw.get("content") or raw.get("memory") or "").strip()
+        if not content:
+            continue
+        candidates.append(raw)
+    # 最近失效的优先（valid_until / event_time 新 → 旧）
+    def _sort_key(item: dict[str, Any]) -> str:
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        return str(
+            item.get("valid_until")
+            or meta.get("valid_until")
+            or commitment_event_time(item)
+            or item.get("updated_at")
+            or ""
+        )
+
+    candidates.sort(key=_sort_key, reverse=True)
+    return candidates[: max(0, limit)]
+
+
+def mark_commitments_expiry_reviewed(
+    memory_store: "MemoryStore",
+    memories: list[dict[str, Any]],
+) -> int:
+    """把已注入整理的刚过期约定标为已回顾。"""
+    mark_fn = getattr(memory_store, "mark_expiry_reviewed", None)
+    if not callable(mark_fn):
+        return 0
+    marked = 0
+    for raw in memories:
+        memory_id = str(raw.get("id") or raw.get("memory_id") or "").strip()
+        if not memory_id:
+            continue
+        try:
+            if mark_fn(memory_id):
+                marked += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return marked
 
 
 def memory_record_is_reflection(record: dict[str, Any]) -> bool:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 
@@ -20,6 +20,27 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
     if then.tzinfo is None:
         then = then.astimezone()
     return then
+
+
+def parse_memory_event_date(event_time: str | None, *, now: datetime | None = None) -> date | None:
+    """解析记忆 event_time（完整 ISO 或 YYYY-MM-DD）为本地日期。"""
+    text = str(event_time or "").strip()
+    if not text:
+        return None
+    current = now or datetime.now().astimezone()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=current.tzinfo)
+            return parsed.astimezone(current.tzinfo).date()
+        except ValueError:
+            pass
+        try:
+            return date.fromisoformat(candidate[:10])
+        except ValueError:
+            continue
+    return None
 
 
 def seconds_since(iso_timestamp: str | None, *, now: datetime | None = None) -> int | None:
@@ -94,6 +115,7 @@ def annotate_with_relative_age(
     *,
     now: datetime | None = None,
     expired: bool = False,
+    expired_label: str = "已失效",
 ) -> str:
     """给正文加相对年龄 / 过期前缀。"""
     text = content.strip()
@@ -101,7 +123,8 @@ def annotate_with_relative_age(
         return text
     parts: list[str] = []
     if expired:
-        parts.append("已过期的约定")
+        label = (expired_label or "已失效").strip() or "已失效"
+        parts.append(label)
     age = format_relative_age(iso_timestamp, now=now)
     if age:
         parts.append(age)
