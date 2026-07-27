@@ -60,3 +60,13 @@ def test_builtin_memory_update_accepts_new_content_alias() -> None:
 
     assert update_result.success
     assert update_result.content["memory"]["content"] == "对方喜欢低糖热咖啡"
+
+
+def test_builtin_registry_hides_get_current_time() -> None:
+    registry = create_builtin_tool_registry(
+        __import__("pathlib").Path("test_builtin_no_get_current_time"),
+        memory=MemoryStore(memory_client=FakeMem0()),
+    )
+    names = {tool.name for tool in registry.all()}
+    assert "get_current_time" not in names
+    assert "memory_search" in names

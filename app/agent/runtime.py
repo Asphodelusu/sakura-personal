@@ -324,6 +324,8 @@ class AgentRuntime:
         mode: str = "normal",
         event_type: str = "",
         event_payload: dict[str, Any] | None = None,
+        memory_fragments: tuple[Any, ...] | list[Any] | None = None,
+        memory_status: str | None = None,
     ) -> ContextSnapshot:
         request = build_context_request(
             messages,
@@ -334,15 +336,21 @@ class AgentRuntime:
             remaining_steps=0,
             available_tools=(),
             event_payload=self._enrich_event_payload(event_payload),
-            service_status={"memory": "unknown"},
+            service_status={"memory": memory_status or "unknown"},
         )
-        recall = self.memory_recall.recall(request)
-        request = replace(request, service_status={"memory": recall.status})
+        if memory_fragments is None:
+            recall = self.memory_recall.recall(request)
+            request = replace(request, service_status={"memory": recall.status})
+            fragments = recall.fragments
+        else:
+            fragments = tuple(memory_fragments)
+            if memory_status:
+                request = replace(request, service_status={"memory": memory_status})
         return self.context_orchestrator.build_snapshot(
             request,
             providers=self.context_providers,
             session_fragments=self._session_state_fragments(request),
-            memory_fragments=recall.fragments,
+            memory_fragments=fragments,
         )
 
     def _record_runtime_role(self, inspection: PromptInspection) -> None:
@@ -468,14 +476,17 @@ class AgentRuntime:
                 ),
             },
         ]
-        compose_client = self.api_client
-        if turn_state is not None and turn_state.turn_plan.tier == "fast":
+        # 与工具轮一致：沿用 TurnPlan 的 client + thinking 开关。
+        # 旧逻辑只在 tier=fast 时带 generation_params，导致 standard 闲聊的
+        # 最终合成落回 DeepSeek 默认开 thinking，白白多等十几秒。
+        if turn_state is not None:
             compose_client = self._client_for_turn(text_messages, turn_state.turn_plan)
             dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params_for_turn(
                 turn_state.turn_plan,
                 compose_client,
             )
         else:
+            compose_client = self.api_client
             dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
         turn = compose_client.complete_with_tools(
             system_prompt,
@@ -540,11 +551,16 @@ class AgentRuntime:
         context_source: str,
         cancel_checker: CancelChecker | None = None,
         turn_state: TurnState | None = None,
+        memory_fragments: tuple[Any, ...] | list[Any] | None = None,
+        memory_status: str | None = None,
+        reuse_memory_fragments: bool = False,
     ) -> ChatReply:
         """工具循环结束后，用单次结构化请求合成最终 segments。"""
         snapshot = self._build_single_context_snapshot(
             working_messages,
             source=context_source,
+            memory_fragments=memory_fragments if reuse_memory_fragments else None,
+            memory_status=memory_status if reuse_memory_fragments else None,
         )
         prompt_build = self._build_final_reply_result(snapshot)
         self._record_prompt_inspection(prompt_build.inspection)
@@ -561,6 +577,7 @@ class AgentRuntime:
             raw_content,
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
+            turn_state=turn_state,
         )
         return self._normalize_reply(
             sanitize_reply_tones(parsed.reply, self.reply_tones)
@@ -621,8 +638,19 @@ class AgentRuntime:
                 "content": self._build_final_reply_repair_instruction(),
             },
         ]
+        repair_client = self.api_client
+        repair_extra: dict[str, Any] = {}
+        if turn_state is not None:
+            repair_client = self._client_for_turn(
+                strip_image_parts_from_messages(working_messages),
+                turn_state.turn_plan,
+            )
+            _, repair_extra = self._resolve_dialogue_params_for_turn(
+                turn_state.turn_plan,
+                repair_client,
+            )
         try:
-            repaired_turn = self.api_client.complete_with_tools(
+            repaired_turn = repair_client.complete_with_tools(
                 system_prompt,
                 repair_messages,
                 tools=[],
@@ -630,6 +658,7 @@ class AgentRuntime:
                 temperature=0.2,
                 structured_response=True,
                 cancel_checker=cancel_checker,
+                **repair_extra,
             )
         except ApiRequestError as exc:
             debug_log("AgentRuntime", "最终回复修复请求失败，使用安全兜底", {"error": str(exc)})
@@ -779,6 +808,7 @@ class AgentRuntime:
         memory_needs_refresh = True
         turn_state: TurnState | None = None
         web_search_nudge_sent = False
+        memory_tool_result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult] = {}
         # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
         user_text = _latest_user_text(working_messages)
         if user_text:
@@ -1130,6 +1160,48 @@ class AgentRuntime:
                         )
                     )
                     continue
+                memory_gate = tool_routing.resolve_memory_search_gate(
+                    tool_name=call.name,
+                    arguments=execution_arguments,
+                    execution_results=execution_results,
+                    recall_decision=turn_state.recall_decision,
+                    result_cache=memory_tool_result_cache,
+                )
+                if memory_gate is None:
+                    memory_gate = tool_routing.resolve_memory_detail_gate(
+                        tool_name=call.name,
+                        arguments=execution_arguments,
+                        result_cache=memory_tool_result_cache,
+                    )
+                if memory_gate is not None:
+                    debug_log(
+                        "AgentRuntime",
+                        "记忆工具闸门短路",
+                        {
+                            "tool_name": call.name,
+                            "reason": (
+                                memory_gate.content.get("reason")
+                                if isinstance(memory_gate.content, dict)
+                                else ""
+                            ),
+                        },
+                    )
+                    step_results.append(memory_gate)
+                    execution_results.append(memory_gate)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            call,
+                            memory_gate,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(memory_gate),
+                        )
+                    )
+                    continue
                 total_tool_calls += 1
                 if tool_routing._should_block_windows_tool_for_browser_page(call_data, browser_page_guard_active):
                     blocked_result = tool_routing._build_browser_page_windows_tool_block_result(call_data)
@@ -1229,6 +1301,12 @@ class AgentRuntime:
                     )
 
                 debug_log("AgentRuntime", "工具调用完成", _redact_tool_result_for_model(prepared))
+                tool_routing.remember_memory_tool_result(
+                    tool_name=call.name,
+                    arguments=execution_arguments,
+                    result=prepared,
+                    result_cache=memory_tool_result_cache,
+                )
                 step_results.append(prepared)
                 execution_results.append(prepared)
                 tool_messages.extend(
@@ -1340,6 +1418,24 @@ class AgentRuntime:
                     },
                 )
 
+            if not should_fast_forward_final_reply and tool_routing.should_fast_forward_after_memory_search(
+                execution_results,
+                recall_decision=turn_state.recall_decision,
+            ):
+                should_fast_forward_final_reply = True
+                debug_log(
+                    "AgentRuntime",
+                    "记忆搜索已达预算，进入最终总结",
+                    {
+                        "step_index": step_index,
+                        "tool_result_count": len(execution_results),
+                        "recall_decision": turn_state.recall_decision,
+                        "memory_search_count": tool_routing.count_successful_memory_searches(
+                            execution_results
+                        ),
+                    },
+                )
+
             if pending_actions:
                 debug_log(
                     "AgentRuntime",
@@ -1404,6 +1500,9 @@ class AgentRuntime:
                 context_source=context_source,
                 cancel_checker=cancel_checker,
                 turn_state=turn_state,
+                memory_fragments=turn_memory_fragments,
+                memory_status=memory_status,
+                reuse_memory_fragments=not memory_needs_refresh,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -1844,13 +1943,21 @@ class AgentRuntime:
                 "- 高风险或需确认的工具会在对方确认后执行；发起时正文要简短说明原因。",
                 self._combine_extra_instructions(extra_instructions),
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
-                "- 跨会话信息优先用 memory_search；对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
+                "- 当前时间已在运行时事实中，不要调用 get_current_time。",
+                "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
+                "同轮优先只搜一次；显式回忆类问题最多两次；禁止对同一意图换措辞反复 full 搜索。"
+                "需要概览时用 mode=index，再对感兴趣条目用 memory_detail，不要反复 memory_search。",
+                "- 记忆诚实：注入片段与 memory_search/detail 结果里没有的事实、专有名词、作品名、偏好，"
+                "一律当不知道——自然承认记不清或没听过，再问对方；禁止用流行梗或常识去填空编造，"
+                "也不要先甩一个可能不对的名字再道歉澄清。",
+                "- 对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
                 "- 记忆语言：关于他的事实用简体中文；你自己的内心感受优先日语。"
                 "- 写入记忆时像日记：主语「我」=你自己，「他」=对方；"
                 "用「我／他」写清谁说了什么/约了什么，再写感受；"
                 "过期约定标明时效；已知名字可用名字代替「他」。",
                 "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
-                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
+                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。"
+                "但只能带出片段里确实有的内容，不能添油加醋。",
             ]
         )
         sections = [

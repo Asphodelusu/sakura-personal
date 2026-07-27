@@ -295,13 +295,6 @@ def create_builtin_tool_registry(
         [
             create_screen_observation_tool(),
             Tool(
-                name="get_current_time",
-                description="获取当前本机时间和时区。",
-                parameters={},
-                handler=lambda _arguments: get_current_time(),
-                group="core",
-            ),
-            Tool(
                 name="set_intimacy_mode",
                 description=_SET_INTIMACY_MODE_DESCRIPTION,
                 parameters={
@@ -460,7 +453,9 @@ def create_builtin_tool_registry(
             Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
+                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
+                    "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
                     "token 消耗约 1/10，适合先概览再按需展开。"
@@ -650,16 +645,11 @@ def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
     registry = ToolRegistry(
         [
             Tool(
-                name="get_current_time",
-                description="获取当前本机时间和时区。",
-                parameters={},
-                handler=lambda _arguments: get_current_time(),
-                group="core",
-            ),
-            Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
+                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
+                    "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
                     "token 消耗约 1/10，适合先概览再按需展开。"

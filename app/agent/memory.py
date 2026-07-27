@@ -1240,12 +1240,17 @@ class MemoryStore:
                 **(
                     {
                         "agent_hint": (
-                            "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆，"
-                            "不要在本轮再次调用 memory_search。"
+                            "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆或记不清，"
+                            "不要编造作品名、偏好或其他细节，不要在本轮再次调用 memory_search。"
                         ),
                     }
                     if not memories
-                    else {}
+                    else {
+                        "agent_hint": (
+                            "只能使用下方 memories 里出现的事实作答；"
+                            "结果未写明的专有名词、作品名、偏好不要补充编造。"
+                        ),
+                    }
                 ),
             }
         try:
@@ -1293,12 +1298,17 @@ class MemoryStore:
             **(
                 {
                     "agent_hint": (
-                        "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆，"
-                        "不要在本轮再次调用 memory_search。"
+                        "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆或记不清，"
+                        "不要编造作品名、偏好或其他细节，不要在本轮再次调用 memory_search。"
                     ),
                 }
                 if not memories
-                else {}
+                else {
+                    "agent_hint": (
+                        "只能使用下方 memories 里出现的事实作答；"
+                        "结果未写明的专有名词、作品名、偏好不要补充编造。"
+                    ),
+                }
             ),
         }
 
@@ -1400,6 +1410,20 @@ class MemoryStore:
                 "count": len(memories),
                 "memories": memories,
                 "mode": "index",
+                **(
+                    {
+                        "agent_hint": (
+                            "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆或记不清，"
+                            "不要编造作品名、偏好或其他细节，不要在本轮再次调用 memory_search。"
+                        ),
+                    }
+                    if not memories
+                    else {
+                        "agent_hint": (
+                            "只能使用下方索引对应的已知条目；未展开或未写明的细节不要编造。"
+                        ),
+                    }
+                ),
             }
         try:
             mem = self._get_memory(wait=wait)
@@ -1444,6 +1468,20 @@ class MemoryStore:
             "count": len(index_memories),
             "memories": index_memories,
             "mode": "index",
+            **(
+                {
+                    "agent_hint": (
+                        "未找到相关长期记忆。请直接告诉对方你目前没有这条记忆或记不清，"
+                        "不要编造作品名、偏好或其他细节，不要在本轮再次调用 memory_search。"
+                    ),
+                }
+                if not index_memories
+                else {
+                    "agent_hint": (
+                        "只能使用下方索引对应的已知条目；未展开或未写明的细节不要编造。"
+                    ),
+                }
+            ),
         }
 
     def create_memory(

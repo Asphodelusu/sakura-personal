@@ -94,6 +94,19 @@ _TOOL_TASK_KEYWORDS: tuple[str, ...] = (
     "提醒",
 )
 
+# 用户明确要求「好好想」时才开 thinking；默认关闭以保拟真与速度。
+# 工具轮暂不开：DeepSeek thinking + tool 多轮需回传 reasoning_content，当前客户端未完整保留。
+_DEEP_THINKING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(仔细|认真|好好)(想|思考|分析)"),
+    re.compile(r"(深入|详细)(分析|推理|解释|说明)"),
+    re.compile(r"(帮我)?(分析|推理|排查|推演)(一下|一遍)?"),
+    re.compile(r"(怎么实现|有什么方案|为什么会这样|根因|排查一下)"),
+    re.compile(r"(think (hard|carefully)|reason step by step|chain of thought)", re.IGNORECASE),
+)
+
+_THINKING_DISABLED: dict[str, Any] = {"thinking": {"type": "disabled"}}
+_THINKING_ENABLED: dict[str, Any] = {"thinking": {"type": "enabled"}}
+
 
 @dataclass(frozen=True)
 class TurnRoutingSettings:
@@ -272,7 +285,7 @@ def resolve_turn_plan(
             tier="standard",
             modality="vision",
             client_key=client_key,
-            generation_params={},
+            generation_params=dict(_THINKING_DISABLED),
             recall_decision=recall,
             decided_by="vision_input",
         )
@@ -287,8 +300,15 @@ def resolve_turn_plan(
         return _standard_plan(recall_decision=recall, decided_by="long_input")
     if _has_consecutive_user_messages(messages):
         return _standard_plan(recall_decision=recall, decided_by="consecutive_user")
+    # 工具意图优先于「好好想想」：避免 thinking+tool 多轮契约问题。
     if _has_tool_task_intent(messages):
         return _standard_plan(recall_decision=recall, decided_by="tool_task")
+    if _user_requests_deep_thinking(messages):
+        return _standard_plan(
+            recall_decision=recall,
+            decided_by="deep_thinking",
+            enable_thinking=True,
+        )
 
     engaged_by = _engaged_reply_decision(messages, settings)
     if engaged_by is not None:
@@ -300,7 +320,11 @@ def resolve_turn_plan(
     if settings.classifier_enabled and classifier_result is not None:
         if classifier_result == "simple":
             return _fast_plan(recall_decision=recall, decided_by="classifier:simple")
-        return _standard_plan(recall_decision=recall, decided_by="classifier:deep")
+        return _standard_plan(
+            recall_decision=recall,
+            decided_by="classifier:deep",
+            enable_thinking=True,
+        )
 
     return _standard_plan(recall_decision=recall, decided_by="default")
 
@@ -309,12 +333,14 @@ def _standard_plan(
     *,
     recall_decision: RecallDecision,
     decided_by: str,
+    enable_thinking: bool = False,
 ) -> TurnPlan:
+    """主对话（chat / Pro）：默认关 thinking；仅深度任务显式开启。"""
     return TurnPlan(
         tier="standard",
         modality="text",
         client_key="chat",
-        generation_params={},
+        generation_params=dict(_THINKING_ENABLED if enable_thinking else _THINKING_DISABLED),
         recall_decision=recall_decision,
         decided_by=decided_by,
     )
@@ -329,7 +355,7 @@ def _fast_plan(
         tier="fast",
         modality="text",
         client_key="chat_fast",
-        generation_params={"thinking": {"type": "disabled"}},
+        generation_params=dict(_THINKING_DISABLED),
         recall_decision=recall_decision,
         decided_by=decided_by,
     )
@@ -345,10 +371,18 @@ def _intimacy_plan(
         tier="fast",
         modality="text",
         client_key="chat",
-        generation_params={"thinking": {"type": "disabled"}},
+        generation_params=dict(_THINKING_DISABLED),
         recall_decision=recall_decision,
         decided_by=decided_by,
     )
+
+
+def _user_requests_deep_thinking(messages: list[ChatMessage]) -> bool:
+    """用户是否明确要求更深一层的思考/分析。"""
+    text = (_latest_user_text(messages) or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _DEEP_THINKING_PATTERNS)
 
 
 def _engaged_reply_decision(
