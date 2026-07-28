@@ -18,6 +18,7 @@ import math
 import re
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -52,6 +53,27 @@ _VOICEABLE_CHAR_RE = re.compile(
     "]"
 )
 _CJK_TEXT_LANGS = {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"}
+
+# 近义 tone → 共用参考池的规范键。立绘仍可按原 tone 变，只有 TTS 参考合并。
+_VOICE_FAMILY: dict[str, str] = {
+    "平静困惑": "中性",
+    "请求": "中性",
+    "开心": "喜悦",
+    "高兴": "喜悦",
+    "高兴困惑": "喜悦",
+    "脸红": "害羞",
+    "吃醋": "不满",
+    "难过": "悲伤",
+    "自信": "认真",
+}
+# 亲密 / H 不参与同轮粘滞，避免被平静系参考拖住。
+_HARD_BREAK_VOICE_KEYS = frozenset({"亲密", "H"})
+_STICKY_VOICE_MAX = 32
+
+
+def _resolve_voice_family_key(tone: str | None) -> str:
+    key = (tone or DEFAULT_TONE).strip() or DEFAULT_TONE
+    return _VOICE_FAMILY.get(key, key)
 
 
 def _is_voiceable_text(text: str) -> bool:
@@ -154,7 +176,10 @@ class GPTSoVITSSynthesisEngine:
             if not supervisor._ensure_character_weights(fail):
                 return None
 
-            reference = queue._select_reference(request.tone)
+            reference = queue._select_reference(
+                request.tone,
+                interaction_id=request.interaction_id,
+            )
             payload = {
                 "text": request.text,
                 "text_lang": _resolve_request_text_lang(
@@ -198,17 +223,22 @@ class GPTSoVITSSynthesisEngine:
             )
 
             try:
+                request_started = time.perf_counter()
                 with urlopen_direct_for_loopback(
                     http_request,
                     timeout=settings.timeout_seconds,
                 ) as response:
                     audio_data = response.read()
+                    synth_ms = int((time.perf_counter() - request_started) * 1000)
                     debug_log(
                         "TTS",
                         "GPT-SoVITS 请求成功",
                         {
                             "status": getattr(response, "status", None),
                             "audio_bytes": len(audio_data),
+                            "synth_ms": synth_ms,
+                            "text_chars": len(request.text),
+                            "streaming_mode": False,
                             "attempt": 2 if restart_attempted else 1,
                         },
                     )
@@ -283,7 +313,10 @@ class GenieSynthesisEngine:
         if not supervisor._ensure_service_available(fail):
             return None
 
-        reference = queue._select_reference(request.tone)
+        reference = queue._select_reference(
+            request.tone,
+            interaction_id=request.interaction_id,
+        )
         if not supervisor._ensure_character_model(reference.ref_lang, fail):
             return None
         if not supervisor._ensure_reference_audio(reference, fail):
@@ -379,6 +412,8 @@ class TTSSynthesisQueue:
         self._pending_requests: list[_TTSRequest] = []
         self._request_running = False
         self._tone_indices: dict[str, int] = {}
+        # interaction_id → 首句锁定的参考族键；同轮短句共用参考，减轻听感跳变。
+        self._sticky_voice_keys: dict[str, str] = {}
         self._thread_resource = (
             resource_manager.track_python_thread(label="tts_synthesis")
             if resource_manager is not None
@@ -485,11 +520,39 @@ class TTSSynthesisQueue:
                 self._request_running = False
             self._start_next_request()
 
-    def _select_reference(self, tone: str | None) -> _ToneReference:
-        tone_key = (tone or DEFAULT_TONE).strip() or DEFAULT_TONE
+    def _select_reference(
+        self,
+        tone: str | None,
+        *,
+        interaction_id: str = "",
+    ) -> _ToneReference:
+        requested_key = (tone or DEFAULT_TONE).strip() or DEFAULT_TONE
+        family_key = _resolve_voice_family_key(requested_key)
+        sticky_applied = False
+        iid = (interaction_id or "").strip()
+
+        if family_key in _HARD_BREAK_VOICE_KEYS:
+            tone_key = family_key
+            if iid:
+                self._sticky_voice_keys.pop(iid, None)
+        elif iid:
+            sticky = self._sticky_voice_keys.get(iid)
+            if sticky:
+                tone_key = sticky
+                sticky_applied = True
+            else:
+                tone_key = family_key
+                if len(self._sticky_voice_keys) >= _STICKY_VOICE_MAX:
+                    oldest = next(iter(self._sticky_voice_keys))
+                    self._sticky_voice_keys.pop(oldest, None)
+                self._sticky_voice_keys[iid] = tone_key
+        else:
+            tone_key = family_key
+
         references = self.settings.tone_references.get(tone_key)
         if not references:
             references = self.settings.tone_references.get(DEFAULT_TONE)
+            tone_key = DEFAULT_TONE if references else tone_key
         if not references:
             reference = _ToneReference(
                 tone=DEFAULT_TONE,
@@ -502,6 +565,9 @@ class TTSSynthesisQueue:
                 "选择默认参考音频",
                 {
                     "requested_tone": tone,
+                    "family_key": family_key,
+                    "sticky_applied": sticky_applied,
+                    "interaction_id": iid,
                     "ref_audio_path": reference.ref_audio_path,
                     "ref_lang": reference.ref_lang,
                 },
@@ -516,7 +582,10 @@ class TTSSynthesisQueue:
             "选择语气参考音频",
             {
                 "requested_tone": tone,
+                "family_key": family_key,
                 "resolved_tone": tone_key,
+                "sticky_applied": sticky_applied,
+                "interaction_id": iid,
                 "index": index,
                 "count": len(references),
                 "ref_audio_path": reference.ref_audio_path,

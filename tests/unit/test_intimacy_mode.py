@@ -246,7 +246,7 @@ class TestModuleLevelSingleton:
 
 
 class TestIntimacyGuidePromptGate:
-    """非亲密模式不得把 H guide 注入 system prompt。"""
+    """非亲密模式不得把本地 intimacy guide 注入 system prompt。"""
 
     def setup_method(self) -> None:
         intimacy_mode_state.exit()
@@ -254,7 +254,7 @@ class TestIntimacyGuidePromptGate:
     def teardown_method(self) -> None:
         intimacy_mode_state.exit()
 
-    def _runtime_with_guide(self, guide: str = "H_GUIDE_MARKER_台詞見本"):
+    def _runtime_with_guide(self, guide: str = "INTIMACY_GUIDE_MARKER"):
         from app.agent.runtime import AgentRuntime
 
         runtime = object.__new__(AgentRuntime)
@@ -280,7 +280,7 @@ class TestIntimacyGuidePromptGate:
         assert section.section_id == "persona.intimacy_reentry"
         assert "自动关闭" in section.body
         assert "再次" in section.body or "重新开启" in section.body
-        assert "H_GUIDE_MARKER_台詞見本" not in section.body
+        assert "INTIMACY_GUIDE_MARKER" not in section.body
 
     def test_tool_description_mentions_reentry(self) -> None:
         assert "不会自动恢复" in _SET_INTIMACY_MODE_DESCRIPTION
@@ -291,7 +291,7 @@ class TestIntimacyGuidePromptGate:
         intimacy_mode_state.enter()
         section = runtime._build_intimacy_section()
         assert section is not None
-        assert "H_GUIDE_MARKER_台詞見本" in section.body
+        assert "INTIMACY_GUIDE_MARKER" in section.body
         assert section.section_id == "persona.intimacy"
         assert "确认" in section.body
 
@@ -316,3 +316,46 @@ class TestIntimacyGuidePromptGate:
         assert "【当下专注】" in soft
         assert len(soft) < len(full)
         assert "勿复述战力" in soft
+
+
+class TestEffectiveReplyTones:
+    """亲密开启时追加扩展 tone；关闭时不开放。"""
+
+    def setup_method(self) -> None:
+        intimacy_mode_state.exit()
+
+    def teardown_method(self) -> None:
+        intimacy_mode_state.exit()
+
+    def _runtime(self, tones: list[str] | None = None):
+        from app.agent.runtime import AgentRuntime
+
+        runtime = object.__new__(AgentRuntime)
+        runtime.reply_tones = list(tones or ["中性", "害羞", "温柔"])
+        return runtime
+
+    def test_extra_tones_only_when_intimacy_active(self) -> None:
+        runtime = self._runtime()
+        assert "亲密" not in runtime._effective_reply_tones()
+        assert "H" not in runtime._effective_reply_tones()
+        intimacy_mode_state.enter()
+        effective = runtime._effective_reply_tones()
+        assert "亲密" in effective
+        assert "H" in effective
+        assert effective.index("亲密") < effective.index("H")
+
+    def test_does_not_duplicate_existing(self) -> None:
+        runtime = self._runtime(["中性", "亲密", "H"])
+        intimacy_mode_state.enter()
+        effective = runtime._effective_reply_tones()
+        assert effective.count("亲密") == 1
+        assert effective.count("H") == 1
+
+    def test_segment_instruction_does_not_embed_private_tone_rules(self) -> None:
+        from app.llm.prompts.recipes import build_segmented_reply_instruction
+
+        text = build_segmented_reply_instruction(["中性", "亲密", "H"])
+        assert "叫床" not in text
+        assert "喘息" not in text
+        plain = build_segmented_reply_instruction(["中性", "害羞"])
+        assert "叫床" not in plain

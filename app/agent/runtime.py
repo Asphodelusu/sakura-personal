@@ -92,6 +92,8 @@ from app.llm.prompts.types import (
 )
 
 _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
+# 亲密节奏开启时追加；分流细则见 gitignore 的 intimacy_guide.txt
+_INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
 
 
 def _load_intimacy_guide() -> str:
@@ -580,7 +582,7 @@ class AgentRuntime:
             turn_state=turn_state,
         )
         return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self.reply_tones)
+            sanitize_reply_tones(parsed.reply, self._effective_reply_tones())
         )
 
     def _parse_final_reply_with_retry(
@@ -726,8 +728,8 @@ class AgentRuntime:
         if portrait_hints:
             portrait_rule = f"{portrait_rule}\n- 立绘按情绪选择：\n{portrait_hints}"
         tone_rule = (
-            f"- tone 只能从以下选择：{'、'.join(self.reply_tones)}。"
-            if self.reply_tones
+            f"- tone 只能从以下选择：{'、'.join(self._effective_reply_tones())}。"
+            if self.reply_tones or self._intimacy_focus_active()
             else ""
         )
         return (
@@ -1103,7 +1105,7 @@ class AgentRuntime:
                     reply=self._normalize_reply(
                         sanitize_reply_tones(
                             parsed.reply,
-                            self.reply_tones,
+                            self._effective_reply_tones(),
                         )
                     ),
                     _debug=_build_debug_meta(
@@ -1608,7 +1610,7 @@ class AgentRuntime:
             reply = self._client_for_messages(final_messages).chat(
                 prompt_build.system_prompt,
                 final_messages,
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
@@ -1740,7 +1742,7 @@ class AgentRuntime:
     ) -> ChatReply:
         """事件回复走结构化 JSON + 格式修复，避免 api_client.chat 直接降级兜底。"""
         segmented_instruction = build_segmented_reply_instruction(
-            self.reply_tones,
+            self._effective_reply_tones(),
             self.reply_portraits,
             portrait_hints=self._portrait_hints() or None,
         )
@@ -1782,7 +1784,7 @@ class AgentRuntime:
             cancel_checker=cancel_checker,
         )
         return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self.reply_tones)
+            sanitize_reply_tones(parsed.reply, self._effective_reply_tones())
         )
 
     def _persona_sections(self, *, intimacy_focus: bool = False) -> list[PromptSection]:
@@ -1817,12 +1819,22 @@ class AgentRuntime:
 
         return bool(intimacy_mode_state.active)
 
+    def _effective_reply_tones(self) -> list[str]:
+        """回复可用 tone：亲密节奏开启时追加扩展 tone；日常不开放。"""
+        tones = [str(t).strip() for t in self.reply_tones if str(t).strip()]
+        if not self._intimacy_focus_active():
+            return tones
+        for extra in _INTIMACY_EXTRA_TONES:
+            if extra not in tones:
+                tones.append(extra)
+        return tones
+
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
         """亲密节奏相关提示段。
 
         - 开启中：注入本地 guide + 何时关闭的提醒
         - 刚因轮次耗尽自动关闭：注入短提示，要求互动仍在继续时再次 on=true
-          （不注入 H guide 正文）
+          （不注入 guide 正文）
         """
         guide = getattr(self, "_intimacy_guide", "")
         from app.agent.builtin_tools import intimacy_mode_state
@@ -1912,7 +1924,7 @@ class AgentRuntime:
     ):
         reply_protocol = self._apply_reply_protocol_patches(
             build_agent_reply_protocol(
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_portraits,
                 portrait_hints=self._portrait_hints() or None,
             )

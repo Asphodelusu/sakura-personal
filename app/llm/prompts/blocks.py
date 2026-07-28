@@ -6,7 +6,7 @@ from app.llm.prompts.render import render_blocks
 from app.llm.prompts.types import PromptBlock
 
 
-DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
+DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑"]
 DEFAULT_REPLY_PORTRAITS = ["站立微笑"]
 
 # 常量名保留 DESKTOP_PET_* 以兼容旧导入；文案按「数字生命」正面定位。

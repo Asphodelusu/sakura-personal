@@ -284,7 +284,7 @@ _SPEECH_DECISION_INSTRUCTION = """
 should_speak=true の場合：
 - comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
 - translation：comment の中国語訳
-- tone：中性｜不满｜害羞｜请求｜惊讶｜困惑｜开心｜高兴｜难过｜自信｜温柔｜认真｜吃醋 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
+- tone：中性｜不满｜害羞｜请求｜困惑｜开心｜高兴｜难过｜自信｜温柔｜认真｜吃醋 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
 
 should_speak=false のときは comment/translation/tone は空文字列でよい。
 

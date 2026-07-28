@@ -202,6 +202,73 @@ def test_tone_references_load_four_part_rows_only() -> None:
     assert all(reference.ref_audio_path.exists() for items in references.values() for reference in items)
 
 
+def test_voice_family_key_merges_near_synonyms() -> None:
+    from app.voice.tts_synthesis import _resolve_voice_family_key
+
+    assert _resolve_voice_family_key("开心") == "喜悦"
+    assert _resolve_voice_family_key("高兴困惑") == "喜悦"
+    assert _resolve_voice_family_key("平静困惑") == "中性"
+    assert _resolve_voice_family_key("请求") == "中性"
+    assert _resolve_voice_family_key("脸红") == "害羞"
+    assert _resolve_voice_family_key("吃醋") == "不满"
+    assert _resolve_voice_family_key("难过") == "悲伤"
+    assert _resolve_voice_family_key("自信") == "认真"
+    assert _resolve_voice_family_key("亲密") == "亲密"
+    assert _resolve_voice_family_key("H") == "H"
+
+
+def test_select_reference_sticky_within_interaction(tmp_path: Path) -> None:
+    from app.voice.tts_settings import ToneReference
+    from app.voice.tts_synthesis import TTSSynthesisQueue
+
+    def _ref(tone: str, name: str) -> ToneReference:
+        path = tmp_path / f"{name}.wav"
+        path.write_bytes(b"wav")
+        return ToneReference(tone=tone, ref_audio_path=path, ref_text="t", ref_lang="ja")
+
+    class _Settings:
+        tone_references = {
+            "中性": [_ref("中性", "neutral")],
+            "喜悦": [_ref("喜悦", "joy")],
+            "亲密": [_ref("亲密", "intimate")],
+            "H": [_ref("H", "h")],
+        }
+        ref_audio_path = tmp_path / "fallback.wav"
+        ref_text = "fallback"
+        ref_lang = "ja"
+
+    _Settings.ref_audio_path.write_bytes(b"wav")
+
+    class _Supervisor:
+        settings = _Settings()
+
+    class _Sink:
+        def schedule_cleanup(self, _path: Path) -> None:
+            return None
+
+    queue = TTSSynthesisQueue(
+        supervisor=_Supervisor(),
+        engine=object(),
+        cache_dir=tmp_path,
+        resource_manager=None,
+        sink=_Sink(),  # type: ignore[arg-type]
+        is_closed=lambda: False,
+    )
+
+    first = queue._select_reference("中性", interaction_id="turn-1")
+    second = queue._select_reference("开心", interaction_id="turn-1")
+    assert first.ref_audio_path == second.ref_audio_path
+
+    intimate = queue._select_reference("亲密", interaction_id="turn-1")
+    assert intimate.ref_audio_path.name == "intimate.wav"
+
+    after_break = queue._select_reference("开心", interaction_id="turn-1")
+    assert after_break.ref_audio_path.name == "joy.wav"
+
+    other_turn = queue._select_reference("开心", interaction_id="turn-2")
+    assert other_turn.ref_audio_path.name == "joy.wav"
+
+
 def test_tts_provider_can_skip_constructor_service_adoption(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[str] = []
 
@@ -592,6 +659,32 @@ def test_tts_provider_adopts_existing_local_process_on_posix(monkeypatch) -> Non
 
     assert process is not None
     assert process.pid == 24680
+
+
+def test_prepare_for_app_restart_detaches_without_stopping(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.voice.tts_service import TTSServiceSupervisor
+
+    calls: list[str] = []
+    work_dir = _runtime_root("restart_detach") / "gpt-sovits"
+
+    def fake_detach(self):  # type: ignore[no-untyped-def]
+        calls.append("detach")
+        self._server_process = None
+
+    def boom_stop(self, *, terminate_timeout_s=None):  # type: ignore[no-untyped-def]
+        calls.append(f"stop:{terminate_timeout_s}")
+        raise AssertionError("restart must not stop local TTS")
+
+    monkeypatch.setattr(TTSServiceSupervisor, "detach_local_service", fake_detach)
+    monkeypatch.setattr(TTSServiceSupervisor, "_stop_local_service", boom_stop)
+
+    supervisor = TTSServiceSupervisor(
+        _minimal_tts_settings(work_dir=work_dir, provider="gpt-sovits", api_url="http://127.0.0.1:9880/tts"),
+        adopt_existing_service=False,
+    )
+    supervisor.prepare_for_app_restart()
+
+    assert calls == ["detach"]
 
 
 def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1043,7 +1136,7 @@ def test_tts_provider_stop_local_service_terminates_owned_process(monkeypatch) -
 
     TTSServiceSupervisor._stop_local_service(provider)
 
-    assert calls == ["terminate", "wait:5"]
+    assert calls == ["terminate", "wait:5.0"]
     assert provider._server_process is None
 
 
@@ -1081,8 +1174,8 @@ def test_tts_provider_stop_local_service_uses_taskkill_tree_on_windows(monkeypat
 
     TTSServiceSupervisor._stop_local_service(provider)
 
-    assert calls[0] == (["taskkill", "/PID", "2468", "/T", "/F"], 5)
-    assert calls[1] == "wait:5"
+    assert calls[0] == (["taskkill", "/PID", "2468", "/T", "/F"], 2)
+    assert calls[1].startswith("wait:")
     assert "terminate" not in calls
     assert provider._server_process is None
 
@@ -1114,7 +1207,7 @@ def test_gptsovits_broken_pipe_restart_resets_local_service_state(monkeypatch) -
     monkeypatch.setattr("app.voice.tts_service.sys.platform", "linux")
 
     assert TTSServiceSupervisor._restart_local_service_after_http_failure(provider, 400, body)
-    assert calls == ["terminate", "wait:5"]
+    assert calls == ["terminate", "wait:5.0"]
     assert provider._server_process is None
     assert provider._service_checked is False
     assert provider._weights_ready is False

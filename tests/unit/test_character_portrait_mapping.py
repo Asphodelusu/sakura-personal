@@ -45,7 +45,7 @@ def _sakura_like_profile() -> CharacterProfile:
             "不满": "不满无语",
             "害羞": "害羞脸红",
             "请求": "伸手命令",
-            "惊讶": "张嘴疑问",
+            "困惑": "平静困惑",
         },
         emotion_portrait_map={
             "neutral": "站立待机",
@@ -53,7 +53,7 @@ def _sakura_like_profile() -> CharacterProfile:
             "happy": "开心脸红",
             "embarrassed": "害羞脸红",
         },
-        reply_tones=["中性", "不满", "害羞", "请求", "惊讶"],
+        reply_tones=["中性", "不满", "害羞", "请求", "困惑"],
         theme_settings=_ThemeStub(),  # type: ignore[arg-type]
     )
 
@@ -115,15 +115,15 @@ def test_portrait_selection_hints_lists_tone_and_emotion_groups() -> None:
 
 
 def test_load_tone_portrait_map_falls_back_to_global_table() -> None:
-    labels = {"站立待机", "不满无语", "伸手命令"}
+    labels = {"站立微笑", "无语", "伸手命令"}
     result = _load_tone_portrait_map(
         {},
         reply_tones=["中性", "不满", "请求"],
         expression_labels=labels,
     )
     assert result == {
-        "中性": "站立待机",
-        "不满": "不满无语",
+        "中性": "站立微笑",
+        "不满": "无语",
         "请求": "伸手命令",
     }
 

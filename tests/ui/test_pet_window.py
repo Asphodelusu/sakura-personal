@@ -3054,6 +3054,31 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
 
 
 
+def test_pet_window_request_app_restart_prepares_tts_then_exits(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.ui.pet_window import PetWindow
+    from app.ui.tray_menu import RESTART_EXIT_CODE
+
+    calls: list[object] = []
+
+    class ProviderStub:
+        def prepare_for_app_restart(self) -> None:
+            calls.append("prepare")
+
+    class MinimalWindow:
+        _request_app_restart = PetWindow._request_app_restart
+        tts_provider = ProviderStub()
+        retired_tts_providers: list[object] = []
+
+    monkeypatch.setattr(
+        "app.ui.pet_window.QApplication.exit",
+        lambda code: calls.append(("exit", code)),
+    )
+
+    MinimalWindow()._request_app_restart()
+
+    assert calls == ["prepare", ("exit", RESTART_EXIT_CODE)]
+
+
 def test_pet_window_retires_tts_provider_by_closing_it() -> None:
     from app.ui.pet_window import PetWindow
 

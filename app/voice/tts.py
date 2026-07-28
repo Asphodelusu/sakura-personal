@@ -385,6 +385,10 @@ class GPTSoVITSTTSProvider(QObject):
         """交出本地服务进程所有权，供新的 Provider 在后台接管（委托服务监督）。"""
         self._supervisor.detach_local_service()
 
+    def prepare_for_app_restart(self) -> None:
+        """托盘「重启 Sakura」前交出本地 TTS，不终止进程，便于新进程 adopt。"""
+        self._supervisor.prepare_for_app_restart()
+
 
 class GenieTTSProvider(GPTSoVITSTTSProvider):
     """Genie TTS Provider：与 GPT-SoVITS 协调器同一实现，无继承覆写。

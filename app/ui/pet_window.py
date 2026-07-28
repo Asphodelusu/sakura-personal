@@ -2904,8 +2904,31 @@ class PetWindow(QWidget):
             on_show_history=self.show_history,
             on_show_runtime_log=self.show_runtime_log,
             on_show_settings=self.show_settings,
-            on_restart=lambda: QApplication.exit(RESTART_EXIT_CODE),
+            on_restart=self._request_app_restart,
         )
+
+    def _request_app_restart(self) -> None:
+        """托盘重启：交出本地 TTS（不杀进程），再以 RESTART_EXIT_CODE 拉起新进程。"""
+        debug_log("App", "请求重启 Sakura，交出本地 TTS 所有权（保持服务常驻）")
+        providers = [self.tts_provider, *getattr(self, "retired_tts_providers", [])]
+        seen: set[int] = set()
+        for provider in providers:
+            provider_id = id(provider)
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            prepare = getattr(provider, "prepare_for_app_restart", None)
+            if not callable(prepare):
+                continue
+            try:
+                prepare()
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "TTS",
+                    "重启前交出本地 TTS 失败",
+                    {"provider": type(provider).__name__, "error": str(exc)},
+                )
+        QApplication.exit(RESTART_EXIT_CODE)
 
     def _refresh_tray_menu(self) -> None:
         if hasattr(self, "tray_icon"):
