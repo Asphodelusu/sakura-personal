@@ -853,6 +853,7 @@ def normalize_proactive_config_mapping(raw: Mapping[str, Any] | None) -> dict[st
         "poll_interval": float(cfg.poll_interval),
         "content_check_interval": float(cfg.content_check_interval),
         "content_min_chars": int(cfg.content_min_chars),
+        "content_quiet_seconds": float(cfg.content_quiet_seconds),
         "game_ocr_enabled": bool(cfg.game_ocr_enabled),
         "max_edge": int(cfg.max_edge),
         "request_timeout": float(cfg.request_timeout),

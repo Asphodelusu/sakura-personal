@@ -3226,10 +3226,9 @@ class PetWindow(QWidget):
     def _record_proactive_evaluate(self, reason: str, should_speak: bool) -> None:
         """记录一次 Observer 评估结果。
 
-        Observer 自身的"看了多少次屏幕"由内部 `_obs_history`（有限队列）+
-        `situational_summary`（单条滚动摘要，带 TTL）承载，不依赖持久化聊天历史。
-        这里只在真正开口（should_speak=True）时补一条系统记录，方便回看"为什么说了这句话"；
-        未发言的评估仅进调试日志，避免频繁评估把聊天历史刷满系统噪音记录。
+        未发言不写聊天历史。短时屏幕印象由 sensory_impression_store 承载
+        （下次 Observer 评估 + 下次主对话薄注入），带 TTL，过期自动淡出。
+        仅在真正开口（should_speak=True）时补一条系统记录，方便回看原因。
         """
         try:
             if should_speak:

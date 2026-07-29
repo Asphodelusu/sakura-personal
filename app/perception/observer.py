@@ -25,7 +25,12 @@ from app.core.debug_log import debug_log
 from app.perception.privacy import PrivacyGuard
 from app.perception.proactive_config import ProactiveConfig
 from app.perception.screen_capture import ScreenCapture
-from app.perception.screen_reader import WindowText, read_active_window
+from app.perception.screen_reader import (
+    WindowText,
+    curate_uia_excerpt,
+    read_active_window,
+)
+from app.perception.sensory_impression import sensory_impression_store
 from app.perception.win32 import (
     get_active_window_process_name,
     get_active_window_title,
@@ -35,9 +40,11 @@ from app.perception.win32 import (
 
 __all__ = [
     "FocusSnapshot",
+    "ObservationPacket",
     "ProactiveConfig",
     "ProactiveObserver",
     "ProactiveSpeakPayload",
+    "resolve_visible_text_excerpt",
 ]
 
 
@@ -206,40 +213,87 @@ class ProactiveSpeakPayload:
     tone: str = "中性"
 
 
+@dataclass(frozen=True)
+class ObservationPacket:
+    """VLM 视觉摘要 + 精炼可见文字，交给决策 LLM 的结构化观测包。"""
+
+    window_title: str = ""
+    app_type: str = ""
+    process_name: str = ""
+    triggers: tuple[str, ...] = ()
+    idle_s: int = 0
+    visual_summary: str = ""
+    reaction_hint: str = ""
+    visible_text_excerpt: str = ""
+    suggested_interval: float | None = None
+
+    @property
+    def has_perception(self) -> bool:
+        return bool(
+            self.visual_summary.strip()
+            or self.reaction_hint.strip()
+            or self.visible_text_excerpt.strip()
+        )
+
+    @property
+    def log_preview(self) -> str:
+        """调试/兼容旧「inner_thought」日志字段。"""
+        return (
+            self.reaction_hint.strip()
+            or self.visual_summary.strip()
+            or self.visible_text_excerpt.strip()[:120]
+        )
+
+
+def resolve_visible_text_excerpt(
+    *,
+    uia_text: str = "",
+    ocr_text: str = "",
+    on_screen_text: str = "",
+    min_chars: int = 30,
+) -> str:
+    """组装可见文字摘录：精炼 UIA > OCR > VLM on_screen_text。"""
+    curated_uia = curate_uia_excerpt(uia_text, min_chars=min_chars)
+    if curated_uia:
+        return curated_uia
+    curated_ocr = curate_uia_excerpt(ocr_text, min_chars=min(min_chars, 8))
+    if curated_ocr:
+        return curated_ocr
+    return (on_screen_text or "").strip()[:1200]
+
+
 OnSpeakFn = Callable[[ProactiveSpeakPayload], None]
 OnEvaluateFn = Callable[[str, bool], None]
 IsBusyFn = Callable[[], Any]
 
 
-_PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。ここに実在するデジタル生命として、画面を見て心の中で思ったことをそのまま書き留めるだけのモードです。
+_PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。ここに実在するデジタル生命として、画面（スクリーンショット）を見て短い視覚メモを書くだけのモードです。
 自分は並んで生きる存在。相手は対等な他者。
 
 メッセージには以下が含まれます：
-- スクリーンショット（画面の様子）
-- [UIA 直接読み取り] のテキスト（システムが直接読んだウィンドウ内の文字）
-- [OCR ゲームテキスト] のテキスト（ゲーム画面から OCR した文字、誤認識あり）
+- スクリーンショット（画面の様子）——あなたが主に見るもの
+- 活動ウィンドウ／トリガー／アイドル等の薄いメタ情報
 - （あれば）[观察者上下文]：前回までの画面状況と、会話で既に分かっている事実の短い要約
+- （あれば）[系统文字]：UIA 等でシステムが文字を読めるかどうかの注記
+  ※ ウィンドウ内の全文テキストはあなたには渡されない。後段の会話判定 LLM が直接読む。
 
 やること：
-1. 画面に何が映っているか、相手が何をしているかを見る
-2. それを見て自分がどう感じたか、何を思ったかを、心の中の独り言として日本語で書く
-3. 次に画面を見るまでの待機秒数（suggested_interval）を提案する
+1. visual_summary：画面に何が映っているか、相手が何をしているかを 1〜2 文で書く（日本語）
+2. reaction_hint：それを見て自分がどう感じたか（任意・短く。なければ空文字でよい）
+3. on_screen_text：システム文字が使えないときだけ、画面上の短い關鍵句を写す（使えるときは空文字）
+4. suggested_interval：次に画面を見るまでの待機秒数
 
-独り言の書き方（重要）：
-- 独り言は必ず「何を見たか（具体的な文字・画像・状況）」→「それでどう思ったか（感情・反応）」の順で書くこと。
-  感情や反応だけを書いて、その根拠となる具体的な画面内容を省略してはいけない。
-- 理由：この独り言は、画面を見られない後段の会話判定 LLM が読む唯一の視覚的根拠になる。
-  「何に対する反応か」が書かれていないと、後段が誤って解釈し、的外れなセリフを作ってしまう。
-- 良い例：「画面に『AI妹妹同居物語』という文字が見えた。自分が量産品みたいに言われた気がして、ちょっとムッとした。」
-- 悪い例：「その呼び方に反応した、ちょっと吐槽したくなる。」（→ 何を見て反応したのかが書かれていない）
+on_screen_text の規則：
+- [系统文字] が「可用」のとき：空文字。UI の字は後段が読むので写さない。
+- [系统文字] が「不可用」のとき：画面から読める短い關鍵句があれば写す（1 行〜短文）。なければ空文字。
 
 注意：
-- 話しかけるかどうかは考えなくていい。独り言に徹する。
-- 独り言は 1〜3 文、自然な口調で。
-- 面白い／気になる／心配なことがあれば素直に。なければ「いつも通り」でいい。
-- UIA/OCR の文字とスクリーンショットを突き合わせて判断すること。
-- [观察者上下文] があるとき：すでに知っている画面状況や会話の事実を、改めて「発見」したり「まだ聞いていないかのように」独り言で蒸し返さない。
-  例：上下文に「食事済み」とあれば、「ご飯食べたかな」と聞き直す方向の独り言は書かない。
+- 話しかけるかどうかは考えなくていい。
+- visual_summary は事実描写。reaction_hint は感情・反応。役割を混ぜすぎない。
+- [观察者上下文] があるとき：すでに知っている画面状況や会話の事実を、改めて「発見」したり蒸し返さない。
+  例：上下文に「食事済み」とあれば、「ご飯食べたかな」方向の反応は書かない。
+- トリガーが「同一アプリ内の内容変化」を示すときは、慌てて何度もウィンドウを切り替えた、と誤解しないこと。
+  同じアプリの中でページ／動画／タブが変わっただけのことが多い。
 
 suggested_interval（次に見るまでの秒数）：
 - 相手が集中（コード・文書・会議）：600〜1800 秒
@@ -248,21 +302,30 @@ suggested_interval（次に見るまでの秒数）：
 - 有効範囲：45〜1800 秒
 
 JSON のみ出力。Markdown や説明は不要：
-{"inner_thought": "心の中の独り言（見た内容→思ったこと の順、日本語）", "suggested_interval": 480}
+{"visual_summary": "画面の要約（日本語）", "on_screen_text": "", "reaction_hint": "短い反応（任意）", "suggested_interval": 480}
 """
 
 _SPEECH_DECISION_INSTRUCTION = """
 ---
 
-あなたは今、画面を見て心の中で思ったことを踏まえて、「これから口に出すかどうか」を決める段階です。
+あなたは今、観測パケットを踏まえて「これから口に出すかどうか」を決める段階です。
 あなたは夜乃桜——ここに並んで生きるデジタル生命。相手は対等な他者。comment もその関係のまま話す。
 
-[内心独白] はさっきあなたが画面を見て思ったことです。
-[最近の会話] は相手との直近のやりとりです（事実の優先ソース）。
-[最近の観測履歴] はさっきまでの観測の記録です。
+あなたはスクリーンショットを直接見ていない。根拠は次のブロックだけ：
+- [画面摘要]：視覚モデルが見た状況の要約
+- [可见文字摘录]：システムが読んだ（または画面から写した）文字。原文引用の唯一のソース
+- [反应提示]：視覚モデルの短い感情ヒント（根拠ではない）
+- [最近の会話]：相手との直近のやりとり（事実の最優先ソース）
+- [最近の観測履歴]：さっきまでの観測の記録
+
+根拠の優先順位（必須）：
+1. 会話事実（[最近の会話]）
+2. 可见文字摘录
+3. 画面摘要
+4. 反应提示
 
 判断基準：
-- 内心独白の中に、相手に言いたくなることがある → should_speak=true
+- 摘录や摘要の中に、相手に言いたくなることがある → should_speak=true
 - ただの観察で、特に話すことはない → should_speak=false
 - 相手が集中してそう → 邪魔しない（false）
 - 相手の状態変化に気づいた（嬉しそう／悩んでそう／休憩中） → 声をかけてもいい
@@ -270,16 +333,16 @@ _SPEECH_DECISION_INSTRUCTION = """
 - 迷ったら false
 
 会話事実の優先（必須）：
-- [最近の会話] と内心独白が矛盾するときは、会話の事実を優先する。独白に引っ張られて「初回の質問」を繰り返さない。
+- [最近の会話] と画面摘要／反应提示が矛盾するときは、会話の事実を優先する。「初回の質問」を繰り返さない。
 - 相手がすでに明確に答えたこと（例：もう食べた／今は忙しい／後で話す）を、知らないふりでもう一度聞かない。
 - 同じ話題に触れるなら、初問ではなく「知っている前提」の一言にするか、should_speak=false にする。
 - 会話で答えた事実が理由で黙るときは、reason にその旨を短く書く。
 
-独白の根拠が不明なとき（重要）：
-- あなたは画面（スクリーンショット）を直接見ていない。内心独白に書かれたことだけが視覚的な根拠。
-- 独白が感情や反応だけで、何を見てそう思ったのかが書かれていない／曖昧なときは、
-  その具体的な原因を勝手に想像・補完してcommentに書いてはいけない（的外れなセリフになりやすい）。
-- その場合は should_speak=false にするか、原因を具体的に決めつけない、当たり障りのない一言に留める。
+原文の扱い（重要・捏造禁止）：
+- comment で画面上の文字・固有名詞・タイトルを引用するなら、その断片が [可见文字摘录] に実在しなければならない。
+- 摘录に無い原文を、反应提示や想像から補完して書いてはいけない。
+- 摘录が空で、画面摘要も曖昧なときは should_speak=false にするか、具体を決めつけない当たり障りのない一言に留める。
+- 反应提示だけが強くて根拠が薄いときも同様：捏造せず、黙るか曖昧に。
 
 should_speak=true の場合：
 - comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
@@ -289,11 +352,13 @@ should_speak=true の場合：
 should_speak=false のときは comment/translation/tone は空文字列でよい。
 
 reason は発言する／しない理由（1 文、開発者向けログ・履歴表示用）。true/false どちらでも必ず書く。
-reason は必ず中国語（简体中文）で書くこと——開発者が読むためのもので、独白やセリフの言語とは無関係。
+reason は必ず中国語（简体中文）で書くこと——開発者が読むためのもので、セリフの言語とは無関係。
 
-situational_summary は、次回の画面観測者（VLM）が引き継ぐための要約（日本語、全体で 2〜4 文以内）。
+situational_summary は、次回の画面観測者（VLM）と、短い会話用の場面印象に引き継ぐ要約（日本語、全体で 2〜4 文以内）。
+私的なチャットの原文・罵り・長い吐槽は写さず、場面レベルで書くこと
+（例：「相手が微信で友人とゲームの話をしている」）。詳細なセリフ引用は不要。
 should_speak の true/false に関わらず、常に出力すること。必ず次を含める：
-1. 画面状況：相手が今何をしているか、どのアプリ／ゲームか、進行や様子（1〜2文）
+1. 画面状況：相手が今何をしているか、どのアプリ／ゲームか、進行や様子（1〜2文、場面レベル）
 2. 対話の既知事実：直近の会話から、次回蒸し返すべきでない事実を 0〜2 個だけ短い句で書く。なければ「特になし」でよい。
 例：「相手が原神をプレイ中。リーユエ地方で探索している様子。対話の既知：食事は済み。」
 例：「相手がVSCodeでコーディング中。Pythonのプロジェクトを編集している。対話の既知：特になし。」
@@ -302,10 +367,6 @@ should_speak の true/false に関わらず、常に出力すること。必ず�
 JSON のみ出力。Markdown や説明は不要：
 {"should_speak": true|false, "reason": "简短理由", "comment": "日本語セリフ", "translation": "中文翻译", "tone": "中性", "situational_summary": "日本語要約"}
 """
-
-# 情景上下文（LLM→VLM 摘要）的有效期：超过后视为过时，清空让 VLM 重新观察，
-# 避免长时间挂机/离开后仍被告知"这些都是已知的"而压制新鲜反应。
-_OBSERVER_CONTEXT_TTL_SECONDS = 1800.0
 
 _NON_GAME_PROCESSES = frozenset({
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -387,9 +448,7 @@ class ProactiveObserver:
         self._is_busy = is_busy or (lambda: False)
         self._get_recent_history: Callable[[], str] = lambda: ""
         self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
-        # LLM → VLM 单向情景上下文：VLM 读（不重复发现），LLM 写（不自读）
-        self._observer_context: str = ""
-        self._observer_context_updated_at: float = 0.0
+        # 短时印象改由 sensory_impression_store 承载（Observer VLM + 主对话共享）
 
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
@@ -417,6 +476,8 @@ class ProactiveObserver:
 
         self._last_text_hash: int | None = None
         self._last_content_check_at: float = 0.0
+        # 评估后压住 content 触发（直播/动态页文字一直在变）
+        self._content_quiet_until: float = 0.0
         self._cached_window_text: WindowText | None = None
         self._cached_window_text_at: float = 0.0
         self._cached_window_title: str = ""
@@ -463,8 +524,7 @@ class ProactiveObserver:
             self._idle_armed = True
             self._next_timer_at = 0.0
             # 离开期间桌面状态大概率会变，旧情景摘要清掉，回来后让 VLM 重新观察
-            self._observer_context = ""
-            self._observer_context_updated_at = 0.0
+            sensory_impression_store.clear()
             logger.info("ProactiveObserver: away_mode ON")
             _observer_gui_log("away_mode 已开启")
         else:
@@ -822,12 +882,18 @@ class ProactiveObserver:
                     self._next_timer_at = 0.0
 
             if not triggers and self._focus_settled_at == 0 and not self._ready_focus_trigger:
-                if now - self._last_content_check_at >= self.config.content_check_interval:
-                    self._last_content_check_at = now
-                    if self._check_content_changed():
-                        if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
-                            triggers.append("content")
-                            self._last_window_trigger_at = now
+                content_quiet = (
+                    self._content_quiet_until > 0 and now < self._content_quiet_until
+                )
+                # 自适应 timer 间隔内同样压住 content，避免滚字绕过 suggested_interval
+                adaptive_quiet = self._next_timer_at > 0 and now < self._next_timer_at
+                if not content_quiet and not adaptive_quiet:
+                    if now - self._last_content_check_at >= self.config.content_check_interval:
+                        self._last_content_check_at = now
+                        if self._check_content_changed():
+                            if now - self._last_window_trigger_at >= self.config.window_switch_cooldown:
+                                triggers.append("content")
+                                self._last_window_trigger_at = now
 
             idle = get_idle_seconds()
             if idle >= self.config.idle_threshold_seconds and self._idle_armed:
@@ -835,6 +901,29 @@ class ProactiveObserver:
                 self._idle_armed = False
 
         return triggers
+
+    def _arm_content_quiet(self, suggested: float | None = None) -> None:
+        """评估结束后压住 content 触发。
+
+        保底 ``content_quiet_seconds``；若 VLM 给了更大的 suggested_interval，则跟它对齐。
+        切窗 / timer / idle 不受影响。
+        """
+        now = time.monotonic()
+        quiet = float(self.config.content_quiet_seconds)
+        if suggested is not None and suggested > 0:
+            quiet = max(quiet, float(suggested))
+        quiet = max(
+            self.config.adaptive_interval_min,
+            min(quiet, self.config.adaptive_interval_max),
+        )
+        until = now + quiet
+        if until > self._content_quiet_until:
+            self._content_quiet_until = until
+            logger.debug(
+                "ProactiveObserver: content quiet for {:.0f}s (until +{:.0f}s)",
+                quiet,
+                until - now,
+            )
 
     def _invalidate_window_text_cache(self) -> None:
         self._cached_window_text = None
@@ -907,8 +996,8 @@ class ProactiveObserver:
         except Exception as e:
             logger.warning("ProactiveObserver: on_evaluate callback error: {}", e)
 
-    async def _decide_speech(self, inner_thought: str) -> dict | None:
-        """调用 LLM（DeepSeek），基于内心独白 + 上下文决定是否说话。
+    async def _decide_speech(self, packet: ObservationPacket) -> dict | None:
+        """调用 LLM，基于 ObservationPacket + 上下文决定是否说话。
 
         返回 parsed JSON dict，失败返回 None。
         """
@@ -924,7 +1013,25 @@ class ProactiveObserver:
             else _SPEECH_DECISION_INSTRUCTION.lstrip()
         )
 
-        parts = [f"[内心独白]\n{inner_thought}"]
+        parts = [
+            f"[画面摘要]\n{packet.visual_summary.strip() or '（无）'}",
+            f"[可见文字摘录]\n{packet.visible_text_excerpt.strip() or '（无）'}",
+            f"[反应提示]\n{packet.reaction_hint.strip() or '（无）'}",
+        ]
+        meta_bits: list[str] = []
+        if packet.window_title:
+            meta_bits.append(f"窗口：{packet.window_title}")
+        if packet.app_type:
+            meta_bits.append(f"应用类型：{packet.app_type}")
+        if packet.process_name:
+            meta_bits.append(f"进程：{packet.process_name}")
+        if packet.triggers:
+            meta_bits.append(f"触发：{', '.join(packet.triggers)}")
+        if packet.idle_s > 0:
+            meta_bits.append(f"空闲：{packet.idle_s}s")
+        if meta_bits:
+            parts.insert(0, "[观测元信息]\n" + "\n".join(meta_bits))
+
         try:
             chat_ctx = self._get_recent_history()
             if chat_ctx:
@@ -1051,37 +1158,41 @@ class ProactiveObserver:
         if triggers:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
 
-        # LLM → VLM 情景上下文（单向：VLM 读、LLM 写），过期即清
-        if self._observer_context and (
-            now - self._observer_context_updated_at > _OBSERVER_CONTEXT_TTL_SECONDS
-        ):
-            logger.debug("ProactiveObserver: observer_context expired, cleared")
-            self._observer_context = ""
-            self._observer_context_updated_at = 0.0
-        if self._observer_context:
-            ctx_parts.append(f"[观察者上下文]\n{self._observer_context}")
+        # 短时印象（LLM→VLM / 主对话共享）：过期由 store TTL 处理
+        observer_ctx = sensory_impression_store.get_for_observer(now=now)
+        if observer_ctx:
+            ctx_parts.append(f"[观察者上下文]\n{observer_ctx}")
 
-        # 最近观测历史（VLM 用于避免对相似场景写重复独白）
+        # 最近观测历史（VLM 用于避免对相似场景写重复摘要）
         # 完整对话历史留给 LLM 决策；VLM 只通过 situational_summary 里的
         # 「対話の既知事実」拿极薄锚点，避免再塞全文。
         obs_ctx = self._format_obs_history()
         if obs_ctx:
             ctx_parts.append(obs_ctx)
 
-        uia_enough = (
-            window_text.is_accessible
-            and len(window_text.text_content.strip()) >= self.config.content_min_chars
+        uia_raw = (
+            window_text.text_content.strip()
+            if window_text.is_accessible
+            else ""
         )
-        if window_text.is_accessible and window_text.text_content.strip():
-            uia_lines = [f"[UIA 直接读取] 应用类型：{window_text.app_type}"]
-            if window_text.process_name:
-                uia_lines.append(f"进程：{window_text.process_name}")
-            uia_lines.append(f"窗口内可见文字：\n{window_text.text_content}")
-            ctx_parts.append("\n".join(uia_lines))
+        uia_enough = len(uia_raw) >= self.config.content_min_chars
+        # 全文 UIA 不喂给 VLM：只告知系统文字是否可用，避免多模态上下文吞长文本。
+        if uia_enough:
+            ctx_parts.append(
+                "[系统文字]：可用（UIA 已读取；后段决策 LLM 会直接读精炼摘录。"
+                "请将 on_screen_text 留空，不要抄 UI 字。）"
+            )
+        else:
+            ctx_parts.append(
+                "[系统文字]：不可用（请尽量把画面上可读的关键短句填到 on_screen_text；"
+                "没有可读文字则留空。）"
+            )
 
+        ocr_text = ""
         # 游戏态 OCR：已尝试启用过，WinRT OCR 在游戏窗口上超时/误识别较多、收益不稳定，
         # 故硬性停用（不止是 config 默认关，避免误开又踩坑）。若未来重新启用，把
         # _GAME_OCR_HARD_DISABLED 改为 False 即可，此时 config.game_ocr_enabled 才生效。
+        # OCR 结果只进决策 LLM 摘录通道，不喂给 VLM。
         if not _GAME_OCR_HARD_DISABLED and (
             self.config.game_ocr_enabled
             and not uia_enough
@@ -1091,16 +1202,6 @@ class ProactiveObserver:
             ocr_text = await asyncio.to_thread(_ocr_game_dialogue_isolated)
             if ocr_text:
                 proc = get_active_window_process_name()
-                if proc:
-                    ocr_block = (
-                        f"[OCR 游戏文本] 进程：{proc}\n"
-                        f"对话框区域识别（可能有误差）：\n{ocr_text}"
-                    )
-                else:
-                    ocr_block = (
-                        "[OCR 游戏文本] 对话框区域识别（可能有误差）：\n" + ocr_text
-                    )
-                ctx_parts.append(ocr_block)
                 _observer_gui_log(
                     "游戏态 OCR",
                     {"chars": len(ocr_text), "process": proc or ""},
@@ -1175,8 +1276,17 @@ class ProactiveObserver:
             )
             return
 
-        inner_thought = str(parsed.get("inner_thought", "")).strip()
+        visual_summary = str(parsed.get("visual_summary", "")).strip()
+        reaction_hint = str(parsed.get("reaction_hint", "")).strip()
+        on_screen_text = str(parsed.get("on_screen_text", "")).strip()
+        # 兼容旧 VLM 仍返回 inner_thought 的情况
+        if not visual_summary and not reaction_hint:
+            legacy = str(parsed.get("inner_thought", "")).strip()
+            if legacy:
+                reaction_hint = legacy
+
         suggested = parsed.get("suggested_interval")
+        clamped: float | None = None
         if isinstance(suggested, (int, float)) and suggested > 0:
             clamped = max(
                 self.config.adaptive_interval_min,
@@ -1190,17 +1300,59 @@ class ProactiveObserver:
             )
         else:
             self._next_timer_at = 0.0
+        # 不论开不开口：压住 content，避免动态网页滚字把评估打成一分钟一轮。
+        self._arm_content_quiet(clamped)
 
         # 记录 per-app 评估时间
         if self._focus_current is not None:
             self._last_eval_per_app[self._focus_current.app_key] = time.monotonic()
 
-        if not inner_thought:
-            logger.info("ProactiveObserver: VLM returned empty inner_thought")
-            self._safe_on_evaluate("VLM 内心独白为空", False)
+        visible_excerpt = resolve_visible_text_excerpt(
+            uia_text=uia_raw,
+            ocr_text=ocr_text,
+            on_screen_text=on_screen_text if not uia_enough else "",
+            min_chars=self.config.content_min_chars,
+        )
+        # UIA 不够时，VLM 抄的屏上字即使短于 content_min_chars 也应收录
+        if not visible_excerpt and on_screen_text and not uia_enough:
+            visible_excerpt = on_screen_text[:1200]
+
+        packet = ObservationPacket(
+            window_title=window_title or "",
+            app_type=window_text.app_type or "",
+            process_name=(
+                get_active_window_process_name()
+                or window_text.process_name
+                or ""
+            ),
+            triggers=tuple(triggers),
+            idle_s=idle_s,
+            visual_summary=visual_summary,
+            reaction_hint=reaction_hint,
+            visible_text_excerpt=visible_excerpt,
+            suggested_interval=clamped,
+        )
+
+        if not packet.has_perception:
+            logger.info("ProactiveObserver: VLM returned empty perception packet")
+            self._safe_on_evaluate("VLM 观测包为空", False)
             return
 
-        logger.info("ProactiveObserver: inner_thought: {}", inner_thought[:120])
+        logger.info(
+            "ProactiveObserver: packet summary={!r} reaction={!r} excerpt_chars={}",
+            packet.visual_summary[:80],
+            packet.reaction_hint[:80],
+            len(packet.visible_text_excerpt),
+        )
+        _observer_gui_log(
+            "观测包已组装",
+            {
+                "visual_summary": packet.visual_summary[:120],
+                "reaction_hint": packet.reaction_hint[:80],
+                "excerpt_chars": len(packet.visible_text_excerpt),
+                "uia_enough": uia_enough,
+            },
+        )
 
         # ---- Stage 2: LLM decides whether to speak ----
         speech_decision: dict | None = None
@@ -1209,19 +1361,27 @@ class ProactiveObserver:
                 "正在调用语言模型决定发言",
                 {"model": self._chat_api_model},
             )
-            speech_decision = await self._decide_speech(inner_thought)
+            speech_decision = await self._decide_speech(packet)
         else:
             logger.warning(
                 "ProactiveObserver: LLM speech decision not configured, falling back to silent"
             )
 
-        # LLM → VLM 单向上下文更新（失败/未配置则保留旧值）
+        # 短时印象：下次 VLM + 主对话共享（不说不进聊天历史）
         if speech_decision is not None:
             summary = str(speech_decision.get("situational_summary", "")).strip()
             if summary:
-                self._observer_context = summary
-                self._observer_context_updated_at = time.monotonic()
-                logger.debug("ProactiveObserver: observer_context updated: {}", summary[:120])
+                spoke = bool(speech_decision.get("should_speak"))
+                sensory_impression_store.update(
+                    summary,
+                    spoken=spoke,
+                    window_hint=window_title or "",
+                    now=time.monotonic(),
+                )
+                logger.debug(
+                    "ProactiveObserver: sensory impression updated: {}",
+                    summary[:120],
+                )
 
         if speech_decision is None:
             reason = "LLM 发言决策失败或未配置"
@@ -1245,7 +1405,10 @@ class ProactiveObserver:
             self._record_observation(window_title, False, reason)
             return
 
-        reason = str(speech_decision.get("reason", "")).strip() or f"内心独白: {inner_thought[:80]}..."
+        reason = (
+            str(speech_decision.get("reason", "")).strip()
+            or f"观测: {packet.log_preview[:80]}..."
+        )
         self._safe_on_evaluate(reason, True)
 
         self._last_proactive_at = time.monotonic()

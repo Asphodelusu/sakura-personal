@@ -45,6 +45,63 @@ class WindowText:
 _MAX_TEXT_CHARS = 2000
 _MAX_WALK_MS = 200  # hard timeout for tree walk
 _MAX_DESCENDANTS = 500  # bail out after this many elements
+
+# 给决策 LLM 的精炼摘录（不喂给 VLM）
+_EXCERPT_MAX_CHARS = 1200
+_EXCERPT_HEAD_CHARS = 800
+_EXCERPT_TAIL_CHARS = 400
+_EXCERPT_MIN_LINE_CHARS = 16
+
+
+def curate_uia_excerpt(
+    text: str,
+    *,
+    max_chars: int = _EXCERPT_MAX_CHARS,
+    min_chars: int = 30,
+    min_line_chars: int = _EXCERPT_MIN_LINE_CHARS,
+) -> str:
+    """精炼 UIA/可见文字，供决策 LLM 引用原文。
+
+    - 去空白、去完全重复行
+    - 优先保留较长行（默认 ≥16 字）；长行合计不足 min_chars 时再保留短行
+    - 超长时头 800 + 尾 400
+    - 最终不足 min_chars 返回空串（视为无可用摘录）
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    seen: set[str] = set()
+    unique_lines: list[str] = []
+    for line in raw.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        unique_lines.append(cleaned)
+
+    if not unique_lines:
+        return ""
+
+    long_lines = [ln for ln in unique_lines if len(ln) >= min_line_chars]
+    long_chars = sum(len(ln) for ln in long_lines) + max(0, len(long_lines) - 1)
+    chosen = long_lines if long_chars >= min_chars else unique_lines
+
+    joined = "\n".join(chosen)
+    if len(joined) < min_chars:
+        return ""
+    if len(joined) <= max_chars:
+        return joined
+
+    head_n = min(_EXCERPT_HEAD_CHARS, max_chars)
+    tail_n = min(_EXCERPT_TAIL_CHARS, max(0, max_chars - head_n - 3))
+    if tail_n <= 0:
+        return joined[:max_chars]
+    head = joined[:head_n]
+    tail = joined[-tail_n:]
+    if head_n + tail_n >= len(joined):
+        return joined[:max_chars]
+    return f"{head}\n…\n{tail}"
 _CONTENT_CONTROL_TYPES = frozenset({
     "TextControl", "EditControl", "DocumentControl",
     "HyperlinkControl", "ListItemControl", "TreeItemControl",

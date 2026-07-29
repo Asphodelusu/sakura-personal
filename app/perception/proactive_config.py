@@ -20,6 +20,8 @@ class ProactiveConfig:
     poll_interval: float = 5.0
     content_check_interval: float = 30.0
     content_min_chars: int = 30
+    # 任意一次评估后（含不发言），content 触发至少静默这么久——避免直播滚字每分钟烧一轮。
+    content_quiet_seconds: float = 180.0
     # 暂时默认关闭：WinRT OCR 在游戏窗上常超时(~8s)，拖慢评估且收益不稳。
     game_ocr_enabled: bool = False
     max_edge: int = 1920
@@ -57,6 +59,9 @@ class ProactiveConfig:
                 d.get("content_check_interval", base.content_check_interval)
             ),
             content_min_chars=int(d.get("content_min_chars", base.content_min_chars)),
+            content_quiet_seconds=float(
+                d.get("content_quiet_seconds", base.content_quiet_seconds)
+            ),
             game_ocr_enabled=bool(d.get("game_ocr_enabled", base.game_ocr_enabled)),
             max_edge=int(d.get("max_edge", base.max_edge)),
             request_timeout=float(d.get("request_timeout", base.request_timeout)),

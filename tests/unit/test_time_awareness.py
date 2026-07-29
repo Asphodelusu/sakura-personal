@@ -46,7 +46,9 @@ def test_format_duration_and_local_time_context() -> None:
     )
     assert "当前本地时间" in text
     assert "晚上" in text
-    assert "距上次和对方互动约 10 分钟" in text
+    assert "距上次对话约 10 分钟" in text
+    assert "客观间隔" in text
+    assert "不要说成明显更短" in text
     short = format_local_time_context(
         "2026-07-20T21:43:00+08:00",
         seconds_since_interaction=30,
@@ -94,7 +96,7 @@ def test_runtime_time_fragment_includes_gap() -> None:
     )
     fragments = _builtin_fragments(request)
     time_frag = next(item for item in fragments if item.fragment_id == "runtime.time")
-    assert "距上次和对方互动约 15 分钟" in time_frag.content
+    assert "距上次对话约 15 分钟" in time_frag.content
     assert "时段" in time_frag.content
 
 

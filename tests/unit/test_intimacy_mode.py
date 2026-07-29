@@ -214,10 +214,12 @@ class TestIntimacyToolBoundaryCopy:
     def test_description_mentions_when_not_to_enable(self) -> None:
         text = _SET_INTIMACY_MODE_DESCRIPTION
         assert "身体亲密" in text
+        assert "准备" in text
         assert "技术" in text or "工作" in text
         assert "日常" in text
         assert "节奏" in text
         assert "确认" in text
+        assert "不开也可以" not in text
 
     def test_registry_uses_boundary_description(self, tmp_path: Path) -> None:
         registry = create_builtin_tool_registry(tmp_path)
@@ -259,6 +261,7 @@ class TestIntimacyGuidePromptGate:
 
         runtime = object.__new__(AgentRuntime)
         runtime._intimacy_guide = guide
+        runtime.reply_tones = ["中性", "害羞", "请求"]
         runtime.system_prompt = with_desktop_pet_context(
             "我是夜乃桜。\n" + ("日常设定。" * 200),
             system_guards="- 勿复述战力",
@@ -266,9 +269,43 @@ class TestIntimacyGuidePromptGate:
         runtime.prompt_patches = []
         return runtime
 
-    def test_hidden_when_mode_inactive(self) -> None:
+    def test_entry_hint_when_mode_inactive_with_guide(self) -> None:
         runtime = self._runtime_with_guide()
+        section = runtime._build_intimacy_section()
+        assert section is not None
+        assert section.section_id == "persona.intimacy_entry"
+        assert "准备" in section.body
+        assert "set_intimacy_mode(on=true)" in section.body
+        assert "INTIMACY_GUIDE_MARKER" not in section.body
+
+    def test_no_entry_hint_without_guide(self) -> None:
+        runtime = self._runtime_with_guide("")
         assert runtime._build_intimacy_section() is None
+
+    def test_auto_enter_when_reply_uses_intimacy_tone(self) -> None:
+        from app.llm.chat_reply import ChatReply, ChatSegment
+        from unittest.mock import patch
+
+        runtime = self._runtime_with_guide()
+        intimacy_mode_state.exit()
+        reply = ChatReply(
+            [
+                ChatSegment("……いいよ。", "亲密", "……好吧。", ""),
+            ]
+        )
+        with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
+            sealed = runtime._seal_reply_tones(reply)
+        assert intimacy_mode_state.active is True
+        assert sealed.segments[0].tone == "亲密"
+
+    def test_daily_tones_exclude_intimacy_extras(self) -> None:
+        runtime = self._runtime_with_guide()
+        runtime.reply_tones = ["中性", "害羞", "亲密", "H"]
+        intimacy_mode_state.exit()
+        assert "亲密" not in runtime._effective_reply_tones()
+        intimacy_mode_state.enter()
+        assert "亲密" in runtime._effective_reply_tones()
+        assert "H" in runtime._effective_reply_tones()
 
     def test_reentry_hint_after_auto_exit_without_guide_body(self) -> None:
         runtime = self._runtime_with_guide()

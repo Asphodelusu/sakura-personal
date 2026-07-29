@@ -25,6 +25,7 @@ from app.agent.session_state_context import (
     SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES,
     build_session_state_fragment,
 )
+from app.agent.sensory_context import build_sensory_impression_fragment
 from app.agent.tool_policy import (
     BROWSER_NAVIGATE_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
@@ -94,6 +95,15 @@ from app.llm.prompts.types import (
 _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
 # 亲密节奏开启时追加；分流细则见 gitignore 的 intimacy_guide.txt
 _INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
+_INTIMACY_ENTRY_HINT = (
+    "# 节奏工具\n"
+    "若本轮双方已同意、正在准备或即将开始身体亲密"
+    "（答应一起做、开始靠近/触碰、动手前的准备，或你准备用 tone「亲密」/「H」），"
+    "必须先调用 set_intimacy_mode(on=true)，再写回复。"
+    "不要等到做到一半才开；准备阶段就要开。"
+    "普通暧昧试探、口头调情、尚未准备动手时不要开。"
+    "开启后才能使用 tone「亲密」与「H」，并获得身体亲密向的演出引导。"
+)
 
 
 def _load_intimacy_guide() -> str:
@@ -245,7 +255,11 @@ class AgentRuntime:
         return payload
 
     def _seconds_since_previous_user_message(self) -> int | None:
-        """当前用户消息与上一条用户消息之间的间隔（秒）。"""
+        """当前用户消息写入后，距上一条历史（任意角色）的秒数。
+
+        用「上一条对话活动 → 现在」比「上上条 user → 当前 user」更贴近停顿感：
+        她刚说完你过很久才回，也会算进间隔。
+        """
         from app.agent.time_awareness import parse_iso_datetime
 
         store = self.history_store
@@ -255,16 +269,14 @@ class AgentRuntime:
             entries, _has_more = store.load_tail(40)
         except Exception:  # noqa: BLE001
             return None
-        user_times: list[datetime] = []
-        for entry in entries:
-            if str(entry.role).strip() != "user":
-                continue
-            then = parse_iso_datetime(str(entry.created_at or ""))
-            if then is not None:
-                user_times.append(then)
-        if len(user_times) < 2:
+        if len(entries) < 2:
             return None
-        delta = (user_times[-1] - user_times[-2]).total_seconds()
+        # load_tail 按时间升序；末条通常是刚写入的当前 user
+        previous = entries[-2]
+        then = parse_iso_datetime(str(previous.created_at or ""))
+        if then is None:
+            return None
+        delta = (datetime.now().astimezone() - then).total_seconds()
         if delta < 0:
             return None
         return int(delta)
@@ -273,12 +285,17 @@ class AgentRuntime:
         self,
         request: ContextRequest,
     ) -> tuple[ContextFragment, ...]:
+        fragments: list[ContextFragment] = []
+        sensory = build_sensory_impression_fragment()
+        if sensory is not None:
+            fragments.append(sensory)
+
         store = self.history_store
         if store is None:
-            return ()
+            return tuple(fragments)
         # 仅在会话刚开始（实时窗口尚浅）时才回看历史，避免每轮全量读盘与重复注入。
         if len(request.recent_messages) >= SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES:
-            return ()
+            return tuple(fragments)
         try:
             entries = store.load()
             fragment = build_session_state_fragment(
@@ -289,8 +306,10 @@ class AgentRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             debug_log("SessionState", "最近会话状态读取失败，已跳过", {"error": str(exc)})
-            return ()
-        return (fragment,) if fragment is not None else ()
+            return tuple(fragments)
+        if fragment is not None:
+            fragments.append(fragment)
+        return tuple(fragments)
 
     def get_last_prompt_inspection(self) -> dict[str, Any] | None:
         """返回最近一次 Prompt 构建的脱敏检查结果。"""
@@ -581,9 +600,7 @@ class AgentRuntime:
             cancel_checker=cancel_checker,
             turn_state=turn_state,
         )
-        return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self._effective_reply_tones())
-        )
+        return self._normalize_reply(self._seal_reply_tones(parsed.reply))
 
     def _parse_final_reply_with_retry(
         self,
@@ -1102,12 +1119,7 @@ class AgentRuntime:
                     turn_state=turn_state,
                 )
                 return AgentResult(
-                    reply=self._normalize_reply(
-                        sanitize_reply_tones(
-                            parsed.reply,
-                            self._effective_reply_tones(),
-                        )
-                    ),
+                    reply=self._normalize_reply(self._seal_reply_tones(parsed.reply)),
                     _debug=_build_debug_meta(
                         turn_client, execution_results,
                         total_tool_calls, turn_started_at,
@@ -1783,9 +1795,7 @@ class AgentRuntime:
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
         )
-        return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self._effective_reply_tones())
-        )
+        return self._normalize_reply(self._seal_reply_tones(parsed.reply))
 
     def _persona_sections(self, *, intimacy_focus: bool = False) -> list[PromptSection]:
         persona_body = self.system_prompt.strip()
@@ -1822,16 +1832,44 @@ class AgentRuntime:
     def _effective_reply_tones(self) -> list[str]:
         """回复可用 tone：亲密节奏开启时追加扩展 tone；日常不开放。"""
         tones = [str(t).strip() for t in self.reply_tones if str(t).strip()]
+        # 角色包若误把扩展 tone 写进日常词表，日常仍剔除，避免不开节奏也能用。
         if not self._intimacy_focus_active():
-            return tones
+            return [tone for tone in tones if tone not in _INTIMACY_EXTRA_TONES]
         for extra in _INTIMACY_EXTRA_TONES:
             if extra not in tones:
                 tones.append(extra)
         return tones
 
+    def _maybe_enter_intimacy_from_reply(self, reply: ChatReply) -> bool:
+        """模型已用亲密/H tone 却漏调工具时，兜底开启节奏（需本地 guide）。"""
+        from app.agent.builtin_tools import intimacy_mode_available, intimacy_mode_state
+
+        if intimacy_mode_state.active or not intimacy_mode_available():
+            return False
+        used = {
+            (segment.tone or "").strip()
+            for segment in reply.segments
+            if (segment.tone or "").strip()
+        }
+        if not used.intersection(_INTIMACY_EXTRA_TONES):
+            return False
+        intimacy_mode_state.enter()
+        debug_log(
+            "AgentRuntime",
+            "回复已使用亲密 tone，自动开启亲密节奏",
+            {"tones": sorted(used.intersection(_INTIMACY_EXTRA_TONES))},
+        )
+        return True
+
+    def _seal_reply_tones(self, reply: ChatReply) -> ChatReply:
+        """先按 tone 兜底开节奏，再按当前可用词表清洗。"""
+        self._maybe_enter_intimacy_from_reply(reply)
+        return sanitize_reply_tones(reply, self._effective_reply_tones())
+
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
         """亲密节奏相关提示段。
 
+        - 未开启但本地有 guide：短入口提示（何时必须 on=true；不注入 guide 正文）
         - 开启中：注入本地 guide + 何时关闭的提醒
         - 刚因轮次耗尽自动关闭：注入短提示，要求互动仍在继续时再次 on=true
           （不注入 guide 正文）
@@ -1873,10 +1911,19 @@ class AgentRuntime:
                 body=(
                     "# 节奏工具\n"
                     "亲密节奏模式已因长时间无用户回话、静默续投耗尽而自动关闭，不会自动恢复。"
-                    "若双方仍在进行或刚刚再次进入身体亲密互动，"
+                    "若双方仍在进行、正在准备或刚刚再次进入身体亲密互动，"
                     "请立刻调用 set_intimacy_mode(on=true) 重新开启；"
                     "对方已明确结束或话题已回到日常则不要开启。"
                 ),
+                source="character",
+                sensitivity="private",
+            )
+
+        # 未开启：只给短入口提示，不注入 guide 正文（避免日常误开时带出私密细则）
+        if guide:
+            return PromptSection(
+                section_id="persona.intimacy_entry",
+                body=_INTIMACY_ENTRY_HINT,
                 source="character",
                 sensitivity="private",
             )
