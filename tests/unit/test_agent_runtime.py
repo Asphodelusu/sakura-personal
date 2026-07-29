@@ -611,6 +611,93 @@ class TestLazyToolGroups:
             ],
         )
 
+    def test_memory_search_success_fast_forwards_without_second_planning(self) -> None:
+        search_calls: list[dict] = []
+
+        def memory_search_handler(arguments: dict) -> dict:
+            search_calls.append(dict(arguments))
+            return {
+                "query": arguments.get("query", ""),
+                "count": 1,
+                "memories": [{"id": "m1", "content": "最初の記憶"}],
+            }
+
+        registry = ToolRegistry(
+            [
+                _dummy_tool("memory_search", group="core", handler=memory_search_handler),
+                _dummy_tool("memory_detail", group="core"),
+            ]
+        )
+        good = json.dumps(
+            {
+                "segments": [
+                    {"ja": "覚えてるよ。", "zh": "我记得。", "tone": "中性", "portrait": "站立待机"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        client = MagicMock(spec=OpenAICompatibleClient)
+        client.resolve_dialogue_params.return_value = (0.8, {})
+
+        def complete_with_tools(*_args, **kwargs):
+            tools = kwargs.get("tools")
+            if tools == []:
+                return ChatCompletionTurn(
+                    content=good,
+                    tool_calls=[],
+                    message={"role": "assistant", "content": good},
+                )
+            call = NativeToolCall(
+                id="call_mem_1",
+                name="memory_search",
+                arguments={"query": "最早的记忆"},
+                arguments_json='{"query":"最早的记忆"}',
+            )
+            return ChatCompletionTurn(
+                content="",
+                tool_calls=[call],
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_mem_1",
+                            "type": "function",
+                            "function": {
+                                "name": "memory_search",
+                                "arguments": '{"query":"最早的记忆"}',
+                            },
+                        }
+                    ],
+                },
+            )
+
+        client.complete_with_tools.side_effect = complete_with_tools
+        runtime = AgentRuntime(client, _dummy_system_prompt(), tools=registry)
+
+        from app.agent.turn_routing import TurnState
+
+        original_resolve = runtime._resolve_turn_state
+
+        def resolve_light_state(*args, **kwargs):
+            state = original_resolve(*args, **kwargs)
+            return TurnState(turn_plan=state.turn_plan, recall_decision="light")
+
+        with (
+            patch.object(runtime, "_resolve_turn_state", side_effect=resolve_light_state),
+            patch.object(runtime.memory_recall, "recall") as recall_mock,
+        ):
+            recall_mock.return_value = MagicMock(fragments=(), status="ready")
+            result = runtime.handle_user_message(
+                [ChatMessage(role="user", content="随便聊聊记忆")]
+            )
+
+        assert len(result.reply.segments) > 0
+        assert len(search_calls) == 1
+        # 规划 1 次 + 最终结构化合成 1 次，不应再规划第二轮工具
+        assert client.complete_with_tools.call_count == 2
+        assert client.complete_with_tools.call_args_list[1].kwargs.get("tools") == []
+
 
 class TestMissedMemoryToolSupplement:
     def test_supplement_memory_remember_when_model_returns_text_only(self) -> None:

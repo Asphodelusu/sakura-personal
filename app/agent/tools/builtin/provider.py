@@ -50,12 +50,6 @@ class BuiltinToolProvider:
         tools: list[Tool] = [
             create_screen_observation_tool(),
             Tool(
-                name="get_current_time",
-                description="获取当前本机时间和时区。",
-                parameters={},
-                handler=lambda _: get_current_time(),
-            ),
-            Tool(
                 name="add_todo",
                 description="新增一条待办事项。",
                 parameters={
@@ -167,7 +161,9 @@ class BuiltinToolProvider:
                 description=(
                     "搜索长期记忆。mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
-                    "token 消耗约 1/10，适合先概览再按需展开。首次可能返回 status='loading'。"
+                    "token 消耗约 1/10，适合先概览再按需展开。"
+                    "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
+                    "首次可能返回 status='loading'。"
                 ),
                 parameters={
                     "type": "object",

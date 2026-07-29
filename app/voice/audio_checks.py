@@ -14,7 +14,8 @@ def _verify_generated_audio(path: Path) -> str | None:
     """音频文件统一检查关卡：生成后入队前、播放前各过一次。
 
     返回 None 表示通过；否则返回错误码，日志可借此区分：
-    audio_file_missing / audio_file_empty / audio_file_unreadable / audio_format_invalid
+    audio_file_missing / audio_file_empty / audio_file_unreadable /
+    audio_format_invalid / audio_silent
     """
     path = Path(path)
     if not path.is_file():
@@ -35,11 +36,24 @@ def _verify_generated_audio(path: Path) -> str | None:
             channels = wav_file.getnchannels()
             sample_width = wav_file.getsampwidth()
             frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            pcm = wav_file.readframes(frame_count)
     # wave 对截断文件抛 EOFError，不属于 wave.Error，需单独捕获
     except (OSError, wave.Error, EOFError):
         return "audio_format_invalid"
     if channels not in (1, 2) or sample_width <= 0 or frame_rate <= 0:
         return "audio_format_invalid"
+    # 部分 TTS 失败路径会返回约 0.67s 全零 wav；当作无效，避免假播放成功。
+    if sample_width == 2 and pcm:
+        import array
+
+        samples = array.array("h")
+        try:
+            samples.frombytes(pcm)
+        except Exception:
+            return "audio_format_invalid"
+        if samples and max(abs(s) for s in samples) < 32:
+            return "audio_silent"
     return None
 
 

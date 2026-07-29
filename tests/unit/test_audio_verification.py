@@ -35,12 +35,28 @@ def _make_dir(name: str) -> Path:
     return path
 
 
-def _write_wav(path: Path, *, channels: int = 1, sample_width: int = 2, frames: int = 16000) -> None:
+def _write_wav(
+    path: Path,
+    *,
+    channels: int = 1,
+    sample_width: int = 2,
+    frames: int = 16000,
+    silent: bool = False,
+) -> None:
+    import array
+
     with wave.open(str(path), "wb") as wav_file:
         wav_file.setnchannels(channels)
         wav_file.setsampwidth(sample_width)
         wav_file.setframerate(16000)
-        wav_file.writeframes(b"\x00" * frames * sample_width * channels)
+        if silent or sample_width != 2:
+            wav_file.writeframes(b"\x00" * frames * sample_width * channels)
+            return
+        samples = array.array("h", [0] * (frames * channels))
+        # 注入可听能量，避免被静音关卡误杀
+        for i in range(0, len(samples), max(1, channels)):
+            samples[i] = 1000
+        wav_file.writeframes(samples.tobytes())
 
 
 class TestVerifyGeneratedAudio:
@@ -71,6 +87,12 @@ class TestVerifyGeneratedAudio:
         wav = root / "stereo.wav"
         _write_wav(wav, channels=2)
         assert _verify_generated_audio(wav) is None
+
+    def test_silent_wav_rejected(self) -> None:
+        root = _make_dir("silent")
+        wav = root / "silent.wav"
+        _write_wav(wav, silent=True)
+        assert _verify_generated_audio(wav) == "audio_silent"
 
 
 class TestFinishFallback:

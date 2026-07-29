@@ -28,7 +28,7 @@ from app.llm.chat_reply import (
 
 
 def test_sanitize_reply_tones_normalizes_out_of_set_tone() -> None:
-    allowed = ["中性", "不满", "害羞", "请求", "惊讶"]
+    allowed = ["中性", "不满", "害羞", "请求", "困惑"]
     reply = ChatReply(
         [
             ChatSegment("hi", "en", "你好", "站立待机"),

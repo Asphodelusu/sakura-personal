@@ -1143,6 +1143,15 @@ class TTSServiceSupervisor:
             return False
         return True
 
+    def prepare_for_app_restart(self) -> None:
+        """应用重启前：交出本地 TTS 所有权，不终止进程。
+
+        GPT-SoVITS 冷启动（加载权重）常要十几秒到几十秒；托盘「重启 Sakura」
+        若顺带杀 TTS，体感会卡在 20s+。新进程会 adopt 同端口上已就绪的服务。
+        若需重载预设/权重，应单独重启 TTS 进程，而不是绑在桌宠重启上。
+        """
+        self.detach_local_service()
+
     def detach_local_service(self) -> None:
         """交出本地服务进程所有权，供新的 Provider 在后台接管（不终止进程）。"""
         with self._service_lifecycle_lock:

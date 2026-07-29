@@ -159,7 +159,11 @@ def format_local_time_context(
         isinstance(seconds_since_interaction, (int, float))
         and seconds_since_interaction >= min_gap_seconds
     ):
-        lines.append(f"距上次和对方互动约 {format_duration_zh(seconds_since_interaction)}。")
+        duration = format_duration_zh(seconds_since_interaction)
+        lines.append(f"距上次对话约 {duration}（这是客观间隔，不是主观感受）。")
+        lines.append(
+            f"若回复里提到过了多久，请用约 {duration}，不要说成明显更短的时间。"
+        )
     return "\n".join(lines)
 
 

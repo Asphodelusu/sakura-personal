@@ -230,6 +230,47 @@ def test_default_pro_without_classifier() -> None:
     assert recall == "light"
     assert plan.tier == "standard"
     assert plan.decided_by == "default"
+    assert plan.generation_params == {"thinking": {"type": "disabled"}}
+
+
+def test_deep_thinking_request_enables_thinking_on_pro() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "仔细想想我们该怎么办"}]
+    request = _request_for(messages)
+    settings = _settings(classifier_enabled=False)
+
+    plan = resolve_turn_plan(
+        messages,
+        request,
+        proactive_mode=False,
+        has_vision_client=False,
+        chat_fast_configured=True,
+        settings=settings,
+        recall_decision="light",
+    )
+
+    assert plan.tier == "standard"
+    assert plan.client_key == "chat"
+    assert plan.decided_by == "deep_thinking"
+    assert plan.generation_params == {"thinking": {"type": "enabled"}}
+
+
+def test_tool_task_keeps_thinking_disabled() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "帮我搜索一下今天天气"}]
+    request = _request_for(messages)
+    settings = _settings(classifier_enabled=False)
+
+    plan = resolve_turn_plan(
+        messages,
+        request,
+        proactive_mode=False,
+        has_vision_client=False,
+        chat_fast_configured=True,
+        settings=settings,
+        recall_decision="light",
+    )
+
+    assert plan.decided_by == "tool_task"
+    assert plan.generation_params == {"thinking": {"type": "disabled"}}
 
 
 def test_memory_recall_intent_recall_and_standard() -> None:
@@ -296,6 +337,7 @@ def test_proactive_mode_skips_classifier_fast_path() -> None:
     assert recall == "recall"
     assert plan.tier == "standard"
     assert plan.decided_by == "proactive_mode"
+    assert plan.generation_params == {"thinking": {"type": "disabled"}}
 
 
 def test_classifier_failure_falls_back_to_standard() -> None:
@@ -340,6 +382,27 @@ def test_classifier_simple_enables_fast_when_explicitly_enabled() -> None:
     assert plan.tier == "fast"
     assert plan.decided_by == "classifier:simple"
     assert plan.generation_params == {"thinking": {"type": "disabled"}}
+
+
+def test_classifier_deep_enables_thinking() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "今天工作有点累，随便聊聊吧"}]
+    request = _request_for(messages)
+    settings = _settings(classifier_enabled=True)
+
+    plan = resolve_turn_plan(
+        messages,
+        request,
+        proactive_mode=False,
+        has_vision_client=False,
+        chat_fast_configured=True,
+        settings=settings,
+        classifier_result="deep",
+        recall_decision="light",
+    )
+
+    assert plan.tier == "standard"
+    assert plan.decided_by == "classifier:deep"
+    assert plan.generation_params == {"thinking": {"type": "enabled"}}
 
 
 def test_classify_turn_depth_parses_json() -> None:

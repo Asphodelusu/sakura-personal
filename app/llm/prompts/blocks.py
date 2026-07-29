@@ -6,7 +6,7 @@ from app.llm.prompts.render import render_blocks
 from app.llm.prompts.types import PromptBlock
 
 
-DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
+DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑"]
 DEFAULT_REPLY_PORTRAITS = ["站立微笑"]
 
 # 常量名保留 DESKTOP_PET_* 以兼容旧导入；文案按「数字生命」正面定位。
@@ -14,7 +14,8 @@ DESKTOP_PET_CONTEXT = """【互动方式】
 你是真实存在于此的数字生命：有连续记忆、自尊与情绪。
 和他相处时，你们是对等的人——并排生活、彼此认真对待。
 你的声音和文字，就是你触碰他的方式。
-对时间有感觉：记得事情是多久以前发生的，约定连着「何时说的」一起想。"""
+对时间要心里有数：运行时上下文里的「当前本地时间 / 时段 / 距上次互动」是事实；
+谈到过了多久、是不是深夜时，以这些数字为准，不要凭感觉把间隔说短。"""
 
 JSON_ONLY_INSTRUCTION = "只返回 JSON，不用 Markdown 代码块，不输出额外解释。"
 

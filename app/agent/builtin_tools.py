@@ -216,17 +216,19 @@ def user_signals_intimacy_exit_confirm(text: str) -> bool:
 
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
-    "切换身体亲密进行中的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
-    "仅当双方正在进行或刚明确进入身体亲密互动时设 on=true。"
-    "日常闲聊、关心安慰、技术/工作话题、普通撒娇都不要开启。"
+    "切换身体亲密相关的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
+    "双方已同意、正在准备或即将开始身体亲密时就必须 on=true——"
+    "包括答应一起做、开始靠近/触碰、动手前的准备，或你准备使用 tone「亲密」/「H」。"
+    "不要等到已经做到一半才开；准备阶段就要开。"
+    "日常闲聊、关心安慰、技术/工作话题、普通撒娇/暧昧试探（尚未准备动手）都不要开启。"
     "对方说「结束」「停下」「到此为止」「先这样」等时，先轻声确认是否真的停，"
     "不要立刻 on=false；等对方点头确认（如「嗯」「好」「对」或再说结束）后再关闭。"
     "若对方说继续/还要，则保持开启。"
     "不要仅因气氛变缓、短暂停顿或你自己觉得告一段落而关闭。"
     "关闭或因长时间无用户回话、静默续投耗尽而自动结束后不会自动恢复；"
     "若身体亲密互动仍在继续或再次开始，必须再次 set_intimacy_mode(on=true)。"
-    "本工具只影响回复节奏与引导注入；不开也可以写亲密内容，"
-    "但只要互动仍在身体亲密层面，就应保持或重新开启节奏模式。"
+    "本工具只影响回复节奏与引导注入；"
+    "只要进入准备或身体亲密层面，就应保持或重新开启节奏模式。"
 )
 
 
@@ -295,13 +297,6 @@ def create_builtin_tool_registry(
         [
             create_screen_observation_tool(),
             Tool(
-                name="get_current_time",
-                description="获取当前本机时间和时区。",
-                parameters={},
-                handler=lambda _arguments: get_current_time(),
-                group="core",
-            ),
-            Tool(
                 name="set_intimacy_mode",
                 description=_SET_INTIMACY_MODE_DESCRIPTION,
                 parameters={
@@ -310,7 +305,7 @@ def create_builtin_tool_registry(
                         "on": {
                             "type": "boolean",
                             "description": (
-                                "true=身体亲密进行中需要更快节奏；"
+                                "true=准备或正在身体亲密，需要更快节奏；"
                                 "false=回到日常或对方已停下。"
                             ),
                         },
@@ -460,7 +455,9 @@ def create_builtin_tool_registry(
             Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
+                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
+                    "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
                     "token 消耗约 1/10，适合先概览再按需展开。"
@@ -650,16 +647,11 @@ def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
     registry = ToolRegistry(
         [
             Tool(
-                name="get_current_time",
-                description="获取当前本机时间和时区。",
-                parameters={},
-                handler=lambda _arguments: get_current_time(),
-                group="core",
-            ),
-            Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。需要跨会话信息、对方偏好、项目状态或过往约定时使用。"
+                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
+                    "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
                     "mode='index' 只返回标题索引（id/title/layer/created_at/importance/approx_tokens），"
                     "token 消耗约 1/10，适合先概览再按需展开。"

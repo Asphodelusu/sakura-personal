@@ -253,3 +253,38 @@ def test_rapid_switch_during_cooldown_keeps_last_deferred() -> None:
         obs._sync_focus_tracking(101.2)
         assert "C" in obs._ready_focus_trigger
         assert "B" not in obs._ready_focus_trigger.split("->")[-1]
+
+
+def test_content_quiet_blocks_content_but_not_focus() -> None:
+    obs = _observer(
+        focus_settle_delay=0.05,
+        window_switch_cooldown=0.0,
+        content_check_interval=0.01,
+    )
+    obs.config.content_quiet_seconds = 100.0
+    obs._arm_content_quiet(None)
+    assert obs._content_quiet_until > 0
+
+    with patch.object(obs, "_check_content_changed", return_value=True):
+        triggers = _collect(obs, obs._content_quiet_until - 1.0)
+    assert "content" not in triggers
+
+    with patch.object(obs, "_check_content_changed", return_value=True):
+        triggers = _collect(obs, obs._content_quiet_until + 0.1)
+    assert "content" in triggers
+
+    # 切窗不受 content quiet 影响
+    obs._arm_content_quiet(480.0)
+    obs._ready_focus_trigger = "window:A->B"
+    triggers = _collect(obs, obs._content_quiet_until - 10.0)
+    assert any(t.startswith("window:") for t in triggers)
+
+
+def test_arm_content_quiet_follows_suggested_when_larger() -> None:
+    obs = _observer()
+    obs.config.content_quiet_seconds = 180.0
+    with patch("app.perception.observer.time.monotonic", return_value=1000.0):
+        obs._arm_content_quiet(480.0)
+        assert abs(obs._content_quiet_until - 1480.0) < 0.01
+        obs._arm_content_quiet(60.0)  # 更短的不缩短已有静默
+        assert abs(obs._content_quiet_until - 1480.0) < 0.01

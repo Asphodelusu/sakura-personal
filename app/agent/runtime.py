@@ -25,6 +25,7 @@ from app.agent.session_state_context import (
     SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES,
     build_session_state_fragment,
 )
+from app.agent.sensory_context import build_sensory_impression_fragment
 from app.agent.tool_policy import (
     BROWSER_NAVIGATE_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
@@ -92,6 +93,17 @@ from app.llm.prompts.types import (
 )
 
 _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
+# 亲密节奏开启时追加；分流细则见 gitignore 的 intimacy_guide.txt
+_INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
+_INTIMACY_ENTRY_HINT = (
+    "# 节奏工具\n"
+    "若本轮双方已同意、正在准备或即将开始身体亲密"
+    "（答应一起做、开始靠近/触碰、动手前的准备，或你准备用 tone「亲密」/「H」），"
+    "必须先调用 set_intimacy_mode(on=true)，再写回复。"
+    "不要等到做到一半才开；准备阶段就要开。"
+    "普通暧昧试探、口头调情、尚未准备动手时不要开。"
+    "开启后才能使用 tone「亲密」与「H」，并获得身体亲密向的演出引导。"
+)
 
 
 def _load_intimacy_guide() -> str:
@@ -243,7 +255,11 @@ class AgentRuntime:
         return payload
 
     def _seconds_since_previous_user_message(self) -> int | None:
-        """当前用户消息与上一条用户消息之间的间隔（秒）。"""
+        """当前用户消息写入后，距上一条历史（任意角色）的秒数。
+
+        用「上一条对话活动 → 现在」比「上上条 user → 当前 user」更贴近停顿感：
+        她刚说完你过很久才回，也会算进间隔。
+        """
         from app.agent.time_awareness import parse_iso_datetime
 
         store = self.history_store
@@ -253,16 +269,14 @@ class AgentRuntime:
             entries, _has_more = store.load_tail(40)
         except Exception:  # noqa: BLE001
             return None
-        user_times: list[datetime] = []
-        for entry in entries:
-            if str(entry.role).strip() != "user":
-                continue
-            then = parse_iso_datetime(str(entry.created_at or ""))
-            if then is not None:
-                user_times.append(then)
-        if len(user_times) < 2:
+        if len(entries) < 2:
             return None
-        delta = (user_times[-1] - user_times[-2]).total_seconds()
+        # load_tail 按时间升序；末条通常是刚写入的当前 user
+        previous = entries[-2]
+        then = parse_iso_datetime(str(previous.created_at or ""))
+        if then is None:
+            return None
+        delta = (datetime.now().astimezone() - then).total_seconds()
         if delta < 0:
             return None
         return int(delta)
@@ -271,12 +285,17 @@ class AgentRuntime:
         self,
         request: ContextRequest,
     ) -> tuple[ContextFragment, ...]:
+        fragments: list[ContextFragment] = []
+        sensory = build_sensory_impression_fragment()
+        if sensory is not None:
+            fragments.append(sensory)
+
         store = self.history_store
         if store is None:
-            return ()
+            return tuple(fragments)
         # 仅在会话刚开始（实时窗口尚浅）时才回看历史，避免每轮全量读盘与重复注入。
         if len(request.recent_messages) >= SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES:
-            return ()
+            return tuple(fragments)
         try:
             entries = store.load()
             fragment = build_session_state_fragment(
@@ -287,8 +306,10 @@ class AgentRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             debug_log("SessionState", "最近会话状态读取失败，已跳过", {"error": str(exc)})
-            return ()
-        return (fragment,) if fragment is not None else ()
+            return tuple(fragments)
+        if fragment is not None:
+            fragments.append(fragment)
+        return tuple(fragments)
 
     def get_last_prompt_inspection(self) -> dict[str, Any] | None:
         """返回最近一次 Prompt 构建的脱敏检查结果。"""
@@ -324,6 +345,8 @@ class AgentRuntime:
         mode: str = "normal",
         event_type: str = "",
         event_payload: dict[str, Any] | None = None,
+        memory_fragments: tuple[Any, ...] | list[Any] | None = None,
+        memory_status: str | None = None,
     ) -> ContextSnapshot:
         request = build_context_request(
             messages,
@@ -334,15 +357,21 @@ class AgentRuntime:
             remaining_steps=0,
             available_tools=(),
             event_payload=self._enrich_event_payload(event_payload),
-            service_status={"memory": "unknown"},
+            service_status={"memory": memory_status or "unknown"},
         )
-        recall = self.memory_recall.recall(request)
-        request = replace(request, service_status={"memory": recall.status})
+        if memory_fragments is None:
+            recall = self.memory_recall.recall(request)
+            request = replace(request, service_status={"memory": recall.status})
+            fragments = recall.fragments
+        else:
+            fragments = tuple(memory_fragments)
+            if memory_status:
+                request = replace(request, service_status={"memory": memory_status})
         return self.context_orchestrator.build_snapshot(
             request,
             providers=self.context_providers,
             session_fragments=self._session_state_fragments(request),
-            memory_fragments=recall.fragments,
+            memory_fragments=fragments,
         )
 
     def _record_runtime_role(self, inspection: PromptInspection) -> None:
@@ -468,14 +497,17 @@ class AgentRuntime:
                 ),
             },
         ]
-        compose_client = self.api_client
-        if turn_state is not None and turn_state.turn_plan.tier == "fast":
+        # 与工具轮一致：沿用 TurnPlan 的 client + thinking 开关。
+        # 旧逻辑只在 tier=fast 时带 generation_params，导致 standard 闲聊的
+        # 最终合成落回 DeepSeek 默认开 thinking，白白多等十几秒。
+        if turn_state is not None:
             compose_client = self._client_for_turn(text_messages, turn_state.turn_plan)
             dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params_for_turn(
                 turn_state.turn_plan,
                 compose_client,
             )
         else:
+            compose_client = self.api_client
             dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
         turn = compose_client.complete_with_tools(
             system_prompt,
@@ -540,11 +572,16 @@ class AgentRuntime:
         context_source: str,
         cancel_checker: CancelChecker | None = None,
         turn_state: TurnState | None = None,
+        memory_fragments: tuple[Any, ...] | list[Any] | None = None,
+        memory_status: str | None = None,
+        reuse_memory_fragments: bool = False,
     ) -> ChatReply:
         """工具循环结束后，用单次结构化请求合成最终 segments。"""
         snapshot = self._build_single_context_snapshot(
             working_messages,
             source=context_source,
+            memory_fragments=memory_fragments if reuse_memory_fragments else None,
+            memory_status=memory_status if reuse_memory_fragments else None,
         )
         prompt_build = self._build_final_reply_result(snapshot)
         self._record_prompt_inspection(prompt_build.inspection)
@@ -561,10 +598,9 @@ class AgentRuntime:
             raw_content,
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
+            turn_state=turn_state,
         )
-        return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self.reply_tones)
-        )
+        return self._normalize_reply(self._seal_reply_tones(parsed.reply))
 
     def _parse_final_reply_with_retry(
         self,
@@ -621,8 +657,19 @@ class AgentRuntime:
                 "content": self._build_final_reply_repair_instruction(),
             },
         ]
+        repair_client = self.api_client
+        repair_extra: dict[str, Any] = {}
+        if turn_state is not None:
+            repair_client = self._client_for_turn(
+                strip_image_parts_from_messages(working_messages),
+                turn_state.turn_plan,
+            )
+            _, repair_extra = self._resolve_dialogue_params_for_turn(
+                turn_state.turn_plan,
+                repair_client,
+            )
         try:
-            repaired_turn = self.api_client.complete_with_tools(
+            repaired_turn = repair_client.complete_with_tools(
                 system_prompt,
                 repair_messages,
                 tools=[],
@@ -630,6 +677,7 @@ class AgentRuntime:
                 temperature=0.2,
                 structured_response=True,
                 cancel_checker=cancel_checker,
+                **repair_extra,
             )
         except ApiRequestError as exc:
             debug_log("AgentRuntime", "最终回复修复请求失败，使用安全兜底", {"error": str(exc)})
@@ -697,8 +745,8 @@ class AgentRuntime:
         if portrait_hints:
             portrait_rule = f"{portrait_rule}\n- 立绘按情绪选择：\n{portrait_hints}"
         tone_rule = (
-            f"- tone 只能从以下选择：{'、'.join(self.reply_tones)}。"
-            if self.reply_tones
+            f"- tone 只能从以下选择：{'、'.join(self._effective_reply_tones())}。"
+            if self.reply_tones or self._intimacy_focus_active()
             else ""
         )
         return (
@@ -779,6 +827,7 @@ class AgentRuntime:
         memory_needs_refresh = True
         turn_state: TurnState | None = None
         web_search_nudge_sent = False
+        memory_tool_result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult] = {}
         # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
         user_text = _latest_user_text(working_messages)
         if user_text:
@@ -1070,12 +1119,7 @@ class AgentRuntime:
                     turn_state=turn_state,
                 )
                 return AgentResult(
-                    reply=self._normalize_reply(
-                        sanitize_reply_tones(
-                            parsed.reply,
-                            self.reply_tones,
-                        )
-                    ),
+                    reply=self._normalize_reply(self._seal_reply_tones(parsed.reply)),
                     _debug=_build_debug_meta(
                         turn_client, execution_results,
                         total_tool_calls, turn_started_at,
@@ -1127,6 +1171,48 @@ class AgentRuntime:
                         AgentAction(
                             type="tool_call",
                             payload=_redact_tool_result_for_model(duplicate_result),
+                        )
+                    )
+                    continue
+                memory_gate = tool_routing.resolve_memory_search_gate(
+                    tool_name=call.name,
+                    arguments=execution_arguments,
+                    execution_results=execution_results,
+                    recall_decision=turn_state.recall_decision,
+                    result_cache=memory_tool_result_cache,
+                )
+                if memory_gate is None:
+                    memory_gate = tool_routing.resolve_memory_detail_gate(
+                        tool_name=call.name,
+                        arguments=execution_arguments,
+                        result_cache=memory_tool_result_cache,
+                    )
+                if memory_gate is not None:
+                    debug_log(
+                        "AgentRuntime",
+                        "记忆工具闸门短路",
+                        {
+                            "tool_name": call.name,
+                            "reason": (
+                                memory_gate.content.get("reason")
+                                if isinstance(memory_gate.content, dict)
+                                else ""
+                            ),
+                        },
+                    )
+                    step_results.append(memory_gate)
+                    execution_results.append(memory_gate)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            call,
+                            memory_gate,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(memory_gate),
                         )
                     )
                     continue
@@ -1229,6 +1315,12 @@ class AgentRuntime:
                     )
 
                 debug_log("AgentRuntime", "工具调用完成", _redact_tool_result_for_model(prepared))
+                tool_routing.remember_memory_tool_result(
+                    tool_name=call.name,
+                    arguments=execution_arguments,
+                    result=prepared,
+                    result_cache=memory_tool_result_cache,
+                )
                 step_results.append(prepared)
                 execution_results.append(prepared)
                 tool_messages.extend(
@@ -1340,6 +1432,24 @@ class AgentRuntime:
                     },
                 )
 
+            if not should_fast_forward_final_reply and tool_routing.should_fast_forward_after_memory_search(
+                execution_results,
+                recall_decision=turn_state.recall_decision,
+            ):
+                should_fast_forward_final_reply = True
+                debug_log(
+                    "AgentRuntime",
+                    "记忆搜索已达预算，进入最终总结",
+                    {
+                        "step_index": step_index,
+                        "tool_result_count": len(execution_results),
+                        "recall_decision": turn_state.recall_decision,
+                        "memory_search_count": tool_routing.count_successful_memory_searches(
+                            execution_results
+                        ),
+                    },
+                )
+
             if pending_actions:
                 debug_log(
                     "AgentRuntime",
@@ -1404,6 +1514,9 @@ class AgentRuntime:
                 context_source=context_source,
                 cancel_checker=cancel_checker,
                 turn_state=turn_state,
+                memory_fragments=turn_memory_fragments,
+                memory_status=memory_status,
+                reuse_memory_fragments=not memory_needs_refresh,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -1509,7 +1622,7 @@ class AgentRuntime:
             reply = self._client_for_messages(final_messages).chat(
                 prompt_build.system_prompt,
                 final_messages,
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_portraits,
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
@@ -1641,7 +1754,7 @@ class AgentRuntime:
     ) -> ChatReply:
         """事件回复走结构化 JSON + 格式修复，避免 api_client.chat 直接降级兜底。"""
         segmented_instruction = build_segmented_reply_instruction(
-            self.reply_tones,
+            self._effective_reply_tones(),
             self.reply_portraits,
             portrait_hints=self._portrait_hints() or None,
         )
@@ -1682,9 +1795,7 @@ class AgentRuntime:
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
         )
-        return self._normalize_reply(
-            sanitize_reply_tones(parsed.reply, self.reply_tones)
-        )
+        return self._normalize_reply(self._seal_reply_tones(parsed.reply))
 
     def _persona_sections(self, *, intimacy_focus: bool = False) -> list[PromptSection]:
         persona_body = self.system_prompt.strip()
@@ -1718,12 +1829,50 @@ class AgentRuntime:
 
         return bool(intimacy_mode_state.active)
 
+    def _effective_reply_tones(self) -> list[str]:
+        """回复可用 tone：亲密节奏开启时追加扩展 tone；日常不开放。"""
+        tones = [str(t).strip() for t in self.reply_tones if str(t).strip()]
+        # 角色包若误把扩展 tone 写进日常词表，日常仍剔除，避免不开节奏也能用。
+        if not self._intimacy_focus_active():
+            return [tone for tone in tones if tone not in _INTIMACY_EXTRA_TONES]
+        for extra in _INTIMACY_EXTRA_TONES:
+            if extra not in tones:
+                tones.append(extra)
+        return tones
+
+    def _maybe_enter_intimacy_from_reply(self, reply: ChatReply) -> bool:
+        """模型已用亲密/H tone 却漏调工具时，兜底开启节奏（需本地 guide）。"""
+        from app.agent.builtin_tools import intimacy_mode_available, intimacy_mode_state
+
+        if intimacy_mode_state.active or not intimacy_mode_available():
+            return False
+        used = {
+            (segment.tone or "").strip()
+            for segment in reply.segments
+            if (segment.tone or "").strip()
+        }
+        if not used.intersection(_INTIMACY_EXTRA_TONES):
+            return False
+        intimacy_mode_state.enter()
+        debug_log(
+            "AgentRuntime",
+            "回复已使用亲密 tone，自动开启亲密节奏",
+            {"tones": sorted(used.intersection(_INTIMACY_EXTRA_TONES))},
+        )
+        return True
+
+    def _seal_reply_tones(self, reply: ChatReply) -> ChatReply:
+        """先按 tone 兜底开节奏，再按当前可用词表清洗。"""
+        self._maybe_enter_intimacy_from_reply(reply)
+        return sanitize_reply_tones(reply, self._effective_reply_tones())
+
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
         """亲密节奏相关提示段。
 
+        - 未开启但本地有 guide：短入口提示（何时必须 on=true；不注入 guide 正文）
         - 开启中：注入本地 guide + 何时关闭的提醒
         - 刚因轮次耗尽自动关闭：注入短提示，要求互动仍在继续时再次 on=true
-          （不注入 H guide 正文）
+          （不注入 guide 正文）
         """
         guide = getattr(self, "_intimacy_guide", "")
         from app.agent.builtin_tools import intimacy_mode_state
@@ -1762,10 +1911,19 @@ class AgentRuntime:
                 body=(
                     "# 节奏工具\n"
                     "亲密节奏模式已因长时间无用户回话、静默续投耗尽而自动关闭，不会自动恢复。"
-                    "若双方仍在进行或刚刚再次进入身体亲密互动，"
+                    "若双方仍在进行、正在准备或刚刚再次进入身体亲密互动，"
                     "请立刻调用 set_intimacy_mode(on=true) 重新开启；"
                     "对方已明确结束或话题已回到日常则不要开启。"
                 ),
+                source="character",
+                sensitivity="private",
+            )
+
+        # 未开启：只给短入口提示，不注入 guide 正文（避免日常误开时带出私密细则）
+        if guide:
+            return PromptSection(
+                section_id="persona.intimacy_entry",
+                body=_INTIMACY_ENTRY_HINT,
                 source="character",
                 sensitivity="private",
             )
@@ -1813,7 +1971,7 @@ class AgentRuntime:
     ):
         reply_protocol = self._apply_reply_protocol_patches(
             build_agent_reply_protocol(
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_portraits,
                 portrait_hints=self._portrait_hints() or None,
             )
@@ -1844,13 +2002,21 @@ class AgentRuntime:
                 "- 高风险或需确认的工具会在对方确认后执行；发起时正文要简短说明原因。",
                 self._combine_extra_instructions(extra_instructions),
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
-                "- 跨会话信息优先用 memory_search；对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
+                "- 当前时间已在运行时事实中，不要调用 get_current_time。",
+                "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
+                "同轮优先只搜一次；显式回忆类问题最多两次；禁止对同一意图换措辞反复 full 搜索。"
+                "需要概览时用 mode=index，再对感兴趣条目用 memory_detail，不要反复 memory_search。",
+                "- 记忆诚实：注入片段与 memory_search/detail 结果里没有的事实、专有名词、作品名、偏好，"
+                "一律当不知道——自然承认记不清或没听过，再问对方；禁止用流行梗或常识去填空编造，"
+                "也不要先甩一个可能不对的名字再道歉澄清。",
+                "- 对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
                 "- 记忆语言：关于他的事实用简体中文；你自己的内心感受优先日语。"
                 "- 写入记忆时像日记：主语「我」=你自己，「他」=对方；"
                 "用「我／他」写清谁说了什么/约了什么，再写感受；"
                 "过期约定标明时效；已知名字可用名字代替「他」。",
                 "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
-                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。",
+                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。"
+                "但只能带出片段里确实有的内容，不能添油加醋。",
             ]
         )
         sections = [

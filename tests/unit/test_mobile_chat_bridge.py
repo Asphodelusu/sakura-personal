@@ -45,6 +45,7 @@ def test_mobile_tool_registry_exposes_memory_write_not_desktop() -> None:
     assert "memory_search" in names
     assert "memory_update" in names
     assert "memory_forget" in names
+    assert "get_current_time" not in names
     assert "open_url" not in names
     assert "observe_screen" not in names
     result = registry.execute("memory_remember", {"content": "对方喜欢抹茶"})

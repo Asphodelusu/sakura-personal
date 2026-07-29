@@ -430,6 +430,8 @@ def _latest_user_is_browser_lookup_request(messages: list[ChatMessage]) -> bool:
 _WEB_SEARCH_TOOL_NAMES = frozenset(
     {"web__web_search", "web_search", "web__fetch_url", "fetch_url"}
 )
+_MEMORY_SEARCH_TOOL_NAMES = frozenset({"memory_search"})
+_MEMORY_DETAIL_TOOL_NAMES = frozenset({"memory_detail"})
 
 
 def _should_fast_forward_after_web_search(
@@ -448,6 +450,186 @@ def _should_fast_forward_after_web_search(
         result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success
         for result in execution_results
     )
+
+
+def memory_search_budget(recall_decision: str) -> int:
+    """同轮 memory_search 成功次数上限：普通 1，显式回忆 2。"""
+    return 2 if recall_decision == "recall" else 1
+
+
+def memory_search_cache_key(arguments: dict[str, Any] | None) -> tuple[str, ...]:
+    args = arguments if isinstance(arguments, dict) else {}
+    query = str(args.get("query") or args.get("keyword") or "").strip().lower()
+    mode = str(args.get("mode") or "full").strip().lower() or "full"
+    layer = str(args.get("layer") or "").strip().lower()
+    category = str(args.get("category") or "").strip().lower()
+    scope = str(args.get("scope") or "").strip().lower()
+    return (query, mode, layer, category, scope)
+
+
+def memory_detail_cache_key(arguments: dict[str, Any] | None) -> tuple[str, ...]:
+    args = arguments if isinstance(arguments, dict) else {}
+    raw_ids = args.get("ids") or args.get("memory_ids") or []
+    ids: list[str] = []
+    if isinstance(raw_ids, str):
+        ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
+    elif isinstance(raw_ids, list):
+        ids = [str(part).strip() for part in raw_ids if str(part).strip()]
+    return tuple(sorted(ids))
+
+
+def _memory_tool_content_status(result: ToolExecutionResult) -> str:
+    if not result.success:
+        return "error"
+    content = result.content
+    if not isinstance(content, dict):
+        return "ok"
+    if content.get("skipped"):
+        return "skipped"
+    status = str(content.get("status") or "").strip().lower()
+    if status in {"loading", "failed"}:
+        return status
+    return "ok"
+
+
+def count_successful_memory_searches(execution_results: list[ToolExecutionResult]) -> int:
+    return sum(
+        1
+        for result in execution_results
+        if result.tool_name in _MEMORY_SEARCH_TOOL_NAMES
+        and _memory_tool_content_status(result) == "ok"
+    )
+
+
+def _has_terminal_memory_search_failure(execution_results: list[ToolExecutionResult]) -> bool:
+    return any(
+        result.tool_name in _MEMORY_SEARCH_TOOL_NAMES
+        and _memory_tool_content_status(result) in {"loading", "failed", "error"}
+        for result in execution_results
+    )
+
+
+def should_fast_forward_after_memory_search(
+    execution_results: list[ToolExecutionResult],
+    *,
+    recall_decision: str,
+) -> bool:
+    """记忆搜索达到本轮预算后收束，避免同意图换词连搜。"""
+    return count_successful_memory_searches(execution_results) >= memory_search_budget(
+        recall_decision
+    )
+
+
+def build_memory_search_gate_result(
+    tool_name: str,
+    *,
+    reason: str,
+    message: str,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        tool_name=tool_name,
+        success=True,
+        content={
+            "skipped": True,
+            "reason": reason,
+            "message": message,
+            "agent_hint": message,
+        },
+        error="",
+    )
+
+
+def resolve_memory_search_gate(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    execution_results: list[ToolExecutionResult],
+    recall_decision: str,
+    result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult],
+) -> ToolExecutionResult | None:
+    """memory_search 执行前闸门：缓存命中 / loading·failed 硬拦 / 预算用尽。"""
+    if tool_name not in _MEMORY_SEARCH_TOOL_NAMES:
+        return None
+    cache_key = ("search", memory_search_cache_key(arguments))
+    cached = result_cache.get(cache_key)
+    if cached is not None:
+        cached_payload = cached.content if isinstance(cached.content, dict) else {"cached": cached.content}
+        return ToolExecutionResult(
+            tool_name=tool_name,
+            success=True,
+            content={
+                **cached_payload,
+                "skipped": True,
+                "reason": "memory_search_cache_hit",
+                "message": "本轮已用相同参数搜索过记忆，以下为缓存结果；请直接作答，不要重复调用。",
+                "agent_hint": "本轮已用相同参数搜索过记忆，请直接根据结果作答，不要重复调用。",
+            },
+            error="",
+        )
+    if _has_terminal_memory_search_failure(execution_results):
+        return build_memory_search_gate_result(
+            tool_name,
+            reason="memory_search_terminal",
+            message="本轮记忆搜索已返回不可用/初始化中状态，请直接作答，不要再次调用 memory_search。",
+        )
+    budget = memory_search_budget(recall_decision)
+    if count_successful_memory_searches(execution_results) >= budget:
+        return build_memory_search_gate_result(
+            tool_name,
+            reason="memory_search_budget",
+            message=(
+                f"本轮 memory_search 已达上限（{budget} 次），"
+                "请基于已有记忆结果直接作答，不要再次搜索。"
+            ),
+        )
+    return None
+
+
+def resolve_memory_detail_gate(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult],
+) -> ToolExecutionResult | None:
+    """memory_detail 同参数缓存回放。"""
+    if tool_name not in _MEMORY_DETAIL_TOOL_NAMES:
+        return None
+    cache_key = ("detail", memory_detail_cache_key(arguments))
+    cached = result_cache.get(cache_key)
+    if cached is None:
+        return None
+    cached_payload = cached.content if isinstance(cached.content, dict) else {"cached": cached.content}
+    return ToolExecutionResult(
+        tool_name=tool_name,
+        success=True,
+        content={
+            **cached_payload,
+            "skipped": True,
+            "reason": "memory_detail_cache_hit",
+            "message": "本轮已取过相同记忆详情，以下为缓存结果；请直接作答。",
+            "agent_hint": "本轮已取过相同记忆详情，请直接根据结果作答。",
+        },
+        error="",
+    )
+
+
+def remember_memory_tool_result(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: ToolExecutionResult,
+    result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult],
+) -> None:
+    """把成功的记忆检索/详情结果写入同 turn 缓存。"""
+    if tool_name in _MEMORY_SEARCH_TOOL_NAMES:
+        if _memory_tool_content_status(result) != "ok":
+            return
+        result_cache[("search", memory_search_cache_key(arguments))] = result
+        return
+    if tool_name in _MEMORY_DETAIL_TOOL_NAMES:
+        if _memory_tool_content_status(result) != "ok":
+            return
+        result_cache[("detail", memory_detail_cache_key(arguments))] = result
 
 
 def _latest_user_is_browser_interaction_request(messages: list[ChatMessage]) -> bool:

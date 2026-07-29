@@ -75,6 +75,8 @@ def test_tone_to_emotion_maps_common_reply_tones() -> None:
     assert tone_to_emotion("害羞") == "embarrassed"
     assert tone_to_emotion("不满") == "frustrated"
     assert tone_to_emotion("开心") == "happy"
+    assert tone_to_emotion("亲密") == "tender"
+    assert tone_to_emotion("H") == "playful"
     assert tone_to_emotion("happy") == "happy"
     assert tone_to_emotion("未知语气") == "neutral"
     assert tone_to_emotion("") == "neutral"

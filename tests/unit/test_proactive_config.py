@@ -18,9 +18,11 @@ def test_proactive_config_from_dict_empty_matches_defaults() -> None:
     assert loaded.window_switch_cooldown == base.window_switch_cooldown
     assert loaded.content_check_interval == base.content_check_interval
     assert loaded.content_min_chars == base.content_min_chars
+    assert loaded.content_quiet_seconds == base.content_quiet_seconds
     assert loaded.game_ocr_enabled == base.game_ocr_enabled
     assert base.focus_settle_delay == 15
     assert base.window_switch_cooldown == 25
+    assert base.content_quiet_seconds == 180
 
 
 def test_proactive_config_from_dict_overrides() -> None:
@@ -31,6 +33,7 @@ def test_proactive_config_from_dict_overrides() -> None:
             "max_edge": 768,
             "min_silence_after_user": 5,
             "content_check_interval": 45,
+            "content_quiet_seconds": 300,
             "game_ocr_enabled": False,
         }
     )
@@ -39,6 +42,7 @@ def test_proactive_config_from_dict_overrides() -> None:
     assert loaded.max_edge == 768
     assert loaded.min_silence_after_user == 5
     assert loaded.content_check_interval == 45
+    assert loaded.content_quiet_seconds == 300
     assert loaded.game_ocr_enabled is False
     assert loaded.cooldown_seconds == ProactiveConfig().cooldown_seconds
 

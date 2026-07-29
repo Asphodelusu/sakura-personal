@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_CHARACTER_ID = "sakura"
-DEFAULT_TONES = ["中性", "不满", "害羞", "请求", "困惑", "惊讶"]
+DEFAULT_TONES = ["中性", "不满", "害羞", "请求", "困惑"]
 FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的数字生命。
 对方是与你对等相处的人。
 对方需要中文解释、开发或调试时，可以使用中文。"""
@@ -41,7 +41,6 @@ _TONE_PORTRAIT_FALLBACKS: dict[str, str] = {
     "不满": "无语",
     "害羞": "害羞脸红",
     "请求": "伸手命令",
-    "惊讶": "张嘴疑问",
     "困惑": "平静困惑",
     "开心": "高兴满足",
     "高兴": "高兴满足",
