@@ -202,6 +202,10 @@ from app.ui.subtitle_controller import (
     SPEECH_TYPING_INTERVAL_MS,
     normalize_subtitle_display_speed,
 )
+from app.ui.speech_bubble_viewport import (
+    build_speech_text_scroll,
+    sync_speech_scroll_for_typing,
+)
 from app.voice.factory import create_tts_provider
 from app.voice.tts_settings import DEFAULT_GPT_SOVITS_API_URL, GPTSoVITSTTSSettings, TTSConfigError
 from app.voice.tts import (
@@ -803,10 +807,10 @@ class PetWindow(QWidget):
             if self.startup_initializing
             else self.character_profile.initial_message
         )
-        self.speech_label = QLabel(initial_speech, self.bubble)
-        self.speech_label.setObjectName("speechText")
-        self.speech_label.setWordWrap(True)
-        self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.speech_scroll, self.speech_label = build_speech_text_scroll(
+            self.bubble,
+            initial_text=initial_speech,
+        )
 
         self.tts_error_label = QLabel("", self.bubble)
         self.tts_error_label.setObjectName("ttsErrorText")
@@ -851,14 +855,16 @@ class PetWindow(QWidget):
             self.subtitle_language,
             self._log_interaction_stage,
             self._apply_reply_segment,
-            lambda: self._end_interaction("reply_completed"),
-            lambda: bool(self.active_interaction_id),
+            self._on_reply_playback_finished,
+            lambda: True,
             self,
             preload_segment=self.portrait_controller.preload_for_segment,
             typing_interval_ms=self.subtitle_typing_interval_ms,
             segment_pause_ms=self.reply_segment_pause_ms,
             bubble_opacity_effect=self.bubble_opacity_effect,
             on_typing_overflow=self._fit_bubble_for_label_height,
+            on_typing_tick=self._on_speech_typing_tick,
+            on_segment_audio_finished=self._reveal_speech_overflow_tail,
         )
         self.speech_timer = self.subtitle_controller.speech_timer
         if not self.startup_initializing:
@@ -874,7 +880,7 @@ class PetWindow(QWidget):
         bubble_text_layout.setContentsMargins(0, 0, 0, 0)
         bubble_text_layout.setSpacing(6)
         bubble_text_layout.addLayout(bubble_header)
-        bubble_text_layout.addWidget(self.speech_label, 1)
+        bubble_text_layout.addWidget(self.speech_scroll, 1)
         bubble_text_layout.addWidget(self.tts_error_label)
 
         history_button_layout = QVBoxLayout()
@@ -2154,18 +2160,20 @@ class PetWindow(QWidget):
             return
         subtitle_controller = getattr(self, "subtitle_controller", None)
         if subtitle_controller is None or not subtitle_controller.is_reply_sequence_active():
-            self.ui_state.finish("speaking_timeout")
+            # 序列已停但 SPEAKING 未清：仍要刷新箭头 / auto-hide，避免 orphan 态。
+            self._finalize_orphan_playback("speaking_timeout")
             return
         debug_log(
             "PetWindow",
             "SPEAKING 状态超时，强制结束当前回复",
             {"timeout_ms": SPEAKING_STATE_TIMEOUT_MS},
         )
+        self._collapse_auto_fit_bubble_height()
         subtitle_controller.cancel_reply_flow()
         if self.active_interaction_id:
             self._end_interaction("speaking_timeout")
         else:
-            self.ui_state.finish("speaking_timeout")
+            self._finalize_orphan_playback("speaking_timeout")
 
     def _normal_input_placeholder_text(self, profile: CharacterProfile | None = None) -> str:
         profile = profile or self.character_profile
@@ -2327,7 +2335,8 @@ class PetWindow(QWidget):
 
         segment = self.reply_history_segments[index]
         self.reply_history_index = index
-        self.reply_history_review_active = True
+        # 停在最新一条视为退出回顾；只有翻到更早消息才保持 review。
+        self.reply_history_review_active = index < len(self.reply_history_segments) - 1
         self.portrait_controller.apply_for_segment(segment)
         maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
         if callable(maybe_resuppress):
@@ -2632,8 +2641,12 @@ class PetWindow(QWidget):
         self._sync_input_bar_native_backdrop_geometry()
         self._sync_renderer_overlay_geometry(layout=layout)
 
-    def _fit_bubble_for_label_height(self, label_h: int) -> None:
-        """打字机溢出回调：按标签实际高度逐行扩展气泡（不持久化、不超上限）。"""
+    def _fit_bubble_for_label_height(self, label_h: int, *, grow_fully: bool = False) -> None:
+        """按标签高度扩展气泡（不持久化、不超上限）。
+
+        grow_fully=True：一次出全文时直接跳到所需高度；
+        False：逐字场景按行增高（更顺滑）。
+        """
         name_h = self.name_label.sizeHint().height()
         # 纵向开销：bubble_layout 上下 margin(12+14) + name_label + 内层 spacing(6) + 余量(4)
         overhead = 12 + name_h + 6 + 14 + 4
@@ -2641,13 +2654,43 @@ class PetWindow(QWidget):
         current = self._effective_bubble_height()
         if needed <= current:
             return
-        line_h = self.speech_label.fontMetrics().lineSpacing()
-        new_h = min(current + line_h, MAX_BUBBLE_HEIGHT)
+        if grow_fully:
+            new_h = min(needed, MAX_BUBBLE_HEIGHT)
+        else:
+            line_h = self.speech_label.fontMetrics().lineSpacing()
+            new_h = min(current + line_h, MAX_BUBBLE_HEIGHT)
         if new_h == current:
             return
         self._auto_fit_bubble_height = new_h
         # 单窗口原子布局：以立绘底边为锚点向上扩展气泡，立绘不动、子控件同帧到位。
         self._apply_pet_layout(anchor_global=self._portrait_anchor_global())
+
+    def _bubble_at_max_height(self) -> bool:
+        return self._effective_bubble_height() >= MAX_BUBBLE_HEIGHT
+
+    def _on_speech_typing_tick(self, label_h: int) -> None:
+        """全文/逐字几何更新：扩展气泡；说话中保持显示前半（不跟读滚底）。"""
+        controller = getattr(self, "subtitle_controller", None)
+        speech_text = getattr(controller, "speech_text", "") or ""
+        speech_index = int(getattr(controller, "speech_index", 0) or 0)
+        fully_shown = bool(speech_text) and speech_index >= len(speech_text)
+        self._fit_bubble_for_label_height(label_h, grow_fully=fully_shown)
+        self._sync_speech_bubble_scroll(reveal_tail=False)
+
+    def _reveal_speech_overflow_tail(self) -> None:
+        """本段语音结束后：若文本溢出，滚到后半再进入段间停顿。"""
+        self._sync_speech_bubble_scroll(reveal_tail=True)
+
+    def _sync_speech_bubble_scroll(self, *, reveal_tail: bool = False) -> None:
+        scroll = getattr(self, "speech_scroll", None)
+        label = getattr(self, "speech_label", None)
+        if scroll is None or label is None:
+            return
+        sync_speech_scroll_for_typing(
+            scroll,
+            label,
+            reveal_tail=reveal_tail,
+        )
 
     def _collapse_auto_fit_bubble_height(self) -> None:
         """将自适应气泡高度收回到用户设置值（回复结束/打断时调用），以立绘底边为锚点收缩。"""
@@ -2666,6 +2709,7 @@ class PetWindow(QWidget):
         self._place_pet_children(layout)
         self._update_stage_debug_overlay(layout)
         self._update_stage_mask(layout)
+        self._sync_speech_bubble_scroll()
 
     def _apply_stage_collision_mask(self, enabled: bool, *, refresh: bool = False) -> None:
         """开关舞台碰撞遮罩。关闭时清除遮罩(整窗可点);开启 + refresh 时立即重算。"""
@@ -2908,26 +2952,12 @@ class PetWindow(QWidget):
         )
 
     def _request_app_restart(self) -> None:
-        """托盘重启：交出本地 TTS（不杀进程），再以 RESTART_EXIT_CODE 拉起新进程。"""
-        debug_log("App", "请求重启 Sakura，交出本地 TTS 所有权（保持服务常驻）")
-        providers = [self.tts_provider, *getattr(self, "retired_tts_providers", [])]
-        seen: set[int] = set()
-        for provider in providers:
-            provider_id = id(provider)
-            if provider_id in seen:
-                continue
-            seen.add(provider_id)
-            prepare = getattr(provider, "prepare_for_app_restart", None)
-            if not callable(prepare):
-                continue
-            try:
-                prepare()
-            except Exception as exc:  # noqa: BLE001
-                debug_log(
-                    "TTS",
-                    "重启前交出本地 TTS 失败",
-                    {"provider": type(provider).__name__, "error": str(exc)},
-                )
+        """托盘重启：退出并由 main 以 RESTART_EXIT_CODE 拉起新进程。
+
+        不 detach TTS：走 aboutToQuit → close_tts_tools 正常杀掉本地服务，
+        新进程冷启动，避免 adopt 旧进程偶发管道/状态异常。
+        """
+        debug_log("App", "请求重启 Sakura（本地 TTS 将随退出一并停止）")
         QApplication.exit(RESTART_EXIT_CODE)
 
     def _refresh_tray_menu(self) -> None:
@@ -3050,6 +3080,56 @@ class PetWindow(QWidget):
             payload.update(data)
         debug_log("Latency", "交互阶段", payload)
 
+    def _finalize_orphan_playback(
+        self,
+        outcome: str,
+        *,
+        touch_proactive_grace: bool = False,
+    ) -> None:
+        """无 active_interaction_id 时的播放收尾（Observer 主动发言 / SPEAKING 超时等）。
+
+        必须刷新历史箭头、结束 SPEAKING、通知气泡 settled，避免与正式对话收尾不对称。
+        """
+        self._stop_speaking_state_watchdog()
+        self._collapse_auto_fit_bubble_height()
+        try:
+            self.ui_state.finish(outcome)
+        except Exception:
+            pass
+        self._update_reply_history_buttons()
+        controller = getattr(self, "bubble_auto_hide", None)
+        if controller is not None:
+            controller.notify_settled()
+        if touch_proactive_grace:
+            self.last_proactive_interaction_at = time.perf_counter()
+        existing_timer = getattr(self, "_portrait_reset_timer", None)
+        if existing_timer is not None:
+            existing_timer.stop()
+        portrait = getattr(self, "portrait_controller", None)
+        reset = getattr(portrait, "reset_to_default", None)
+        if callable(reset):
+            timer_parent = self if isinstance(self, QObject) else None
+            timer = QTimer(timer_parent)
+            timer.setSingleShot(True)
+            timer.timeout.connect(reset)
+            timer.start(20_000)
+            self._portrait_reset_timer = timer
+
+    def _on_reply_playback_finished(self) -> None:
+        """字幕/TTS 分段播完后的统一收尾。
+
+        普通对话：有 active_interaction_id → 走完整 _end_interaction。
+        Observer 主动发言等旁路：未 begin_interaction，也必须刷新历史箭头并结束 SPEAKING，
+        否则 is_reply_sequence_active 结束后箭头会一直保持禁用，直到下一次偶然刷新。
+        """
+        if self.active_interaction_id:
+            self._end_interaction("reply_completed")
+            return
+        self._finalize_orphan_playback(
+            "proactive_reply_completed",
+            touch_proactive_grace=True,
+        )
+
     def _end_interaction(self, outcome: str) -> None:
         self._log_interaction_stage("interaction_finished", {"outcome": outcome})
         self.active_interaction_id = ""
@@ -3061,16 +3141,17 @@ class PetWindow(QWidget):
             self.ui_state.finish(outcome)
             self._emit_bus_event("agent.thinking.finished", {"outcome": outcome})
         self._update_reply_history_buttons()
+        # 与 orphan/proactive 路径对齐：播完/打断/空回复都收回 auto-fit，并启动自动隐藏。
+        if outcome in {"reply_completed", "speaking_timeout", "empty_reply"}:
+            self._collapse_auto_fit_bubble_height()
+            controller = getattr(self, "bubble_auto_hide", None)
+            if controller is not None:
+                controller.notify_settled()
         # 每完成一轮对话（含完整回复）累计一次，驱动自动记忆整理触发
         if outcome == "reply_completed":
             # 续投不累计记忆整理轮次（用户未实际参与）
             if not self._is_intimacy_continue_turn():
                 self._record_completed_memory_turn()
-            # 说完话：开始气泡无操作自动隐藏倒计时。
-            controller = getattr(self, "bubble_auto_hide", None)
-            if controller is not None:
-                controller.notify_settled()
-            # 说完话：40 秒后若无新对话，立绘退回默认（中性）表情。
             # 亲密模式：说完话启动续投计时器
             self._schedule_intimacy_continue()
             _PORTRAIT_IDLE_RESET_MS = 20_000
@@ -3184,6 +3265,8 @@ class PetWindow(QWidget):
         if intimacy_mode_state.active:
             # 日志对外用中性标签，避免命令行/GUI 出现敏感语义
             return "rhythm_focus"
+        # 注意：不把 reply_history_review 算 busy。翻历史只改气泡展示，
+        # 该标志若未及时清掉会永久挡住 Observer（曾卡十几分钟）。
         if self.screen_observation_encode_thread is not None:
             return "screen_observation_encode"
         if self.active_interaction_id:
@@ -7013,7 +7096,15 @@ class PetWindow(QWidget):
         segments = [
             resolve_reply_segment(segment, self.character_profile, interaction_id=interaction_id)
             for segment in segments
+            if getattr(segment, "text", None) and str(segment.text).strip()
         ]
+        if not segments:
+            # 空分段不会启动字幕序列，必须主动收尾，否则 interaction 泄漏、Observer 一直 busy。
+            if self.active_interaction_id:
+                self._end_interaction("empty_reply")
+            else:
+                self._finalize_orphan_playback("empty_reply")
+            return
         self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)
 

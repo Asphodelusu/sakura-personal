@@ -34,6 +34,8 @@ class VoicePlaybackController:
         self._on_tts_finished = on_tts_finished
         self._prepared_next_segment: ChatSegment | None = None
         self._prepared_next_tts: TTSPreparedAudio | None = None
+        # 最近一次开播音频时长（毫秒）；供字幕打字机对齐语音节奏。无则 None。
+        self.last_speak_duration_ms: int | None = None
 
     def set_provider(self, tts_provider: TTSProvider) -> None:
         self.discard_prepared()
@@ -47,9 +49,11 @@ class VoicePlaybackController:
         on_finished: TTSCallback,
     ) -> None:
         prepared_tts = self._take_prepared_tts_for_segment(segment)
+        self.last_speak_duration_ms = _duration_ms_from_prepared(prepared_tts)
         try:
             if prepared_tts is None and self._should_skip_segment_tts(segment):
                 self._log_tts_skipped(segment, sequence_id, "speak")
+                self.last_speak_duration_ms = None
                 on_started()
                 on_finished()
                 return
@@ -88,6 +92,7 @@ class VoicePlaybackController:
             )
             debug_log("TTS", "播放失败，已继续显示字幕", {"error": str(exc)})
             self._notify_error(f"播放失败，已继续显示字幕：{exc}")
+            self.last_speak_duration_ms = None
             on_started()
             on_finished()
 
@@ -240,3 +245,17 @@ class VoicePlaybackController:
             self._on_tts_finished(segment, sequence_id)
         except Exception as exc:  # noqa: BLE001
             debug_log("TTS", "TTS end hook 回调失败", {"error": str(exc)})
+
+
+def _duration_ms_from_prepared(handle: TTSPreparedAudio | None) -> int | None:
+    if handle is None or handle.audio_path is None:
+        return None
+    try:
+        from app.voice.audio_checks import _wav_duration_ms
+
+        duration = _wav_duration_ms(handle.audio_path)
+    except Exception:
+        return None
+    if not isinstance(duration, int) or duration <= 0:
+        return None
+    return duration

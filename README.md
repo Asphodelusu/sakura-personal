@@ -171,4 +171,4 @@ Copyright © 2026 Rvosy
 
 ## 关于本仓库
 
-Personal Edition（当前 `0.9.9-personal.3`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。问题与讨论请优先在本仓库发起。
+Personal Edition（当前 `0.9.9-personal.3`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。本分支未经过完整部署测试，遇到问题欢迎提交 [Issue](https://github.com/Asphodelusu/sakura-personal/issues)，会尽量跟进。
