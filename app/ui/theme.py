@@ -241,7 +241,13 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     font-size: 13px;
     font-weight: 700;
 }}
+#speechTextScroll,
+#speechTextScroll QWidget {{
+    background-color: rgba(0, 0, 0, 0);
+    border: none;
+}}
 #speechText {{
+    background-color: rgba(0, 0, 0, 0);
     color: {theme.text_color};
     font-size: 19px;
     line-height: 1.35;

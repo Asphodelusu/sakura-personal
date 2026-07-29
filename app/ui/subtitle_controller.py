@@ -30,6 +30,7 @@ REPLY_SEGMENT_PAUSE_MAX_MS = 3000
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]
 SegmentCallback = Callable[[ChatSegment], None]
+TypingTickCallback = Callable[[int], None]
 
 
 class SubtitleController(QObject):
@@ -49,7 +50,9 @@ class SubtitleController(QObject):
         typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
         segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
         bubble_opacity_effect: Any = None,
-        on_typing_overflow: Callable[[int], None] | None = None,
+        on_typing_overflow: TypingTickCallback | None = None,
+        on_typing_tick: TypingTickCallback | None = None,
+        on_segment_audio_finished: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.speech_label = speech_label
@@ -65,7 +68,13 @@ class SubtitleController(QObject):
         self._bubble_fade_anim: QSequentialAnimationGroup | None = None
         # 打字机溢出回调：标签高度增大时通知调用方按需扩展气泡（None 时不触发）。
         self._on_typing_overflow = on_typing_overflow
+        # 全文/逐字几何回调：用于限高扩展与滚动。
+        self._on_typing_tick = on_typing_tick
+        # 本段 TTS 播完：用于溢出文本滚到后半。
+        self._on_segment_audio_finished = on_segment_audio_finished
         self._last_label_height: int = 0
+        # 本段若按 TTS 时长调过 interval，结束后要恢复
+        self._segment_typing_interval_override_ms: int | None = None
 
         self.speech_text = ""
         self.speech_index = 0
@@ -161,6 +170,8 @@ class SubtitleController(QObject):
         self.pending_reply_segments = []
         self.queued_reply_segment_batches = []
         self.reset_current_segment_progress()
+        self.speech_timer.stop()
+        self._restore_typing_interval()
         if placeholder_text is not None:
             # transition=True 用于真正打断当前台词的场景（如通信失败），让新文本带轻微浮现；
             # 发消息占位等高频路径用默认 False 瞬时切换，避免气泡频繁闪烁。
@@ -201,26 +212,71 @@ class SubtitleController(QObject):
         self.subtitle_language = subtitle_language
 
     @Slot(str)
-    def set_speech(self, text: str, *, pulse: bool = False) -> None:
+    def set_speech(
+        self,
+        text: str,
+        *,
+        pulse: bool = False,
+        duration_ms: int | None = None,
+        instant: bool = False,
+    ) -> None:
         self.stop_waiting_indicator()
         cleaned = " ".join(text.split())
         self.speech_timer.stop()
         self.speech_text = cleaned
         self._last_label_height = 0
-        if not self.speech_text:
-            self.speech_index = 0
-            self.speech_label.clear()
-        else:
-            # 首字立即呈现，避免 clear 后等一拍定时器造成的空白闪烁。
-            self.speech_index = 1
-            self.speech_label.setText(self.speech_text[:1])
-            if len(self.speech_text) > 1:
-                self.speech_timer.start()
-            elif self.current_segment_sequence_id is not None:
-                self._mark_segment_speech_done(self.current_segment_sequence_id)
-            if pulse and self._should_pulse_bubble():
+        if instant or not cleaned:
+            self._restore_typing_interval()
+            self.speech_index = len(cleaned)
+            self.speech_label.setText(cleaned)
+            self._emit_typing_geometry()
+            if pulse and cleaned and self._should_pulse_bubble():
                 self._pulse_bubble()
+            if self.current_segment_sequence_id is not None:
+                self._mark_segment_speech_done(self.current_segment_sequence_id)
+            self._log_stage(
+                "speech_text_shown_instant" if instant else "speech_text_started",
+                {"text": cleaned},
+            )
+            return
+
+        self._apply_typing_pace(duration_ms=duration_ms, text_len=len(cleaned))
+        # 首字立即呈现，避免 clear 后等一拍定时器造成的空白闪烁。
+        self.speech_index = 1
+        self.speech_label.setText(self.speech_text[:1])
+        self._emit_typing_geometry()
+        if len(self.speech_text) > 1:
+            self.speech_timer.start()
+        elif self.current_segment_sequence_id is not None:
+            self._mark_segment_speech_done(self.current_segment_sequence_id)
+        if pulse and self._should_pulse_bubble():
+            self._pulse_bubble()
         self._log_stage("speech_text_started", {"text": cleaned})
+
+    def _apply_typing_pace(self, *, duration_ms: int | None, text_len: int) -> None:
+        """有 TTS 时长时，把打字机节奏对齐语音（滚动自然跟读）；否则用用户设置。"""
+        self._segment_typing_interval_override_ms = None
+        if (
+            isinstance(duration_ms, int)
+            and duration_ms >= 200
+            and text_len > 1
+        ):
+            # 略快于音频结束，避免字还没打完语音已结束空等
+            paced = int(duration_ms * 0.92 / (text_len - 1))
+            paced = max(
+                SUBTITLE_TYPING_INTERVAL_MIN_MS,
+                min(SUBTITLE_TYPING_INTERVAL_MAX_MS, paced),
+            )
+            self._segment_typing_interval_override_ms = paced
+            self.speech_timer.setInterval(paced)
+            return
+        self.speech_timer.setInterval(self.typing_interval_ms)
+
+    def _restore_typing_interval(self) -> None:
+        if self._segment_typing_interval_override_ms is None:
+            return
+        self._segment_typing_interval_override_ms = None
+        self.speech_timer.setInterval(self.typing_interval_ms)
 
     def _should_pulse_bubble(self) -> bool:
         # 分段停顿极短时跳过脉冲，避免快速连段时气泡频闪。
@@ -258,24 +314,22 @@ class SubtitleController(QObject):
         self.stop_waiting_indicator()
         cleaned = " ".join(text.split())
         self.speech_timer.stop()
+        self._restore_typing_interval()
         self.speech_text = cleaned
         self.speech_index = len(cleaned)
         self.speech_label.setText(cleaned)
+        self._emit_typing_geometry()
         self._log_stage("speech_text_shown_immediately", {"text": cleaned})
 
     def show_proactive_segment(self, segment: ChatSegment) -> None:
-        """显示主动发言：字幕用 zh，同时播 ja 语音。"""
-        self.stop_waiting_indicator()
-        display = segment.display_text(self.subtitle_language)
-        self.set_speech(display, pulse=True)
+        """已弃用：主动发言请走 PetWindow._show_proactive_comment → show_segments。
 
-        # TTS: 用 ja 原文播放，不依赖 prepared audio
-        sequence_id = self.reply_sequence_id
-        self.voice_playback.speak_segment(
-            segment,
-            sequence_id,
-            on_started=lambda: None,
-            on_finished=lambda: None,
+        保留空实现以免旧调用方崩溃；不再单独开 TTS/字幕旁路。
+        """
+        debug_log(
+            "Subtitle",
+            "show_proactive_segment 已弃用，忽略调用",
+            {"text": segment.text[:40] if segment.text else ""},
         )
 
     def restart_current_segment_speech(self) -> None:
@@ -288,6 +342,7 @@ class SubtitleController(QObject):
         self.set_speech(
             self.current_segment.display_text(self.subtitle_language),
             pulse=self._should_pulse_bubble(),
+            instant=True,
         )
 
     def reset_current_segment_progress(self) -> None:
@@ -373,12 +428,14 @@ class SubtitleController(QObject):
         self.set_speech(
             self.current_segment.display_text(self.subtitle_language),
             pulse=self._should_pulse_bubble(),
+            instant=True,
         )
 
     def _mark_segment_speech_done(self, sequence_id: int) -> None:
         if sequence_id != self.reply_sequence_id or sequence_id != self.current_segment_sequence_id:
             return
         self.current_segment_speech_done = True
+        self._restore_typing_interval()
         self._log_stage("segment_text_render_done", {"sequence_id": sequence_id})
         self._end_interaction_if_reply_done()
         self._schedule_next_reply_segment_if_ready(sequence_id)
@@ -388,6 +445,9 @@ class SubtitleController(QObject):
             return
         self.current_segment_tts_done = True
         self._log_stage("segment_tts_done", {"sequence_id": sequence_id})
+        # 先露后半，再进入段间停顿 / 下一段，听完还能扫一眼溢出部分。
+        if self._on_segment_audio_finished is not None:
+            self._on_segment_audio_finished()
         self._end_interaction_if_reply_done()
         self._schedule_next_reply_segment_if_ready(sequence_id)
 
@@ -457,19 +517,43 @@ class SubtitleController(QObject):
 
         self.speech_index += 1
         self.speech_label.setText(self.speech_text[: self.speech_index])
-
-        if self._on_typing_overflow is not None:
-            w = self.speech_label.width()
-            if w > 0:
-                h = self.speech_label.heightForWidth(w)
-                if h > 0 and h > self._last_label_height:
-                    self._last_label_height = h
-                    self._on_typing_overflow(h)
+        self._emit_typing_geometry()
 
         if self.speech_index >= len(self.speech_text):
             self.speech_timer.stop()
             if self.current_segment_sequence_id is not None:
                 self._mark_segment_speech_done(self.current_segment_sequence_id)
+
+    def _emit_typing_geometry(self) -> None:
+        width_getter = getattr(self.speech_label, "width", None)
+        w = int(width_getter()) if callable(width_getter) else 0
+        if w <= 0:
+            parent_getter = getattr(self.speech_label, "parentWidget", None)
+            parent = parent_getter() if callable(parent_getter) else None
+            if parent is not None:
+                pw = getattr(parent, "width", None)
+                w = int(pw()) if callable(pw) else 0
+        if w <= 0:
+            return
+        # 滚动视口可能把 label 钉成视口高；测文案高度前必须松开，否则会误撑气泡。
+        label = self.speech_label
+        old_min = label.minimumHeight()
+        old_max = label.maximumHeight()
+        label.setMinimumHeight(0)
+        label.setMaximumHeight(16777215)
+        hfw = getattr(label, "heightForWidth", None)
+        h = int(hfw(w)) if callable(hfw) else 0
+        label.setMinimumHeight(old_min)
+        label.setMaximumHeight(old_max)
+        if h <= 0:
+            return
+        if self._on_typing_overflow is not None and h > self._last_label_height:
+            self._last_label_height = h
+            self._on_typing_overflow(h)
+        elif h > self._last_label_height:
+            self._last_label_height = h
+        if self._on_typing_tick is not None:
+            self._on_typing_tick(h)
 
     def _show_waiting_indicator_frame(self) -> None:
         if not self.waiting_indicator_active:

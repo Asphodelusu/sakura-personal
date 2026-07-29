@@ -1349,6 +1349,7 @@ def test_speaking_state_timeout_cancels_reply_and_ends_interaction() -> None:
 
     class MinimalWindow:
         _handle_speaking_state_timeout = PetWindow._handle_speaking_state_timeout
+        _collapse_auto_fit_bubble_height = lambda self: None
 
     window = MinimalWindow()
     subtitle = SubtitleStub()
@@ -2849,6 +2850,8 @@ def test_pet_window_show_reply_segments_discards_backchannel_before_play() -> No
             self._backchannel_prepared_audio = {("b", "中性", "つなぎ"): unready}
             self._exit_reply_history_review = lambda update_buttons=False: None
             self._remember_reply_history_segments = lambda segments: None
+            self.active_interaction_id = None
+            self.character_profile = None
 
     window = WindowStub()
     segment = ChatSegment("本題だよ。", "中性", "正题来了。", "站立待机")
@@ -3054,7 +3057,7 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
 
 
 
-def test_pet_window_request_app_restart_prepares_tts_then_exits(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_pet_window_request_app_restart_exits_without_detaching_tts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from app.ui.pet_window import PetWindow
     from app.ui.tray_menu import RESTART_EXIT_CODE
 
@@ -3076,7 +3079,8 @@ def test_pet_window_request_app_restart_prepares_tts_then_exits(monkeypatch) -> 
 
     MinimalWindow()._request_app_restart()
 
-    assert calls == ["prepare", ("exit", RESTART_EXIT_CODE)]
+    assert calls == [("exit", RESTART_EXIT_CODE)]
+    assert "prepare" not in calls
 
 
 def test_pet_window_retires_tts_provider_by_closing_it() -> None:
@@ -4896,6 +4900,9 @@ def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
     window.reply_history_index = None
     window.reply_history_review_active = False
     window.worker_thread = None
+    window.active_interaction_id = None
+    window.character_profile = None
+    window._history_has_more = False
     window.subtitle_language = SUBTITLE_LANGUAGE_ZH
     window.subtitle_controller = _DummySubtitleController()
     window.portrait_controller = DummyPortraitController()
@@ -5702,7 +5709,11 @@ def test_reply_segments_queue_while_current_segment_is_active() -> None:
     ended = []
     controller = SubtitleController(
         DummyLabel(),  # type: ignore[arg-type]
-        VoicePlaybackController(DummyTTS(), lambda *_args, **_kwargs: None),
+        VoicePlaybackController(
+            DummyTTS(),
+            lambda *_args, **_kwargs: None,
+            target_text_lang_getter=lambda: "zh",
+        ),
         "zh",
         lambda *_args, **_kwargs: None,
         lambda _segment: None,
@@ -5893,7 +5904,7 @@ def test_subtitle_waiting_indicator_animates_and_stops_on_text() -> None:
         controller._show_next_waiting_indicator_frame()
         frames.append(label.text)
 
-    assert frames == ["..", "...", "....", ".....", "......", ".....", "......", "....."]
+    assert frames == ["..", "...", "....", ".....", "......", ".....", ".", ".."]
 
     controller.show_text_immediately("回复到了")
 
