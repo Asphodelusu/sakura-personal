@@ -21,7 +21,7 @@ def test_proactive_config_from_dict_empty_matches_defaults() -> None:
     assert loaded.content_quiet_seconds == base.content_quiet_seconds
     assert loaded.game_ocr_enabled == base.game_ocr_enabled
     assert base.focus_settle_delay == 15
-    assert base.window_switch_cooldown == 25
+    assert base.window_switch_cooldown == 60
     assert base.content_quiet_seconds == 180
 
 

@@ -15,12 +15,14 @@ MODEL_SLOT_CHAT = "chat"
 MODEL_SLOT_CHAT_FAST = "chat_fast"
 MODEL_SLOT_VISION_CHAT = "vision_chat"
 MODEL_SLOT_MEMORY_CURATION = "memory_curation"
+MODEL_SLOT_INNER_THOUGHT = "inner_thought"
 
 MODEL_SLOT_ORDER = (
     MODEL_SLOT_CHAT,
     MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_INNER_THOUGHT,
 )
 
 MODEL_SLOT_UI_ORDER = (
@@ -28,6 +30,7 @@ MODEL_SLOT_UI_ORDER = (
     MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_INNER_THOUGHT,
 )
 
 MODEL_SLOT_LABELS = {
@@ -35,6 +38,7 @@ MODEL_SLOT_LABELS = {
     MODEL_SLOT_CHAT_FAST: "快速聊天模型",
     MODEL_SLOT_VISION_CHAT: "视觉模型",
     MODEL_SLOT_MEMORY_CURATION: "记忆整理模型",
+    MODEL_SLOT_INNER_THOUGHT: "内心独白模型",
 }
 
 MODEL_SLOT_DESCRIPTIONS = {
@@ -42,12 +46,14 @@ MODEL_SLOT_DESCRIPTIONS = {
     MODEL_SLOT_CHAT_FAST: "简单寒暄等轻量轮次使用的快速模型；留空则轻量轮次仍走聊天模型。",
     MODEL_SLOT_VISION_CHAT: "当聊天模型不支持图片，或想要自定义视觉模型时使用；留空则由聊天模型直接看原图。",
     MODEL_SLOT_MEMORY_CURATION: "用于自动整理长期记忆；留空则继承聊天模型。",
+    MODEL_SLOT_INNER_THOUGHT: "每轮回复前生成角色内心独白；留空则优先继承快速聊天模型，再回退聊天模型。",
 }
 
 MODEL_SLOT_FALLBACKS = {
     MODEL_SLOT_CHAT_FAST: (MODEL_SLOT_CHAT,),
     MODEL_SLOT_VISION_CHAT: (MODEL_SLOT_CHAT,),
     MODEL_SLOT_MEMORY_CURATION: (MODEL_SLOT_CHAT,),
+    MODEL_SLOT_INNER_THOUGHT: (MODEL_SLOT_CHAT_FAST, MODEL_SLOT_CHAT),
 }
 
 
@@ -101,6 +107,7 @@ class ModelSelectionSettings:
     chat_fast: ModelSlotSelection | None = None
     vision_chat: ModelSlotSelection | None = None
     memory_curation: ModelSlotSelection | None = None
+    inner_thought: ModelSlotSelection | None = None
 
     def get(self, slot: str) -> ModelSlotSelection | None:
         if slot == MODEL_SLOT_CHAT:
@@ -111,6 +118,8 @@ class ModelSelectionSettings:
             return self.vision_chat
         if slot == MODEL_SLOT_MEMORY_CURATION:
             return self.memory_curation
+        if slot == MODEL_SLOT_INNER_THOUGHT:
+            return self.inner_thought
         return None
 
     @property

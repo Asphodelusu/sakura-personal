@@ -2642,39 +2642,18 @@ class PetWindow(QWidget):
         self._sync_renderer_overlay_geometry(layout=layout)
 
     def _fit_bubble_for_label_height(self, label_h: int, *, grow_fully: bool = False) -> None:
-        """按标签高度扩展气泡（不持久化、不超上限）。
+        """文案变高时的回调：刻意不撑大气泡。
 
-        grow_fully=True：一次出全文时直接跳到所需高度；
-        False：逐字场景按行增高（更顺滑）。
+        气泡高度只用用户设置值；超出部分在视口内滚动（说话中看前半，段末露后半）。
         """
-        name_h = self.name_label.sizeHint().height()
-        # 纵向开销：bubble_layout 上下 margin(12+14) + name_label + 内层 spacing(6) + 余量(4)
-        overhead = 12 + name_h + 6 + 14 + 4
-        needed = label_h + overhead
-        current = self._effective_bubble_height()
-        if needed <= current:
-            return
-        if grow_fully:
-            new_h = min(needed, MAX_BUBBLE_HEIGHT)
-        else:
-            line_h = self.speech_label.fontMetrics().lineSpacing()
-            new_h = min(current + line_h, MAX_BUBBLE_HEIGHT)
-        if new_h == current:
-            return
-        self._auto_fit_bubble_height = new_h
-        # 单窗口原子布局：以立绘底边为锚点向上扩展气泡，立绘不动、子控件同帧到位。
-        self._apply_pet_layout(anchor_global=self._portrait_anchor_global())
+        _ = (label_h, grow_fully)
 
     def _bubble_at_max_height(self) -> bool:
         return self._effective_bubble_height() >= MAX_BUBBLE_HEIGHT
 
     def _on_speech_typing_tick(self, label_h: int) -> None:
-        """全文/逐字几何更新：扩展气泡；说话中保持显示前半（不跟读滚底）。"""
-        controller = getattr(self, "subtitle_controller", None)
-        speech_text = getattr(controller, "speech_text", "") or ""
-        speech_index = int(getattr(controller, "speech_index", 0) or 0)
-        fully_shown = bool(speech_text) and speech_index >= len(speech_text)
-        self._fit_bubble_for_label_height(label_h, grow_fully=fully_shown)
+        """全文几何更新：不改气泡外框，只同步内滚。"""
+        _ = label_h
         self._sync_speech_bubble_scroll(reveal_tail=False)
 
     def _reveal_speech_overflow_tail(self) -> None:
@@ -6375,6 +6354,10 @@ class PetWindow(QWidget):
             self.agent_runtime.api_client = clients.chat
         self.agent_runtime.vision_api_client = clients.vision
         self.agent_runtime.chat_fast_api_client = clients.chat_fast
+        self.agent_runtime.inner_thought_api_client = clients.inner_thought
+        self.agent_runtime.inner_thought_settings = (
+            self.settings_service.load_inner_thought_settings()
+        )
         self.memory_curator.api_client = clients.memory_curation
         reflector = getattr(self, "memory_reflector", None)
         if reflector is not None:

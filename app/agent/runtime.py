@@ -26,6 +26,17 @@ from app.agent.session_state_context import (
     build_session_state_fragment,
 )
 from app.agent.sensory_context import build_sensory_impression_fragment
+from app.agent.inner_thought import (
+    InnerThoughtSettings,
+    InnerThoughtWindow,
+    build_inner_thought_fragment,
+    format_recent_dialogue,
+    generate_inner_thought,
+    load_character_excerpt,
+    mood_summary_from_store,
+    sensory_impression_text,
+    should_generate_inner_thought,
+)
 from app.agent.tool_policy import (
     BROWSER_NAVIGATE_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
@@ -138,14 +149,20 @@ class AgentRuntime:
         runtime_loop_settings: RuntimeLoopSettings | None = None,
         vision_api_client: OpenAICompatibleClient | None = None,
         chat_fast_api_client: OpenAICompatibleClient | None = None,
+        inner_thought_api_client: OpenAICompatibleClient | None = None,
         turn_routing_settings: TurnRoutingSettings | None = None,
+        inner_thought_settings: InnerThoughtSettings | None = None,
         character_id: str = "",
         character_name: str = "",
     ) -> None:
         self.api_client = api_client
         self._vision_api_client = vision_api_client
         self._chat_fast_api_client = chat_fast_api_client
+        self._inner_thought_api_client = inner_thought_api_client
         self.turn_routing_settings = turn_routing_settings or TurnRoutingSettings()
+        self.inner_thought_settings = (
+            inner_thought_settings or InnerThoughtSettings()
+        ).normalized()
         self.system_prompt = system_prompt
         self.character_id = character_id.strip()
         self.character_name = character_name.strip()
@@ -163,6 +180,10 @@ class AgentRuntime:
         self.prompt_runtime = PromptRuntime()
         self.context_orchestrator = ContextOrchestrator()
         self.memory_recall = MemoryRecallService(self.memory)
+        self._inner_thought_window = InnerThoughtWindow(
+            self.inner_thought_settings.window_size
+        )
+        self._inner_thought_done_for_turn = False
         self._last_prompt_inspection: PromptInspection | None = None
         self._prompt_inspection_lock = Lock()
         self.model_vision_enabled = True
@@ -187,6 +208,14 @@ class AgentRuntime:
     @chat_fast_api_client.setter
     def chat_fast_api_client(self, client: OpenAICompatibleClient | None) -> None:
         self._chat_fast_api_client = client
+
+    @property
+    def inner_thought_api_client(self) -> OpenAICompatibleClient | None:
+        return self._inner_thought_api_client
+
+    @inner_thought_api_client.setter
+    def inner_thought_api_client(self, client: OpenAICompatibleClient | None) -> None:
+        self._inner_thought_api_client = client
 
     def _client_for_messages(self, messages: list[ChatMessage]) -> OpenAICompatibleClient:
         """含图消息优先走独立视觉 client；未配置时回退主 client。"""
@@ -219,6 +248,11 @@ class AgentRuntime:
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
         self.character_profile = character_profile
+        # 换角色后清空内心独白窗口，避免串戏
+        self._inner_thought_window.clear()
+        if character_profile is not None:
+            self.character_id = character_profile.id.strip()
+            self.character_name = character_profile.display_name.strip()
 
     def set_prompt_patches(self, prompt_patches: list[PromptPatchContribution] | None) -> None:
         """同步插件提示词补丁。"""
@@ -281,6 +315,53 @@ class AgentRuntime:
             return None
         return int(delta)
 
+    def _maybe_generate_inner_thought(
+        self,
+        working_messages: list[ChatMessage],
+        turn_state: TurnState,
+        *,
+        proactive_mode: bool,
+    ) -> None:
+        """本轮仅生成一次内心独白并推入滑动窗口；失败则跳过。"""
+        if self._inner_thought_done_for_turn:
+            return
+        settings = self.inner_thought_settings.normalized()
+        self._inner_thought_window.configure(settings.window_size)
+        if not should_generate_inner_thought(
+            settings,
+            api_client=self._inner_thought_api_client,
+            turn_tier=turn_state.turn_plan.tier,
+            proactive_mode=proactive_mode,
+        ):
+            self._inner_thought_done_for_turn = True
+            return
+        assert self._inner_thought_api_client is not None
+        self._inner_thought_done_for_turn = True
+        profile = self.character_profile
+        card_path = profile.card_path if profile is not None else None
+        previous = self._inner_thought_window.items()
+        text = generate_inner_thought(
+            self._inner_thought_api_client,
+            character_name=self.character_name,
+            character_excerpt=load_character_excerpt(
+                card_path=card_path,
+                system_prompt=self.system_prompt,
+            ),
+            mood_summary=mood_summary_from_store(self.memory),
+            recent_dialogue=format_recent_dialogue(working_messages),
+            sensory_impression=sensory_impression_text(),
+            previous_thoughts=previous,
+            settings=settings,
+        )
+        if not text:
+            return
+        self._inner_thought_window.push(text)
+        debug_log(
+            "InnerThought",
+            "本轮内心独白已更新",
+            {"chars": len(text), "window": len(self._inner_thought_window)},
+        )
+
     def _session_state_fragments(
         self,
         request: ContextRequest,
@@ -289,6 +370,12 @@ class AgentRuntime:
         sensory = build_sensory_impression_fragment()
         if sensory is not None:
             fragments.append(sensory)
+        thought = build_inner_thought_fragment(
+            self._inner_thought_window,
+            character_name=self.character_name,
+        )
+        if thought is not None:
+            fragments.append(thought)
 
         store = self.history_store
         if store is None:
@@ -816,6 +903,7 @@ class AgentRuntime:
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
+        self._inner_thought_done_for_turn = False
         active_groups: set[str] = tool_routing.infer_active_tool_groups_from_messages(working_messages)
         debug_log(
             "AgentRuntime",
@@ -886,6 +974,13 @@ class AgentRuntime:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
+                if step_index == 0:
+                    # 串行：先路由/召回准备，再生成独白（稳定优先；独白失败不阻塞）
+                    self._maybe_generate_inner_thought(
+                        working_messages,
+                        turn_state,
+                        proactive_mode=proactive_mode,
+                    )
                 intimacy_focus = self._intimacy_focus_active()
                 if memory_needs_refresh:
                     if intimacy_focus:
@@ -2006,9 +2101,10 @@ class AgentRuntime:
                 "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
                 "同轮优先只搜一次；显式回忆类问题最多两次；禁止对同一意图换措辞反复 full 搜索。"
                 "需要概览时用 mode=index，再对感兴趣条目用 memory_detail，不要反复 memory_search。",
-                "- 记忆诚实：注入片段与 memory_search/detail 结果里没有的事实、专有名词、作品名、偏好，"
-                "一律当不知道——自然承认记不清或没听过，再问对方；禁止用流行梗或常识去填空编造，"
-                "也不要先甩一个可能不对的名字再道歉澄清。",
+                "- 记忆诚实：关于「已经发生过的事实 / 专有名词 / 作品名 / 长期偏好」，"
+                "只依据运行时已注入片段与 memory_search/detail 结果来谈；"
+                "材料里没有就自然承认记不清或没听过，并温和追问。"
+                "对话里的语气、缩略、玩笑、网语按当下语境理解即可，那不属于在补写记忆事实。",
                 "- 对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
                 "- 记忆语言：关于他的事实用简体中文；你自己的内心感受优先日语。"
                 "- 写入记忆时像日记：主语「我」=你自己，「他」=对方；"
@@ -2024,8 +2120,8 @@ class AgentRuntime:
             PromptSection(
                 "agent.identity",
                 "她手边有一些可以实际使用的工具（如查看屏幕、搜索网页、设置提醒、记住事情）。"
-                "遇到信息不足、需要核实、或工具能明显帮到对方时，她会自然地先用一下再回应，而不是凭空猜测或用套话敷衍；"
-                "信息已经够用时就直接按下面的回复协议正常回答。\n"
+                "遇到信息不足、需要核实、或工具能帮她把事实看准时，她会自然地先用一下再回应，而不是凭空猜测或用套话敷衍；"
+                "信息已经够用时就直接按下面的回复协议、按人设正常说话。\n"
                 "不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文——那些是她动作背后的机制，不是她会说出口的话。",
             ),
             PromptSection(
@@ -2089,9 +2185,9 @@ class AgentRuntime:
             *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
             PromptSection(
                 "final_reply.instructions",
-                "你会收到上一轮工具调用结果。请基于这些结果给对方最终回复。\n"
+                "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
                 "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
-                "如果工具结果信息丰富，可以适当展开总结、补充细节或引导对话继续，让对方能感受到信息已经被充分理解和整理。",
+                "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。",
             ),
             PromptSection("reply.patch", self._reply_protocol_patch_text()),
         ]
@@ -3137,7 +3233,7 @@ def _normalize_image_detail(value: Any, *, default: str = "low") -> str:
 
 def _format_event_for_model(event: AgentEvent) -> str:
     if event.type in {"screen_awareness_check", "proactive_check"}:
-        instruction = "主动屏幕感知事件如下，请基于屏幕内容找话题：可以评论变化、接续任务、询问卡点、轻量协助或保持安静感；不要把时间或停留时长自动泛化成休息建议。"
+        instruction = "主动屏幕感知事件如下，请基于屏幕内容找话题：可以评论变化、接续任务、询问卡点，或保持安静；不要把时间或停留时长自动泛化成休息建议。"
     elif event.type == "user_interaction":
         action_text = event.payload.get("text", "对你做了一个动作")
         return f"（{action_text}）[请用角色语气直接回应这个互动，一句话，不超过20字。]"

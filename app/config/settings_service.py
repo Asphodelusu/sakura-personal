@@ -700,6 +700,42 @@ class AppSettingsService:
         }
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_inner_thought_settings(self):
+        from app.agent.inner_thought import InnerThoughtSettings
+
+        section = self._system_section("inner_thought")
+        return InnerThoughtSettings(
+            enabled=_bool_value(section.get("enabled"), True),
+            window_size=_int_value(section.get("window_size"), 6),
+            timeout_seconds=_int_value(section.get("timeout_seconds"), 8),
+            skip_fast_tier=_bool_value(section.get("skip_fast_tier"), True),
+            skip_proactive=_bool_value(section.get("skip_proactive"), True),
+        ).normalized()
+
+    def save_inner_thought_settings(self, settings) -> None:
+        from app.agent.inner_thought import InnerThoughtSettings
+
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, InnerThoughtSettings)
+            else InnerThoughtSettings(
+                enabled=bool(getattr(settings, "enabled", True)),
+                window_size=int(getattr(settings, "window_size", 6)),
+                timeout_seconds=int(getattr(settings, "timeout_seconds", 3)),
+                skip_fast_tier=bool(getattr(settings, "skip_fast_tier", True)),
+                skip_proactive=bool(getattr(settings, "skip_proactive", True)),
+            ).normalized()
+        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["inner_thought"] = {
+            "enabled": bool(normalized.enabled),
+            "window_size": int(normalized.window_size),
+            "timeout_seconds": int(normalized.timeout_seconds),
+            "skip_fast_tier": bool(normalized.skip_fast_tier),
+            "skip_proactive": bool(normalized.skip_proactive),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
         from app.config.defaults import (

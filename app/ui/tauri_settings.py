@@ -2775,6 +2775,7 @@ def _normalized_request_model_selection(
         chat_fast=selection.chat_fast,
         vision_chat=selection.vision_chat,
         memory_curation=selection.memory_curation,
+        inner_thought=selection.inner_thought,
     )
 
 
@@ -2864,6 +2865,7 @@ def _model_selection_from_mapping_required(mapping: dict[str, Any]) -> ModelSele
         chat_fast=_slot_selection_from_mapping(slots, "chat_fast", required=False),
         vision_chat=_slot_selection_from_mapping(slots, "vision_chat", required=False),
         memory_curation=_slot_selection_from_mapping(slots, "memory_curation", required=False),
+        inner_thought=_slot_selection_from_mapping(slots, "inner_thought", required=False),
     )
 
 

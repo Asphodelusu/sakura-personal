@@ -44,6 +44,18 @@ if sys.platform == "win32":
         except Exception:
             return 0
 
+    def get_active_window_pid() -> int:
+        """Foreground window process id; 0 if none/unavailable."""
+        try:
+            hwnd = _user32.GetForegroundWindow()
+            if not hwnd:
+                return 0
+            pid = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value or 0)
+        except Exception:
+            return 0
+
     def get_active_window_process_name() -> str:
         """Returns basename of foreground process exe, e.g. 'notepad.exe'. Empty on failure."""
         try:
@@ -86,6 +98,9 @@ else:
         return ""
 
     def get_foreground_hwnd() -> int:
+        return 0
+
+    def get_active_window_pid() -> int:
         return 0
 
     def get_active_window_process_name() -> str:

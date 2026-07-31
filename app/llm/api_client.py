@@ -355,11 +355,13 @@ class OpenAICompatibleClient:
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
         task: str | None = None,
+        request_timeout: float | None = None,
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。
 
         task 仅由 RoutingLlmClient / DualProviderLlmClient 消费，底层直连时忽略。
+        request_timeout 仅覆盖本次 HTTP 读/写超时，不重建连接池。
         """
         _ = task
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
@@ -375,6 +377,11 @@ class OpenAICompatibleClient:
             temperature=temperature,
             chat_params=chat_params,
         )
+        effective_timeout = (
+            float(request_timeout)
+            if request_timeout is not None
+            else float(self.settings.timeout_seconds)
+        )
         debug_log(
             "API",
             "准备发送聊天补全请求",
@@ -383,7 +390,7 @@ class OpenAICompatibleClient:
                 "configured_base_url": self.settings.base_url,
                 "model": request_model,
                 "model_split_enabled": self.settings.model_split_enabled,
-                "timeout_seconds": self.settings.timeout_seconds,
+                "timeout_seconds": effective_timeout,
                 "temperature": temperature,
                 "message_count": len(payload["messages"]),
                 "has_image": messages_contain_image(payload["messages"]),
@@ -395,6 +402,7 @@ class OpenAICompatibleClient:
             data = self._post_chat_completions_with_compatibility_fallbacks(
                 payload,
                 cancel_checker=cancel_checker,
+                request_timeout=request_timeout,
             )
         except ApiRequestError as exc:
             if (
@@ -416,7 +424,9 @@ class OpenAICompatibleClient:
                     {"error": str(exc)},
                 )
                 data = self._post_chat_completions_with_compatibility_fallbacks(
-                    payload, cancel_checker=cancel_checker
+                    payload,
+                    cancel_checker=cancel_checker,
+                    request_timeout=request_timeout,
                 )
             else:
                 raise
@@ -656,6 +666,7 @@ class OpenAICompatibleClient:
         payload: dict[str, Any],
         *,
         cancel_checker: CancelChecker | None = None,
+        request_timeout: float | None = None,
     ) -> dict[str, Any]:
         fallback_payload = dict(payload)
         for param in self._unsupported_chat_params:
@@ -666,6 +677,7 @@ class OpenAICompatibleClient:
                 return self._post_chat_completions(
                     fallback_payload,
                     cancel_checker=cancel_checker,
+                    request_timeout=request_timeout,
                 )
             except ApiRequestError as exc:
                 if "response_format" in fallback_payload and _is_response_format_unsupported_error(exc):
@@ -707,6 +719,7 @@ class OpenAICompatibleClient:
         payload: dict[str, Any],
         *,
         cancel_checker: CancelChecker | None = None,
+        request_timeout: float | None = None,
     ) -> dict[str, Any]:
         """调用 OpenAI 兼容的 chat/completions 接口并返回 JSON 数据。"""
         check_cancelled(cancel_checker)
@@ -730,6 +743,7 @@ class OpenAICompatibleClient:
                 content=body,
                 headers={"Content-Type": "application/json"},
                 cancel_checker=cancel_checker,
+                request_timeout=request_timeout,
             )
             check_cancelled(cancel_checker)
             try:
@@ -756,21 +770,25 @@ class OpenAICompatibleClient:
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
         cancel_checker: CancelChecker | None = None,
+        request_timeout: float | None = None,
     ) -> str:
         """使用 httpx 连接池发送 HTTP 请求，支持自动重试。"""
         last_error: BaseException | None = None
+        # httpx 0.28+：timeout 只能传给 request()/stream()，不能传给 send()
+        request_kwargs: dict[str, Any] = {
+            "content": content,
+            "headers": headers,
+        }
+        if request_timeout is not None:
+            request_kwargs["timeout"] = httpx.Timeout(
+                request_timeout, read=request_timeout
+            )
         for attempt in range(1, MAX_API_RETRY_ATTEMPTS + 1):
             check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
                 client = self._http_client()
-                request = client.build_request(
-                    method=method,
-                    url=path,
-                    content=content,
-                    headers=headers,
-                )
-                response = client.send(request)
+                response = client.request(method, path, **request_kwargs)
                 response_body = response.text
                 debug_log(
                     "API",
