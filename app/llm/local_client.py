@@ -245,6 +245,7 @@ class RoutingLlmClient:
         cancel_checker=None,
         runtime_context: str = "",
         task: RawTaskKind = "default",
+        request_timeout: float | None = None,
         **chat_params: Any,
     ) -> str:
         client, backend = self._resolve_raw_client(messages, task=task)
@@ -266,6 +267,7 @@ class RoutingLlmClient:
                 cancel_checker=cancel_checker,
                 runtime_context=runtime_context,
                 task=task,
+                request_timeout=request_timeout,
                 **chat_params,
             )
         except ApiRequestError as exc:
@@ -282,6 +284,7 @@ class RoutingLlmClient:
                     cancel_checker=cancel_checker,
                     runtime_context=runtime_context,
                     task=task,
+                    request_timeout=request_timeout,
                     **chat_params,
                 )
             raise

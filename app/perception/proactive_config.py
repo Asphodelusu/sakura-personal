@@ -12,8 +12,8 @@ class ProactiveConfig:
     cooldown_seconds: float = 600
     min_silence_after_user: float = 10
     window_switch_enabled: bool = True
-    # APP_FOCUS 类型冷却（对齐同类 ~20s；冷却内切换记 deferred，结束后补票）
-    window_switch_cooldown: float = 25
+    # APP_FOCUS 类型冷却（冷却内切换记 deferred，结束后补票）
+    window_switch_cooldown: float = 60
     # 前台稳定多久才算一次切应用触发（快切会不断重置）
     focus_settle_delay: float = 15
     idle_threshold_seconds: float = 600
@@ -28,7 +28,7 @@ class ProactiveConfig:
     request_timeout: float = 60.0
     eval_temperature: float = 0.7
     max_tokens: int = 1024
-    adaptive_interval_min: float = 45.0
+    adaptive_interval_min: float = 60.0
     adaptive_interval_max: float = 1800.0
     away_max_seconds: float = 12 * 3600
 

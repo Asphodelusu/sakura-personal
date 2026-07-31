@@ -25,6 +25,39 @@ def test_with_desktop_pet_context_without_guards() -> None:
     assert text.startswith("【人格设定】")
 
 
+def test_desktop_pet_context_includes_chinese_pragmatics() -> None:
+    from app.llm.prompts.blocks import DESKTOP_PET_CONTEXT
+
+    text = with_desktop_pet_context("人格正文")
+    assert "网络缩略" in DESKTOP_PET_CONTEXT
+    assert "当下语境" in DESKTOP_PET_CONTEXT
+    assert "网络缩略" in text
+    assert "自然确认" in text
+    assert "人格设定" in DESKTOP_PET_CONTEXT
+    assert "不必把自己演成只会帮忙的助手" in DESKTOP_PET_CONTEXT
+
+
+def test_segment_protocol_follows_real_mood_not_default_neutral() -> None:
+    from app.llm.prompts.recipes import build_segmented_reply_instruction
+
+    text = build_segmented_reply_instruction(["中性", "不满"])
+    assert "优先选择中性" not in text
+    assert "真实心情" in text
+    assert "不必为了稳妥默认成中性" in text
+
+
+def test_memory_honesty_rule_is_positive_framed() -> None:
+    import inspect
+
+    from app.agent.runtime import AgentRuntime
+
+    src = inspect.getsource(AgentRuntime._build_tool_prompt_result)
+    assert "流行梗" not in src
+    assert "补写记忆事实" in src
+    assert "只依据运行时已注入片段" in src
+    assert "按当下语境理解" in src
+
+
 def test_load_system_prompt_includes_guards(tmp_path: Path) -> None:
     card = tmp_path / "card.md"
     guards = tmp_path / "system_guards.md"

@@ -41,6 +41,8 @@ DEFAULT_AUTO_MEMORY_LONG_IDLE_MINUTES = 30
 DEFAULT_AUTO_MEMORY_CATCH_UP_TURNS = 12
 MAX_CURATION_CHUNK_MESSAGES = 32
 MAX_CURATION_CHUNK_CHARS = 12000
+# 相邻消息间隔超过此时长，视为新会话段（主题切分优先于字数硬切）
+CURATION_SESSION_GAP_SECONDS = 20 * 60
 # 整理时一次性注入给模型的现有记忆条数上限，远大于日常摘要，便于全量对照去重纠错。
 CURATION_MEMORY_SNAPSHOT_LIMIT = 500
 # 现有记忆清单注入的字符预算，超出后截断以保护 token 开销。
@@ -50,7 +52,13 @@ MAX_CURATION_OPERATIONS = 50
 MIN_AUTO_WRITE_CONFIDENCE = 0.55
 CURATION_DUPLICATE_SIMILARITY = 0.92
 CURATION_MERGE_SIMILARITY = 0.78
+# 本批已写入条目的近义阈值（略宽于库内精确去重，挡同场换皮再 add）
+CURATION_BATCH_NEAR_DUP_SIMILARITY = 0.86
 MAX_CURATION_OPERATIONS_PER_LAYER = 20
+# 单次整理（整次 curate）最多写一条心情
+MAX_MOOD_UPDATES_PER_CURATION = 1
+# 过短才直接拒；稍长的应酬靠模式匹配
+MIN_MEMORY_CONTENT_CHARS = 4
 # recent_status 未给 valid_until 时的默认时效（天）
 DEFAULT_RECENT_STATUS_TTL_DAYS = 14
 MAX_EXPIRY_REVIEW_COMMITMENTS = 5
@@ -284,6 +292,9 @@ class MemoryCurator:
         ignored = 0
         event_counts: dict[str, int] = {}
         review_injected = False
+        mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
+        # 同一次整理里前序 chunk 刚写下的正文，供后段对照，减少会话被二次切开时重复 add
+        prior_chunk_writes: list[str] = []
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -301,14 +312,25 @@ class MemoryCurator:
                 existing,
                 cancel_checker=cancel_checker,
                 just_expired_commitments_block=review_block,
+                prior_chunk_writes=prior_chunk_writes,
             )
             check_cancelled(cancel_checker)
-            counts = self._apply_operations(operations, existing)
+            counts = self._apply_operations(
+                operations,
+                existing,
+                mood_budget=mood_budget,
+            )
             created += counts["created"]
             updated += counts["updated"]
             archived += counts["archived"]
             ignored += counts["ignored"]
             _merge_event_counts(event_counts, counts["event_counts"])
+            for text in counts.get("written_contents") or []:
+                if text and text not in prior_chunk_writes:
+                    prior_chunk_writes.append(text)
+            # 控制注入体积：只保留最近若干条
+            if len(prior_chunk_writes) > 12:
+                prior_chunk_writes = prior_chunk_writes[-12:]
         if just_expired and review_injected:
             try:
                 marked = mark_commitments_expiry_reviewed(self.memory_store, just_expired)
@@ -416,6 +438,7 @@ class MemoryCurator:
         *,
         cancel_checker: CancelChecker | None = None,
         just_expired_commitments_block: str = "",
+        prior_chunk_writes: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """让模型以第一人称对照已有记忆，产出整理操作；解析失败时视为无操作。"""
 
@@ -428,6 +451,7 @@ class MemoryCurator:
             mood_history_block=mood_history_block,
             user_emotion_history_block=user_emotion_history_block,
             just_expired_commitments_block=just_expired_commitments_block,
+            prior_chunk_writes=prior_chunk_writes or [],
         )
         llm_messages = [{"role": "user", "content": user_prompt}]
         repair_hint = (
@@ -467,6 +491,8 @@ class MemoryCurator:
         self,
         operations: list[dict[str, Any]],
         existing: list[dict[str, Any]],
+        *,
+        mood_budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """把整理操作写回记忆库；id 必须真实存在，单条失败只跳过不中断。"""
 
@@ -482,8 +508,13 @@ class MemoryCurator:
         ignored = 0
         event_counts: dict[str, int] = {}
         superseded = 0
-        _added_in_batch: set[tuple[str, str]] = set()
-        for operation in operations[:MAX_CURATION_OPERATIONS]:
+        written_contents: list[str] = []
+        _added_in_batch: list[str] = []
+        _completed_commitment_texts: list[str] = []
+        if mood_budget is None:
+            mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
+        # 先 update/delete 再 add，便于识别「约定已完成」后丢弃未完成态的再 add
+        for operation in _ordered_curation_operations(operations[:MAX_CURATION_OPERATIONS]):
             if not isinstance(operation, dict):
                 ignored += 1
                 continue
@@ -541,10 +572,19 @@ class MemoryCurator:
                     if not content:
                         ignored += 1
                         continue
-                    batch_key = (content, layer)
-                    if batch_key in _added_in_batch:
+                    if looks_like_trivial_memory(content):
+                        ignored += 1
+                        event_counts["SKIP_TRIVIAL"] = event_counts.get("SKIP_TRIVIAL", 0) + 1
+                        continue
+                    if _batch_near_duplicate(content, _added_in_batch):
                         ignored += 1
                         event_counts["SKIP_BATCH_DUP"] = event_counts.get("SKIP_BATCH_DUP", 0) + 1
+                        continue
+                    if _conflicts_with_completed_commitment(content, _completed_commitment_texts):
+                        ignored += 1
+                        event_counts["SKIP_STALE_COMMITMENT"] = (
+                            event_counts.get("SKIP_STALE_COMMITMENT", 0) + 1
+                        )
                         continue
                     matched = _find_existing_memory_for_candidate(
                         existing,
@@ -580,6 +620,10 @@ class MemoryCurator:
                             matched["layer"] = layer
                             matched["category"] = category
                             updated += 1
+                            written_contents.append(content)
+                            _added_in_batch.append(content)
+                            if _looks_like_completed_commitment(content):
+                                _completed_commitment_texts.append(content)
                             operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                             event_counts["MERGE_UPDATE"] = event_counts.get("MERGE_UPDATE", 0) + 1
                             superseded += _expire_superseded_volatile(
@@ -605,7 +649,8 @@ class MemoryCurator:
                         allow_sensitive=True,
                     )
                     created += 1
-                    _added_in_batch.add(batch_key)
+                    written_contents.append(content)
+                    _added_in_batch.append(content)
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["ADD"] = event_counts.get("ADD", 0) + 1
                     superseded += _expire_superseded_volatile(
@@ -623,6 +668,10 @@ class MemoryCurator:
                         )
                         ignored += 1
                         continue
+                    if looks_like_trivial_memory(content):
+                        ignored += 1
+                        event_counts["SKIP_TRIVIAL"] = event_counts.get("SKIP_TRIVIAL", 0) + 1
+                        continue
                     self.memory_store.update_memory(
                         _curation_memory_payload(
                             operation,
@@ -639,6 +688,10 @@ class MemoryCurator:
                         allow_sensitive=True,
                     )
                     updated += 1
+                    written_contents.append(content)
+                    _added_in_batch.append(content)
+                    if _looks_like_completed_commitment(content):
+                        _completed_commitment_texts.append(content)
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["UPDATE"] = event_counts.get("UPDATE", 0) + 1
                     superseded += _expire_superseded_volatile(
@@ -660,6 +713,10 @@ class MemoryCurator:
                     if not content:
                         ignored += 1
                         continue
+                    if int(mood_budget.get("left", 0)) <= 0:
+                        ignored += 1
+                        event_counts["MOOD_BUDGET"] = event_counts.get("MOOD_BUDGET", 0) + 1
+                        continue
                     # 与最近心情历史做相似度检查，避免重复写入
                     if self._is_mood_duplicate(content):
                         ignored += 1
@@ -667,6 +724,7 @@ class MemoryCurator:
                         continue
                     try:
                         self.memory_store.set_mood_state(content)
+                        mood_budget["left"] = max(0, int(mood_budget.get("left", 0)) - 1)
                         updated += 1
                         event_counts["MOOD_UPDATE"] = event_counts.get("MOOD_UPDATE", 0) + 1
                     except Exception as exc:
@@ -694,6 +752,7 @@ class MemoryCurator:
             "archived": archived,
             "ignored": ignored,
             "event_counts": event_counts,
+            "written_contents": written_contents,
         }
 
     def _is_mood_duplicate(self, content: str) -> bool:
@@ -727,6 +786,39 @@ def _merge_event_counts(target: dict[str, int], source: dict[str, int]) -> None:
 
 
 def _chunk_entries_for_curation(entries: list[ChatHistoryEntry]) -> list[list[ChatHistoryEntry]]:
+    """先按会话间隔分段，会话内再按字数/条数切，避免一场戏被硬切成多轮重复记账。"""
+    sessions = _group_entries_by_session(entries)
+    chunks: list[list[ChatHistoryEntry]] = []
+    for session in sessions:
+        chunks.extend(_split_entries_by_size(session))
+    return chunks
+
+
+def _group_entries_by_session(entries: list[ChatHistoryEntry]) -> list[list[ChatHistoryEntry]]:
+    sessions: list[list[ChatHistoryEntry]] = []
+    current: list[ChatHistoryEntry] = []
+    last_ts: datetime | None = None
+    for entry in entries:
+        if _entry_for_model(entry) is None:
+            continue
+        ts = _parse_entry_timestamp(entry.created_at)
+        if (
+            current
+            and last_ts is not None
+            and ts is not None
+            and (ts - last_ts).total_seconds() >= CURATION_SESSION_GAP_SECONDS
+        ):
+            sessions.append(current)
+            current = []
+        current.append(entry)
+        if ts is not None:
+            last_ts = ts
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def _split_entries_by_size(entries: list[ChatHistoryEntry]) -> list[list[ChatHistoryEntry]]:
     chunks: list[list[ChatHistoryEntry]] = []
     current: list[ChatHistoryEntry] = []
     current_messages = 0
@@ -750,6 +842,94 @@ def _chunk_entries_for_curation(entries: list[ChatHistoryEntry]) -> list[list[Ch
     if current:
         chunks.append(current)
     return chunks
+
+
+def _parse_entry_timestamp(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def looks_like_trivial_memory(content: str) -> bool:
+    """应酬短句、空应答不进长期记忆。"""
+    text = (content or "").strip()
+    if not text:
+        return True
+    if len(text) < MIN_MEMORY_CONTENT_CHARS:
+        return True
+    compact = re.sub(r"[\s　]+", "", text)
+    trivial_patterns = (
+        r"^(嗯+|好的?|哦|喔|行|知道了|记下了|我记下了)[。.!！~～…]*$",
+        r"^嗯呢.*记下了[。.!！~～…]*$",
+        r"^(晚安|おやすみ)[哦喔呀啊]?[。.!！~～…]*$",
+        r"^嗯[，,].{0,12}记下了[。.!！~～…]*$",
+        r"^嗯.?晚安.*记住.*$",
+        r"^晚安[，,].{0,20}记住.*$",
+    )
+    return any(re.fullmatch(pattern, compact) for pattern in trivial_patterns)
+
+
+def _ordered_curation_operations(operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    priority = {"delete": 0, "update": 1, "add": 2, "mood_update": 3}
+
+    def sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int]:
+        index, operation = item
+        action = str(operation.get("op") or operation.get("action") or "").strip().lower()
+        return (priority.get(action, 9), index)
+
+    indexed = [(index, op) for index, op in enumerate(operations) if isinstance(op, dict)]
+    indexed.sort(key=sort_key)
+    return [op for _, op in indexed]
+
+
+def _batch_near_duplicate(content: str, batch_contents: list[str]) -> bool:
+    for existing in batch_contents:
+        if content == existing:
+            return True
+        if _memory_similarity(content, existing) >= CURATION_BATCH_NEAR_DUP_SIMILARITY:
+            return True
+    return False
+
+
+def _looks_like_completed_commitment(content: str) -> bool:
+    text = content or ""
+    markers = ("约定已完成", "已兑现", "兑现了之前", "约定已经完成", "约定已了结")
+    return any(marker in text for marker in markers)
+
+
+def _conflicts_with_completed_commitment(content: str, completed_texts: list[str]) -> bool:
+    """本批已把某约定标成完成时，拒绝再 add 未完成态的同主题约定。"""
+    if not completed_texts or not content.strip():
+        return False
+    # 未完成承诺常见写法；已完成条文本身允许保留
+    if _looks_like_completed_commitment(content):
+        return False
+    pending_hints = ("下次", "会由我", "再等等", "还不是", "承诺", "约定")
+    if not any(hint in content for hint in pending_hints):
+        return False
+    for completed in completed_texts:
+        if _memory_similarity(content, completed) >= 0.55:
+            return True
+        stem = completed
+        for marker in ("约定已完成。", "约定已完成", "已兑现。", "已兑现", "兑现了之前"):
+            stem = stem.replace(marker, "")
+        if stem.strip() and _memory_similarity(content, stem) >= 0.55:
+            return True
+        # 关键短语同时出现时也视为同主题（完成条文常改写较大）
+        shared = 0
+        for phrase in ("主动开口邀请", "主动邀请", "下次由我", "下次我会"):
+            if phrase in content and phrase in completed:
+                shared += 1
+        if shared >= 1 and ("下次" in content or "承诺" in content or "约定" in content):
+            return True
+    return False
 
 
 def _entry_for_model(entry: ChatHistoryEntry) -> dict[str, str] | None:
@@ -805,9 +985,12 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 一般人第一次身体亲密、关系明显更近一步、他说出想被怎样对待、事后仍想记住的话——"
     "这类事不会轻易忘掉；应写入长期记忆，importance 通常 ≥ 0.85，"
     "可用 memory_kind=shared_moment 或更新 core_profile「今の関係」。\n"
-    "- 记的是记忆点：是否发生过、关系怎么变了、他的偏好/边界、你当时最难忘的感受或原话；"
+    "- 记的是记忆点：是否发生过、具体偏好/边界/安全词、难忘的原话或转折；"
     "不要把过程流水账、动作节拍、喘息声逐句存成多条记忆。\n"
     "- 若已有「我们发生过亲密」类记忆，新一次只补充新偏好、新边界或关系变化；重复过程不必再堆一条。\n"
+    "- 关系已经稳定亲近之后，不会每次相处都「变得更加亲密」；不要反复写这类空泛收束句"
+    "（如「关系更加亲密」「信任更深了」「标志着新阶段」）。没有新事实就不要为了升华而再记一条。\n"
+    "- 写日记要像人：记下发生了什么、他说了什么、你当时怎么想；少用总结腔套话收尾。\n"
     "如果你自己认为某件事很重要——比如他说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
     "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
     "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn。\n"
@@ -843,8 +1026,9 @@ _SELF_CURATION_TASK_PROMPT = (
     "除了 core_profile，你还有一份「心の記録」——只属于你的心情日记。它记录的是你自己的内心：高兴、寂寞、不满、安心、累了？哪句话触动了你？想靠近还是想留一点距离？正文优先日语，一两段完整可读的自语即可。\n"
     "心の記録可以点到触发情绪的对话，写成「他说了…让我感到…」，且对话里确有那句话。旧内容会自动进回忆，每次只写当下最真实的感受。\n"
     "更新日记时，用 mood_update 操作：{\"op\":\"mood_update\",\"content\":\"あなたが今、自分に語りかける一言（日本語で）\"}。\n"
-    "当你因为对话中的某件事而更新了心情时，那件事本身也值得被长久记住——检查你是否已经为它创建了记忆。如果还没有、或者已经有了但 importance 偏低，请同时用 add 或 update 操作确保它被记下来，importance 至少 0.85。情绪越强烈，importance 应该越高。关于他的事实仍用简体中文写。\n"
-    "如果你在心情历史里看到一条刚留下的新心情，而这段对话里正好有触发它的事——同样的，把那件事记住。无论心情是谁写下的，值得记住的事不应该被遗忘。\n"
+    "一次整理里 mood_update 最多一条；只在心情相对上次有质的变化时才写。\n"
+    "若触发心情的那件事还完全没有对应记忆，再用一条 add/update 补上即可，importance 按真实分量设；"
+    "不必因为写了心情就再堆一条高 importance 的重复事件。关于他的事实仍用简体中文写。\n"
     "整理记忆时，看一看「最近的心情轨迹」和「他的情绪轨迹」。\n"
     "反过来也一样重要：如果你翻开心情历史，发现最近几次的情绪基调几乎一模一样（连着好几次害羞、好几次相似的幸福或不安），那就不要再用 mood_update 写新条目了。心情没有质的变化时，重复记录只会让日记变得像循环播放的录音带。除非此刻的你和上次相比有了真正的不同——比如从害羞变成了安心、从不安变成了被理解、从淡淡的幸福变成了深层的感动——才值得在日记里更新。日记的厚度不等于情感的深度。\n"
     "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
@@ -1083,6 +1267,7 @@ def _build_curation_user_prompt(
     mood_history_block: str = "",
     user_emotion_history_block: str = "",
     just_expired_commitments_block: str = "",
+    prior_chunk_writes: list[str] | None = None,
 ) -> str:
     parts = [
         "【我目前的长期记忆】\n" f"{existing_block}",
@@ -1093,6 +1278,13 @@ def _build_curation_user_prompt(
         parts.append(f"【他的情绪轨迹】\n{user_emotion_history_block}")
     if just_expired_commitments_block.strip():
         parts.append(f"【刚过期的约定（一次性回顾）】\n{just_expired_commitments_block}")
+    if prior_chunk_writes:
+        lines = [f"- {text}" for text in prior_chunk_writes if text.strip()]
+        if lines:
+            parts.append(
+                "【本轮整理前段已写入（勿再 add 同义内容；需要时 update）】\n"
+                + "\n".join(lines)
+            )
     parts.append(
         "【最近的新对话】\n"
         f"{_format_dialog_for_curation(dialog_entries)}"

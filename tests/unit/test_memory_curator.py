@@ -16,8 +16,10 @@ from app.agent.memory_curator import (
     MemoryCurationSettings,
     MemoryCurationState,
     MemoryCurator,
+    _chunk_entries_for_curation,
     _entries_for_model,
     evaluate_idle_curation_trigger,
+    looks_like_trivial_memory,
 )
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.storage.chat_history import ChatHistoryEntry
@@ -529,6 +531,86 @@ def test_mem0_openai_llm_retries_empty_structured_response(monkeypatch: pytest.M
     assert "response_format" not in fake_client.chat.completions.calls[1]
 
 
+def test_chunk_entries_splits_on_session_gap() -> None:
+    early = [
+        ChatHistoryEntry(
+            created_at=f"2026-07-31T12:00:{index:02d}+08:00",
+            role="user",
+            content=f"早段 {index}",
+        )
+        for index in range(3)
+    ]
+    late = [
+        ChatHistoryEntry(
+            created_at=f"2026-07-31T13:00:{index:02d}+08:00",
+            role="user",
+            content=f"晚段 {index}",
+        )
+        for index in range(3)
+    ]
+    chunks = _chunk_entries_for_curation(early + late)
+    assert len(chunks) == 2
+    assert [entry.content for entry in chunks[0]] == ["早段 0", "早段 1", "早段 2"]
+    assert [entry.content for entry in chunks[1]] == ["晚段 0", "晚段 1", "晚段 2"]
+
+
+def test_looks_like_trivial_memory() -> None:
+    assert looks_like_trivial_memory("嗯呢，可以，我记下了") is True
+    assert looks_like_trivial_memory("嗯，晚安，下次要好好记住哦") is True
+    assert looks_like_trivial_memory("好的") is True
+    assert (
+        looks_like_trivial_memory(
+            "2026年7月31日下午，我和铭君约定下次由我主动邀请亲密互动。"
+        )
+        is False
+    )
+
+
+def test_curator_skips_trivial_and_stale_commitment_add() -> None:
+    store = FakeMemoryStore(
+        existing=[
+            {
+                "id": "c1",
+                "content": "2026年7月31日下午，我向铭君承诺，下次亲密互动时会由我主动开口邀请他。",
+                "layer": "episodic",
+            }
+        ]
+    )
+    api = FakeCurationApiClient(
+        [
+            """{"operations":[
+            {"op":"add","content":"嗯呢，可以，我记下了"},
+            {"op":"update","id":"c1","content":"2026年7月31日下午，我兑现了之前「下次由我主动开口邀请」的约定，主动向铭君提出亲密互动并主导了整个过程。约定已完成。"},
+            {"op":"add","content":"2026年7月31日下午，我向铭君承诺，下次亲密互动时会由我主动开口邀请他。我说会再等等。"}
+            ]}"""
+        ]
+    )
+    curator = MemoryCurator(api, store)
+    result = curator.curate_entries([_entry("user", "你主动来好不好")])
+    assert result.created == 0
+    assert result.updated == 1
+    assert store.created == []
+    assert "约定已完成" in store.updated[0]["content"]
+
+
+def test_curator_mood_budget_one_per_run() -> None:
+    store = FakeMemoryStore()
+    api = FakeCurationApiClient(
+        [
+            """{"operations":[
+            {"op":"mood_update","content":"今日は少し安心した。"},
+            {"op":"mood_update","content":"でもまだ少し疲れている。"}
+            ]}"""
+        ]
+    )
+    curator = MemoryCurator(api, store)
+    result = curator.curate_entries([_entry("user", "今天还好吗")])
+    assert result.event_counts is not None
+    assert result.event_counts.get("MOOD_UPDATE") == 1
+    assert result.event_counts.get("MOOD_BUDGET") == 1
+    assert store.mood_updates == ["今日は少し安心した。"]
+
+
 def _entry(role: str, content: str) -> ChatHistoryEntry:
     return ChatHistoryEntry(
         created_at="2026-05-31T12:00:00+08:00",
@@ -568,9 +650,16 @@ class FakeMemoryStore:
         self.deleted: list[dict[str, Any]] = []
         self.expired: list[str] = []
         self.expiry_reviewed: list[str] = []
+        self.mood_updates: list[str] = []
 
     def list_memories(self, *, limit: int) -> list[dict[str, Any]]:
         return list(self.existing)[: max(1, int(limit))]
+
+    def mood_history(self) -> list[dict[str, Any]]:
+        return []
+
+    def set_mood_state(self, content: str) -> None:
+        self.mood_updates.append(str(content))
 
     def list_scope_memories(  # type: ignore[no-untyped-def]
         self,

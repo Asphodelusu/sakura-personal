@@ -3136,9 +3136,13 @@ function selectedMemory() {
   return memoryState.entries.find((entry) => entry.id === memoryState.selectedId) || null;
 }
 
+function memoryTimestamp(record, key) {
+  return String(record?.[key] || record?.updated_at || record?.created_at || "");
+}
+
 function sortedMemories() {
   const entries = [...memoryState.entries];
-  const sort = fields.memorySort.value;
+  const sort = fields.memorySort.value || "created_desc";
   entries.sort((a, b) => {
     if (a.layer === "core_profile" && b.layer !== "core_profile") {
       return -1;
@@ -3147,16 +3151,166 @@ function sortedMemories() {
       return 1;
     }
     if (sort === "importance_desc") {
-      return Number(b.importance || 0) - Number(a.importance || 0);
+      const byImportance = Number(b.importance || 0) - Number(a.importance || 0);
+      if (byImportance !== 0) {
+        return byImportance;
+      }
+      // 重要度相同时用创建时间稳定次序，避免保存后无意义跳动
+      return memoryTimestamp(b, "created_at").localeCompare(memoryTimestamp(a, "created_at"));
     }
     if (sort === "confidence_desc") {
-      return Number(b.confidence || 0) - Number(a.confidence || 0);
+      const byConfidence = Number(b.confidence || 0) - Number(a.confidence || 0);
+      if (byConfidence !== 0) {
+        return byConfidence;
+      }
+      return memoryTimestamp(b, "created_at").localeCompare(memoryTimestamp(a, "created_at"));
     }
-    return String(b.updated_at || b.created_at || "").localeCompare(
-      String(a.updated_at || a.created_at || ""),
-    );
+    if (sort === "updated_desc") {
+      return memoryTimestamp(b, "updated_at").localeCompare(memoryTimestamp(a, "updated_at"));
+    }
+    // created_desc：整顿记忆时的默认稳定时间序
+    return memoryTimestamp(b, "created_at").localeCompare(memoryTimestamp(a, "created_at"));
   });
   return entries;
+}
+
+function cssEscapeAttr(value) {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(String(value));
+  }
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function memoryScrollContainer() {
+  // 左侧记忆列表（#memoryList.admin-list）才是红框里那根滚动条；
+  // 不要回退到 .page-scroll，否则保存后「恢复」的是整页滚动，列表条会自己回到顶。
+  return fields.memoryList || null;
+}
+
+function freezeMemoryListScroll() {
+  const scroller = memoryScrollContainer();
+  return scroller ? scroller.scrollTop || 0 : 0;
+}
+
+function applyMemoryListScroll(scrollTop) {
+  const top = Math.max(0, Number(scrollTop) || 0);
+  const apply = () => {
+    const scroller = memoryScrollContainer();
+    if (scroller) {
+      scroller.scrollTop = top;
+    }
+  };
+  apply();
+  window.requestAnimationFrame(() => {
+    apply();
+    window.requestAnimationFrame(apply);
+  });
+}
+
+function captureMemoryListAnchor(preferredId = "") {
+  const scroller = memoryScrollContainer();
+  const list = fields.memoryList;
+  if (!scroller || !list) {
+    return { id: "", offset: 0, scrollTop: 0 };
+  }
+  const anchorId = String(preferredId || memoryState.selectedId || "");
+  let card = null;
+  if (anchorId && anchorId !== "__draft__") {
+    card = list.querySelector(`[data-memory-id="${cssEscapeAttr(anchorId)}"]`);
+  }
+  if (!card) {
+    card = list.querySelector(".memory-card.is-selected");
+  }
+  const scrollerRect = scroller.getBoundingClientRect();
+  const cardRect = card ? card.getBoundingClientRect() : null;
+  return {
+    id: anchorId,
+    offset: cardRect ? cardRect.top - scrollerRect.top : 0,
+    scrollTop: scroller.scrollTop || 0,
+  };
+}
+
+function restoreMemoryListAnchor(anchor) {
+  if (!anchor) {
+    return;
+  }
+  const apply = () => {
+    const scroller = memoryScrollContainer();
+    const list = fields.memoryList;
+    if (!scroller || !list) {
+      return;
+    }
+    const targetId = String(anchor.id || memoryState.selectedId || "");
+    let card = null;
+    if (targetId && targetId !== "__draft__") {
+      card = list.querySelector(`[data-memory-id="${cssEscapeAttr(targetId)}"]`);
+    }
+    if (card) {
+      const scrollerRect = scroller.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      const delta = cardRect.top - scrollerRect.top - Number(anchor.offset || 0);
+      scroller.scrollTop = Math.max(0, (scroller.scrollTop || 0) + delta);
+      return;
+    }
+    scroller.scrollTop = Math.max(0, Number(anchor.scrollTop) || 0);
+  };
+  apply();
+  window.requestAnimationFrame(() => {
+    apply();
+    window.requestAnimationFrame(apply);
+  });
+}
+
+function normalizeMemoryEntry(record, fallback = {}) {
+  const base = { ...fallback, ...(record || {}) };
+  const id = String(base.id || "").trim();
+  const content = memoryContent(base);
+  return {
+    ...base,
+    id,
+    content,
+    memory: content,
+    layer: base.layer || memoryDefaults().layer,
+    category: base.category || "",
+    source: base.source || memoryDefaults().source,
+    importance: Number(base.importance ?? memoryDefaults().importance),
+    confidence: Number(base.confidence ?? memoryDefaults().confidence),
+    created_at: base.created_at || fallback.created_at || "",
+    updated_at: base.updated_at || fallback.updated_at || "",
+  };
+}
+
+function upsertMemoryEntryLocally(record) {
+  const id = String(record?.id || "").trim();
+  if (!id) {
+    return;
+  }
+  const index = memoryState.entries.findIndex((entry) => entry.id === id);
+  const previous = index >= 0 ? memoryState.entries[index] : {};
+  const merged = normalizeMemoryEntry(record, previous);
+  if (index >= 0) {
+    memoryState.entries[index] = merged;
+  } else {
+    memoryState.entries.unshift(merged);
+  }
+}
+
+function removeMemoryEntryLocally(memoryId) {
+  const id = String(memoryId || "").trim();
+  if (!id) {
+    return;
+  }
+  memoryState.entries = memoryState.entries.filter((entry) => entry.id !== id);
+}
+
+function neighborMemoryId(memoryId) {
+  // 删除后默认落到「下面」那一条；没有下面才回退到上面。
+  const sorted = sortedMemories();
+  const index = sorted.findIndex((entry) => entry.id === memoryId);
+  if (index < 0) {
+    return "";
+  }
+  return sorted[index + 1]?.id || sorted[index - 1]?.id || "";
 }
 
 function setMemoryEditorDisabled(disabled) {
@@ -3237,6 +3391,122 @@ function renderMemoryStatus() {
   ]);
 }
 
+function buildMemoryCard(entry) {
+  const row = document.createElement("div");
+  row.className = "memory-card";
+  row.dataset.memoryId = entry.id;
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
+  row.classList.toggle("is-selected", entry.id === memoryState.selectedId);
+  row.classList.toggle("is-core", entry.layer === "core_profile");
+  const selectRow = () => {
+    selectMemoryEntry(entry.id);
+  };
+  row.addEventListener("click", selectRow);
+  row.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectRow();
+    }
+  });
+  const title = document.createElement("strong");
+  title.className = "memory-card-title";
+  title.textContent = compactText(memoryContent(entry) || "(空记忆)");
+  const meta = document.createElement("span");
+  meta.className = "card-meta";
+  meta.textContent = [
+    memoryLayerLabel(entry.layer),
+    entry.category || "未分类",
+    entry.source || "未知来源",
+    entry.updated_at || entry.created_at || "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const chips = document.createElement("span");
+  chips.className = "chip-row";
+  [
+    `重要 ${Number(entry.importance ?? 0).toFixed(2)}`,
+    `置信 ${Number(entry.confidence ?? 0).toFixed(2)}`,
+  ].forEach((text) => {
+    const chip = document.createElement("span");
+    chip.className = "permission-chip";
+    chip.textContent = text;
+    chips.append(chip);
+  });
+  row.append(title, meta, chips);
+  return row;
+}
+
+function patchMemoryCard(entry) {
+  if (!fields.memoryList || !entry?.id) {
+    return false;
+  }
+  const row = fields.memoryList.querySelector(
+    `[data-memory-id="${cssEscapeAttr(entry.id)}"]`,
+  );
+  if (!row) {
+    return false;
+  }
+  const title = row.querySelector(".memory-card-title");
+  if (title) {
+    title.textContent = compactText(memoryContent(entry) || "(空记忆)");
+  }
+  const meta = row.querySelector(".card-meta");
+  if (meta) {
+    meta.textContent = [
+      memoryLayerLabel(entry.layer),
+      entry.category || "未分类",
+      entry.source || "未知来源",
+      entry.updated_at || entry.created_at || "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+  const chips = row.querySelector(".chip-row");
+  if (chips) {
+    chips.textContent = "";
+    [
+      `重要 ${Number(entry.importance ?? 0).toFixed(2)}`,
+      `置信 ${Number(entry.confidence ?? 0).toFixed(2)}`,
+    ].forEach((text) => {
+      const chip = document.createElement("span");
+      chip.className = "permission-chip";
+      chip.textContent = text;
+      chips.append(chip);
+    });
+  }
+  row.classList.toggle("is-selected", entry.id === memoryState.selectedId);
+  row.classList.toggle("is-core", entry.layer === "core_profile");
+  return true;
+}
+
+function selectMemoryEntry(memoryId) {
+  const id = String(memoryId || "").trim();
+  if (!id || id === memoryState.selectedId) {
+    fillMemoryEditor(selectedMemory());
+    return;
+  }
+  const previousId = memoryState.selectedId;
+  memoryState.selectedId = id;
+  if (previousId && previousId !== "__draft__") {
+    fields.memoryList
+      ?.querySelector(`[data-memory-id="${cssEscapeAttr(previousId)}"]`)
+      ?.classList.remove("is-selected");
+  }
+  fields.memoryList
+    ?.querySelector(`[data-memory-id="${cssEscapeAttr(id)}"]`)
+    ?.classList.add("is-selected");
+  fillMemoryEditor(selectedMemory());
+  fields.memoryDeleteButton.disabled =
+    memoryState.status === "loading"
+    || memoryState.status === "failed"
+    || memoryState.selectedId === "__draft__";
+  fields.memoryRevertButton.disabled =
+    memoryState.status === "loading"
+    || memoryState.status === "failed"
+    || memoryState.selectedId === "__draft__";
+}
+
 function renderMemoryList() {
   fields.memoryList.textContent = "";
   if (memoryState.loading) {
@@ -3262,48 +3532,7 @@ function renderMemoryList() {
     return;
   }
   entries.forEach((entry) => {
-    const row = document.createElement("div");
-    row.className = "memory-card";
-    row.setAttribute("role", "button");
-    row.tabIndex = 0;
-    row.classList.toggle("is-selected", entry.id === memoryState.selectedId);
-    row.classList.toggle("is-core", entry.layer === "core_profile");
-    const selectRow = () => {
-      memoryState.selectedId = entry.id;
-      renderMemoryPage();
-    };
-    row.addEventListener("click", selectRow);
-    row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectRow();
-      }
-    });
-    const title = document.createElement("strong");
-    title.textContent = compactText(memoryContent(entry) || "(空记忆)");
-    const meta = document.createElement("span");
-    meta.className = "card-meta";
-    meta.textContent = [
-      memoryLayerLabel(entry.layer),
-      entry.category || "未分类",
-      entry.source || "未知来源",
-      entry.updated_at || entry.created_at || "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    const chips = document.createElement("span");
-    chips.className = "chip-row";
-    [
-      `重要 ${Number(entry.importance ?? 0).toFixed(2)}`,
-      `置信 ${Number(entry.confidence ?? 0).toFixed(2)}`,
-    ].forEach((text) => {
-      const chip = document.createElement("span");
-      chip.className = "permission-chip";
-      chip.textContent = text;
-      chips.append(chip);
-    });
-    row.append(title, meta, chips);
-    fields.memoryList.append(row);
+    fields.memoryList.append(buildMemoryCard(entry));
   });
 }
 
@@ -3316,16 +3545,28 @@ function renderMemoryPage() {
   renderMemoryModelResourceCard();
 }
 
-async function loadMemories() {
+async function loadMemories(options = {}) {
   if (!request) {
     return;
   }
+  const silent = Boolean(options.silent);
+  const preserveScroll = options.preserveScroll !== false;
+  const preferredSelectedId = String(
+    options.preferredSelectedId !== undefined
+      ? options.preferredSelectedId
+      : memoryState.selectedId || "",
+  );
+  const anchor =
+    options.anchor
+    || (preserveScroll ? captureMemoryListAnchor(preferredSelectedId) : null);
   clearMemoryRetry();
-  memoryState.loading = true;
-  memoryState.status = "loading";
-  memoryState.message = "记忆系统正在加载。";
   let shouldRetry = false;
-  renderMemoryPage();
+  if (!silent) {
+    memoryState.loading = true;
+    memoryState.status = "loading";
+    memoryState.message = "记忆系统正在加载。";
+    renderMemoryPage();
+  }
   try {
     const params = {
       query: fields.memorySearch.value.trim(),
@@ -3339,19 +3580,40 @@ async function loadMemories() {
     memoryState.message = result.message || result.error || "";
     shouldRetry = memoryState.status === "loading";
     memoryState.entries = Array.isArray(result.memories)
-      ? result.memories.filter((entry) => entry && entry.id)
+      ? result.memories
+          .filter((entry) => entry && entry.id)
+          .map((entry) => normalizeMemoryEntry(entry))
       : [];
     memoryState.loaded = true;
-    if (!memoryState.entries.some((entry) => entry.id === memoryState.selectedId)) {
+    if (preferredSelectedId === "__draft__" && memoryState.draft) {
+      memoryState.selectedId = "__draft__";
+    } else if (
+      preferredSelectedId
+      && memoryState.entries.some((entry) => entry.id === preferredSelectedId)
+    ) {
+      memoryState.selectedId = preferredSelectedId;
+    } else if (memoryState.entries.some((entry) => entry.id === memoryState.selectedId)) {
+      // 保持现有选中
+    } else if (preferredSelectedId === "" && options.allowEmptySelection) {
+      memoryState.selectedId = "";
+    } else {
       memoryState.selectedId = memoryState.entries[0]?.id || "";
     }
   } catch (error) {
     memoryState.status = "failed";
     memoryState.message = String(error);
-    memoryState.entries = [];
+    if (!silent) {
+      memoryState.entries = [];
+    }
   } finally {
     memoryState.loading = false;
     renderMemoryPage();
+    if (preserveScroll && anchor) {
+      restoreMemoryListAnchor({
+        ...anchor,
+        id: memoryState.selectedId || anchor.id,
+      });
+    }
     if (shouldRetry) {
       scheduleMemoryRetry();
     }
@@ -3396,19 +3658,53 @@ async function saveMemoryEditor() {
     return;
   }
   setError("");
+  const previous = selectedMemory();
+  const wasDraft = memoryState.selectedId === "__draft__";
+  const frozenScrollTop = freezeMemoryListScroll();
   try {
+    fields.memorySaveButton.disabled = true;
     const result = await hostCall("memory.upsert", payload);
     if (result.status === "loading" || result.status === "failed") {
       setError(result.error || result.message || "记忆系统暂不可用。");
       return;
     }
-    const saved = result.memory || {};
-    memoryState.selectedId = saved.id || payload.id || "";
+    const savedId = String(result.memory?.id || payload.id || "").trim();
+    const merged = normalizeMemoryEntry(
+      {
+        ...(result.memory || {}),
+        ...payload,
+        id: savedId,
+        // 保留原创建时间，避免「创建时间」排序下无意义跳动
+        created_at: result.memory?.created_at || previous?.created_at || result.memory?.updated_at || "",
+        // 保存时优先保留本地旧 updated_at，避免「最近更新」排序下条目跳到列表顶
+        updated_at: previous?.updated_at || result.memory?.updated_at || "",
+      },
+      previous || {},
+    );
     memoryState.draft = null;
-    await loadMemories();
+    memoryState.selectedId = savedId;
+    upsertMemoryEntryLocally(merged);
+    // 主路径：不整表重绘，只改右侧编辑器 + 左侧对应卡片
+    if (!wasDraft && patchMemoryCard(merged)) {
+      fillMemoryEditor(merged);
+      renderMemoryStatus();
+      applyMemoryListScroll(frozenScrollTop);
+    } else {
+      // 新建草稿首次落库：需要插入列表，再按冻结位置恢复
+      renderMemoryPage();
+      applyMemoryListScroll(frozenScrollTop);
+      restoreMemoryListAnchor({
+        id: savedId,
+        offset: 0,
+        scrollTop: frozenScrollTop,
+      });
+    }
     notify("已保存记忆。", "success");
   } catch (error) {
     setError(String(error));
+  } finally {
+    const readOnly = memoryState.status === "loading" || memoryState.status === "failed";
+    fields.memorySaveButton.disabled = readOnly || !selectedMemory();
   }
 }
 
@@ -3426,17 +3722,36 @@ async function deleteSelectedMemory() {
     return;
   }
   setError("");
+  const nextSelectedId = neighborMemoryId(record.id);
+  const frozenScrollTop = freezeMemoryListScroll();
   try {
+    fields.memoryDeleteButton.disabled = true;
     const result = await hostCall("memory.delete", { id: record.id });
     if (Array.isArray(result.failed) && result.failed.length) {
       setError(result.failed[0].error || "记忆删除失败。");
       return;
     }
-    memoryState.selectedId = "";
-    await loadMemories();
+    const row = fields.memoryList?.querySelector(
+      `[data-memory-id="${cssEscapeAttr(record.id)}"]`,
+    );
+    row?.remove();
+    removeMemoryEntryLocally(record.id);
+    memoryState.selectedId = nextSelectedId;
+    renderMemoryStatus();
+    if (nextSelectedId) {
+      selectMemoryEntry(nextSelectedId);
+    } else {
+      fillMemoryEditor(null);
+    }
+    // 只恢复左侧列表滚动条位置，不整表重绘
+    applyMemoryListScroll(frozenScrollTop);
     notify("已删除记忆。", "success");
   } catch (error) {
     setError(String(error));
+  } finally {
+    const readOnly = memoryState.status === "loading" || memoryState.status === "failed";
+    fields.memoryDeleteButton.disabled =
+      readOnly || memoryState.selectedId === "__draft__" || !selectedMemory()?.id;
   }
 }
 
@@ -4368,12 +4683,12 @@ async function load() {
   setNumericBounds(fields.proactiveMaxEdge, request.limits.proactive_max_edge);
   fields.proactiveCooldownSeconds.value = proactive.cooldown_seconds ?? 600;
   fields.proactiveTimerSeconds.value = proactive.timer_seconds ?? 480;
-  fields.proactiveAdaptiveMin.value = proactive.adaptive_interval_min ?? 45;
+  fields.proactiveAdaptiveMin.value = proactive.adaptive_interval_min ?? 60;
   fields.proactiveAdaptiveMax.value = proactive.adaptive_interval_max ?? 1800;
   fields.proactiveIdleThreshold.value = proactive.idle_threshold_seconds ?? 600;
   fields.proactiveMinSilence.value = proactive.min_silence_after_user ?? 10;
   fields.proactiveWindowSwitch.checked = proactive.window_switch_enabled !== false;
-  fields.proactiveWindowSwitchCooldown.value = proactive.window_switch_cooldown ?? 25;
+  fields.proactiveWindowSwitchCooldown.value = proactive.window_switch_cooldown ?? 60;
   fields.proactiveFocusSettle.value = proactive.focus_settle_delay ?? 15;
   fields.proactiveMaxEdge.value = proactive.max_edge ?? 1920;
   fields.proactiveBlockedProcesses.value = listToLines(privacy.blocked_processes);
@@ -4521,7 +4836,11 @@ fields.memorySearch.addEventListener("input", () => {
   memorySearchTimer = window.setTimeout(loadMemories, 180);
 });
 fields.memoryLayerFilter.addEventListener("change", loadMemories);
-fields.memorySort.addEventListener("change", renderMemoryPage);
+fields.memorySort.addEventListener("change", () => {
+  const anchor = captureMemoryListAnchor();
+  renderMemoryPage();
+  restoreMemoryListAnchor(anchor);
+});
 fields.memoryAddButton.addEventListener("click", newMemoryDraft);
 fields.memoryRefreshButton.addEventListener("click", loadMemories);
 fields.memorySaveButton.addEventListener("click", saveMemoryEditor);

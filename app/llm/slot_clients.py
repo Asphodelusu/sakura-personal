@@ -12,6 +12,7 @@ from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
 from app.config.models import (
     MODEL_SLOT_CHAT,
     MODEL_SLOT_CHAT_FAST,
+    MODEL_SLOT_INNER_THOUGHT,
     MODEL_SLOT_MEMORY_CURATION,
     MODEL_SLOT_VISION_CHAT,
 )
@@ -26,6 +27,7 @@ class AppLlmClients:
     chat_fast: OpenAICompatibleClient | None
     vision: OpenAICompatibleClient | None
     memory_curation: object
+    inner_thought: OpenAICompatibleClient | None
 
 
 def resolve_chat_api_settings(
@@ -84,11 +86,23 @@ def build_app_llm_clients(
     else:
         memory_client = chat_client
 
+    # 内心独白：显式槽 → 独立 client；否则优先复用 chat_fast，再回退 resolve 到的 chat
+    inner_slot = resolve_model_slot(profiles, selection, MODEL_SLOT_INNER_THOUGHT, base)
+    if inner_slot is not None and inner_slot.source_slot == MODEL_SLOT_INNER_THOUGHT:
+        inner_client: OpenAICompatibleClient | None = OpenAICompatibleClient(inner_slot.settings)
+    elif chat_fast_client is not None:
+        inner_client = chat_fast_client
+    elif inner_slot is not None:
+        inner_client = OpenAICompatibleClient(inner_slot.settings)
+    else:
+        inner_client = None
+
     return AppLlmClients(
         chat=chat_client,
         chat_fast=chat_fast_client,
         vision=vision_client,
         memory_curation=memory_client,
+        inner_thought=inner_client,
     )
 
 

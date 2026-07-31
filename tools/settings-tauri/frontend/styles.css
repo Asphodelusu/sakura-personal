@@ -1551,7 +1551,14 @@ input[type="checkbox"]:disabled + span {
   grid-template-columns: minmax(260px, 0.9fr) minmax(340px, 1.1fr);
   gap: 14px;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
+}
+
+#page-memory .admin-workbench,
+#page-plugins .admin-workbench,
+#page-providers .admin-workbench {
+  min-height: 0;
 }
 
 .admin-list,
@@ -1567,7 +1574,15 @@ input[type="checkbox"]:disabled + span {
   flex-direction: column;
   gap: 9px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
   padding: 10px;
+}
+
+#page-memory .admin-list {
+  /* 强制成为独立滚动容器，避免保存重绘时整页/父级滚动被当成列表滚动 */
+  min-height: 0;
+  max-height: 100%;
 }
 
 .admin-detail {

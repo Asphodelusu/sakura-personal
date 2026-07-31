@@ -37,7 +37,7 @@ def test_curator_prompt_requires_fact_discipline() -> None:
 
 
 def test_curator_prompt_treats_intimacy_as_memorable() -> None:
-    """亲密关系按「人」记：里程碑高价值，过程流水账不堆。"""
+    """亲密关系按「人」记：里程碑高价值，过程流水账不堆，稳定后不空喊更亲密。"""
     text = _SELF_CURATION_TASK_PROMPT
     assert "亲密关系" in text
     assert "第一次" in text
@@ -45,6 +45,8 @@ def test_curator_prompt_treats_intimacy_as_memorable() -> None:
     assert "0.85" in text
     assert "过程流水账" in text
     assert "今の関係" in text
+    assert "更加亲密" in text
+    assert "mood_update 最多一条" in text
 
 
 def test_looks_like_third_person_self_detects_common_slips() -> None:

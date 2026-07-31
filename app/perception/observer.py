@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 import time
@@ -32,6 +33,7 @@ from app.perception.screen_reader import (
 )
 from app.perception.sensory_impression import sensory_impression_store
 from app.perception.win32 import (
+    get_active_window_pid,
     get_active_window_process_name,
     get_active_window_title,
     get_foreground_hwnd,
@@ -297,9 +299,9 @@ on_screen_text の規則：
 
 suggested_interval（次に見るまでの秒数）：
 - 相手が集中（コード・文書・会議）：600〜1800 秒
-- 相手がリラックス（ブラウジング・動画・ゲーム）：45〜120 秒
+- 相手がリラックス（ブラウジング・動画・ゲーム）：60〜300 秒
 - わからない／デフォルト：480 秒
-- 有効範囲：45〜1800 秒
+- 有効範囲：60〜1800 秒
 
 JSON のみ出力。Markdown や説明は不要：
 {"visual_summary": "画面の要約（日本語）", "on_screen_text": "", "reaction_hint": "短い反応（任意）", "suggested_interval": 480}
@@ -391,6 +393,7 @@ class FocusSnapshot:
     process: str
     title: str
     changed_at: float = 0.0
+    pid: int = 0
 
     @property
     def app_key(self) -> str:
@@ -400,6 +403,11 @@ class FocusSnapshot:
     @property
     def label(self) -> str:
         return self.title or self.process or f"hwnd:{self.hwnd}"
+
+    @property
+    def is_own_process(self) -> bool:
+        """前台是否为本进程（含历史/日志等同 PID 窗口）。"""
+        return int(self.pid or 0) == int(os.getpid())
 
 
 @dataclass
@@ -468,8 +476,8 @@ class ProactiveObserver:
         self._last_window_trigger_at = 0.0
         self._idle_armed = True
 
-        # per-app 评估记录：同窗口评过后 cooldown 内不再因切窗重新评估
-        self._last_eval_per_app: dict[str, float] = {}
+        # 同窗口下次允许因切窗再评估的时刻（跟本次 suggested_interval）
+        self._window_eval_ok_at: dict[str, float] = {}
 
         self._last_frame_dhash: int | None = None
         self._last_dedup_skip_at: float = 0.0
@@ -697,6 +705,7 @@ class ProactiveObserver:
         hwnd = int(get_foreground_hwnd() or 0)
         title = get_active_window_title()
         process = get_active_window_process_name()
+        pid = int(get_active_window_pid() or 0)
         if hwnd <= 0 and not title and not process:
             return None
         return FocusSnapshot(
@@ -704,6 +713,7 @@ class ProactiveObserver:
             process=process or "",
             title=title or "",
             changed_at=time.monotonic() if now is None else now,
+            pid=pid,
         )
 
     def _arm_focus_settle(self, snap: FocusSnapshot, *, now: float) -> None:
@@ -747,6 +757,9 @@ class ProactiveObserver:
         current: FocusSnapshot,
         now: float,
     ) -> None:
+        # 切到本进程（主窗/历史/日志）不发 window: 触发，避免自评自家 UI。
+        if current.is_own_process:
+            return
         from_label = previous.label if previous is not None else "(unknown)"
         self._ready_focus_trigger = f"window:{from_label!r}->{current.label!r}"
         self._last_window_trigger_at = now
@@ -770,20 +783,45 @@ class ProactiveObserver:
         current = self._focus_current
         if snap.app_key == current.app_key:
             # 同应用仅标题变化：更新展示名，不重置 APP_FOCUS settle
-            if snap.title != current.title or snap.process != current.process:
+            if (
+                snap.title != current.title
+                or snap.process != current.process
+                or snap.pid != current.pid
+            ):
                 self._focus_current = FocusSnapshot(
                     hwnd=current.hwnd,
                     process=snap.process or current.process,
                     title=snap.title or current.title,
                     changed_at=current.changed_at,
+                    pid=snap.pid or current.pid,
                 )
                 self._last_window_title = self._focus_current.title
             self._promote_deferred_focus(now=now)
             self._finalize_focus_settle(now=now)
             return
 
-        # —— APP_FOCUS 切换 ——
-        self._next_timer_at = 0.0
+        # 本进程内窗口互切（主窗↔历史↔日志）：只跟踪，不重置 timer、不 settle。
+        if snap.is_own_process and current.is_own_process:
+            self._focus_current = snap
+            self._last_window_title = snap.title
+            self._pending_focus = None
+            self._focus_settled_at = 0.0
+            self._deferred_focus = None
+            return
+
+        # 外部 → 本进程：更新焦点，但不重置 idle timer、不发 window: 评估。
+        if snap.is_own_process:
+            self._focus_previous = current
+            self._focus_current = snap
+            self._last_window_title = snap.title
+            self._ready_focus_trigger = ""
+            self._pending_focus = None
+            self._focus_settled_at = 0.0
+            self._deferred_focus = None
+            return
+
+        # —— 外部 APP_FOCUS 切换（含本进程 → 外部）——
+        # 不清除 _next_timer_at：周期节奏继续跟 suggested_interval，不被切窗打断。
         self._invalidate_window_text_cache()
         self._last_text_hash = None
         self._focus_previous = current
@@ -849,16 +887,11 @@ class ProactiveObserver:
 
         triggers: list[str] = []
         if self._ready_focus_trigger:
-            # per-app 冷却：同一窗口「评过之后」cooldown 内不再因切窗重新评估。
-            # 注意用成员判断而非 get(..., 0.0)：从未评估过的窗口不应被冷却，
-            # 否则在 monotonic 时钟较小时（刚开机/测试）会误杀首次切窗触发。
+            # 同窗口再聚焦：冷却跟上次评估的 suggested_interval（见 _window_eval_ok_at）。
+            # 从未评过的窗口没有条目，首次切窗不受影响。
             app_key = self._focus_current.app_key if self._focus_current else ""
-            last_eval = self._last_eval_per_app.get(app_key)
-            if (
-                app_key
-                and last_eval is not None
-                and now - last_eval < self.config.cooldown_seconds
-            ):
+            ok_at = self._window_eval_ok_at.get(app_key) if app_key else None
+            if ok_at is not None and now < ok_at:
                 self._ready_focus_trigger = ""
             else:
                 triggers.append(self._ready_focus_trigger)
@@ -901,6 +934,17 @@ class ProactiveObserver:
                 self._idle_armed = False
 
         return triggers
+
+    def _clamp_suggested_interval(self, suggested: object) -> float | None:
+        """把 VLM / 默认 timer 的建议秒数夹到 adaptive 上下限；无效则 None。"""
+        if isinstance(suggested, bool) or not isinstance(suggested, (int, float)):
+            return None
+        if suggested <= 0:
+            return None
+        return max(
+            self.config.adaptive_interval_min,
+            min(float(suggested), self.config.adaptive_interval_max),
+        )
 
     def _arm_content_quiet(self, suggested: float | None = None) -> None:
         """评估结束后压住 content 触发。
@@ -1286,26 +1330,28 @@ class ProactiveObserver:
                 reaction_hint = legacy
 
         suggested = parsed.get("suggested_interval")
-        clamped: float | None = None
-        if isinstance(suggested, (int, float)) and suggested > 0:
-            clamped = max(
-                self.config.adaptive_interval_min,
-                min(float(suggested), self.config.adaptive_interval_max),
-            )
+        clamped = self._clamp_suggested_interval(suggested)
+        if clamped is not None:
             self._next_timer_at = time.monotonic() + clamped
             logger.debug(
-                "ProactiveObserver: adaptive interval set to {:.0f}s (requested {:.0f}s)",
+                "ProactiveObserver: adaptive interval set to {:.0f}s (requested {!r})",
                 clamped,
                 suggested,
             )
         else:
-            self._next_timer_at = 0.0
+            # 未给建议时回退默认 timer_seconds，周期与同窗冷却仍可对齐
+            clamped = self._clamp_suggested_interval(self.config.timer_seconds)
+            self._next_timer_at = (
+                time.monotonic() + clamped if clamped is not None else 0.0
+            )
         # 不论开不开口：压住 content，避免动态网页滚字把评估打成一分钟一轮。
         self._arm_content_quiet(clamped)
 
-        # 记录 per-app 评估时间
-        if self._focus_current is not None:
-            self._last_eval_per_app[self._focus_current.app_key] = time.monotonic()
+        # 同窗口切焦再评：跟本次 suggested_interval（或默认 timer）
+        if self._focus_current is not None and clamped is not None:
+            self._window_eval_ok_at[self._focus_current.app_key] = (
+                time.monotonic() + clamped
+            )
 
         visible_excerpt = resolve_visible_text_excerpt(
             uia_text=uia_raw,

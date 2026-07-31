@@ -3263,13 +3263,12 @@ def test_proactive_check_event_attaches_screen_context_image() -> None:
     assert content[1]["image_url"]["detail"] == "high"
     assert "abc123" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
-    assert "先理解屏幕画面本身" in client.prompts[0]
-    assert "自然评论、接续任务、提问或轻量协助" in client.prompts[0]
-    assert "不要编造看不清" in client.prompts[0]
-    assert "不要再请求 observe_screen" in client.prompts[0]
-    assert "主动搭话时不要固定使用同一种语气" in client.prompts[0]
+    assert "主动屏幕感知事件" in client.prompts[0]
+    assert "评论变化、接续任务、询问卡点" in client.prompts[0]
     assert "基于屏幕内容找话题" in content[0]["text"]
-
+    assert "image_attached" in content[0]["text"]
+    # 看不清不编造（proactive 核心规则）
+    assert "看不清" in client.prompts[0] and "不编造" in client.prompts[0]
 
 def test_proactive_check_event_attaches_screen_context_image_batch() -> None:
     event = AgentEvent(
