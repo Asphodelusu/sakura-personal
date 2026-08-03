@@ -1494,6 +1494,10 @@ class MemoryStore:
         content = _required_text(arguments, "content")
         if not allow_sensitive and looks_like_sensitive_memory(content):
             raise ValueError("这条内容看起来包含敏感凭据或身份信息，已拒绝写入长期记忆。")
+        from app.agent.memory_evidence import looks_like_transient_local_memory
+
+        if looks_like_transient_local_memory(content):
+            raise ValueError("这条内容像本机瞬时状态（时间/正在播放等），已拒绝写入长期记忆。")
         requested_layer = _normalize_memory_layer(arguments.get("layer"))
         now = _now_iso()
         metadata = _memory_metadata(
@@ -1542,6 +1546,10 @@ class MemoryStore:
         content = _required_text(arguments, "content")
         if not allow_sensitive and looks_like_sensitive_memory(content):
             raise ValueError("这条内容看起来包含敏感凭据或身份信息，已拒绝写入长期记忆。")
+        from app.agent.memory_evidence import looks_like_transient_local_memory
+
+        if looks_like_transient_local_memory(content):
+            raise ValueError("这条内容像本机瞬时状态（时间/正在播放等），已拒绝写入长期记忆。")
         requested_layer = _normalize_memory_layer(arguments.get("layer"))
         if _is_core_profile_id(memory_id):
             existing = self.core_profile()
@@ -2588,10 +2596,10 @@ def _memory_metadata(
             ),
         }
     )
-    for key in ("memory_kind", "valid_until", "event_time"):
+    for key in ("memory_kind", "valid_until", "event_time", "evidence"):
         value = _optional_text(arguments, key) or str(metadata.get(key) or "").strip()
         if value:
-            metadata[key] = value
+            metadata[key] = value[:240] if key == "evidence" else value
     emotion_value = _optional_text(arguments, "emotion") or str(metadata.get("emotion") or "").strip()
     if emotion_value:
         metadata["emotion"] = normalize_emotion(emotion_value)

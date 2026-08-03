@@ -281,9 +281,14 @@ class OpenAICompatibleClient:
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
         on_chunk: Callable[[str], None] | None = None,
+        verbosity_guidance: str | None = None,
     ) -> ChatReply:
         """角色聊天回复，支持流式回调 on_chunk。"""
-        segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones, reply_portraits)
+        segmented_reply_instruction = _build_segmented_reply_instruction(
+            reply_tones,
+            reply_portraits,
+            verbosity_guidance=verbosity_guidance,
+        )
         temperature, extra_params = self.resolve_dialogue_params()
         if on_chunk is not None:
             content = self._stream_accumulate(
@@ -896,8 +901,14 @@ def _extract_choice_diagnostics(data: dict[str, Any]) -> dict[str, Any]:
 def _build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
+    *,
+    verbosity_guidance: str | None = None,
 ) -> str:
-    return build_segmented_reply_instruction(reply_tones, reply_portraits)
+    return build_segmented_reply_instruction(
+        reply_tones,
+        reply_portraits,
+        verbosity_guidance=verbosity_guidance,
+    )
 
 
 def _parse_model_ids(data: dict[str, Any]) -> list[str]:

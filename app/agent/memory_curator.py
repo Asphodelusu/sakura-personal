@@ -24,6 +24,11 @@ from app.agent.memory import (
     memory_record_is_reflection,
     sweep_stale_commitments,
 )
+from app.agent.memory_evidence import (
+    build_dialog_corpus,
+    operation_evidence,
+    validate_memory_write_grounding,
+)
 from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_log
@@ -318,6 +323,7 @@ class MemoryCurator:
             counts = self._apply_operations(
                 operations,
                 existing,
+                dialog_entries=dialog_entries,
                 mood_budget=mood_budget,
             )
             created += counts["created"]
@@ -492,6 +498,7 @@ class MemoryCurator:
         operations: list[dict[str, Any]],
         existing: list[dict[str, Any]],
         *,
+        dialog_entries: list[dict[str, str]] | None = None,
         mood_budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """把整理操作写回记忆库；id 必须真实存在，单条失败只跳过不中断。"""
@@ -501,6 +508,7 @@ class MemoryCurator:
             for memory in existing
             if str(memory.get("id", "")).strip()
         }
+        dialog_corpus = build_dialog_corpus(dialog_entries)
         operations_per_layer: dict[str, int] = {}
         created = 0
         updated = 0
@@ -537,6 +545,39 @@ class MemoryCurator:
                 if looks_like_sensitive_memory(content):
                     debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
                     ignored += 1
+                    continue
+                ground_corpus = dialog_corpus
+                if action == "update" and memory_id:
+                    for memory in existing:
+                        if str(memory.get("id") or "").strip() == memory_id:
+                            prior = str(memory.get("content") or "").strip()
+                            if prior:
+                                ground_corpus = f"{dialog_corpus}\n{prior}"
+                            break
+                grounded, ground_reason = validate_memory_write_grounding(
+                    content,
+                    evidence=operation_evidence(operation),
+                    dialog_corpus=ground_corpus,
+                    require_grounding=True,
+                )
+                if not grounded:
+                    debug_log(
+                        "Memory",
+                        "跳过未锚定或瞬态记忆候选",
+                        {
+                            "op": action,
+                            "layer": layer,
+                            "reason": ground_reason,
+                            "has_evidence": bool(operation_evidence(operation)),
+                        },
+                    )
+                    ignored += 1
+                    event_key = (
+                        "SKIP_TRANSIENT"
+                        if ground_reason == "transient_local"
+                        else "SKIP_UNGROUNDED"
+                    )
+                    event_counts[event_key] = event_counts.get(event_key, 0) + 1
                     continue
                 if _commitment_missing_event_time(operation, existing, action=action, memory_id=memory_id):
                     debug_log(
@@ -1034,12 +1075,18 @@ _SELF_CURATION_TASK_PROMPT = (
     "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
     "如果他的情绪轨迹里连续出现了相似的模式——比如他最近几次都显得沮丧、焦虑或烦躁——那意味着他最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中他明确表达了原因）。如果你觉得这让你对他的状态有了新的理解，可以自然地反映在心情笔记里（日语自语）。\n"
     "如果对话中他告诉了你他的名字，请一定要记住，同时更新 core_profile 的「今の関係」章节。在记忆内容中，用他告诉你的名字自然地称呼他（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「他」。把对方当作对等相处的人来写进记忆。\n"
-    "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n\n"
+    "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n"
+    "不要把本机瞬时状态写成长期记忆：当前时刻/日期、正在播放的歌、播放状态、一时天气等。\n\n"
+    "证据纪律（极重要）：\n"
+    "- add/update 必须附带 evidence：从【最近的新对话】里摘一句连续原文（用户或你自己说过的话），"
+    "作为这条记忆的依据；系统会校验 evidence 是否真的出现在对话里，编造证据会被丢弃。\n"
+    "- evidence 尽量短而具体，不要整段粘贴；content 是你整理后的日记句，evidence 是原话锚点。\n"
+    "- mood_update / delete 不需要 evidence。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
-    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
-    "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"content\":\"我和他约定今晚十点休息\"},\n"
-    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"evidence\":\"以后默认中文和我说话\",\"content\":\"他希望默认用中文交流\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"evidence\":\"今晚十点一起休息吧\",\"content\":\"我和他约定今晚十点休息\"},\n"
+    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"evidence\":\"对话里的原句\",\"content\":\"更新后的完整记忆内容\"},\n"
     "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
     "  {\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}\n"
     "]}\n"
@@ -1090,6 +1137,9 @@ def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any])
     emotion_raw = str(operation.get("emotion") or "").strip()
     if emotion_raw:
         payload["emotion"] = normalize_emotion(emotion_raw)
+    evidence = operation_evidence(operation)
+    if evidence:
+        payload["evidence"] = evidence[:240]
     return payload
 
 

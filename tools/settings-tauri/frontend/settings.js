@@ -2031,12 +2031,51 @@ function setSlotSelection(slot, selection, { preserveMissing = true } = {}) {
   syncModelOptions(slot, selection?.model || "", { preserveMissing });
 }
 
+const DEFAULT_SLOT_FALLBACKS = {
+  chat_fast: ["chat"],
+  vision_chat: ["chat"],
+  memory_curation: ["chat"],
+  inner_thought: ["chat_fast", "chat"],
+};
+
+function slotFallbackChain(slot) {
+  const field = request.api.slot_fields?.find((item) => item.id === slot);
+  if (Array.isArray(field?.fallbacks) && field.fallbacks.length) {
+    return field.fallbacks;
+  }
+  return DEFAULT_SLOT_FALLBACKS[slot] || ["chat"];
+}
+
+function slotIsExplicitlyConfigured(slot) {
+  if (slot === "chat") {
+    const selection = readSlotSelection(slot);
+    return Boolean(selection.profile_id && selection.model);
+  }
+  const inheritInput = fields.modelSlots.querySelector(`[data-slot-inherit="${slot}"]`);
+  if (inheritInput?.checked) {
+    return false;
+  }
+  const selection = readSlotSelection(slot);
+  return Boolean(selection.profile_id && selection.model);
+}
+
 function inheritedSlotSourceSelection(slot) {
   if (slot === "chat") {
     return null;
   }
-  const chat = readSlotSelection("chat");
-  return chat.profile_id && chat.model ? chat : null;
+  for (const candidate of slotFallbackChain(slot)) {
+    if (!slotIsExplicitlyConfigured(candidate)) {
+      continue;
+    }
+    return readSlotSelection(candidate);
+  }
+  return null;
+}
+
+function slotHasInheritDependents(slot) {
+  return (request.api.slot_fields || []).some((field) =>
+    (field.fallbacks || DEFAULT_SLOT_FALLBACKS[field.id] || []).includes(slot)
+  );
 }
 
 function syncInheritedSlotDisplays() {
@@ -2060,6 +2099,9 @@ function handleSlotInheritChange(slot) {
     delete inheritedSlotManualSelections[slot];
   }
   syncSlotInheritState(slot);
+  if (slotHasInheritDependents(slot)) {
+    syncInheritedSlotDisplays();
+  }
 }
 
 function renderModelSlots(selection) {
@@ -2095,15 +2137,16 @@ function renderModelSlots(selection) {
     enhanceSelect(modelSelect);
     profileSelect.addEventListener("change", () => {
       syncModelOptions(slot.id, "", { preserveMissing: false });
-      if (slot.id === "chat") {
+      if (slotHasInheritDependents(slot.id)) {
         syncInheritedSlotDisplays();
       }
     });
     modelSelect.addEventListener("change", () => {
-      if (slot.id === "chat") {
+      if (slotHasInheritDependents(slot.id)) {
         syncInheritedSlotDisplays();
       }
     });
+
     const selected = selection?.slots?.[slot.id] || { profile_id: "", model: "" };
     const inheritInput = fields.modelSlots.querySelector(`[data-slot-inherit="${slot.id}"]`);
     if (inheritInput) {

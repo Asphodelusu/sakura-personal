@@ -85,6 +85,8 @@ from app.config.defaults import (
 from app.config.model_slots import normalize_provider_models, resolve_model_slot
 from app.config.models import (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_DESCRIPTIONS,
+    MODEL_SLOT_FALLBACKS,
     MODEL_SLOT_LABELS,
     MODEL_SLOT_ORDER,
     MODEL_SLOT_VISION_CHAT,
@@ -2075,7 +2077,9 @@ def _api_to_mapping(
             {
                 "id": slot,
                 "label": MODEL_SLOT_LABELS.get(slot, slot),
+                "description": MODEL_SLOT_DESCRIPTIONS.get(slot, ""),
                 "required": slot == MODEL_SLOT_CHAT,
+                "fallbacks": list(MODEL_SLOT_FALLBACKS.get(slot, ())),
             }
             for slot in MODEL_SLOT_ORDER
         ],

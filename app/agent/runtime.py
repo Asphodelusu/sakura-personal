@@ -4,6 +4,7 @@ from pathlib import Path
 
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from dataclasses import dataclass, replace
 from threading import Lock
@@ -26,7 +27,14 @@ from app.agent.session_state_context import (
     build_session_state_fragment,
 )
 from app.agent.sensory_context import build_sensory_impression_fragment
+from app.agent.lore import LoreIndex, build_lore_context_fragment, load_lore_index
+from app.agent.local_context import build_media_context_fragment
+from app.agent.reply_verbosity import (
+    decision_from_interest,
+    format_verbosity_guidance,
+)
 from app.agent.inner_thought import (
+    InnerThoughtResult,
     InnerThoughtSettings,
     InnerThoughtWindow,
     build_inner_thought_fragment,
@@ -132,6 +140,14 @@ _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
 })
 
 
+@dataclass
+class _InnerThoughtLaunch:
+    """step0 与记忆召回并行的内心独白任务句柄（仅 runtime 内部使用）。"""
+
+    future: Future[str]
+    executor: ThreadPoolExecutor
+
+
 class AgentRuntime:
     """封装聊天决策链路，为后续工具调用和长期记忆留下扩展点。"""
 
@@ -169,6 +185,10 @@ class AgentRuntime:
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
         self.character_profile: CharacterProfile | None = None
+        self._lore_index: LoreIndex | None = None
+        self._lore_index_path: str = ""
+        self._turn_verbosity_guidance: str = ""
+        self._turn_interest: str | None = None
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
         self.history_store = history_store
@@ -250,9 +270,19 @@ class AgentRuntime:
         self.character_profile = character_profile
         # 换角色后清空内心独白窗口，避免串戏
         self._inner_thought_window.clear()
+        self._reload_lore_index()
         if character_profile is not None:
             self.character_id = character_profile.id.strip()
             self.character_name = character_profile.display_name.strip()
+
+    def _reload_lore_index(self) -> None:
+        profile = self.character_profile
+        path = profile.lore_index_path if profile is not None else None
+        path_key = str(path) if path is not None else ""
+        if path_key == self._lore_index_path:
+            return
+        self._lore_index_path = path_key
+        self._lore_index = load_lore_index(path) if path is not None else None
 
     def set_prompt_patches(self, prompt_patches: list[PromptPatchContribution] | None) -> None:
         """同步插件提示词补丁。"""
@@ -315,16 +345,16 @@ class AgentRuntime:
             return None
         return int(delta)
 
-    def _maybe_generate_inner_thought(
+    def _launch_inner_thought_worker(
         self,
         working_messages: list[ChatMessage],
         turn_state: TurnState,
         *,
         proactive_mode: bool,
-    ) -> None:
-        """本轮仅生成一次内心独白并推入滑动窗口；失败则跳过。"""
+    ) -> _InnerThoughtLaunch | None:
+        """主线程拍快照后提交 Flash；与记忆召回并行。跳过则返回 None。"""
         if self._inner_thought_done_for_turn:
-            return
+            return None
         settings = self.inner_thought_settings.normalized()
         self._inner_thought_window.configure(settings.window_size)
         if not should_generate_inner_thought(
@@ -334,33 +364,79 @@ class AgentRuntime:
             proactive_mode=proactive_mode,
         ):
             self._inner_thought_done_for_turn = True
-            return
+            return None
         assert self._inner_thought_api_client is not None
         self._inner_thought_done_for_turn = True
         profile = self.character_profile
         card_path = profile.card_path if profile is not None else None
+        # 只读快照在主线程取齐，避免 worker 与召回争用可变会话状态
+        character_name = self.character_name
+        character_excerpt = load_character_excerpt(
+            card_path=card_path,
+            system_prompt=self.system_prompt,
+        )
+        mood_summary = mood_summary_from_store(self.memory)
+        recent_dialogue = format_recent_dialogue(working_messages)
+        sensory = sensory_impression_text()
         previous = self._inner_thought_window.items()
-        text = generate_inner_thought(
-            self._inner_thought_api_client,
-            character_name=self.character_name,
-            character_excerpt=load_character_excerpt(
-                card_path=card_path,
-                system_prompt=self.system_prompt,
-            ),
-            mood_summary=mood_summary_from_store(self.memory),
-            recent_dialogue=format_recent_dialogue(working_messages),
-            sensory_impression=sensory_impression_text(),
+        api_client = self._inner_thought_api_client
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inner-thought")
+        future = executor.submit(
+            generate_inner_thought,
+            api_client,
+            character_name=character_name,
+            character_excerpt=character_excerpt,
+            mood_summary=mood_summary,
+            recent_dialogue=recent_dialogue,
+            sensory_impression=sensory,
             previous_thoughts=previous,
             settings=settings,
         )
-        if not text:
-            return
-        self._inner_thought_window.push(text)
         debug_log(
             "InnerThought",
-            "本轮内心独白已更新",
-            {"chars": len(text), "window": len(self._inner_thought_window)},
+            "内心独白已与记忆召回并行启动",
+            {"window": len(previous)},
         )
+        return _InnerThoughtLaunch(future=future, executor=executor)
+
+    def _finalize_inner_thought_worker(
+        self,
+        launch: _InnerThoughtLaunch | None,
+    ) -> None:
+        """join Flash worker；仅在主线程写入滑动窗口，并接通 interest→篇幅。"""
+        if launch is None:
+            return
+        result = InnerThoughtResult(text="", interest=None)
+        try:
+            raw = launch.future.result()
+            if isinstance(raw, InnerThoughtResult):
+                result = raw
+            elif isinstance(raw, str):
+                # 兼容旧 mock / 仅返回正文的调用
+                result = InnerThoughtResult(text=str(raw or "").strip(), interest=None)
+            elif raw is not None:
+                result = InnerThoughtResult(text=str(raw).strip(), interest=None)
+        except Exception as exc:  # noqa: BLE001 — 独白失败不阻断主链路
+            debug_log(
+                "InnerThought",
+                "内心独白并行任务异常，已跳过",
+                {"error": str(exc)},
+            )
+            result = InnerThoughtResult(text="", interest=None)
+        finally:
+            launch.executor.shutdown(wait=True, cancel_futures=False)
+        if result.text:
+            self._inner_thought_window.push(result.text)
+            debug_log(
+                "InnerThought",
+                "本轮内心独白已更新",
+                {
+                    "chars": len(result.text),
+                    "interest": result.interest,
+                    "window": len(self._inner_thought_window),
+                },
+            )
+        self._apply_turn_interest(result.interest)
 
     def _session_state_fragments(
         self,
@@ -376,6 +452,28 @@ class AgentRuntime:
         )
         if thought is not None:
             fragments.append(thought)
+
+        current_input = str(getattr(request, "current_input", "") or "").strip()
+        media_fragment = build_media_context_fragment(current_input)
+        if media_fragment is not None:
+            fragments.append(media_fragment)
+
+        if self._lore_index is None and self.character_profile is not None:
+            self._reload_lore_index()
+        if self._lore_index is not None and current_input:
+            history_payload: list[dict[str, str]] = []
+            for message in request.recent_messages[-8:]:
+                role = str(getattr(message, "role", "") or "").strip()
+                content = str(getattr(message, "content", "") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    history_payload.append({"role": role, "content": content})
+            lore_fragment = build_lore_context_fragment(
+                current_input,
+                self._lore_index,
+                history=history_payload,
+            )
+            if lore_fragment is not None:
+                fragments.append(lore_fragment)
 
         store = self.history_store
         if store is None:
@@ -904,6 +1002,8 @@ class AgentRuntime:
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
         self._inner_thought_done_for_turn = False
+        self._turn_interest = None
+        self._turn_verbosity_guidance = ""
         active_groups: set[str] = tool_routing.infer_active_tool_groups_from_messages(working_messages)
         debug_log(
             "AgentRuntime",
@@ -974,93 +1074,98 @@ class AgentRuntime:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
+                # step0：Flash 独白与记忆召回 fork-join（先 resolve turn_state；join 后再拼 prompt）
+                thought_launch: _InnerThoughtLaunch | None = None
                 if step_index == 0:
-                    # 串行：先路由/召回准备，再生成独白（稳定优先；独白失败不阻塞）
-                    self._maybe_generate_inner_thought(
+                    thought_launch = self._launch_inner_thought_worker(
                         working_messages,
                         turn_state,
                         proactive_mode=proactive_mode,
                     )
-                intimacy_focus = self._intimacy_focus_active()
-                if memory_needs_refresh:
-                    if intimacy_focus:
-                        # 亲密模式：轻量语义召回（当下亲密相关记忆可进；不做全量/渐进索引）
+                try:
+                    intimacy_focus = self._intimacy_focus_active()
+                    if memory_needs_refresh:
+                        if intimacy_focus:
+                            # 亲密模式：轻量语义召回（当下亲密相关记忆可进；不做全量/渐进索引）
+                            light_recall = self.memory_recall.recall(
+                                request, light_mode=True,
+                            )
+                            turn_memory_fragments = tuple(light_recall.fragments)
+                            memory_status = "rhythm_light"
+                        elif turn_state.recall_decision == "recall":
+                            recall = self.memory_recall.recall(request)
+                            turn_memory_fragments = list(recall.fragments)
+                            memory_status = recall.status
+                            # 渐进检索：追加以往记忆的标题索引 + 工具提示
+                            if self._progressive_memory:
+                                progressive = self._build_progressive_index_fragment(
+                                    request.current_input,
+                                    recall.fragments,
+                                )
+                                if progressive:
+                                    turn_memory_fragments.append(progressive)
+                            turn_memory_fragments = tuple(turn_memory_fragments)
+                        elif turn_state.recall_decision == "light":
+                            # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
+                            light_recall = self.memory_recall.recall(
+                                request, light_mode=True,
+                            )
+                            continuity = self.memory.build_continuity_context()
+                            combined = list(light_recall.fragments)
+                            if continuity:
+                                combined.insert(
+                                    0,
+                                    ContextFragment(
+                                        fragment_id="memory.continuity",
+                                        source="memory",
+                                        content=continuity,
+                                        trust="trusted",
+                                        priority=90,
+                                        token_budget=600,
+                                        sensitivity="private",
+                                        cache_scope="turn",
+                                        required=True,
+                                    ),
+                                )
+                            turn_memory_fragments = tuple(combined)
+                            memory_status = "light"
+                        else:
+                            # defer/skip：仅注入连续性上下文（心情+关系快照）
+                            continuity = self.memory.build_continuity_context()
+                            if continuity:
+                                turn_memory_fragments = (
+                                    ContextFragment(
+                                        fragment_id="memory.continuity",
+                                        source="memory",
+                                        content=continuity,
+                                        trust="trusted",
+                                        priority=90,
+                                        token_budget=600,
+                                        sensitivity="private",
+                                        cache_scope="turn",
+                                        required=True,
+                                    ),
+                                )
+                            else:
+                                turn_memory_fragments = ()
+                            memory_status = (
+                                "skipped"
+                                if turn_state.recall_decision == "skip"
+                                else "deferred"
+                            )
+                        memory_needs_refresh = False
+                        request = replace(request, service_status={"memory": memory_status})
+                    # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
+                    if intimacy_focus and memory_status != "rhythm_light":
                         light_recall = self.memory_recall.recall(
                             request, light_mode=True,
                         )
                         turn_memory_fragments = tuple(light_recall.fragments)
                         memory_status = "rhythm_light"
-                    elif turn_state.recall_decision == "recall":
-                        recall = self.memory_recall.recall(request)
-                        turn_memory_fragments = list(recall.fragments)
-                        memory_status = recall.status
-                        # 渐进检索：追加以往记忆的标题索引 + 工具提示
-                        if self._progressive_memory:
-                            progressive = self._build_progressive_index_fragment(
-                                request.current_input,
-                                recall.fragments,
-                            )
-                            if progressive:
-                                turn_memory_fragments.append(progressive)
-                        turn_memory_fragments = tuple(turn_memory_fragments)
-                    elif turn_state.recall_decision == "light":
-                        # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
-                        light_recall = self.memory_recall.recall(
-                            request, light_mode=True,
-                        )
-                        continuity = self.memory.build_continuity_context()
-                        combined = list(light_recall.fragments)
-                        if continuity:
-                            combined.insert(
-                                0,
-                                ContextFragment(
-                                    fragment_id="memory.continuity",
-                                    source="memory",
-                                    content=continuity,
-                                    trust="trusted",
-                                    priority=90,
-                                    token_budget=600,
-                                    sensitivity="private",
-                                    cache_scope="turn",
-                                    required=True,
-                                ),
-                            )
-                        turn_memory_fragments = tuple(combined)
-                        memory_status = "light"
-                    else:
-                        # defer/skip：仅注入连续性上下文（心情+关系快照）
-                        continuity = self.memory.build_continuity_context()
-                        if continuity:
-                            turn_memory_fragments = (
-                                ContextFragment(
-                                    fragment_id="memory.continuity",
-                                    source="memory",
-                                    content=continuity,
-                                    trust="trusted",
-                                    priority=90,
-                                    token_budget=600,
-                                    sensitivity="private",
-                                    cache_scope="turn",
-                                    required=True,
-                                ),
-                            )
-                        else:
-                            turn_memory_fragments = ()
-                        memory_status = (
-                            "skipped"
-                            if turn_state.recall_decision == "skip"
-                            else "deferred"
-                        )
-                    memory_needs_refresh = False
-                    request = replace(request, service_status={"memory": memory_status})
-                # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
-                if intimacy_focus and memory_status != "rhythm_light":
-                    light_recall = self.memory_recall.recall(
-                        request, light_mode=True,
-                    )
-                    turn_memory_fragments = tuple(light_recall.fragments)
-                    memory_status = "rhythm_light"
-                    request = replace(request, service_status={"memory": memory_status})
+                        request = replace(request, service_status={"memory": memory_status})
+                finally:
+                    # 召回抛错也要回收线程；窗口写入仅发生在此处（主线程）
+                    self._finalize_inner_thought_worker(thought_launch)
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
                     providers=self.context_providers,
@@ -1079,6 +1184,7 @@ class AgentRuntime:
                         extra_instructions=planning_extra_instructions,
                         browser_page_mode=browser_page_guard_active,
                         visible_browser_mode=visible_browser_guard_active,
+                        recent_messages=working_messages,
                     )
                 )
                 self._record_prompt_inspection(prompt_build.inspection)
@@ -1722,6 +1828,7 @@ class AgentRuntime:
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
                 on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
+                verbosity_guidance=self._turn_verbosity_guidance or None,
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -2055,6 +2162,42 @@ class AgentRuntime:
         parts = [extra_instructions.strip(), self._reply_protocol_patch_text()]
         return "\n".join(part for part in parts if part)
 
+    def _apply_turn_interest(self, interest: str | None) -> str:
+        """仅用独白 interest 驱动篇幅；无 interest 则不注入本轮篇幅块。"""
+        self._turn_interest = None
+        self._turn_verbosity_guidance = ""
+        decision = decision_from_interest(interest)
+        if decision is None:
+            if interest:
+                debug_log(
+                    "ReplyVerbosity",
+                    "interest 无法识别，本轮不注入篇幅块",
+                    {"interest": interest},
+                )
+            return ""
+        self._turn_interest = decision.interest
+        guidance = format_verbosity_guidance(decision)
+        self._turn_verbosity_guidance = guidance
+        debug_log(
+            "ReplyVerbosity",
+            "本轮篇幅档位已更新",
+            {
+                "interest": decision.interest,
+                "tier": decision.tier,
+                "segments": f"{decision.min_segments}-{decision.max_segments}",
+            },
+        )
+        return guidance
+
+    def _refresh_turn_verbosity_guidance(
+        self,
+        messages: list[ChatMessage] | None = None,
+    ) -> str:
+        del messages  # 篇幅不再看消息规则，只吃独白 interest
+        if self._turn_verbosity_guidance.strip():
+            return self._turn_verbosity_guidance
+        return self._apply_turn_interest(self._turn_interest)
+
     def _build_tool_prompt_result(
         self,
         snapshot: ContextSnapshot | None,
@@ -2063,12 +2206,19 @@ class AgentRuntime:
         extra_instructions: str = "",
         browser_page_mode: bool = False,
         visible_browser_mode: bool = False,
+        recent_messages: list[ChatMessage] | None = None,
     ):
+        verbosity = (
+            self._refresh_turn_verbosity_guidance(recent_messages)
+            if recent_messages is not None
+            else self._turn_verbosity_guidance
+        )
         reply_protocol = self._apply_reply_protocol_patches(
             build_agent_reply_protocol(
                 self._effective_reply_tones(),
                 self.reply_portraits,
                 portrait_hints=self._portrait_hints() or None,
+                verbosity_guidance=verbosity or None,
             )
         )
         context_strategy = build_context_acquisition_strategy(
@@ -2181,13 +2331,20 @@ class AgentRuntime:
         ).system_prompt
 
     def _build_final_reply_result(self, snapshot: ContextSnapshot | None = None):
+        final_instructions = (
+            "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
+            "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
+            "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。"
+        )
+        if self._turn_verbosity_guidance.strip():
+            final_instructions = (
+                f"{final_instructions}\n\n{self._turn_verbosity_guidance.strip()}"
+            )
         sections = [
             *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
             PromptSection(
                 "final_reply.instructions",
-                "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
-                "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
-                "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。",
+                final_instructions,
             ),
             PromptSection("reply.patch", self._reply_protocol_patch_text()),
         ]

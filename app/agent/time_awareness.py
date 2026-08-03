@@ -164,6 +164,7 @@ def format_local_time_context(
         lines.append(
             f"若回复里提到过了多久，请用约 {duration}，不要说成明显更短的时间。"
         )
+    lines.append("本机时刻是只读临时状态，只用于回答当前问题，不要写入长期记忆。")
     return "\n".join(lines)
 
 

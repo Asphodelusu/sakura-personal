@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import httpx
 
@@ -18,10 +19,33 @@ DEFAULT_INNER_THOUGHT_WINDOW_SIZE = 6
 # Flash 实测常要 4–6s；过短会误杀已返回的内容
 DEFAULT_INNER_THOUGHT_TIMEOUT_SECONDS = 8
 DEFAULT_INNER_THOUGHT_MAX_CHARS = 200
-DEFAULT_INNER_THOUGHT_MAX_TOKENS = 160
+DEFAULT_INNER_THOUGHT_MAX_TOKENS = 180
 _RECENT_DIALOGUE_CHAR_BUDGET = 800
 _CHARACTER_EXCERPT_CHAR_BUDGET = 800
 _MOOD_CHAR_BUDGET = 300
+
+InterestLevel = Literal["low", "mid", "high"]
+
+_INTEREST_ALIASES: dict[str, InterestLevel] = {
+    "low": "low",
+    "mid": "mid",
+    "high": "high",
+    "低": "low",
+    "中": "mid",
+    "高": "high",
+}
+_INTEREST_LINE_RE = re.compile(
+    r"^\s*(?:interest|兴致|興趣|兴趣)\s*[:：]\s*(low|mid|high|低|中|高)\s*$",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class InnerThoughtResult:
+    """本轮内心独白解析结果；interest 驱动篇幅，缺失则不注入篇幅块。"""
+
+    text: str
+    interest: InterestLevel | None = None
 
 _STYLE_FEW_SHOTS = """示例 1（日常闲聊）：
 あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…
@@ -119,8 +143,8 @@ def generate_inner_thought(
     sensory_impression: str = "",
     previous_thoughts: Sequence[str] = (),
     settings: InnerThoughtSettings | None = None,
-) -> str:
-    """调用轻量模型生成本轮内心独白；失败/超时返回空串。"""
+) -> InnerThoughtResult:
+    """调用轻量模型生成本轮内心独白；失败/超时返回空结果。"""
     cfg = (settings or InnerThoughtSettings()).normalized()
     system_prompt = build_inner_thought_system_prompt(character_name)
     user_prompt = build_inner_thought_user_prompt(
@@ -134,6 +158,7 @@ def generate_inner_thought(
     # 复用已有 client 的连接池（keep-alive）；仅用单次 request_timeout，勿每轮 new Client
     base_timeout = int(getattr(api_client.settings, "timeout_seconds", 0) or cfg.timeout_seconds)
     timeout = min(base_timeout, cfg.timeout_seconds)
+    empty = InnerThoughtResult(text="", interest=None)
     try:
         raw = api_client.complete_raw(
             system_prompt,
@@ -150,7 +175,7 @@ def generate_inner_thought(
             "内心独白超时，已跳过",
             {"timeout": timeout, "error": str(exc)},
         )
-        return ""
+        return empty
     except ApiRequestError as exc:
         message = str(exc).lower()
         if "timeout" in message or "timed out" in message:
@@ -159,13 +184,46 @@ def generate_inner_thought(
                 "内心独白超时，已跳过",
                 {"timeout": timeout, "error": str(exc)},
             )
-            return ""
+            return empty
         debug_log("InnerThought", "内心独白生成失败，已跳过", {"error": str(exc)})
-        return ""
+        return empty
     except Exception as exc:  # noqa: BLE001
         debug_log("InnerThought", "内心独白生成失败，已跳过", {"error": str(exc)})
-        return ""
-    return _normalize_thought_text(raw)
+        return empty
+    return parse_inner_thought_output(raw)
+
+
+def parse_inner_thought_output(raw: object) -> InnerThoughtResult:
+    """解析 Flash 输出：首行 interest，其后为独白正文。"""
+    text = str(raw or "").strip()
+    if not text:
+        return InnerThoughtResult(text="", interest=None)
+    # 去掉常见代码块包装，保留换行以便抽 interest
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("text"):
+            text = text[4:].lstrip("\n")
+        text = text.strip()
+    lines = text.splitlines()
+    interest: InterestLevel | None = None
+    body_start = 0
+    for index, line in enumerate(lines):
+        match = _INTEREST_LINE_RE.match(line.strip())
+        if match is None:
+            if line.strip():
+                break
+            continue
+        alias = match.group(1).lower()
+        interest = _INTEREST_ALIASES.get(alias) or _INTEREST_ALIASES.get(match.group(1))
+        body_start = index + 1
+        break
+    body = "\n".join(lines[body_start:]).strip()
+    if interest is None:
+        # 模型漏了独立首行时，整段当正文（本轮不注入篇幅块）
+        normalized = _normalize_thought_text(text)
+    else:
+        normalized = _normalize_thought_text(body)
+    return InnerThoughtResult(text=normalized, interest=interest)
 
 
 def build_inner_thought_fragment(
@@ -207,7 +265,10 @@ def build_inner_thought_system_prompt(character_name: str) -> str:
     return (
         f"你是 {name} 的内心之声（inner voice）。\n"
         "你正在观察此刻的对话，并记录角色真实但不会说出口的内心活动。\n"
-        "只输出内心独白正文，不带标记或前缀。"
+        "输出格式固定两段：\n"
+        "1) 第一行：interest: low|mid|high\n"
+        "2) 第二行起：内心独白正文（日文，不要再写 interest）\n"
+        "不要输出其它标记、前缀或解释。"
     )
 
 
@@ -223,13 +284,20 @@ def build_inner_thought_user_prompt(
     name = (character_name or "角色").strip() or "角色"
     parts = [
         "# 规则",
-        "- 输出 2-4 句日文，第一人称",
+        "- 第一行必须是：interest: low|mid|high",
+        "- interest = 此刻你对「继续聊这件事 / 这一拍交流」的主观兴致（不是字面热闹程度）",
+        "- 对方只回「嗯」「好」也可能是 high（比如答应了你在意的提案）；冷场闲聊也可能是 low",
+        "- 第二行起输出 2-4 句日文内心独白，第一人称",
         "- 只写内心感受、直觉反应、隐藏的疑惑或渴望——不写对话策略、不写「我应该说什么」",
         f"- 可以和 {name} 实际说出来的话不同甚至相反",
         "- 不要评价自己说的话、不要总结、不要给出结论",
         "- 如果此刻没有特别的内心波动，写一句简短的现状即可，不要编造",
         "",
-        "# 思考风格示例",
+        "# 输出示例",
+        "interest: high",
+        "あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…",
+        "",
+        "# 思考风格示例（仅正文风格参考；正式输出仍要带 interest 行）",
         _STYLE_FEW_SHOTS,
         "",
         "# 角色档案（节选）",
@@ -255,7 +323,12 @@ def build_inner_thought_user_prompt(
     sensory = _clip(sensory_impression, 200)
     if sensory:
         parts.extend(["", "# 最近感知印象", sensory])
-    parts.extend(["", f"请输出 {name} 此刻的内心独白："])
+    parts.extend(
+        [
+            "",
+            f"请输出 {name} 此刻的 interest 行 + 内心独白：",
+        ]
+    )
     return "\n".join(parts)
 
 
