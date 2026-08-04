@@ -1681,6 +1681,7 @@ def _build_screen_and_desktop_routing_rule(allow_screen_observation: bool) -> st
         return "\n".join(
             [
                 "- 当用户询问当前屏幕内容、可见文字、报错含义、界面状态或“这个是什么意思”时，优先调用 observe_screen；这是 Sakura 内置视觉观察，只用于理解画面和解释，不用于鼠标坐标。",
+                "- 寒暄、打招呼、「喂」、叫名字、闲聊情绪时不要调用 observe_screen；没有明确画面依赖就直接回复。",
                 "- 当用户要求你点击、移动鼠标、输入、切换窗口或操作桌面应用时，不要用 observe_screen 推理坐标；改用 Windows MCP 的 windows__Snapshot / windows__Screenshot 作为操作前观察。",
             ]
         )

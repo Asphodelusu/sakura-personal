@@ -16,8 +16,9 @@ def create_screen_observation_tool() -> Tool:
     return Tool(
         name=OBSERVE_SCREEN_TOOL_NAME,
         description=(
-            "自主请求获取当前屏幕截图，用来理解对方当前窗口、屏幕内容、正在做什么、"
-            "是否卡住，或为主动搭话寻找具体画面话题。"
+            "仅在对方明确询问当前屏幕/窗口/界面/报错/是否卡住等内容时，"
+            "请求获取当前屏幕截图以便理解画面。寒暄、闲聊、叫名字时不要调用；"
+            "不要为了找话题主动截屏。"
         ),
         parameters={
             "type": "object",

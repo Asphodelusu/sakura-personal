@@ -10,8 +10,6 @@
 - [x] 全量 tests/unit 跑绿（1113 passed, 12 skipped，连续两次稳定）
 - [x] commit + push dev4
 
-## 遗留（产品 bug，已 skip 保测试）
-- `test_list_models_wraps_http_error` / `test_google_ai_studio_auth_error_gets_actionable_message`：
-  `_send_http_with_retries` 不检查 status_code（httpx 默认不 raise_for_status，HTTPStatusError 分支死代码），
-  401 错误体被当正常 JSON 解析报「模型列表格式无法解析」。stream 路径有显式 status>=400 检查，非 stream 缺失。
-  修复方向：在 `_send_http_with_retries` 对 `status_code >= 400` 抛 `ApiRequestError(_format_api_http_error(...))`，修复后移除 skip。
+## 已修复（原 skip 产品 bug）
+- [x] `test_list_models_wraps_http_error` / `test_google_ai_studio_auth_error_gets_actionable_message`：
+  `_send_http_with_retries` 对 `status_code >= 400` 抛 `_format_api_http_error`（对齐 stream 路径），skip 已移除。

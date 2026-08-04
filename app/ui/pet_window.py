@@ -3960,6 +3960,11 @@ class PetWindow(QWidget):
         reply = progress.reply
         if not reply.text.strip() and not reply.translation.strip():
             return
+        stage = str(progress.stage or "")
+        # 仅联网搜索空档旁白上气泡/TTS。工具规划中间稿（observe_screen 等）
+        # 不当成回复字幕，避免「字出来了却迟迟不送正式 TTS」的错觉。
+        if not stage.startswith("web_"):
+            return
         self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
             "agent_progress_received",
@@ -3971,7 +3976,7 @@ class PetWindow(QWidget):
         )
         debug_log(
             "PetWindow",
-            "收到 Agent 中间回复",
+            "收到联网过程旁白",
             {
                 "stage": progress.stage,
                 "segments": len(reply.segments),
@@ -3986,7 +3991,6 @@ class PetWindow(QWidget):
                 TRANSIENT_PROGRESS_MESSAGE_KEY: True,
             }
         )
-        # 过程旁白：立刻显示在气泡里（不入正式回复队列 / 不抢最终 TTS）。
         segment = reply.segments[0] if reply.segments else None
         bubble_text = (
             segment.display_text(self.subtitle_language)
@@ -4000,6 +4004,28 @@ class PetWindow(QWidget):
             subtitle_controller = getattr(self, "subtitle_controller", None)
             if subtitle_controller is not None:
                 subtitle_controller.set_speech(bubble_text, pulse=True)
+        # 「我查查 / 搜到了」等短旁白：搜索等待空档播 TTS；读页长摘要仍 suppress_tts。
+        if (
+            segment is not None
+            and not segment.suppress_tts
+            and bubble_text
+        ):
+            playback = getattr(self, "voice_playback_controller", None)
+            speak = getattr(playback, "speak_segment", None) if playback is not None else None
+            if callable(speak):
+                try:
+                    speak(
+                        segment,
+                        0,
+                        on_started=lambda: None,
+                        on_finished=lambda: None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    debug_log(
+                        "PetWindow",
+                        "过程旁白 TTS 失败，已保留字幕",
+                        {"error": str(exc), "stage": stage},
+                    )
         # 不回写历史记录：_handle_reply 收到最终回复后再统一写
 
     def _remove_transient_progress_messages(self) -> None:

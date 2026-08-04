@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 from typing import Any
 
 import httpx
@@ -571,21 +570,32 @@ def test_segmented_reply_instruction_requests_portrait_field() -> None:
     assert "portrait 只能从这些类别中选择：站立待机、伸手命令" in instruction
 
 
-def _fake_http_response(text: str, status_code: int = 200) -> Any:
+def _fake_http_response(
+    text: str,
+    status_code: int = 200,
+    *,
+    url: str = "https://api.example.com/v1",
+) -> Any:
     """构造 _send_http_with_retries 读取的最小响应对象。"""
     # 类体里同名赋值会 NameError，改用 type() 动态构造。
     return type(
         "_FakeResponse",
         (),
-        {"text": text, "status_code": status_code, "url": "https://api.example.com/v1"},
+        {"text": text, "status_code": status_code, "url": url},
     )()
 
 
 class _FakeHttpWithResponse:
     """最小 httpx.Client 替身：固定响应体，记录请求路径。"""
 
-    def __init__(self, text: str) -> None:
-        self._response = _fake_http_response(text)
+    def __init__(
+        self,
+        text: str,
+        status_code: int = 200,
+        *,
+        url: str = "https://api.example.com/v1",
+    ) -> None:
+        self._response = _fake_http_response(text, status_code, url=url)
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         return self._response
@@ -770,28 +780,13 @@ def test_list_models_rejects_bad_response_shape(monkeypatch) -> None:  # type: i
         raise AssertionError("模型列表格式错误时应抛出 ApiRequestError")
 
 
-@pytest.mark.skip(
-    reason=(
-        "产品 bug：_send_http_with_retries 未检查 status_code，httpx 默认不 raise_for_status，"
-        "HTTPStatusError 分支为死代码；401 错误体被当正常 JSON 解析成「模型列表格式无法解析」。"
-        "修复（在 _send_http_with_retries 中对 status_code >= 400 抛 _format_api_http_error）后移除 skip。"
-    )
-)
 def test_list_models_wraps_http_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "key", "", timeout_seconds=1))
-
-    def fake_urlopen(_request, timeout):  # type: ignore[no-untyped-def]
-        import urllib.error
-
-        raise urllib.error.HTTPError(
-            "https://api.example.com/v1/models",
-            401,
-            "Unauthorized",
-            {},
-            None,
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        client,
+        "_http_client",
+        lambda: _FakeHttpWithResponse("unauthorized", status_code=401),
+    )
 
     try:
         client.list_models()
@@ -801,12 +796,6 @@ def test_list_models_wraps_http_error(monkeypatch) -> None:  # type: ignore[no-u
         raise AssertionError("HTTP 错误应包装为 ApiRequestError")
 
 
-@pytest.mark.skip(
-    reason=(
-        "产品 bug：同 test_list_models_wraps_http_error，list_models 的 401 走不到 _format_api_http_error，"
-        "Google AI Studio 友好认证提示不会触发。修复后移除 skip。"
-    )
-)
 def test_google_ai_studio_auth_error_gets_actionable_message(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client = OpenAICompatibleClient(
         ApiSettings("https://generativelanguage.googleapis.com/v1beta", "key", "", timeout_seconds=1)
@@ -816,20 +805,15 @@ def test_google_ai_studio_auth_error_gets_actionable_message(monkeypatch) -> Non
         '"status":"UNAUTHENTICATED","details":[{"reason":"API_KEY_SERVICE_BLOCKED",'
         '"method":"google.ai.generativelanguage.v1.ModelService.ListModels"}]}}'
     )
-
-    def fake_urlopen(_request, timeout):  # type: ignore[no-untyped-def]
-        _ = timeout
-        import urllib.error
-
-        raise urllib.error.HTTPError(
-            "https://generativelanguage.googleapis.com/v1beta/openai/models",
-            401,
-            "Unauthorized",
-            {},
-            io.BytesIO(error_body.encode("utf-8")),
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        client,
+        "_http_client",
+        lambda: _FakeHttpWithResponse(
+            error_body,
+            status_code=401,
+            url="https://generativelanguage.googleapis.com/v1beta/openai/models",
+        ),
+    )
 
     try:
         client.list_models()

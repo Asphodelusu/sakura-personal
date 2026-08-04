@@ -213,12 +213,14 @@ def build_proactive_check_segment_rules() -> str:
 
 def context_acquisition_strategy_block(*, allow_screen_observation: bool) -> PromptBlock:
     rules = [
-        "- 信息不足、对方话很短含糊或需要核实时，可以用低风险只读工具把事实补清楚，再按人设回应。",
+        "- 信息不足、需要核实时，可以用低风险只读工具把事实补清楚，再按人设回应；"
+        "单纯寒暄、叫名字、「喂」之类短搭话，直接按人设回话，不要为了找话题去截屏或搜网页。",
     ]
     if allow_screen_observation:
         rules.extend(
             [
-                "- 需要确认当前画面、报错或界面状态时，可以调用 observe_screen。",
+                "- 只有对方明确在问当前画面、可见文字、报错、界面状态，或回答必须依赖此刻屏幕时，"
+                "才调用 observe_screen；不要把看屏当成每轮默认动作。",
                 "- 本轮已有 screen_context、screen_contexts 或图片时，不要重复截图。",
             ]
         )

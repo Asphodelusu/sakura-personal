@@ -4598,76 +4598,122 @@ def test_input_bar_not_pinned_just_because_reply_is_waiting() -> None:
     assert not window._input_bar_pinned()
 
 
-def test_progress_reply_displays_and_records_assistant_message() -> None:
-    pytest.skip("personal fork — chat pipeline differs")
+def test_progress_reply_ignores_non_web_stages() -> None:
     from app.agent import AgentProgress
     from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+    from app.ui.pet_window import PetWindow
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
+        subtitle_language = "ja"
+        messages: list = []
+        spoken: list = []
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = [{"role": "user", "content": "看屏幕"}]
+            self.ui_state = type("S", (), {"begin_streaming": lambda *_a, **_k: None})()
+            self._log_interaction_stage = lambda *_a, **_k: None
+            self.voice_playback_controller = type(
+                "P",
+                (),
+                {"speak_segment": lambda *a, **k: self.spoken.append(a)},
+            )()
 
     window = MinimalProgressWindow()
-    from app.ui.state import PetUiStateStore
-    window.ui_state = PetUiStateStore()
-    history = []
-    window.messages = [{"role": "user", "content": "查一下"}]
-    window._log_interaction_stage = lambda *_args, **_kwargs: None
-    window._record_history = lambda *args, **_kwargs: history.append(args)
-    window._record_assistant_reply_history = (
-        PetWindow._record_assistant_reply_history.__get__(window, type(window))
-    )
-
     window._handle_progress_reply(
         AgentProgress(
             reply=parse_chat_reply(
-                '{"segments":[{"ja":"調べるね。","zh":"我查一下。","tone":"中性"}]}'
-            )
+                '{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"中性"}]}'
+            ),
+            stage="tool_planning",
         )
+    )
+
+    assert len(window.messages) == 1
+    assert window.spoken == []
+
+
+def test_web_progress_reply_shows_bubble_and_speaks_tts() -> None:
+    from app.agent import AgentProgress
+    from app.llm.chat_reply import ChatReply, ChatSegment
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class FakeSubtitle:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def set_speech(self, text: str, pulse: bool = False) -> None:
+            self.texts.append(text)
+
+    class FakePlayback:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def speak_segment(self, segment, sequence_id, on_started, on_finished) -> None:
+            self.calls.append((segment.text, sequence_id))
+            on_started()
+            on_finished()
+
+    class MinimalProgressWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        subtitle_language = "ja"
+
+    window = MinimalProgressWindow()
+    window._shutdown_in_progress = False
+    window.messages = [{"role": "user", "content": "查一下"}]
+    window.ui_state = type("S", (), {"begin_streaming": lambda *_a, **_k: None})()
+    window._log_interaction_stage = lambda *_a, **_k: None
+    window.subtitle_controller = FakeSubtitle()
+    window.voice_playback_controller = FakePlayback()
+    window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
+
+    segment = ChatSegment("調べるね。", "中性", "我查一下。", suppress_tts=False)
+    window._handle_progress_reply(
+        AgentProgress(reply=ChatReply([segment]), stage="web_planning")
     )
 
     assert window.messages[-1]["role"] == "assistant"
     assert window.messages[-1]["content"] == "調べるね。"
     assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
-    assert history[-1] == ("assistant", "調べるね。", "我查一下。", "中性", "")
+    assert window.subtitle_controller.texts == ["調べるね。"]
+    assert window.voice_playback_controller.calls == [("調べるね。", 0)]
 
 
-def test_progress_reply_records_segments_as_separate_history_entries() -> None:
-    pytest.skip("personal fork — chat pipeline differs")
+def test_web_fetch_progress_reply_skips_tts_when_suppressed() -> None:
     from app.agent import AgentProgress
-    from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+    from app.llm.chat_reply import ChatReply, ChatSegment
+    from app.ui.pet_window import PetWindow
+
+    class FakePlayback:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def speak_segment(self, *args, **kwargs) -> None:
+            self.calls.append(args)
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
-        _record_assistant_reply_history = PetWindow._record_assistant_reply_history
+        subtitle_language = "zh"
 
     window = MinimalProgressWindow()
-    from app.ui.state import PetUiStateStore
-    window.ui_state = PetUiStateStore()
-    history = []
-    window.messages = [{"role": "user", "content": "查一下"}]
-    window._log_interaction_stage = lambda *_args, **_kwargs: None
-    window._record_history = lambda *args, **_kwargs: history.append(args)
+    window._shutdown_in_progress = False
+    window.messages = []
+    window.ui_state = type("S", (), {"begin_streaming": lambda *_a, **_k: None})()
+    window._log_interaction_stage = lambda *_a, **_k: None
+    window.subtitle_controller = type(
+        "Sub", (), {"set_speech": lambda *a, **k: None}
+    )()
+    window.voice_playback_controller = FakePlayback()
+    window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
 
+    segment = ChatSegment("ページ要約。", "中性", "页面摘要。", suppress_tts=True)
     window._handle_progress_reply(
-        AgentProgress(
-            reply=parse_chat_reply(
-                '{"segments":['
-                '{"ja":"一つ目。","zh":"第一段。","tone":"中性"},'
-                '{"ja":"二つ目。","zh":"第二段。","tone":"中性"}'
-                "]}"
-            )
-        )
+        AgentProgress(reply=ChatReply([segment]), stage="web_fetch")
     )
 
-    assert window.messages[-1]["role"] == "assistant"
-    assert window.messages[-1]["content"] == "一つ目。\n二つ目。"
-    assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
-    assert history == [
-        ("assistant", "一つ目。", "第一段。", "中性", ""),
-        ("assistant", "二つ目。", "第二段。", "中性", ""),
-    ]
+    assert window.messages[-1]["content"] == "页面摘要。"
+    assert window.voice_playback_controller.calls == []
 
 
 def test_assistant_reply_history_records_tone_and_portrait() -> None:

@@ -122,7 +122,7 @@ def main() -> int:
                 "tts_route": "skip_bubble_only" if seg.suppress_tts else "speak",
             }
             segs.append(item)
-            # 过程旁白约定 suppress_tts=True，不应进 TTS
+            # web_planning/web_search 旁白可播 TTS；web_fetch 等长摘要仍 suppress
             if not seg.suppress_tts and seg.text.strip():
                 tts_jobs.append(
                     {

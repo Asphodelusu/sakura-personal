@@ -837,18 +837,45 @@ class OpenAICompatibleClient:
                 client = self._http_client()
                 response = client.request(method, path, **request_kwargs)
                 response_body = response.text
-                debug_log(
-                    "API",
-                    "HTTP 请求成功",
-                    {
-                        "attempt": attempt,
-                        "status": response.status_code,
-                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                        "response_body": response_body,
-                    },
-                )
-                return response_body
+                status_code = int(response.status_code)
+                url = str(getattr(response, "url", "") or path)
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                # httpx 默认不 raise_for_status；必须显式检查，否则 401 体会被当 JSON 误解析。
+                if status_code >= 400:
+                    debug_log(
+                        "API",
+                        "HTTP 请求失败",
+                        {
+                            "attempt": attempt,
+                            "status": status_code,
+                            "elapsed_ms": elapsed_ms,
+                            "error_body": response_body,
+                        },
+                    )
+                    if (
+                        status_code not in {429, 500, 502, 503, 504}
+                        or attempt == MAX_API_RETRY_ATTEMPTS
+                    ):
+                        raise ApiRequestError(
+                            _format_api_http_error(status_code, response_body, url)
+                        )
+                    last_error = ApiRequestError(
+                        _format_api_http_error(status_code, response_body, url)
+                    )
+                else:
+                    debug_log(
+                        "API",
+                        "HTTP 请求成功",
+                        {
+                            "attempt": attempt,
+                            "status": status_code,
+                            "elapsed_ms": elapsed_ms,
+                            "response_body": response_body,
+                        },
+                    )
+                    return response_body
             except httpx.HTTPStatusError as exc:
+                # 若上层启用了 raise_for_status，仍走同一套格式化与重试。
                 error_body = exc.response.text
                 status_code = exc.response.status_code
                 url = str(exc.request.url) if exc.request is not None else path

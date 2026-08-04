@@ -2838,7 +2838,7 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
 
     assert "observe_screen" in client.prompts[0]
     assert "主动获取上下文策略" in client.prompts[0]
-    assert "对方话很短含糊" in client.prompts[0] or "对方话很短" in client.prompts[0]
+    assert "不要把看屏当成每轮默认动作" in client.prompts[0]
     assert "不要重复截图" in client.prompts[0]
     assert [progress.reply.translation for progress in progress_replies] == ["我看看。"]
     assert result.actions
