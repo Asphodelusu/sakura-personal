@@ -192,6 +192,7 @@ def summarize_visual_observation(
             temperature=0.2,
             cancel_checker=cancel_checker,
             task="vision",
+            thinking={"type": "disabled"},
         )
     except OperationCancelled:
         raise

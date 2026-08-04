@@ -1188,6 +1188,19 @@ def test_pet_window_registers_runtime_services_in_registry_order() -> None:
     assert order == ["memory", "tts", "mcp", "renderer", "plugins"]
 
 
+def test_message_implies_away_requires_explicit_departure() -> None:
+    from app.ui.pet_window import message_implies_away
+
+    assert message_implies_away("聊睡觉的事情") is None
+    assert message_implies_away("我们说睡眠质量") is None
+    assert message_implies_away("睡不着怎么办") is None
+    assert message_implies_away("今天要睡了吗") is None
+    assert message_implies_away("晚安") == "晚安"
+    assert message_implies_away("我去睡了") == "我去睡了"
+    assert message_implies_away("先走了") == "先走了"
+    assert message_implies_away("别回我") == "别回"
+
+
 def test_shutdown_ignores_late_progress_and_reply() -> None:
     from app.agent import AgentProgress, AgentResult
     from app.llm.chat_reply import parse_chat_reply

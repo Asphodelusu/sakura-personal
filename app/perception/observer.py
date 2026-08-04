@@ -1569,6 +1569,7 @@ class ProactiveObserver:
             "messages": messages,
             "temperature": self.config.eval_temperature,
             "max_tokens": self.config.max_tokens,
+            "thinking": {"type": "disabled"},
         }
 
         resp = await self._http.post(url, headers=headers, json=payload)

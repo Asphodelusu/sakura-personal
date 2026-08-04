@@ -509,6 +509,97 @@ class ScreenObservationEncodeWorker(QObject):
         self.finished.emit(self.context, observation)
 
 
+# 离开意图：必须是明确道别/暂停观察，不能把「聊睡觉」这类话题词当成 away。
+_AWAY_PHRASES: tuple[str, ...] = (
+    "我出去了",
+    "先走了",
+    "出门了",
+    "我走了",
+    "离开一下",
+    "我出去了哦",
+    "别回",
+    "不要回",
+    "别说话",
+    "不用回",
+    "不用说话",
+    "暂时不要说话",
+    "忙去了",
+    "去忙了",
+    "工作去了",
+    "开会去了",
+    "我去睡了",
+    "我去睡觉",
+    "去睡觉了",
+    "去睡了",
+    "先睡了",
+    "要睡了",
+    "该睡了",
+    "晚安",
+    "おやすみ",
+    "お休み",
+)
+_AWAY_SLEEP_PHRASES = frozenset(
+    {
+        "我去睡了",
+        "我去睡觉",
+        "去睡觉了",
+        "去睡了",
+        "先睡了",
+        "要睡了",
+        "该睡了",
+        "晚安",
+        "おやすみ",
+        "お休み",
+    }
+)
+# 这些出现时，说明在聊睡觉/睡眠话题，而不是宣告离开去睡。
+_AWAY_TOPIC_BLOCKERS: tuple[str, ...] = (
+    "睡不着",
+    "失眠",
+    "睡眠",
+    "午睡",
+    "聊睡",
+    "说睡",
+    "谈睡",
+    "睡觉的事",
+    "睡觉的事情",
+    "关于睡",
+    "梦见",
+    "做梦",
+    "想睡觉吗",
+    "要不要睡",
+)
+_AWAY_QUESTION_MARKERS: tuple[str, ...] = ("吗", "麼", "么", "?", "？", "呢")
+
+
+def message_implies_away(text: str) -> str | None:
+    """若用户话明确表示离开/去睡/别回，返回命中短语；否则 None。"""
+    normalized = "".join((text or "").split())
+    if not normalized:
+        return None
+    topic_like = any(blocker in normalized for blocker in _AWAY_TOPIC_BLOCKERS)
+    is_question = any(marker in normalized for marker in _AWAY_QUESTION_MARKERS)
+    for phrase in _AWAY_PHRASES:
+        if phrase not in normalized:
+            continue
+        # 话题讨论里的「要睡了」等不算；晚安/おやすみ仍算道别。
+        if topic_like and phrase in _AWAY_SLEEP_PHRASES and phrase not in {
+            "晚安",
+            "おやすみ",
+            "お休み",
+        }:
+            continue
+        # 「要睡了吗 / 该睡了么」是在问，不是宣告离开。
+        if (
+            is_question
+            and phrase in _AWAY_SLEEP_PHRASES
+            and phrase not in {"晚安", "おやすみ", "お休み"}
+        ):
+            continue
+        return phrase
+    return None
+
+
 def _screen_observation_max_edge_from_context(context: dict[str, Any]) -> int:
     value = context.get("max_edge")
     try:
@@ -3449,13 +3540,6 @@ class PetWindow(QWidget):
     # Away mode detection — user explicitly says they're leaving
     # ------------------------------------------------------------------
 
-    _AWAY_PATTERNS: tuple[tuple[str, ...], ...] = (
-        ("我出去了", "先走了", "出门了", "我走了", "离开一下", "我出去了哦"),
-        ("别回", "不要回", "别说话", "不用回", "不用说话", "暂时不要说话"),
-        ("忙去了", "去忙", "工作去了", "开会去了"),
-        ("睡", "晚安", "おやすみ"),
-    )
-
     def _detect_away_from_message(self, text: str) -> None:
         """检测用户消息是否隐含'我要离开'意图，触发 away_mode。
 
@@ -3467,17 +3551,14 @@ class PetWindow(QWidget):
         if observer.away_mode:
             return  # already in away mode
 
-        text_lower = text.lower()
-        for group in self._AWAY_PATTERNS:
-            for keyword in group:
-                if keyword in text:
-                    debug_log(
-                        "PetWindow",
-                        "检测到离开意图，触发 away_mode",
-                        {"keyword": keyword, "text": text[:80]},
-                    )
-                    observer.set_away_mode(True)
-                    return
+        hit = message_implies_away(text)
+        if hit:
+            debug_log(
+                "PetWindow",
+                "检测到离开意图，触发 away_mode",
+                {"keyword": hit, "text": text[:80]},
+            )
+            observer.set_away_mode(True)
 
     def _mark_user_activity(self, *, proactive: bool = True) -> None:
         """记录用户活动。
