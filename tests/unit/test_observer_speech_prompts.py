@@ -40,3 +40,12 @@ def test_vlm_prompt_vision_only_no_full_uia_pipeline() -> None:
     assert "全文テキストはあなたには渡されない" in text
     # 同应用内容切换 ≠ 慌乱切窗
     assert "同一アプリ" in text
+    # 右下角桌宠 / 自己的台词不得当屏上内容
+    assert "右下" in text
+    assert "自分のセリフ" in text or "吹き出し" in text
+
+
+def test_speech_decision_ignores_own_bubble_text() -> None:
+    text = _SPEECH_DECISION_INSTRUCTION
+    assert "自問自答" in text
+    assert "吹き出し" in text

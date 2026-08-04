@@ -944,11 +944,11 @@ def test_memory_store_builds_layered_context_with_core_profile() -> None:
 
     context = store.build_memory_context("", mode="tool")
 
-    assert "【常驻档案】" in context
+    assert "【常驻档案" in context
     assert "主人长期偏好中文沟通" in context
     assert "【当前任务记忆】" in context
     assert "【相关长期事实】" in context
-    assert "【协作规则与偏好】" in context
+    assert "【相处习惯与偏好】" in context
     episodic_context = store.build_memory_context("上次", mode="event")
     assert "【过往事件总结】" in episodic_context
 

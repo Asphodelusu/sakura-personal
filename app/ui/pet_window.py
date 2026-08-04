@@ -3955,7 +3955,7 @@ class PetWindow(QWidget):
         if getattr(self, "_shutdown_in_progress", False):
             return
         reply = progress.reply
-        if not reply.text.strip():
+        if not reply.text.strip() and not reply.translation.strip():
             return
         self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
@@ -3975,13 +3975,28 @@ class PetWindow(QWidget):
                 "metadata": progress.metadata,
             },
         )
+        display = reply.display_text(self.subtitle_language) or reply.text
         self.messages.append(
             {
                 "role": "assistant",
-                "content": reply.text,
+                "content": display,
                 TRANSIENT_PROGRESS_MESSAGE_KEY: True,
             }
         )
+        # 过程旁白：立刻显示在气泡里（不入正式回复队列 / 不抢最终 TTS）。
+        segment = reply.segments[0] if reply.segments else None
+        bubble_text = (
+            segment.display_text(self.subtitle_language)
+            if segment is not None
+            else display
+        ).strip()
+        if bubble_text:
+            controller = getattr(self, "bubble_auto_hide", None)
+            if controller is not None:
+                controller.notify_speaking()
+            subtitle_controller = getattr(self, "subtitle_controller", None)
+            if subtitle_controller is not None:
+                subtitle_controller.set_speech(bubble_text, pulse=True)
         # 不回写历史记录：_handle_reply 收到最终回复后再统一写
 
     def _remove_transient_progress_messages(self) -> None:
@@ -5984,11 +5999,11 @@ class PetWindow(QWidget):
         self.memory_failure_dialog_last_message = message
         show_themed_warning(
             self,
-            "记忆模型下载失败",
+            "记忆模型未就绪",
             format_failure_message(
-                "长期记忆所需的本地模型没有下载成功。",
-                "请按诊断信息中的 Release 链接下载 ZIP 后在设置页手动导入，"
-                "或开启代理并重启 Sakura 重新下载。",
+                "长期记忆所需的本地嵌入模型尚未安装或加载失败。",
+                "请到设置页「记忆」→ 记忆检索模型 在线安装，"
+                "或手动导入 HuggingFace hub 缓存 ZIP（目录名通常为 models--BAAI--bge-m3）。",
                 message,
             ),
         )

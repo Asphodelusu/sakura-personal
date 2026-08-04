@@ -22,7 +22,15 @@ class HuggingFaceEmbedding(EmbeddingBase):
         else:
             self.config.model = self.config.model or "multi-qa-MiniLM-L6-cos-v1"
 
-            self.model = SentenceTransformer(self.config.model, **self.config.model_kwargs)
+            model_kwargs = dict(self.config.model_kwargs or {})
+            # Sakura / desktop: allow capping seq length without breaking ST ctor kwargs.
+            max_seq_length = model_kwargs.pop("max_seq_length", None)
+            self.model = SentenceTransformer(self.config.model, **model_kwargs)
+            if max_seq_length is not None:
+                try:
+                    self.model.max_seq_length = int(max_seq_length)
+                except (TypeError, ValueError):
+                    pass
 
             self.config.embedding_dims = self.config.embedding_dims or self.model.get_sentence_embedding_dimension()
 

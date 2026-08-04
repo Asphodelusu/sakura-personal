@@ -15,6 +15,11 @@ from app.agent.memory import (
     memory_record_is_reflection,
     _bounded_float,
 )
+from app.agent.memory_query_rewrite import (
+    MemoryQueryPlan,
+    rewrite_memory_query,
+)
+from app.agent.memory_rerank import rerank_memory_candidates
 from app.agent.persona_state import (
     PersonaState,
     emotion_congruence_factor,
@@ -24,12 +29,10 @@ from app.llm.prompts.types import ContextFragment, ContextRequest
 
 
 DEFAULT_MEMORY_RECALL_LIMIT = 5
-DEFAULT_MEMORY_RECALL_CANDIDATES = 10
-# all-MiniLM 这类轻量嵌入模型的余弦相似度天然偏低（实测相关命中也常在 0.3~0.45），
-# 0.5 会把所有候选都过滤掉、令自动召回形同虚设。用 0.3 作为去噪下限，配合 top-k=5
-# 与按分排序，既挡住明显无关项，又能让最相关的少量记忆进入上下文。
+# 与改写后的更干净 query 配合：候选略放大，再由阈值+软因子压到 limit。
+DEFAULT_MEMORY_RECALL_CANDIDATES = 30
+# bge-m3 / 前代中文 bge 相关命中常见在 0.3+；过严会让自动召回空转。
 DEFAULT_MEMORY_RELEVANCE_THRESHOLD = 0.3
-MAX_MEMORY_QUERY_CHARS = 4000
 
 # 用户在问旧事时，才允许把已失效记忆召回进上下文（默认只取「当前为真」）。
 _PAST_LOOKING_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -114,13 +117,20 @@ class MemoryRecallService:
         *,
         limit: int = DEFAULT_MEMORY_RECALL_LIMIT,
         threshold: float = DEFAULT_MEMORY_RELEVANCE_THRESHOLD,
+        query_rewriter_client: Any | None = None,
     ) -> None:
         self.memory = memory
         self.limit = max(1, limit)
         self.threshold = threshold
+        self._query_rewriter_client = query_rewriter_client
+
+    def set_query_rewriter_client(self, client: Any | None) -> None:
+        """注入 chat_fast 等轻量客户端，供自动召回 query 改写。"""
+        self._query_rewriter_client = client
 
     def recall(self, request: ContextRequest, *, light_mode: bool = False) -> MemoryRecallResult:
-        query = _build_memory_query(request)
+        plan = self._plan_query(request)
+        query = plan.query
         if not query:
             return MemoryRecallResult(query="")
 
@@ -137,6 +147,8 @@ class MemoryRecallService:
                     "query": query,
                     "limit": limit,
                     "include_expired": include_expired,
+                    # 实体扩展后再统一 rerank，避免对同一批候选打两遍分。
+                    "skip_rerank": True,
                 },
                 wait=False,
             )
@@ -162,6 +174,13 @@ class MemoryRecallService:
         )
         if expanded:
             memories = _deduplicate_memories(memories + expanded)
+
+        # 向量粗捞之后用 cross-encoder 精排；实体 hop 无语义分时也能被正确抬/压。
+        memories = rerank_memory_candidates(
+            query,
+            memories if isinstance(memories, list) else [],
+            base_dir=self.memory.base_dir,
+        )
 
         # 回忆强化：只批量点查本轮候选（通常 <=15 条），不管历史累计追踪了多少条，
         # 与旧的"整份 JSON 读入内存"相比，开销只与本轮候选数成正比。
@@ -206,6 +225,9 @@ class MemoryRecallService:
             for index, memory in enumerate(selected)
         )
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
+
+    def _plan_query(self, request: ContextRequest) -> MemoryQueryPlan:
+        return rewrite_memory_query(request, client=self._query_rewriter_client)
 
 
 def _annotate_recalled_memory_content(memory: dict[str, Any], *, now: datetime) -> str:
@@ -255,19 +277,8 @@ def _recall_fragment_token_budget(memory: dict[str, Any]) -> int:
 
 
 def _build_memory_query(request: ContextRequest) -> str:
-    parts: list[str] = []
-    if request.current_input.strip():
-        parts.append(request.current_input.strip())
-    recent_user = [
-        message.content.strip()
-        for message in request.recent_messages
-        if message.role == "user" and message.content.strip()
-    ]
-    parts.extend(recent_user[-2:])
-    parts.extend(summary.strip() for summary in request.visual_summaries if summary.strip())
-    unique = list(dict.fromkeys(parts))
-    query = "\n".join(unique).strip()
-    return query[:MAX_MEMORY_QUERY_CHARS].rstrip()
+    """兼容旧调用：返回改写后的自动召回 query。"""
+    return rewrite_memory_query(request, client=None).query
 
 
 def _resolve_recall_persona(memory_store: MemoryStore, query: str) -> PersonaState:

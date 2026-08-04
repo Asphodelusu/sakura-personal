@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import time
 import types
 import uuid
 import wave
@@ -268,6 +269,18 @@ def test_sink_player_accepts_valid_16bit_stereo_wav() -> None:
     assert channels == 2
     assert sample_rate == 44100
     assert total_pcm_bytes > 0
+
+
+def test_active_drain_rechecks_cover_remaining_duration() -> None:
+    """长音频在 ActiveState 下复查次数必须覆盖剩余时长，不能固定约 6 秒就强制收尾。"""
+    player = AudioSinkPlayer()
+    player._started_at = time.perf_counter()
+    player._duration_ms = 36_000
+    # 刚开播：剩余约 36s + 宽限，复查次数应远大于旧硬顶 20
+    assert player._max_active_drain_rechecks() >= 100
+    # 模拟已接近播完：只剩很少复查
+    player._started_at = time.perf_counter() - 35.5
+    assert player._max_active_drain_rechecks() >= 20
 
 
 def test_sink_player_do_finish_is_exactly_once() -> None:

@@ -199,7 +199,10 @@ class AgentRuntime:
         self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
         self.prompt_runtime = PromptRuntime()
         self.context_orchestrator = ContextOrchestrator()
-        self.memory_recall = MemoryRecallService(self.memory)
+        self.memory_recall = MemoryRecallService(
+            self.memory,
+            query_rewriter_client=self._chat_fast_api_client,
+        )
         self._inner_thought_window = InnerThoughtWindow(
             self.inner_thought_settings.window_size
         )
@@ -228,6 +231,9 @@ class AgentRuntime:
     @chat_fast_api_client.setter
     def chat_fast_api_client(self, client: OpenAICompatibleClient | None) -> None:
         self._chat_fast_api_client = client
+        # 自动召回 query 改写共用 chat_fast（未配置时走启发式）。
+        if hasattr(self, "memory_recall"):
+            self.memory_recall.set_query_rewriter_client(client)
 
     @property
     def inner_thought_api_client(self) -> OpenAICompatibleClient | None:
@@ -667,20 +673,27 @@ class AgentRuntime:
         runtime_context: str,
         cancel_checker: CancelChecker | None = None,
         turn_state: TurnState | None = None,
+        web_lookup_completed: bool = False,
     ) -> str:
         """工具规划轮结束后，用不含 tools 的请求专门合成 JSON segments。"""
         check_cancelled(cancel_checker)
         text_messages = strip_image_parts_from_messages(working_messages)
+        if web_lookup_completed:
+            compose_nudge = (
+                "检索/读页阶段已结束。请阅读上方【联网证据】与 tool 结果，"
+                "输出本轮给对方的最终 Sakura 回复（回答问题本身，不要再说正在查询）。"
+                "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
+                "不要调用工具，不要解释，不要使用 Markdown。"
+            )
+        else:
+            compose_nudge = (
+                "请根据以上对话与工具执行结果（如有），输出本轮给对方的最终 Sakura 回复。"
+                "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
+                "不要调用工具，不要解释，不要使用 Markdown。"
+            )
         compose_messages: list[ChatMessage] = [
             *text_messages,
-            {
-                "role": "user",
-                "content": (
-                    "请根据以上对话与工具执行结果（如有），输出本轮给对方的最终 Sakura 回复。"
-                    "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
-                    "不要调用工具，不要解释，不要使用 Markdown。"
-                ),
-            },
+            {"role": "user", "content": compose_nudge},
         ]
         # 与工具轮一致：沿用 TurnPlan 的 client + thinking 开关。
         # 旧逻辑只在 tier=fast 时带 generation_params，导致 standard 闲聊的
@@ -760,6 +773,7 @@ class AgentRuntime:
         memory_fragments: tuple[Any, ...] | list[Any] | None = None,
         memory_status: str | None = None,
         reuse_memory_fragments: bool = False,
+        execution_results: list[ToolExecutionResult] | None = None,
     ) -> ChatReply:
         """工具循环结束后，用单次结构化请求合成最终 segments。"""
         snapshot = self._build_single_context_snapshot(
@@ -768,7 +782,27 @@ class AgentRuntime:
             memory_fragments=memory_fragments if reuse_memory_fragments else None,
             memory_status=memory_status if reuse_memory_fragments else None,
         )
-        prompt_build = self._build_final_reply_result(snapshot)
+        has_web_evidence = _working_messages_have_web_search_evidence(working_messages) or bool(
+            execution_results and _turn_had_successful_web_search(execution_results)
+        )
+        extra_parts: list[str] = []
+        if has_web_evidence:
+            extra_parts.append(
+                "检索阶段已经结束：上方有【联网证据】摘要，以及 web_search/读页的 tool 结果。"
+                "请据此直接回答对方；这不是还在搜索的中间态。"
+            )
+        if tool_routing._latest_user_is_deep_web_lookup(working_messages):
+            extra_parts.append(
+                "对方在问作品或资料的具体内容。请优先吃搜索结果里的 digest/长摘要，其次才是网页正文。"
+                "尽量从证据里抽出：类型、开发者/作者、平台、年份、标签，以及剧情主题、章节/结构、主要角色；"
+                "摘要里出现的具体信息不要丢掉。若涉及剧透先轻轻提醒再概括。"
+                "正文抓取失败或没有正文时，仍要用摘要尽量答完整；只有证据明显无关时才说没找到。"
+                "不要把名字相近的其他作品当成目标。用你自己的语气说，可以条理清晰，但不要写成客服报告。"
+            )
+        prompt_build = self._build_final_reply_result(
+            snapshot,
+            extra_instructions="\n".join(extra_parts),
+        )
         self._record_prompt_inspection(prompt_build.inspection)
         raw_content = self._compose_structured_final_reply(
             prompt_build.system_prompt,
@@ -776,6 +810,7 @@ class AgentRuntime:
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
             turn_state=turn_state,
+            web_lookup_completed=has_web_evidence,
         )
         parsed = self._parse_final_reply_with_retry(
             prompt_build.system_prompt,
@@ -1330,6 +1365,23 @@ class AgentRuntime:
                     actions=emitted_actions,
                 )
 
+            web_planned = any(
+                call.name in {"web__web_search", "web_search", "web__fetch_url", "fetch_url"}
+                for call in turn.tool_calls
+            )
+            if web_planned and step_index == 0 and not (turn.content or "").strip():
+                _emit_progress_reply(
+                    progress_callback,
+                    ja="ちょっと調べてみるね。",
+                    zh="我查查。",
+                    stage="web_planning",
+                    metadata={
+                        "step_index": step_index,
+                        "tool_names": [call.name for call in turn.tool_calls],
+                    },
+                    cancel_checker=cancel_checker,
+                )
+
             _emit_progress_from_content(
                 progress_callback,
                 turn.content,
@@ -1539,6 +1591,45 @@ class AgentRuntime:
                         payload=_redact_tool_result_for_model(prepared),
                     )
                 )
+                if (
+                    call.name in {"web__web_search", "web_search"}
+                    and prepared.success
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
+                ):
+                    ja, zh = tool_routing.build_web_search_progress_texts(prepared)
+                    _emit_progress_reply(
+                        progress_callback,
+                        ja=ja,
+                        zh=zh,
+                        stage="web_search",
+                        metadata={
+                            "step_index": step_index,
+                            "tool_names": [call.name],
+                        },
+                        cancel_checker=cancel_checker,
+                    )
+                elif (
+                    call.name in {"web__fetch_url", "fetch_url"}
+                    and prepared.success
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("auto_fetched"))
+                ):
+                    fetch_index = len(tool_routing._successful_web_fetches(execution_results))
+                    ja, zh = tool_routing.build_web_fetch_progress_texts(
+                        prepared,
+                        index=max(1, fetch_index),
+                    )
+                    _emit_progress_reply(
+                        progress_callback,
+                        ja=ja,
+                        zh=zh,
+                        stage="web_fetch",
+                        metadata={
+                            "step_index": step_index,
+                            "tool_names": [call.name],
+                        },
+                        cancel_checker=cancel_checker,
+                    )
 
             skipped_calls = len(turn.tool_calls) - allowed_calls
             if skipped_calls > 0:
@@ -1619,6 +1710,162 @@ class AgentRuntime:
                     snapshot_result,
                 )
 
+            if tool_routing._should_refine_web_search(working_messages, execution_results):
+                refined_query = tool_routing.build_refined_web_search_query(working_messages)
+                if refined_query:
+                    check_cancelled(cancel_checker)
+                    try:
+                        from app.agent.mcp import web_search_server as web_mod
+
+                        refined_payload = web_mod.search_web(refined_query, max_results=5)
+                        refined_result = ToolExecutionResult(
+                            tool_name="web__web_search",
+                            success=bool(refined_payload.get("results")),
+                            content={**refined_payload, "refined_query": refined_query},
+                            error="",
+                        )
+                    except Exception as exc:
+                        refined_result = ToolExecutionResult(
+                            tool_name="web__web_search",
+                            success=False,
+                            content={"query": refined_query, "refined_query": refined_query},
+                            error=str(exc),
+                        )
+                    step_results.append(refined_result)
+                    execution_results.append(refined_result)
+                    refined_call = NativeToolCall(
+                        id=f"auto_web_search_refine_{step_index}",
+                        name="web__web_search",
+                        arguments={"query": refined_query},
+                        arguments_json="{}",
+                    )
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            refined_call,
+                            refined_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(refined_result),
+                        )
+                    )
+                    if refined_result.success:
+                        ja, zh = tool_routing.build_web_search_progress_texts(refined_result)
+                        _emit_progress_reply(
+                            progress_callback,
+                            ja=ja or "もう少し絞って調べてみる。",
+                            zh=zh or "我再换个更准的关键词查一下。",
+                            stage="web_search",
+                            metadata={
+                                "step_index": step_index,
+                                "tool_names": ["web__web_search"],
+                                "refined": True,
+                            },
+                            cancel_checker=cancel_checker,
+                        )
+
+            if tool_routing._should_auto_fetch_after_web_search(
+                working_messages,
+                step_results,
+                execution_results,
+            ):
+                user_query = tool_routing._latest_user_text(working_messages) or ""
+                auto_urls = tool_routing._select_urls_for_auto_fetch(
+                    tool_routing._successful_web_searches(step_results),
+                    max_urls=4,
+                    query=user_query,
+                )
+
+                def _on_auto_fetch_page(fetch_index: int, fetch_result: ToolExecutionResult) -> None:
+                    check_cancelled(cancel_checker)
+                    step_results.append(fetch_result)
+                    execution_results.append(fetch_result)
+                    fetch_url = ""
+                    reader = "fetch_url"
+                    if isinstance(fetch_result.content, dict):
+                        fetch_url = str(fetch_result.content.get("url") or "")
+                        reader = str(fetch_result.content.get("reader") or reader)
+                    tool_name = fetch_result.tool_name or "web__fetch_url"
+                    auto_call = NativeToolCall(
+                        id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                        name=tool_name,
+                        arguments={"url": fetch_url},
+                        arguments_json="{}",
+                    )
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            auto_call,
+                            fetch_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(fetch_result),
+                        )
+                    )
+                    ja, zh = tool_routing.build_web_fetch_progress_texts(
+                        fetch_result,
+                        index=fetch_index,
+                    )
+                    if ja or zh:
+                        _emit_progress_reply(
+                            progress_callback,
+                            ja=ja,
+                            zh=zh,
+                            stage="web_fetch",
+                            metadata={
+                                "step_index": step_index,
+                                "tool_names": [tool_name],
+                                "auto_fetched": True,
+                                "page_index": fetch_index,
+                                "reader": reader,
+                            },
+                            cancel_checker=cancel_checker,
+                        )
+
+                auto_fetch_results = tool_routing._execute_auto_web_fetches(
+                    auto_urls,
+                    step_index=step_index,
+                    max_keep=3,
+                    enough_chars=1600,
+                    on_page=_on_auto_fetch_page,
+                    tools=self.tools,
+                )
+                # 全部失败时仍写入一条失败结果，便于日志与收束。
+                if auto_fetch_results and not any(item.success for item in auto_fetch_results):
+                    for fetch_index, fetch_result in enumerate(auto_fetch_results, start=1):
+                        check_cancelled(cancel_checker)
+                        step_results.append(fetch_result)
+                        execution_results.append(fetch_result)
+                        fetch_url = ""
+                        if isinstance(fetch_result.content, dict):
+                            fetch_url = str(fetch_result.content.get("url") or "")
+                        tool_name = fetch_result.tool_name or "web__fetch_url"
+                        auto_call = NativeToolCall(
+                            id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                            name=tool_name,
+                            arguments={"url": fetch_url},
+                            arguments_json="{}",
+                        )
+                        tool_messages.extend(
+                            _build_tool_messages_for_result(
+                                auto_call,
+                                fetch_result,
+                                include_images=self.model_vision_enabled,
+                            )
+                        )
+                        emitted_actions.append(
+                            AgentAction(
+                                type="tool_call",
+                                payload=_redact_tool_result_for_model(fetch_result),
+                            )
+                        )
+
             if not should_fast_forward_final_reply and tool_routing._should_fast_forward_after_web_search(
                 working_messages,
                 execution_results,
@@ -1630,6 +1877,8 @@ class AgentRuntime:
                     {
                         "step_index": step_index,
                         "tool_result_count": len(execution_results),
+                        "deep_lookup": tool_routing._latest_user_is_deep_web_lookup(working_messages),
+                        "fetch_count": len(tool_routing._successful_web_fetches(execution_results)),
                     },
                 )
 
@@ -1694,12 +1943,17 @@ class AgentRuntime:
             ):
                 memory_needs_refresh = True
             if should_fast_forward_final_reply:
+                # 搜/读已完成：把确定性证据包放进上下文，避免终局合成仍处在「还在查」的中间态。
+                evidence_packet = _build_web_search_evidence_packet_message(execution_results)
+                if evidence_packet is not None:
+                    working_messages.append(evidence_packet)
                 debug_log(
                     "AgentRuntime",
                     "工具结果已足够，进入最终总结",
                     {
                         "step_index": step_index,
                         "tool_result_count": len(execution_results),
+                        "web_evidence_packet": evidence_packet is not None,
                         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                     },
                 )
@@ -1718,6 +1972,7 @@ class AgentRuntime:
                 memory_fragments=turn_memory_fragments,
                 memory_status=memory_status,
                 reuse_memory_fragments=not memory_needs_refresh,
+                execution_results=execution_results,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -2330,12 +2585,20 @@ class AgentRuntime:
             None, extra_instructions=extra_instructions
         ).system_prompt
 
-    def _build_final_reply_result(self, snapshot: ContextSnapshot | None = None):
+    def _build_final_reply_result(
+        self,
+        snapshot: ContextSnapshot | None = None,
+        *,
+        extra_instructions: str = "",
+    ):
         final_instructions = (
             "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
             "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
-            "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。"
+            "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。\n"
+            "若工具结果里已有搜索摘要或网页正文，禁止用「稍等/正在查/今調べてる」搪塞，必须作答。"
         )
+        if extra_instructions.strip():
+            final_instructions = f"{final_instructions}\n{extra_instructions.strip()}"
         if self._turn_verbosity_guidance.strip():
             final_instructions = (
                 f"{final_instructions}\n\n{self._turn_verbosity_guidance.strip()}"
@@ -2504,8 +2767,58 @@ def _emit_progress_from_content(
         debug_log("AgentRuntime", "中间回复回调失败，已忽略", {"error": str(exc), "stage": stage})
 
 
+def _progress_reply_suppress_tts(stage: str) -> bool:
+    """过程旁白是否静音。
+
+    「我查查」「搜到了…我先打开看看」落在搜索/开页等待空档，短句可播；
+    读页摘要等较长旁白仍静音，避免和最终回答抢麦。
+    """
+    return stage not in {"web_planning", "web_search"}
+
+
+def _emit_progress_reply(
+    progress_callback: ProgressCallback | None,
+    *,
+    ja: str,
+    zh: str,
+    stage: str,
+    metadata: dict[str, Any],
+    cancel_checker: CancelChecker | None = None,
+    suppress_tts: bool | None = None,
+) -> None:
+    """发送联网搜索过程旁白（不依赖模型 planning content）。"""
+    check_cancelled(cancel_checker)
+    if progress_callback is None:
+        return
+    ja_text = (ja or "").strip()
+    zh_text = (zh or "").strip()
+    if not ja_text and not zh_text:
+        return
+    quiet = _progress_reply_suppress_tts(stage) if suppress_tts is None else suppress_tts
+    reply = ChatReply(
+        [
+            ChatSegment(
+                text=ja_text or zh_text,
+                translation=zh_text or ja_text,
+                tone="中性",
+                suppress_tts=quiet,
+            )
+        ]
+    )
+    try:
+        check_cancelled(cancel_checker)
+        progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        debug_log("AgentRuntime", "过程旁白回调失败，已忽略", {"error": str(exc), "stage": stage})
+
+
 def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     """只播报关键等待点，避免工具链每一步都打断用户。"""
+    stage = str(metadata.get("stage") or "")
+    if stage.startswith("web_"):
+        return True
     step_index = metadata.get("step_index")
     if not isinstance(step_index, int):
         return True
@@ -2514,6 +2827,8 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     tool_names = metadata.get("tool_names", [])
     if not isinstance(tool_names, list):
         return False
+    if any(str(name).startswith(("web__", "web_")) for name in tool_names):
+        return True
     return any(str(name).startswith("windows__") for name in tool_names)
 
 
@@ -2600,9 +2915,84 @@ _WEB_SEARCH_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
 
 
 def _turn_had_successful_web_search(results: list[ToolExecutionResult]) -> bool:
-    return any(
-        result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success for result in results
-    )
+    return bool(tool_routing._successful_web_searches(results))
+
+
+def _working_messages_have_web_search_evidence(messages: list[ChatMessage]) -> bool:
+    for message in messages:
+        content = str(message.get("content") or "")
+        if message.get("role") == "user" and content.startswith("【联网证据】"):
+            return True
+        if message.get("role") != "tool":
+            continue
+        name = str(message.get("name") or "")
+        if "web_search" not in name:
+            continue
+        raw = message.get("content")
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        if "skipped" in text[:240] and "digest" not in text[:800]:
+            continue
+        if len(text) >= 80:
+            return True
+    return False
+
+
+def _extract_web_lookup_evidence_text(results: list[ToolExecutionResult]) -> str:
+    """从本轮搜索/读页结果抽出给模型看的确定性证据正文。"""
+    chunks: list[str] = []
+    for result in results:
+        if not result.success:
+            continue
+        content = tool_routing.web_tool_payload(result)
+        if result.tool_name in _WEB_SEARCH_TOOL_NAMES:
+            digest = str(content.get("digest") or "").strip()
+            if digest:
+                chunks.append(digest[:1800])
+                continue
+            rows = content.get("results")
+            if isinstance(rows, list):
+                lines: list[str] = []
+                for item in rows[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    snippet = str(item.get("snippet") or "").strip()
+                    piece = "：".join(part for part in (title, snippet) if part)
+                    if piece:
+                        lines.append(piece)
+                if lines:
+                    chunks.append("\n".join(lines)[:1800])
+            continue
+        if result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}:
+            title = str(content.get("title") or "").strip()
+            text = str(content.get("text") or "").strip()
+            if text:
+                head = f"《{title}》\n{text}" if title else text
+                chunks.append(head[:1600])
+    return "\n\n----\n\n".join(chunks).strip()
+
+
+def _build_web_search_evidence_packet_message(
+    results: list[ToolExecutionResult],
+) -> ChatMessage | None:
+    """搜/读完成后注入一条明确的「已结束+证据」消息，供最终总结阅读。"""
+    if not _turn_had_successful_web_search(results) and not any(
+        result.success
+        and result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}
+        for result in results
+    ):
+        return None
+    evidence = _extract_web_lookup_evidence_text(results)
+    if len(evidence) < 40:
+        return None
+    return {
+        "role": "user",
+        "content": (
+            "【联网证据】检索/读页已经完成（不是还在查询）。"
+            "请只根据下列证据回答我刚才的问题；不要再说稍等或正在查。\n\n"
+            f"{evidence[:4000]}"
+        ),
+    }
 
 
 def _latest_user_text(messages: list[ChatMessage]) -> str:
@@ -2910,6 +3300,51 @@ def _redact_tool_result_for_model(result: ToolExecutionResult) -> dict[str, Any]
         return data
     if not isinstance(content, dict):
         return data
+
+    # 网页搜索：先解开 MCP 外壳，再保留 digest/长摘要，避免模型只看到空 results。
+    if result.tool_name in {"web__web_search", "web_search"}:
+        payload = tool_routing.unwrap_mcp_tool_payload(content)
+        if not isinstance(payload, dict):
+            payload = {}
+        rows_in = payload.get("results")
+        rows_out: list[dict[str, Any]] = []
+        if isinstance(rows_in, list):
+            for item in rows_in[:8]:
+                if not isinstance(item, dict):
+                    continue
+                rows_out.append(
+                    {
+                        "title": item.get("title"),
+                        "url": item.get("url"),
+                        "snippet": str(item.get("snippet") or "")[:1600],
+                    }
+                )
+        data["content"] = {
+            "query": payload.get("query"),
+            "source": payload.get("source"),
+            "digest": str(payload.get("digest") or "")[:5500],
+            "snippet_chars": payload.get("snippet_chars"),
+            "results": rows_out,
+            "refined_query": payload.get("refined_query"),
+            "is_error": bool(content.get("is_error")),
+        }
+        return data
+
+    if result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}:
+        payload = tool_routing.unwrap_mcp_tool_payload(content)
+        if isinstance(payload, dict) and (
+            payload.get("text") is not None or payload.get("url") is not None
+        ):
+            data["content"] = {
+                "url": payload.get("url"),
+                "title": payload.get("title"),
+                "text": str(payload.get("text") or "")[:6000],
+                "truncated": payload.get("truncated"),
+                "reader": payload.get("reader"),
+                "auto_fetched": payload.get("auto_fetched"),
+                "is_error": bool(content.get("is_error")),
+            }
+            return data
 
     redacted, image_count = _redact_tool_images_from_content(content)
     if image_count:
@@ -3225,7 +3660,8 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
-_DEDUP_TOOL_NAMES_PER_TURN = frozenset({"web__web_search", "web__fetch_url"})
+_DEDUP_SEARCH_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
+_DEDUP_FETCH_TOOL_NAMES = frozenset({"web__fetch_url", "fetch_url"})
 
 
 @dataclass(frozen=True)
@@ -3276,32 +3712,61 @@ def _try_supplement_missed_memory_tools(
     return None
 
 
+def _normalize_fetch_url_for_dedup(url: object) -> str:
+    return str(url or "").strip().rstrip("/").lower()
+
+
 def _is_duplicate_tool_call(
     call: NativeToolCall,
     execution_results: list[ToolExecutionResult],
 ) -> bool:
-    if call.name not in _DEDUP_TOOL_NAMES_PER_TURN:
+    if call.name in _DEDUP_SEARCH_TOOL_NAMES:
+        return any(
+            result.tool_name in _DEDUP_SEARCH_TOOL_NAMES
+            and result.success
+            and not (isinstance(result.content, dict) and result.content.get("skipped"))
+            for result in execution_results
+        )
+    if call.name in _DEDUP_FETCH_TOOL_NAMES:
+        target = _normalize_fetch_url_for_dedup(call.arguments.get("url"))
+        if not target:
+            return False
+        for result in execution_results:
+            if result.tool_name not in _DEDUP_FETCH_TOOL_NAMES or not result.success:
+                continue
+            if isinstance(result.content, dict) and result.content.get("skipped"):
+                continue
+            existing = ""
+            if isinstance(result.content, dict):
+                existing = _normalize_fetch_url_for_dedup(result.content.get("url"))
+            if existing and existing == target:
+                return True
         return False
-    return any(result.tool_name == call.name and result.success for result in execution_results)
+    return False
 
 
 def _build_duplicate_tool_call_result(call: NativeToolCall) -> ToolExecutionResult:
+    if call.name in _DEDUP_FETCH_TOOL_NAMES:
+        message = "本轮已读取过该网页，请直接根据之前的工具结果作答，不要重复抓取同一 URL。"
+    else:
+        message = "本轮已执行过同名工具，请直接根据之前的工具结果作答，不要重复调用。"
     return ToolExecutionResult(
         tool_name=call.name,
         success=True,
         content={
             "skipped": True,
             "reason": "duplicate_tool_call",
-            "message": "本轮已执行过同名工具，请直接根据之前的工具结果作答，不要重复调用。",
+            "message": message,
         },
         error="",
     )
 
 
 def _summarize_web_search_result(content: object) -> str:
-    if not isinstance(content, dict):
+    payload = tool_routing.unwrap_mcp_tool_payload(content)
+    if not isinstance(payload, dict):
         return "搜索已完成。"
-    results = content.get("results")
+    results = payload.get("results")
     if not isinstance(results, list) or not results:
         return "搜索已完成，但没有找到可用结果。"
     titles: list[str] = []
@@ -3316,9 +3781,10 @@ def _summarize_web_search_result(content: object) -> str:
 
 
 def _summarize_fetch_url_result(content: object) -> str:
-    if not isinstance(content, dict):
+    payload = tool_routing.unwrap_mcp_tool_payload(content)
+    if not isinstance(payload, dict):
         return "网页内容已读取。"
-    title = str(content.get("title", "")).strip()
+    title = str(payload.get("title", "")).strip()
     if title:
         return f"网页已读取：{title}。"
     return "网页内容已读取。"
