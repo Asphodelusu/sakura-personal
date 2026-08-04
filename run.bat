@@ -12,5 +12,18 @@ if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 if not exist "%FASTEMBED_CACHE_PATH%" mkdir "%FASTEMBED_CACHE_PATH%"
 
 cd /d "%PRJ_ROOT%"
+set "SAKURA_LAUNCHER_RESTART=1"
+
+:run
 ".venv\Scripts\python.exe" main.py
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="73" (
+    cls
+    echo [Sakura] 正在重启...
+    goto run
+)
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [Sakura] 进程已退出，代码 %EXIT_CODE%
+)
 pause

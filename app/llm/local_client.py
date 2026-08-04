@@ -157,6 +157,10 @@ class RoutingLlmClient:
     def test_connection(self) -> str:
         return self._cloud.test_connection()
 
+    def warm_connection(self, *, timeout_seconds: float = 8.0) -> bool:
+        """预热云端对话连接；本地路由客户端不在启动关键路径上强制预热。"""
+        return self._cloud.warm_connection(timeout_seconds=timeout_seconds)
+
     def test_local_connection(self) -> str:
         client = self._require_local_client(text=True)
         return client.test_connection()

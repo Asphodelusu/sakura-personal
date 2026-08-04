@@ -32,8 +32,21 @@ set "SENTENCE_TRANSFORMERS_HOME=%PRJ_ROOT%\runtime\hf-cache"
 if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 
 REM ============================================================
-REM 启动
+REM 启动（退出码 73 = 托盘「重启 Sakura」，由本脚本清屏后重跑）
 REM ============================================================
 cd /d "%PRJ_ROOT%"
+set "SAKURA_LAUNCHER_RESTART=1"
+
+:run
 "%PYTHON_EXE%" main.py
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="73" (
+    cls
+    echo [Sakura] 正在重启...
+    goto run
+)
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [Sakura] 进程已退出，代码 %EXIT_CODE%
+)
 pause

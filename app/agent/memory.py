@@ -2071,7 +2071,7 @@ class MemoryStore:
                 return
             with self._lock:
                 self._loading = False
-            if report_dependency_loading:
+            if missing_embedding:
                 self._publish_status("ready", "长期记忆系统已就绪。")
 
         thread = self._thread_group.spawn(

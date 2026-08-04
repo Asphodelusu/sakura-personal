@@ -651,6 +651,9 @@ class PetWindow(QWidget):
         self.pet_hidden_at: float | None = None
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
+        # LLM 连接预热代数：设置变更时递增，作废进行中的旧预热。
+        self._llm_warmup_generation = 0
+        self._llm_warmup_threads = None
         # 后台线程生命周期、lingering 线程与退役 wrapper 统一由资源管理器治理。
         self.resource_manager = ResourceManager(self, registry=context.resource_registry)
         self._register_runtime_service_resources()
@@ -6379,6 +6382,31 @@ class PetWindow(QWidget):
             reflector.api_client = clients.memory_curation
         self.memory_store.reload_api_settings(chat_settings, wait=False)
         self._restart_proactive_observer()
+        # 连接池已随 update_settings 丢弃，重新预热新端点。
+        self.start_llm_connection_warmup()
+
+    def start_llm_connection_warmup(self) -> None:
+        """窗口可见后后台预热 LLM HTTP/TLS；不阻塞输入，不与对话互斥。"""
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        self._llm_warmup_generation += 1
+        generation = self._llm_warmup_generation
+        runtime = self.agent_runtime
+
+        def run() -> None:
+            if getattr(self, "_shutdown_in_progress", False):
+                return
+            if generation != getattr(self, "_llm_warmup_generation", 0):
+                return
+            from app.core.llm_warmup import warm_agent_runtime_llm_connections
+
+            warm_agent_runtime_llm_connections(runtime)
+
+        if self._llm_warmup_threads is None:
+            self._llm_warmup_threads = self.resource_manager.track_thread_group(
+                label="llm-connection-warmup"
+            )
+        self._llm_warmup_threads.spawn(run, name="sakura-llm-warmup", daemon=True)
 
     def _apply_tauri_settings_result(self, result: object, *, final: bool) -> bool:
         """将 Tauri 设置结果持久化并即时生效。"""
