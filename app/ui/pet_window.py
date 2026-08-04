@@ -651,6 +651,9 @@ class PetWindow(QWidget):
         self.pet_hidden_at: float | None = None
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
+        # LLM 连接预热代数：设置变更时递增，作废进行中的旧预热。
+        self._llm_warmup_generation = 0
+        self._llm_warmup_threads = None
         # 后台线程生命周期、lingering 线程与退役 wrapper 统一由资源管理器治理。
         self.resource_manager = ResourceManager(self, registry=context.resource_registry)
         self._register_runtime_service_resources()
@@ -3955,7 +3958,12 @@ class PetWindow(QWidget):
         if getattr(self, "_shutdown_in_progress", False):
             return
         reply = progress.reply
-        if not reply.text.strip():
+        if not reply.text.strip() and not reply.translation.strip():
+            return
+        stage = str(progress.stage or "")
+        # 仅联网搜索空档旁白上气泡/TTS。工具规划中间稿（observe_screen 等）
+        # 不当成回复字幕，避免「字出来了却迟迟不送正式 TTS」的错觉。
+        if not stage.startswith("web_"):
             return
         self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
@@ -3968,20 +3976,56 @@ class PetWindow(QWidget):
         )
         debug_log(
             "PetWindow",
-            "收到 Agent 中间回复",
+            "收到联网过程旁白",
             {
                 "stage": progress.stage,
                 "segments": len(reply.segments),
                 "metadata": progress.metadata,
             },
         )
+        display = reply.display_text(self.subtitle_language) or reply.text
         self.messages.append(
             {
                 "role": "assistant",
-                "content": reply.text,
+                "content": display,
                 TRANSIENT_PROGRESS_MESSAGE_KEY: True,
             }
         )
+        segment = reply.segments[0] if reply.segments else None
+        bubble_text = (
+            segment.display_text(self.subtitle_language)
+            if segment is not None
+            else display
+        ).strip()
+        if bubble_text:
+            controller = getattr(self, "bubble_auto_hide", None)
+            if controller is not None:
+                controller.notify_speaking()
+            subtitle_controller = getattr(self, "subtitle_controller", None)
+            if subtitle_controller is not None:
+                subtitle_controller.set_speech(bubble_text, pulse=True)
+        # 「我查查 / 搜到了」等短旁白：搜索等待空档播 TTS；读页长摘要仍 suppress_tts。
+        if (
+            segment is not None
+            and not segment.suppress_tts
+            and bubble_text
+        ):
+            playback = getattr(self, "voice_playback_controller", None)
+            speak = getattr(playback, "speak_segment", None) if playback is not None else None
+            if callable(speak):
+                try:
+                    speak(
+                        segment,
+                        0,
+                        on_started=lambda: None,
+                        on_finished=lambda: None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    debug_log(
+                        "PetWindow",
+                        "过程旁白 TTS 失败，已保留字幕",
+                        {"error": str(exc), "stage": stage},
+                    )
         # 不回写历史记录：_handle_reply 收到最终回复后再统一写
 
     def _remove_transient_progress_messages(self) -> None:
@@ -5984,11 +6028,11 @@ class PetWindow(QWidget):
         self.memory_failure_dialog_last_message = message
         show_themed_warning(
             self,
-            "记忆模型下载失败",
+            "记忆模型未就绪",
             format_failure_message(
-                "长期记忆所需的本地模型没有下载成功。",
-                "请按诊断信息中的 Release 链接下载 ZIP 后在设置页手动导入，"
-                "或开启代理并重启 Sakura 重新下载。",
+                "长期记忆所需的本地嵌入模型尚未安装或加载失败。",
+                "请到设置页「记忆」→ 记忆检索模型 在线安装，"
+                "或手动导入 HuggingFace hub 缓存 ZIP（目录名通常为 models--BAAI--bge-m3）。",
                 message,
             ),
         )
@@ -6364,6 +6408,31 @@ class PetWindow(QWidget):
             reflector.api_client = clients.memory_curation
         self.memory_store.reload_api_settings(chat_settings, wait=False)
         self._restart_proactive_observer()
+        # 连接池已随 update_settings 丢弃，重新预热新端点。
+        self.start_llm_connection_warmup()
+
+    def start_llm_connection_warmup(self) -> None:
+        """窗口可见后后台预热 LLM HTTP/TLS；不阻塞输入，不与对话互斥。"""
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        self._llm_warmup_generation += 1
+        generation = self._llm_warmup_generation
+        runtime = self.agent_runtime
+
+        def run() -> None:
+            if getattr(self, "_shutdown_in_progress", False):
+                return
+            if generation != getattr(self, "_llm_warmup_generation", 0):
+                return
+            from app.core.llm_warmup import warm_agent_runtime_llm_connections
+
+            warm_agent_runtime_llm_connections(runtime)
+
+        if self._llm_warmup_threads is None:
+            self._llm_warmup_threads = self.resource_manager.track_thread_group(
+                label="llm-connection-warmup"
+            )
+        self._llm_warmup_threads.spawn(run, name="sakura-llm-warmup", daemon=True)
 
     def _apply_tauri_settings_result(self, result: object, *, final: bool) -> bool:
         """将 Tauri 设置结果持久化并即时生效。"""

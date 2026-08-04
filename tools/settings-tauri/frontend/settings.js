@@ -76,6 +76,7 @@ const fields = {
   backchannelResourceCard: document.getElementById("backchannelResourceCard"),
   memoryTriggerTurns: document.getElementById("memoryTriggerTurns"),
   memoryModelResourceCard: document.getElementById("memoryModelResourceCard"),
+  memoryRerankResourceCard: document.getElementById("memoryRerankResourceCard"),
   speechFontSize: document.getElementById("speechFontSize"),
   nameFontSize: document.getElementById("nameFontSize"),
   inputFontSize: document.getElementById("inputFontSize"),
@@ -2031,12 +2032,51 @@ function setSlotSelection(slot, selection, { preserveMissing = true } = {}) {
   syncModelOptions(slot, selection?.model || "", { preserveMissing });
 }
 
+const DEFAULT_SLOT_FALLBACKS = {
+  chat_fast: ["chat"],
+  vision_chat: ["chat"],
+  memory_curation: ["chat"],
+  inner_thought: ["chat_fast", "chat"],
+};
+
+function slotFallbackChain(slot) {
+  const field = request.api.slot_fields?.find((item) => item.id === slot);
+  if (Array.isArray(field?.fallbacks) && field.fallbacks.length) {
+    return field.fallbacks;
+  }
+  return DEFAULT_SLOT_FALLBACKS[slot] || ["chat"];
+}
+
+function slotIsExplicitlyConfigured(slot) {
+  if (slot === "chat") {
+    const selection = readSlotSelection(slot);
+    return Boolean(selection.profile_id && selection.model);
+  }
+  const inheritInput = fields.modelSlots.querySelector(`[data-slot-inherit="${slot}"]`);
+  if (inheritInput?.checked) {
+    return false;
+  }
+  const selection = readSlotSelection(slot);
+  return Boolean(selection.profile_id && selection.model);
+}
+
 function inheritedSlotSourceSelection(slot) {
   if (slot === "chat") {
     return null;
   }
-  const chat = readSlotSelection("chat");
-  return chat.profile_id && chat.model ? chat : null;
+  for (const candidate of slotFallbackChain(slot)) {
+    if (!slotIsExplicitlyConfigured(candidate)) {
+      continue;
+    }
+    return readSlotSelection(candidate);
+  }
+  return null;
+}
+
+function slotHasInheritDependents(slot) {
+  return (request.api.slot_fields || []).some((field) =>
+    (field.fallbacks || DEFAULT_SLOT_FALLBACKS[field.id] || []).includes(slot)
+  );
 }
 
 function syncInheritedSlotDisplays() {
@@ -2060,6 +2100,9 @@ function handleSlotInheritChange(slot) {
     delete inheritedSlotManualSelections[slot];
   }
   syncSlotInheritState(slot);
+  if (slotHasInheritDependents(slot)) {
+    syncInheritedSlotDisplays();
+  }
 }
 
 function renderModelSlots(selection) {
@@ -2095,15 +2138,16 @@ function renderModelSlots(selection) {
     enhanceSelect(modelSelect);
     profileSelect.addEventListener("change", () => {
       syncModelOptions(slot.id, "", { preserveMissing: false });
-      if (slot.id === "chat") {
+      if (slotHasInheritDependents(slot.id)) {
         syncInheritedSlotDisplays();
       }
     });
     modelSelect.addEventListener("change", () => {
-      if (slot.id === "chat") {
+      if (slotHasInheritDependents(slot.id)) {
         syncInheritedSlotDisplays();
       }
     });
+
     const selected = selection?.slots?.[slot.id] || { profile_id: "", model: "" };
     const inheritInput = fields.modelSlots.querySelector(`[data-slot-inherit="${slot.id}"]`);
     if (inheritInput) {
@@ -2451,8 +2495,7 @@ function resourcesSnapshot() {
   return resourceState.snapshot || request?.resources || {};
 }
 
-function taskFor(kind) {
-  const snapshot = resourcesSnapshot();
+function taskFor(kind, snapshot = resourcesSnapshot()) {
   if (kind === "tts") {
     return snapshot.tts?.task || snapshot.tasks?.tts || null;
   }
@@ -2462,6 +2505,9 @@ function taskFor(kind) {
   if (kind === "memory_model") {
     return snapshot.memory_model?.task || snapshot.tasks?.memory_model || null;
   }
+  if (kind === "memory_rerank") {
+    return snapshot.memory_rerank?.task || snapshot.tasks?.memory_rerank || null;
+  }
   return null;
 }
 
@@ -2470,15 +2516,9 @@ function taskRunning(task) {
 }
 
 function hasRunningResourceTask(snapshot = resourcesSnapshot()) {
-  return ["tts", "backchannel", "memory_model"].some((kind) => {
-    const task =
-      kind === "tts"
-        ? snapshot.tts?.task || snapshot.tasks?.tts
-        : kind === "backchannel"
-          ? snapshot.backchannel?.task || snapshot.tasks?.backchannel
-          : snapshot.memory_model?.task || snapshot.tasks?.memory_model;
-    return taskRunning(task);
-  });
+  return ["tts", "backchannel", "memory_model", "memory_rerank"].some((kind) =>
+    taskRunning(taskFor(kind, snapshot))
+  );
 }
 
 function resourceStatusLabel(status, ready = false) {
@@ -2523,6 +2563,7 @@ function renderResourceCards() {
   renderTtsResourceCard();
   renderBackchannelResourceCard();
   renderMemoryModelResourceCard();
+  renderMemoryRerankResourceCard();
 }
 
 function renderResourceCard(container, model) {
@@ -2559,6 +2600,31 @@ function renderResourceCard(container, model) {
     detail.className = "resource-detail";
     detail.textContent = model.detail;
     body.append(detail);
+  }
+  if (Array.isArray(model.selectOptions) && model.selectOptions.length) {
+    const row = document.createElement("label");
+    row.className = "resource-select-row";
+    const caption = document.createElement("span");
+    caption.textContent = model.selectLabel || "型号";
+    const select = document.createElement("select");
+    select.disabled = Boolean(model.selectDisabled);
+    model.selectOptions.forEach((option) => {
+      const node = document.createElement("option");
+      node.value = option.value;
+      node.textContent = option.label;
+      if (option.value === model.selectValue) {
+        node.selected = true;
+      }
+      select.append(node);
+    });
+    select.addEventListener("change", () => {
+      if (typeof model.onSelectChange === "function") {
+        model.onSelectChange(select.value);
+      }
+    });
+    row.append(caption, select);
+    body.append(row);
+    enhanceSelect(select);
   }
   if (model.progressVisible) {
     const progress = document.createElement("div");
@@ -2889,13 +2955,14 @@ function renderMemoryModelResourceCard() {
   const running = taskRunning(task);
   const ready = Boolean(resources.ready) || task?.status === "succeeded";
   const available = resources.available !== false;
+  const sizeLabel = resources.size_label || "约 2.3GB";
   const message = !available
     ? "长期记忆系统暂不可用。"
     : running
-      ? task.message || "正在处理记忆模型。"
+      ? task.message || "正在处理记忆嵌入模型。"
       : ready
-        ? "记忆模型已就绪。"
-        : "记忆检索需要本地嵌入模型。";
+        ? "记忆嵌入模型已就绪（必需）。"
+        : `记忆检索需要本地嵌入模型（${sizeLabel}），请按需在线安装，不会在启动时自动下载。`;
   const actions = [
     {
       label: running ? "安装中" : ready ? "重新安装" : "在线安装",
@@ -2918,7 +2985,7 @@ function renderMemoryModelResourceCard() {
   actions.push({ label: "刷新", disabled: !available, onClick: refreshResources });
 
   renderResourceCard(fields.memoryModelResourceCard, {
-    title: "记忆模型",
+    title: "记忆嵌入模型",
     subtitle: resources.model_name || "",
     status: task?.status || "",
     ready,
@@ -2928,6 +2995,78 @@ function renderMemoryModelResourceCard() {
     progressVisible: running,
     progress: task?.progress || (running ? 35 : 0),
     meta: [
+      ["体积", sizeLabel],
+      ["缓存", task?.result?.cache_folder],
+      ["错误", task?.error || resources.error],
+    ],
+    actions,
+  });
+}
+
+function renderMemoryRerankResourceCard() {
+  const resources = resourcesSnapshot().memory_rerank || {};
+  const task = taskFor("memory_rerank");
+  const running = taskRunning(task);
+  const ready = Boolean(resources.ready) || task?.status === "succeeded";
+  const available = resources.available !== false;
+  const catalog = Array.isArray(resources.catalog) ? resources.catalog : [];
+  const selected =
+    resources.model_name ||
+    catalog[0]?.model_id ||
+    "BAAI/bge-reranker-v2-m3";
+  const selectedEntry = catalog.find((item) => item.model_id === selected) || null;
+  const sizeLabel = selectedEntry?.size_label || resources.size_label || "";
+  const note = selectedEntry?.note || resources.note || "";
+  const message = !available
+    ? "长期记忆系统暂不可用。"
+    : running
+      ? task.message || "正在处理记忆精排模型。"
+      : ready
+        ? `当前型号已就绪（可选，提升排序）${note ? `：${note}` : "。"}`
+        : `可选：先选型号再安装。未安装时仍用向量检索，不影响基本记忆。${
+            note ? ` ${note}。` : ""
+          }`;
+  const selectOptions = catalog.map((item) => ({
+    value: item.model_id,
+    label: `${item.label}（${item.size_label}${item.installed ? " · 已下载" : ""}）`,
+  }));
+  const actions = [
+    {
+      label: running ? "安装中" : ready ? "重新安装" : "在线安装",
+      primary: !ready,
+      disabled: running || !available || !selected,
+      onClick: () =>
+        startResourceAction("resources.memory_rerank.download", { model_id: selected }),
+    },
+  ];
+  if (task?.status === "failed") {
+    actions.push({
+      label: "复制诊断",
+      onClick: () =>
+        copyResourceDiagnostic("memory_rerank", task, { model_name: selected || "" }),
+    });
+  }
+  actions.push({ label: "刷新", disabled: !available, onClick: refreshResources });
+
+  renderResourceCard(fields.memoryRerankResourceCard, {
+    title: "记忆精排模型",
+    subtitle: selected || "",
+    status: task?.status || "",
+    ready,
+    muted: !available,
+    message,
+    detail: running ? task.detail || "" : resources.error || "",
+    selectLabel: "型号",
+    selectValue: selected,
+    selectDisabled: running || !available || selectOptions.length === 0,
+    selectOptions,
+    onSelectChange: (modelId) =>
+      startResourceAction("resources.memory_rerank.select", { model_id: modelId }),
+    progressVisible: running,
+    progress: task?.progress || (running ? 35 : 0),
+    meta: [
+      ["体积", sizeLabel],
+      ["说明", note],
       ["缓存", task?.result?.cache_folder],
       ["错误", task?.error || resources.error],
     ],
@@ -2996,6 +3135,11 @@ function handleResourceTaskTransitions(previous, next) {
       previous?.memory_model?.task || previous?.tasks?.memory_model,
       next?.memory_model?.task || next?.tasks?.memory_model,
     ],
+    [
+      "memory_rerank",
+      previous?.memory_rerank?.task || previous?.tasks?.memory_rerank,
+      next?.memory_rerank?.task || next?.tasks?.memory_rerank,
+    ],
   ];
   pairs.forEach(([kind, before, after]) => {
     if (!after || after.status !== "succeeded") {
@@ -3015,10 +3159,12 @@ function handleResourceTaskTransitions(previous, next) {
     } else if (kind === "backchannel") {
       notify("接话模型已就绪。", "success");
     } else if (kind === "memory_model") {
-      notify("记忆模型已就绪。", "success");
+      notify("记忆嵌入模型已就绪。", "success");
       if (fields.pages.memory.classList.contains("is-active")) {
         loadMemories();
       }
+    } else if (kind === "memory_rerank") {
+      notify("记忆精排模型已就绪。", "success");
     }
   });
 }

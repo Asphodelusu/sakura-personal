@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import sys
 import uuid
+from typing import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,7 +72,7 @@ def test_tts_bundle_downloads_to_part_then_verifies_and_extracts() -> None:
     assert not archive.with_name(f"{archive.name}.part").exists()
     assert work_dir == (root / "tts" / entry.key).resolve()
     assert (work_dir / "api_v2.py").exists()
-    assert statuses == ["verify", "download", "extract", "cleanup"]
+    assert statuses == ["verify", "download", "extract", "install", "cleanup"]
     assert progress[-1] == 100
 
 
@@ -104,13 +104,14 @@ def test_tts_bundle_verifies_cached_archive_with_progress() -> None:
 
     assert work_dir == (root / "tts" / entry.key).resolve()
     assert not archive.exists()
-    assert statuses == ["verify", "extract", "cleanup"]
+    assert statuses == ["verify", "extract", "install", "cleanup"]
     assert 10 in progress
     assert progress[-1] == 100
 
 
-def test_tts_bundle_download_removes_part_on_verification_failure() -> None:
-    root = _runtime_root("bundle_verify_failure")
+def test_tts_bundle_download_keeps_part_for_resume_on_size_mismatch() -> None:
+    """下载不完整（大小不匹配）时保留 .part 供断点续传。"""
+    root = _runtime_root("bundle_size_mismatch")
     payload = b"too-short"
     entry = TTSBundleEntry(
         key="demo",
@@ -126,6 +127,31 @@ def test_tts_bundle_download_removes_part_on_verification_failure() -> None:
         return FakeResponse(payload)
 
     with pytest.raises(RuntimeError, match="文件大小不匹配"):
+        download_and_extract_bundle(entry, root, urlopen=fake_urlopen, extractor=lambda *_args: None)
+
+    archive = root / "tts" / "_dl" / entry.filename
+    assert not archive.exists()
+    assert archive.with_name(f"{archive.name}.part").exists()
+
+
+def test_tts_bundle_download_removes_part_on_sha256_mismatch() -> None:
+    """下载完整但校验失败（sha256 不匹配）时删除 .part，下次重新下载。"""
+    root = _runtime_root("bundle_verify_failure")
+    payload = b"full-size-but-corrupt"
+    entry = TTSBundleEntry(
+        key="demo",
+        label="Demo",
+        filename="demo.7z",
+        download_url="https://example.test/demo.7z",
+        size=len(payload),
+        sha256=hashlib.sha256(b"expected-different-payload").hexdigest(),
+    )
+
+    def fake_urlopen(_request, timeout: int):  # type: ignore[no-untyped-def]
+        assert timeout == 600
+        return FakeResponse(payload)
+
+    with pytest.raises(RuntimeError, match="SHA256 不匹配"):
         download_and_extract_bundle(entry, root, urlopen=fake_urlopen, extractor=lambda *_args: None)
 
     archive = root / "tts" / "_dl" / entry.filename
@@ -233,7 +259,9 @@ def test_tts_bundle_default_provider_work_dir_uses_installed_root(monkeypatch: p
     runtime_python.parent.mkdir(parents=True)
     _write_fake_runtime_python(runtime_python)
 
-    assert default_provider_bundle_work_dir("gpt-sovits", root) == work_dir.resolve()
+    # 显式传 50 系 GPU，避免真实本机探测（4060）把推荐拉到 standard 包。
+    gpus = [GPUInfo("NVIDIA GeForce RTX 5080", 16.0)]
+    assert default_provider_bundle_work_dir("gpt-sovits", root, gpus=gpus) == work_dir.resolve()
 
 
 def test_tts_bundle_default_provider_prefers_short_installed_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,7 +272,8 @@ def test_tts_bundle_default_provider_prefers_short_installed_root(monkeypatch: p
     runtime_python.parent.mkdir(parents=True)
     _write_fake_runtime_python(runtime_python)
 
-    assert default_provider_bundle_work_dir("gpt-sovits", root) == work_dir.resolve()
+    gpus = [GPUInfo("NVIDIA GeForce RTX 5080", 16.0)]
+    assert default_provider_bundle_work_dir("gpt-sovits", root, gpus=gpus) == work_dir.resolve()
 
 
 def test_tts_bundle_detects_and_migrates_legacy_install() -> None:
@@ -483,6 +512,8 @@ def test_list_nvidia_gpus_swallows_which_errors(monkeypatch: pytest.MonkeyPatch)
 
     # 伪造为 Windows，使 GPT-SoVITS 整合包在任意宿主上都判定为兼容，从而让推荐逻辑真正走到 GPU 探测。
     monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
+    # 清掉可能由其他测试填充的真实 GPU 缓存，确保走到 shutil.which 异常路径。
+    monkeypatch.setattr(tts_bundle, "_NVIDIA_GPU_CACHE", None)
 
     def _boom(_name: str):  # type: ignore[no-untyped-def]
         # 模拟非 Windows 宿主上 shutil.which 因 _winapi 缺失抛出的 AttributeError
@@ -529,25 +560,56 @@ def test_tts_bundle_rejects_incompatible_platform_before_download(monkeypatch: p
         )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
-def test_tts_bundle_runs_script_installer_and_returns_runtime_paths() -> None:
+class FakeScriptOutput:
+    """模拟脚本 stdout：首次迭代时执行 on_start（建目录写文件），再逐行输出。"""
+
+    def __init__(self, lines: list[str], on_start: Callable[[], None]) -> None:
+        self._lines = iter(lines)
+        self._on_start = on_start
+        self._started = False
+
+    def __iter__(self) -> "FakeScriptOutput":
+        return self
+
+    def __next__(self) -> str:
+        if not self._started:
+            self._started = True
+            self._on_start()
+        return next(self._lines)
+
+    def close(self) -> None:
+        return None
+
+
+class FakeScriptProcess:
+    """模拟 subprocess.Popen：固定 stdout 行与退出码，不真实执行 bash。"""
+
+    def __init__(
+        self,
+        lines: list[str],
+        returncode: int,
+        on_start: Callable[[], None],
+    ) -> None:
+        self.stdout = FakeScriptOutput(lines, on_start)
+        self._returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def poll(self) -> int:
+        return self._returncode
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+def test_tts_bundle_runs_script_installer_and_returns_runtime_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     root = _runtime_root("bundle_script_installer")
     script = root / "fake_installer.sh"
-    script.write_text(
-        """#!/bin/bash
-set -e
-install_root="$1"
-echo "::sakura-progress status=install progress=50"
-mkdir -p "$install_root/GPT-SoVITS/GPT_SoVITS/configs"
-mkdir -p "$install_root/miniforge3/envs/gpt-sovits310/bin"
-echo "fake api" > "$install_root/GPT-SoVITS/api_v2.py"
-echo "custom: {}" > "$install_root/GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml"
-echo '#!/bin/sh' > "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
-chmod +x "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
-""",
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
+    script.write_text("#!/bin/bash\necho fake\n", encoding="utf-8")
     entry = TTSBundleEntry(
         key="script_demo",
         label="Script Demo",
@@ -557,6 +619,23 @@ chmod +x "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
         work_dir_name="GPT-SoVITS",
         python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
         tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
+    )
+    tmp_dir = root / "data" / "tts_bundles" / "tmp" / entry.key
+
+    def fake_script() -> None:
+        (tmp_dir / "GPT-SoVITS/GPT_SoVITS/configs").mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "miniforge3/envs/gpt-sovits310/bin").mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "GPT-SoVITS/api_v2.py").write_text("fake api", encoding="utf-8")
+        (tmp_dir / "GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml").write_text(
+            "custom: {}",
+            encoding="utf-8",
+        )
+        (tmp_dir / "miniforge3/envs/gpt-sovits310/bin/python").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        tts_bundle.subprocess,
+        "Popen",
+        lambda **_kwargs: FakeScriptProcess(["::sakura-progress status=install progress=50", ""], 0, fake_script),
     )
     progress: list[int] = []
     statuses: list[str] = []
@@ -584,22 +663,10 @@ chmod +x "$install_root/miniforge3/envs/gpt-sovits310/bin/python"
     assert not (root / "data" / "tts_bundles" / "tmp" / entry.key).exists()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
-def test_tts_bundle_script_installer_cleans_tmp_dir_on_failure() -> None:
+def test_tts_bundle_script_installer_cleans_tmp_dir_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     root = _runtime_root("bundle_script_installer_failure")
     script = root / "fake_installer_failure.sh"
-    script.write_text(
-        """#!/bin/bash
-set -e
-install_root="$1"
-mkdir -p "$install_root/GPT-SoVITS"
-echo "partial" > "$install_root/GPT-SoVITS/api_v2.py"
-echo "boom"
-exit 1
-""",
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
+    script.write_text("#!/bin/bash\necho boom\n", encoding="utf-8")
     entry = TTSBundleEntry(
         key="script_failure",
         label="Script Failure",
@@ -610,6 +677,17 @@ exit 1
         python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
         tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
     )
+    tmp_dir = root / "data" / "tts_bundles" / "tmp" / entry.key
+
+    def fake_script() -> None:
+        (tmp_dir / "GPT-SoVITS").mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "GPT-SoVITS/api_v2.py").write_text("partial", encoding="utf-8")
+
+    monkeypatch.setattr(
+        tts_bundle.subprocess,
+        "Popen",
+        lambda **_kwargs: FakeScriptProcess(["boom"], 1, fake_script),
+    )
 
     with pytest.raises(RuntimeError, match="安装失败"):
         install_tts_bundle(entry, root)
@@ -618,8 +696,9 @@ exit 1
     assert not (root / "data" / "tts_bundles" / "installed" / entry.key).exists()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="macOS source installer tests use bash paths")
-def test_tts_bundle_script_installer_preserves_existing_install_on_failure() -> None:
+def test_tts_bundle_script_installer_preserves_existing_install_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = _runtime_root("bundle_script_installer_preserve_existing")
     entry = TTSBundleEntry(
         key="script_existing",
@@ -640,27 +719,25 @@ def test_tts_bundle_script_installer_preserves_existing_install_on_failure() -> 
         encoding="utf-8",
     )
     (installed_dir / "miniforge3/envs/gpt-sovits310/bin/python").write_text("#!/bin/sh\n", encoding="utf-8")
-
     script = root / "fake_installer_failure.sh"
-    script.write_text(
-        """#!/bin/bash
-set -e
-install_root="$1"
-mkdir -p "$install_root/GPT-SoVITS"
-echo "partial" > "$install_root/GPT-SoVITS/api_v2.py"
-exit 1
-""",
-        encoding="utf-8",
+    script.write_text("#!/bin/bash\necho boom\n", encoding="utf-8")
+    tmp_dir = root / "data" / "tts_bundles" / "tmp" / entry.key
+
+    def fake_script() -> None:
+        (tmp_dir / "GPT-SoVITS").mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "GPT-SoVITS/api_v2.py").write_text("partial", encoding="utf-8")
+
+    monkeypatch.setattr(
+        tts_bundle.subprocess,
+        "Popen",
+        lambda **_kwargs: FakeScriptProcess(["boom"], 1, fake_script),
     )
-    script.chmod(0o755)
 
     with pytest.raises(RuntimeError, match="安装失败"):
         install_tts_bundle(entry, root)
 
     assert not (root / "data" / "tts_bundles" / "tmp" / entry.key).exists()
     assert (installed_dir / "GPT-SoVITS/api_v2.py").read_text(encoding="utf-8") == "existing"
-
-
 def test_extract_archive_prefers_py7zz(monkeypatch: pytest.MonkeyPatch) -> None:
     root = _runtime_root("extract_prefers_py7zz")
     calls: list[str] = []

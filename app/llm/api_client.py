@@ -185,6 +185,48 @@ class OpenAICompatibleClient:
         self._unsupported_chat_params.clear()
         self._runtime_context_role = "system"
         self._close_http()
+
+    def warm_connection(self, *, timeout_seconds: float = 8.0) -> bool:
+        """预热可复用 HTTP/TLS 连接；失败静默返回 False。
+
+        与正式对话可并发：共用同一 httpx.Client 连接池即可。
+        设置变更会 ``_close_http``，预热中请求可能失败——视为无害。
+        HTTP 4xx 也算握手成功（TCP/TLS/连接池已建立）。
+        """
+        if not str(self.settings.api_key or "").strip():
+            return False
+        if not str(self.settings.base_url or "").strip():
+            return False
+        started_at = time.perf_counter()
+        try:
+            client = self._http_client()
+            response = client.request(
+                "GET",
+                "/models",
+                timeout=httpx.Timeout(timeout_seconds, read=timeout_seconds),
+            )
+            debug_log(
+                "API",
+                "连接预热完成",
+                {
+                    "base_url": _normalize_openai_base_url(self.settings.base_url),
+                    "status": response.status_code,
+                    "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                },
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — 预热不得打扰主路径
+            debug_log(
+                "API",
+                "连接预热失败（已忽略）",
+                {
+                    "base_url": _normalize_openai_base_url(self.settings.base_url),
+                    "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                    "error": str(exc),
+                },
+            )
+            return False
+
     @property
     def runtime_context_role(self) -> str:
         return self._runtime_context_role
@@ -281,9 +323,14 @@ class OpenAICompatibleClient:
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
         on_chunk: Callable[[str], None] | None = None,
+        verbosity_guidance: str | None = None,
     ) -> ChatReply:
         """角色聊天回复，支持流式回调 on_chunk。"""
-        segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones, reply_portraits)
+        segmented_reply_instruction = _build_segmented_reply_instruction(
+            reply_tones,
+            reply_portraits,
+            verbosity_guidance=verbosity_guidance,
+        )
         temperature, extra_params = self.resolve_dialogue_params()
         if on_chunk is not None:
             content = self._stream_accumulate(
@@ -790,18 +837,45 @@ class OpenAICompatibleClient:
                 client = self._http_client()
                 response = client.request(method, path, **request_kwargs)
                 response_body = response.text
-                debug_log(
-                    "API",
-                    "HTTP 请求成功",
-                    {
-                        "attempt": attempt,
-                        "status": response.status_code,
-                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                        "response_body": response_body,
-                    },
-                )
-                return response_body
+                status_code = int(response.status_code)
+                url = str(getattr(response, "url", "") or path)
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                # httpx 默认不 raise_for_status；必须显式检查，否则 401 体会被当 JSON 误解析。
+                if status_code >= 400:
+                    debug_log(
+                        "API",
+                        "HTTP 请求失败",
+                        {
+                            "attempt": attempt,
+                            "status": status_code,
+                            "elapsed_ms": elapsed_ms,
+                            "error_body": response_body,
+                        },
+                    )
+                    if (
+                        status_code not in {429, 500, 502, 503, 504}
+                        or attempt == MAX_API_RETRY_ATTEMPTS
+                    ):
+                        raise ApiRequestError(
+                            _format_api_http_error(status_code, response_body, url)
+                        )
+                    last_error = ApiRequestError(
+                        _format_api_http_error(status_code, response_body, url)
+                    )
+                else:
+                    debug_log(
+                        "API",
+                        "HTTP 请求成功",
+                        {
+                            "attempt": attempt,
+                            "status": status_code,
+                            "elapsed_ms": elapsed_ms,
+                            "response_body": response_body,
+                        },
+                    )
+                    return response_body
             except httpx.HTTPStatusError as exc:
+                # 若上层启用了 raise_for_status，仍走同一套格式化与重试。
                 error_body = exc.response.text
                 status_code = exc.response.status_code
                 url = str(exc.request.url) if exc.request is not None else path
@@ -896,8 +970,14 @@ def _extract_choice_diagnostics(data: dict[str, Any]) -> dict[str, Any]:
 def _build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
+    *,
+    verbosity_guidance: str | None = None,
 ) -> str:
-    return build_segmented_reply_instruction(reply_tones, reply_portraits)
+    return build_segmented_reply_instruction(
+        reply_tones,
+        reply_portraits,
+        verbosity_guidance=verbosity_guidance,
+    )
 
 
 def _parse_model_ids(data: dict[str, Any]) -> list[str]:

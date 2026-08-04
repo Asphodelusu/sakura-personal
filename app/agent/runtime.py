@@ -4,6 +4,7 @@ from pathlib import Path
 
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from dataclasses import dataclass, replace
 from threading import Lock
@@ -26,7 +27,14 @@ from app.agent.session_state_context import (
     build_session_state_fragment,
 )
 from app.agent.sensory_context import build_sensory_impression_fragment
+from app.agent.lore import LoreIndex, build_lore_context_fragment, load_lore_index
+from app.agent.local_context import build_media_context_fragment
+from app.agent.reply_verbosity import (
+    decision_from_interest,
+    format_verbosity_guidance,
+)
 from app.agent.inner_thought import (
+    InnerThoughtResult,
     InnerThoughtSettings,
     InnerThoughtWindow,
     build_inner_thought_fragment,
@@ -132,6 +140,14 @@ _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
 })
 
 
+@dataclass
+class _InnerThoughtLaunch:
+    """step0 与记忆召回并行的内心独白任务句柄（仅 runtime 内部使用）。"""
+
+    future: Future[str]
+    executor: ThreadPoolExecutor
+
+
 class AgentRuntime:
     """封装聊天决策链路，为后续工具调用和长期记忆留下扩展点。"""
 
@@ -169,6 +185,10 @@ class AgentRuntime:
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
         self.character_profile: CharacterProfile | None = None
+        self._lore_index: LoreIndex | None = None
+        self._lore_index_path: str = ""
+        self._turn_verbosity_guidance: str = ""
+        self._turn_interest: str | None = None
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
         self.history_store = history_store
@@ -179,7 +199,10 @@ class AgentRuntime:
         self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
         self.prompt_runtime = PromptRuntime()
         self.context_orchestrator = ContextOrchestrator()
-        self.memory_recall = MemoryRecallService(self.memory)
+        self.memory_recall = MemoryRecallService(
+            self.memory,
+            query_rewriter_client=self._chat_fast_api_client,
+        )
         self._inner_thought_window = InnerThoughtWindow(
             self.inner_thought_settings.window_size
         )
@@ -208,6 +231,9 @@ class AgentRuntime:
     @chat_fast_api_client.setter
     def chat_fast_api_client(self, client: OpenAICompatibleClient | None) -> None:
         self._chat_fast_api_client = client
+        # 自动召回 query 改写共用 chat_fast（未配置时走启发式）。
+        if hasattr(self, "memory_recall"):
+            self.memory_recall.set_query_rewriter_client(client)
 
     @property
     def inner_thought_api_client(self) -> OpenAICompatibleClient | None:
@@ -250,9 +276,19 @@ class AgentRuntime:
         self.character_profile = character_profile
         # 换角色后清空内心独白窗口，避免串戏
         self._inner_thought_window.clear()
+        self._reload_lore_index()
         if character_profile is not None:
             self.character_id = character_profile.id.strip()
             self.character_name = character_profile.display_name.strip()
+
+    def _reload_lore_index(self) -> None:
+        profile = self.character_profile
+        path = profile.lore_index_path if profile is not None else None
+        path_key = str(path) if path is not None else ""
+        if path_key == self._lore_index_path:
+            return
+        self._lore_index_path = path_key
+        self._lore_index = load_lore_index(path) if path is not None else None
 
     def set_prompt_patches(self, prompt_patches: list[PromptPatchContribution] | None) -> None:
         """同步插件提示词补丁。"""
@@ -315,16 +351,16 @@ class AgentRuntime:
             return None
         return int(delta)
 
-    def _maybe_generate_inner_thought(
+    def _launch_inner_thought_worker(
         self,
         working_messages: list[ChatMessage],
         turn_state: TurnState,
         *,
         proactive_mode: bool,
-    ) -> None:
-        """本轮仅生成一次内心独白并推入滑动窗口；失败则跳过。"""
+    ) -> _InnerThoughtLaunch | None:
+        """主线程拍快照后提交 Flash；与记忆召回并行。跳过则返回 None。"""
         if self._inner_thought_done_for_turn:
-            return
+            return None
         settings = self.inner_thought_settings.normalized()
         self._inner_thought_window.configure(settings.window_size)
         if not should_generate_inner_thought(
@@ -334,33 +370,79 @@ class AgentRuntime:
             proactive_mode=proactive_mode,
         ):
             self._inner_thought_done_for_turn = True
-            return
+            return None
         assert self._inner_thought_api_client is not None
         self._inner_thought_done_for_turn = True
         profile = self.character_profile
         card_path = profile.card_path if profile is not None else None
+        # 只读快照在主线程取齐，避免 worker 与召回争用可变会话状态
+        character_name = self.character_name
+        character_excerpt = load_character_excerpt(
+            card_path=card_path,
+            system_prompt=self.system_prompt,
+        )
+        mood_summary = mood_summary_from_store(self.memory)
+        recent_dialogue = format_recent_dialogue(working_messages)
+        sensory = sensory_impression_text()
         previous = self._inner_thought_window.items()
-        text = generate_inner_thought(
-            self._inner_thought_api_client,
-            character_name=self.character_name,
-            character_excerpt=load_character_excerpt(
-                card_path=card_path,
-                system_prompt=self.system_prompt,
-            ),
-            mood_summary=mood_summary_from_store(self.memory),
-            recent_dialogue=format_recent_dialogue(working_messages),
-            sensory_impression=sensory_impression_text(),
+        api_client = self._inner_thought_api_client
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inner-thought")
+        future = executor.submit(
+            generate_inner_thought,
+            api_client,
+            character_name=character_name,
+            character_excerpt=character_excerpt,
+            mood_summary=mood_summary,
+            recent_dialogue=recent_dialogue,
+            sensory_impression=sensory,
             previous_thoughts=previous,
             settings=settings,
         )
-        if not text:
-            return
-        self._inner_thought_window.push(text)
         debug_log(
             "InnerThought",
-            "本轮内心独白已更新",
-            {"chars": len(text), "window": len(self._inner_thought_window)},
+            "内心独白已与记忆召回并行启动",
+            {"window": len(previous)},
         )
+        return _InnerThoughtLaunch(future=future, executor=executor)
+
+    def _finalize_inner_thought_worker(
+        self,
+        launch: _InnerThoughtLaunch | None,
+    ) -> None:
+        """join Flash worker；仅在主线程写入滑动窗口，并接通 interest→篇幅。"""
+        if launch is None:
+            return
+        result = InnerThoughtResult(text="", interest=None)
+        try:
+            raw = launch.future.result()
+            if isinstance(raw, InnerThoughtResult):
+                result = raw
+            elif isinstance(raw, str):
+                # 兼容旧 mock / 仅返回正文的调用
+                result = InnerThoughtResult(text=str(raw or "").strip(), interest=None)
+            elif raw is not None:
+                result = InnerThoughtResult(text=str(raw).strip(), interest=None)
+        except Exception as exc:  # noqa: BLE001 — 独白失败不阻断主链路
+            debug_log(
+                "InnerThought",
+                "内心独白并行任务异常，已跳过",
+                {"error": str(exc)},
+            )
+            result = InnerThoughtResult(text="", interest=None)
+        finally:
+            launch.executor.shutdown(wait=True, cancel_futures=False)
+        if result.text:
+            self._inner_thought_window.push(result.text)
+            debug_log(
+                "InnerThought",
+                "本轮内心独白已更新",
+                {
+                    "chars": len(result.text),
+                    "interest": result.interest,
+                    "window": len(self._inner_thought_window),
+                },
+            )
+        self._apply_turn_interest(result.interest)
 
     def _session_state_fragments(
         self,
@@ -376,6 +458,28 @@ class AgentRuntime:
         )
         if thought is not None:
             fragments.append(thought)
+
+        current_input = str(getattr(request, "current_input", "") or "").strip()
+        media_fragment = build_media_context_fragment(current_input)
+        if media_fragment is not None:
+            fragments.append(media_fragment)
+
+        if self._lore_index is None and self.character_profile is not None:
+            self._reload_lore_index()
+        if self._lore_index is not None and current_input:
+            history_payload: list[dict[str, str]] = []
+            for message in request.recent_messages[-8:]:
+                role = str(getattr(message, "role", "") or "").strip()
+                content = str(getattr(message, "content", "") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    history_payload.append({"role": role, "content": content})
+            lore_fragment = build_lore_context_fragment(
+                current_input,
+                self._lore_index,
+                history=history_payload,
+            )
+            if lore_fragment is not None:
+                fragments.append(lore_fragment)
 
         store = self.history_store
         if store is None:
@@ -569,20 +673,27 @@ class AgentRuntime:
         runtime_context: str,
         cancel_checker: CancelChecker | None = None,
         turn_state: TurnState | None = None,
+        web_lookup_completed: bool = False,
     ) -> str:
         """工具规划轮结束后，用不含 tools 的请求专门合成 JSON segments。"""
         check_cancelled(cancel_checker)
         text_messages = strip_image_parts_from_messages(working_messages)
+        if web_lookup_completed:
+            compose_nudge = (
+                "检索/读页阶段已结束。请阅读上方【联网证据】与 tool 结果，"
+                "输出本轮给对方的最终 Sakura 回复（回答问题本身，不要再说正在查询）。"
+                "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
+                "不要调用工具，不要解释，不要使用 Markdown。"
+            )
+        else:
+            compose_nudge = (
+                "请根据以上对话与工具执行结果（如有），输出本轮给对方的最终 Sakura 回复。"
+                "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
+                "不要调用工具，不要解释，不要使用 Markdown。"
+            )
         compose_messages: list[ChatMessage] = [
             *text_messages,
-            {
-                "role": "user",
-                "content": (
-                    "请根据以上对话与工具执行结果（如有），输出本轮给对方的最终 Sakura 回复。"
-                    "只返回合法 JSON segments；每个 segment 必须同时包含 ja 与 zh。"
-                    "不要调用工具，不要解释，不要使用 Markdown。"
-                ),
-            },
+            {"role": "user", "content": compose_nudge},
         ]
         # 与工具轮一致：沿用 TurnPlan 的 client + thinking 开关。
         # 旧逻辑只在 tier=fast 时带 generation_params，导致 standard 闲聊的
@@ -662,6 +773,7 @@ class AgentRuntime:
         memory_fragments: tuple[Any, ...] | list[Any] | None = None,
         memory_status: str | None = None,
         reuse_memory_fragments: bool = False,
+        execution_results: list[ToolExecutionResult] | None = None,
     ) -> ChatReply:
         """工具循环结束后，用单次结构化请求合成最终 segments。"""
         snapshot = self._build_single_context_snapshot(
@@ -670,7 +782,27 @@ class AgentRuntime:
             memory_fragments=memory_fragments if reuse_memory_fragments else None,
             memory_status=memory_status if reuse_memory_fragments else None,
         )
-        prompt_build = self._build_final_reply_result(snapshot)
+        has_web_evidence = _working_messages_have_web_search_evidence(working_messages) or bool(
+            execution_results and _turn_had_successful_web_search(execution_results)
+        )
+        extra_parts: list[str] = []
+        if has_web_evidence:
+            extra_parts.append(
+                "检索阶段已经结束：上方有【联网证据】摘要，以及 web_search/读页的 tool 结果。"
+                "请据此直接回答对方；这不是还在搜索的中间态。"
+            )
+        if tool_routing._latest_user_is_deep_web_lookup(working_messages):
+            extra_parts.append(
+                "对方在问作品或资料的具体内容。请优先吃搜索结果里的 digest/长摘要，其次才是网页正文。"
+                "尽量从证据里抽出：类型、开发者/作者、平台、年份、标签，以及剧情主题、章节/结构、主要角色；"
+                "摘要里出现的具体信息不要丢掉。若涉及剧透先轻轻提醒再概括。"
+                "正文抓取失败或没有正文时，仍要用摘要尽量答完整；只有证据明显无关时才说没找到。"
+                "不要把名字相近的其他作品当成目标。用你自己的语气说，可以条理清晰，但不要写成客服报告。"
+            )
+        prompt_build = self._build_final_reply_result(
+            snapshot,
+            extra_instructions="\n".join(extra_parts),
+        )
         self._record_prompt_inspection(prompt_build.inspection)
         raw_content = self._compose_structured_final_reply(
             prompt_build.system_prompt,
@@ -678,6 +810,7 @@ class AgentRuntime:
             runtime_context=prompt_build.runtime_context,
             cancel_checker=cancel_checker,
             turn_state=turn_state,
+            web_lookup_completed=has_web_evidence,
         )
         parsed = self._parse_final_reply_with_retry(
             prompt_build.system_prompt,
@@ -904,6 +1037,8 @@ class AgentRuntime:
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
         self._inner_thought_done_for_turn = False
+        self._turn_interest = None
+        self._turn_verbosity_guidance = ""
         active_groups: set[str] = tool_routing.infer_active_tool_groups_from_messages(working_messages)
         debug_log(
             "AgentRuntime",
@@ -974,93 +1109,98 @@ class AgentRuntime:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
+                # step0：Flash 独白与记忆召回 fork-join（先 resolve turn_state；join 后再拼 prompt）
+                thought_launch: _InnerThoughtLaunch | None = None
                 if step_index == 0:
-                    # 串行：先路由/召回准备，再生成独白（稳定优先；独白失败不阻塞）
-                    self._maybe_generate_inner_thought(
+                    thought_launch = self._launch_inner_thought_worker(
                         working_messages,
                         turn_state,
                         proactive_mode=proactive_mode,
                     )
-                intimacy_focus = self._intimacy_focus_active()
-                if memory_needs_refresh:
-                    if intimacy_focus:
-                        # 亲密模式：轻量语义召回（当下亲密相关记忆可进；不做全量/渐进索引）
+                try:
+                    intimacy_focus = self._intimacy_focus_active()
+                    if memory_needs_refresh:
+                        if intimacy_focus:
+                            # 亲密模式：轻量语义召回（当下亲密相关记忆可进；不做全量/渐进索引）
+                            light_recall = self.memory_recall.recall(
+                                request, light_mode=True,
+                            )
+                            turn_memory_fragments = tuple(light_recall.fragments)
+                            memory_status = "rhythm_light"
+                        elif turn_state.recall_decision == "recall":
+                            recall = self.memory_recall.recall(request)
+                            turn_memory_fragments = list(recall.fragments)
+                            memory_status = recall.status
+                            # 渐进检索：追加以往记忆的标题索引 + 工具提示
+                            if self._progressive_memory:
+                                progressive = self._build_progressive_index_fragment(
+                                    request.current_input,
+                                    recall.fragments,
+                                )
+                                if progressive:
+                                    turn_memory_fragments.append(progressive)
+                            turn_memory_fragments = tuple(turn_memory_fragments)
+                        elif turn_state.recall_decision == "light":
+                            # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
+                            light_recall = self.memory_recall.recall(
+                                request, light_mode=True,
+                            )
+                            continuity = self.memory.build_continuity_context()
+                            combined = list(light_recall.fragments)
+                            if continuity:
+                                combined.insert(
+                                    0,
+                                    ContextFragment(
+                                        fragment_id="memory.continuity",
+                                        source="memory",
+                                        content=continuity,
+                                        trust="trusted",
+                                        priority=90,
+                                        token_budget=600,
+                                        sensitivity="private",
+                                        cache_scope="turn",
+                                        required=True,
+                                    ),
+                                )
+                            turn_memory_fragments = tuple(combined)
+                            memory_status = "light"
+                        else:
+                            # defer/skip：仅注入连续性上下文（心情+关系快照）
+                            continuity = self.memory.build_continuity_context()
+                            if continuity:
+                                turn_memory_fragments = (
+                                    ContextFragment(
+                                        fragment_id="memory.continuity",
+                                        source="memory",
+                                        content=continuity,
+                                        trust="trusted",
+                                        priority=90,
+                                        token_budget=600,
+                                        sensitivity="private",
+                                        cache_scope="turn",
+                                        required=True,
+                                    ),
+                                )
+                            else:
+                                turn_memory_fragments = ()
+                            memory_status = (
+                                "skipped"
+                                if turn_state.recall_decision == "skip"
+                                else "deferred"
+                            )
+                        memory_needs_refresh = False
+                        request = replace(request, service_status={"memory": memory_status})
+                    # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
+                    if intimacy_focus and memory_status != "rhythm_light":
                         light_recall = self.memory_recall.recall(
                             request, light_mode=True,
                         )
                         turn_memory_fragments = tuple(light_recall.fragments)
                         memory_status = "rhythm_light"
-                    elif turn_state.recall_decision == "recall":
-                        recall = self.memory_recall.recall(request)
-                        turn_memory_fragments = list(recall.fragments)
-                        memory_status = recall.status
-                        # 渐进检索：追加以往记忆的标题索引 + 工具提示
-                        if self._progressive_memory:
-                            progressive = self._build_progressive_index_fragment(
-                                request.current_input,
-                                recall.fragments,
-                            )
-                            if progressive:
-                                turn_memory_fragments.append(progressive)
-                        turn_memory_fragments = tuple(turn_memory_fragments)
-                    elif turn_state.recall_decision == "light":
-                        # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
-                        light_recall = self.memory_recall.recall(
-                            request, light_mode=True,
-                        )
-                        continuity = self.memory.build_continuity_context()
-                        combined = list(light_recall.fragments)
-                        if continuity:
-                            combined.insert(
-                                0,
-                                ContextFragment(
-                                    fragment_id="memory.continuity",
-                                    source="memory",
-                                    content=continuity,
-                                    trust="trusted",
-                                    priority=90,
-                                    token_budget=600,
-                                    sensitivity="private",
-                                    cache_scope="turn",
-                                    required=True,
-                                ),
-                            )
-                        turn_memory_fragments = tuple(combined)
-                        memory_status = "light"
-                    else:
-                        # defer/skip：仅注入连续性上下文（心情+关系快照）
-                        continuity = self.memory.build_continuity_context()
-                        if continuity:
-                            turn_memory_fragments = (
-                                ContextFragment(
-                                    fragment_id="memory.continuity",
-                                    source="memory",
-                                    content=continuity,
-                                    trust="trusted",
-                                    priority=90,
-                                    token_budget=600,
-                                    sensitivity="private",
-                                    cache_scope="turn",
-                                    required=True,
-                                ),
-                            )
-                        else:
-                            turn_memory_fragments = ()
-                        memory_status = (
-                            "skipped"
-                            if turn_state.recall_decision == "skip"
-                            else "deferred"
-                        )
-                    memory_needs_refresh = False
-                    request = replace(request, service_status={"memory": memory_status})
-                # 同轮中途开启亲密模式：从全量/日常召回切到轻量语义召回
-                if intimacy_focus and memory_status != "rhythm_light":
-                    light_recall = self.memory_recall.recall(
-                        request, light_mode=True,
-                    )
-                    turn_memory_fragments = tuple(light_recall.fragments)
-                    memory_status = "rhythm_light"
-                    request = replace(request, service_status={"memory": memory_status})
+                        request = replace(request, service_status={"memory": memory_status})
+                finally:
+                    # 召回抛错也要回收线程；窗口写入仅发生在此处（主线程）
+                    self._finalize_inner_thought_worker(thought_launch)
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
                     providers=self.context_providers,
@@ -1079,6 +1219,7 @@ class AgentRuntime:
                         extra_instructions=planning_extra_instructions,
                         browser_page_mode=browser_page_guard_active,
                         visible_browser_mode=visible_browser_guard_active,
+                        recent_messages=working_messages,
                     )
                 )
                 self._record_prompt_inspection(prompt_build.inspection)
@@ -1222,6 +1363,23 @@ class AgentRuntime:
                         turn_state=turn_state,
                     ),
                     actions=emitted_actions,
+                )
+
+            web_planned = any(
+                call.name in {"web__web_search", "web_search", "web__fetch_url", "fetch_url"}
+                for call in turn.tool_calls
+            )
+            if web_planned and step_index == 0 and not (turn.content or "").strip():
+                _emit_progress_reply(
+                    progress_callback,
+                    ja="ちょっと調べてみるね。",
+                    zh="我查查。",
+                    stage="web_planning",
+                    metadata={
+                        "step_index": step_index,
+                        "tool_names": [call.name for call in turn.tool_calls],
+                    },
+                    cancel_checker=cancel_checker,
                 )
 
             _emit_progress_from_content(
@@ -1433,6 +1591,45 @@ class AgentRuntime:
                         payload=_redact_tool_result_for_model(prepared),
                     )
                 )
+                if (
+                    call.name in {"web__web_search", "web_search"}
+                    and prepared.success
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
+                ):
+                    ja, zh = tool_routing.build_web_search_progress_texts(prepared)
+                    _emit_progress_reply(
+                        progress_callback,
+                        ja=ja,
+                        zh=zh,
+                        stage="web_search",
+                        metadata={
+                            "step_index": step_index,
+                            "tool_names": [call.name],
+                        },
+                        cancel_checker=cancel_checker,
+                    )
+                elif (
+                    call.name in {"web__fetch_url", "fetch_url"}
+                    and prepared.success
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
+                    and not (isinstance(prepared.content, dict) and prepared.content.get("auto_fetched"))
+                ):
+                    fetch_index = len(tool_routing._successful_web_fetches(execution_results))
+                    ja, zh = tool_routing.build_web_fetch_progress_texts(
+                        prepared,
+                        index=max(1, fetch_index),
+                    )
+                    _emit_progress_reply(
+                        progress_callback,
+                        ja=ja,
+                        zh=zh,
+                        stage="web_fetch",
+                        metadata={
+                            "step_index": step_index,
+                            "tool_names": [call.name],
+                        },
+                        cancel_checker=cancel_checker,
+                    )
 
             skipped_calls = len(turn.tool_calls) - allowed_calls
             if skipped_calls > 0:
@@ -1513,6 +1710,162 @@ class AgentRuntime:
                     snapshot_result,
                 )
 
+            if tool_routing._should_refine_web_search(working_messages, execution_results):
+                refined_query = tool_routing.build_refined_web_search_query(working_messages)
+                if refined_query:
+                    check_cancelled(cancel_checker)
+                    try:
+                        from app.agent.mcp import web_search_server as web_mod
+
+                        refined_payload = web_mod.search_web(refined_query, max_results=5)
+                        refined_result = ToolExecutionResult(
+                            tool_name="web__web_search",
+                            success=bool(refined_payload.get("results")),
+                            content={**refined_payload, "refined_query": refined_query},
+                            error="",
+                        )
+                    except Exception as exc:
+                        refined_result = ToolExecutionResult(
+                            tool_name="web__web_search",
+                            success=False,
+                            content={"query": refined_query, "refined_query": refined_query},
+                            error=str(exc),
+                        )
+                    step_results.append(refined_result)
+                    execution_results.append(refined_result)
+                    refined_call = NativeToolCall(
+                        id=f"auto_web_search_refine_{step_index}",
+                        name="web__web_search",
+                        arguments={"query": refined_query},
+                        arguments_json="{}",
+                    )
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            refined_call,
+                            refined_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(refined_result),
+                        )
+                    )
+                    if refined_result.success:
+                        ja, zh = tool_routing.build_web_search_progress_texts(refined_result)
+                        _emit_progress_reply(
+                            progress_callback,
+                            ja=ja or "もう少し絞って調べてみる。",
+                            zh=zh or "我再换个更准的关键词查一下。",
+                            stage="web_search",
+                            metadata={
+                                "step_index": step_index,
+                                "tool_names": ["web__web_search"],
+                                "refined": True,
+                            },
+                            cancel_checker=cancel_checker,
+                        )
+
+            if tool_routing._should_auto_fetch_after_web_search(
+                working_messages,
+                step_results,
+                execution_results,
+            ):
+                user_query = tool_routing._latest_user_text(working_messages) or ""
+                auto_urls = tool_routing._select_urls_for_auto_fetch(
+                    tool_routing._successful_web_searches(step_results),
+                    max_urls=4,
+                    query=user_query,
+                )
+
+                def _on_auto_fetch_page(fetch_index: int, fetch_result: ToolExecutionResult) -> None:
+                    check_cancelled(cancel_checker)
+                    step_results.append(fetch_result)
+                    execution_results.append(fetch_result)
+                    fetch_url = ""
+                    reader = "fetch_url"
+                    if isinstance(fetch_result.content, dict):
+                        fetch_url = str(fetch_result.content.get("url") or "")
+                        reader = str(fetch_result.content.get("reader") or reader)
+                    tool_name = fetch_result.tool_name or "web__fetch_url"
+                    auto_call = NativeToolCall(
+                        id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                        name=tool_name,
+                        arguments={"url": fetch_url},
+                        arguments_json="{}",
+                    )
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            auto_call,
+                            fetch_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(fetch_result),
+                        )
+                    )
+                    ja, zh = tool_routing.build_web_fetch_progress_texts(
+                        fetch_result,
+                        index=fetch_index,
+                    )
+                    if ja or zh:
+                        _emit_progress_reply(
+                            progress_callback,
+                            ja=ja,
+                            zh=zh,
+                            stage="web_fetch",
+                            metadata={
+                                "step_index": step_index,
+                                "tool_names": [tool_name],
+                                "auto_fetched": True,
+                                "page_index": fetch_index,
+                                "reader": reader,
+                            },
+                            cancel_checker=cancel_checker,
+                        )
+
+                auto_fetch_results = tool_routing._execute_auto_web_fetches(
+                    auto_urls,
+                    step_index=step_index,
+                    max_keep=3,
+                    enough_chars=1600,
+                    on_page=_on_auto_fetch_page,
+                    tools=self.tools,
+                )
+                # 全部失败时仍写入一条失败结果，便于日志与收束。
+                if auto_fetch_results and not any(item.success for item in auto_fetch_results):
+                    for fetch_index, fetch_result in enumerate(auto_fetch_results, start=1):
+                        check_cancelled(cancel_checker)
+                        step_results.append(fetch_result)
+                        execution_results.append(fetch_result)
+                        fetch_url = ""
+                        if isinstance(fetch_result.content, dict):
+                            fetch_url = str(fetch_result.content.get("url") or "")
+                        tool_name = fetch_result.tool_name or "web__fetch_url"
+                        auto_call = NativeToolCall(
+                            id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                            name=tool_name,
+                            arguments={"url": fetch_url},
+                            arguments_json="{}",
+                        )
+                        tool_messages.extend(
+                            _build_tool_messages_for_result(
+                                auto_call,
+                                fetch_result,
+                                include_images=self.model_vision_enabled,
+                            )
+                        )
+                        emitted_actions.append(
+                            AgentAction(
+                                type="tool_call",
+                                payload=_redact_tool_result_for_model(fetch_result),
+                            )
+                        )
+
             if not should_fast_forward_final_reply and tool_routing._should_fast_forward_after_web_search(
                 working_messages,
                 execution_results,
@@ -1524,6 +1877,8 @@ class AgentRuntime:
                     {
                         "step_index": step_index,
                         "tool_result_count": len(execution_results),
+                        "deep_lookup": tool_routing._latest_user_is_deep_web_lookup(working_messages),
+                        "fetch_count": len(tool_routing._successful_web_fetches(execution_results)),
                     },
                 )
 
@@ -1588,12 +1943,17 @@ class AgentRuntime:
             ):
                 memory_needs_refresh = True
             if should_fast_forward_final_reply:
+                # 搜/读已完成：把确定性证据包放进上下文，避免终局合成仍处在「还在查」的中间态。
+                evidence_packet = _build_web_search_evidence_packet_message(execution_results)
+                if evidence_packet is not None:
+                    working_messages.append(evidence_packet)
                 debug_log(
                     "AgentRuntime",
                     "工具结果已足够，进入最终总结",
                     {
                         "step_index": step_index,
                         "tool_result_count": len(execution_results),
+                        "web_evidence_packet": evidence_packet is not None,
                         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                     },
                 )
@@ -1612,6 +1972,7 @@ class AgentRuntime:
                 memory_fragments=turn_memory_fragments,
                 memory_status=memory_status,
                 reuse_memory_fragments=not memory_needs_refresh,
+                execution_results=execution_results,
             )
             check_cancelled(cancel_checker)
         except OperationCancelled:
@@ -1722,6 +2083,7 @@ class AgentRuntime:
                 runtime_context=prompt_build.runtime_context,
                 cancel_checker=cancel_checker,
                 on_chunk=_build_stream_progress_emitter(progress_callback, cancel_checker),
+                verbosity_guidance=self._turn_verbosity_guidance or None,
             )
             self._record_runtime_role(prompt_build.inspection)
             check_cancelled(cancel_checker)
@@ -2055,6 +2417,42 @@ class AgentRuntime:
         parts = [extra_instructions.strip(), self._reply_protocol_patch_text()]
         return "\n".join(part for part in parts if part)
 
+    def _apply_turn_interest(self, interest: str | None) -> str:
+        """仅用独白 interest 驱动篇幅；无 interest 则不注入本轮篇幅块。"""
+        self._turn_interest = None
+        self._turn_verbosity_guidance = ""
+        decision = decision_from_interest(interest)
+        if decision is None:
+            if interest:
+                debug_log(
+                    "ReplyVerbosity",
+                    "interest 无法识别，本轮不注入篇幅块",
+                    {"interest": interest},
+                )
+            return ""
+        self._turn_interest = decision.interest
+        guidance = format_verbosity_guidance(decision)
+        self._turn_verbosity_guidance = guidance
+        debug_log(
+            "ReplyVerbosity",
+            "本轮篇幅档位已更新",
+            {
+                "interest": decision.interest,
+                "tier": decision.tier,
+                "segments": f"{decision.min_segments}-{decision.max_segments}",
+            },
+        )
+        return guidance
+
+    def _refresh_turn_verbosity_guidance(
+        self,
+        messages: list[ChatMessage] | None = None,
+    ) -> str:
+        del messages  # 篇幅不再看消息规则，只吃独白 interest
+        if self._turn_verbosity_guidance.strip():
+            return self._turn_verbosity_guidance
+        return self._apply_turn_interest(self._turn_interest)
+
     def _build_tool_prompt_result(
         self,
         snapshot: ContextSnapshot | None,
@@ -2063,12 +2461,19 @@ class AgentRuntime:
         extra_instructions: str = "",
         browser_page_mode: bool = False,
         visible_browser_mode: bool = False,
+        recent_messages: list[ChatMessage] | None = None,
     ):
+        verbosity = (
+            self._refresh_turn_verbosity_guidance(recent_messages)
+            if recent_messages is not None
+            else self._turn_verbosity_guidance
+        )
         reply_protocol = self._apply_reply_protocol_patches(
             build_agent_reply_protocol(
                 self._effective_reply_tones(),
                 self.reply_portraits,
                 portrait_hints=self._portrait_hints() or None,
+                verbosity_guidance=verbosity or None,
             )
         )
         context_strategy = build_context_acquisition_strategy(
@@ -2180,14 +2585,29 @@ class AgentRuntime:
             None, extra_instructions=extra_instructions
         ).system_prompt
 
-    def _build_final_reply_result(self, snapshot: ContextSnapshot | None = None):
+    def _build_final_reply_result(
+        self,
+        snapshot: ContextSnapshot | None = None,
+        *,
+        extra_instructions: str = "",
+    ):
+        final_instructions = (
+            "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
+            "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
+            "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。\n"
+            "若工具结果里已有搜索摘要或网页正文，禁止用「稍等/正在查/今調べてる」搪塞，必须作答。"
+        )
+        if extra_instructions.strip():
+            final_instructions = f"{final_instructions}\n{extra_instructions.strip()}"
+        if self._turn_verbosity_guidance.strip():
+            final_instructions = (
+                f"{final_instructions}\n\n{self._turn_verbosity_guidance.strip()}"
+            )
         sections = [
             *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
             PromptSection(
                 "final_reply.instructions",
-                "你会收到上一轮工具调用结果。请基于这些结果，按人设给对方最终回复。\n"
-                "不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。\n"
-                "工具结果信息丰富时，可以自然带出关键要点或接着聊；不必写成客服式总结。",
+                final_instructions,
             ),
             PromptSection("reply.patch", self._reply_protocol_patch_text()),
         ]
@@ -2347,8 +2767,58 @@ def _emit_progress_from_content(
         debug_log("AgentRuntime", "中间回复回调失败，已忽略", {"error": str(exc), "stage": stage})
 
 
+def _progress_reply_suppress_tts(stage: str) -> bool:
+    """过程旁白是否静音。
+
+    「我查查」「搜到了…我先打开看看」落在搜索/开页等待空档，短句可播；
+    读页摘要等较长旁白仍静音，避免和最终回答抢麦。
+    """
+    return stage not in {"web_planning", "web_search"}
+
+
+def _emit_progress_reply(
+    progress_callback: ProgressCallback | None,
+    *,
+    ja: str,
+    zh: str,
+    stage: str,
+    metadata: dict[str, Any],
+    cancel_checker: CancelChecker | None = None,
+    suppress_tts: bool | None = None,
+) -> None:
+    """发送联网搜索过程旁白（不依赖模型 planning content）。"""
+    check_cancelled(cancel_checker)
+    if progress_callback is None:
+        return
+    ja_text = (ja or "").strip()
+    zh_text = (zh or "").strip()
+    if not ja_text and not zh_text:
+        return
+    quiet = _progress_reply_suppress_tts(stage) if suppress_tts is None else suppress_tts
+    reply = ChatReply(
+        [
+            ChatSegment(
+                text=ja_text or zh_text,
+                translation=zh_text or ja_text,
+                tone="中性",
+                suppress_tts=quiet,
+            )
+        ]
+    )
+    try:
+        check_cancelled(cancel_checker)
+        progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        debug_log("AgentRuntime", "过程旁白回调失败，已忽略", {"error": str(exc), "stage": stage})
+
+
 def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     """只播报关键等待点，避免工具链每一步都打断用户。"""
+    stage = str(metadata.get("stage") or "")
+    if stage.startswith("web_"):
+        return True
     step_index = metadata.get("step_index")
     if not isinstance(step_index, int):
         return True
@@ -2357,6 +2827,8 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     tool_names = metadata.get("tool_names", [])
     if not isinstance(tool_names, list):
         return False
+    if any(str(name).startswith(("web__", "web_")) for name in tool_names):
+        return True
     return any(str(name).startswith("windows__") for name in tool_names)
 
 
@@ -2443,9 +2915,84 @@ _WEB_SEARCH_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
 
 
 def _turn_had_successful_web_search(results: list[ToolExecutionResult]) -> bool:
-    return any(
-        result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success for result in results
-    )
+    return bool(tool_routing._successful_web_searches(results))
+
+
+def _working_messages_have_web_search_evidence(messages: list[ChatMessage]) -> bool:
+    for message in messages:
+        content = str(message.get("content") or "")
+        if message.get("role") == "user" and content.startswith("【联网证据】"):
+            return True
+        if message.get("role") != "tool":
+            continue
+        name = str(message.get("name") or "")
+        if "web_search" not in name:
+            continue
+        raw = message.get("content")
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        if "skipped" in text[:240] and "digest" not in text[:800]:
+            continue
+        if len(text) >= 80:
+            return True
+    return False
+
+
+def _extract_web_lookup_evidence_text(results: list[ToolExecutionResult]) -> str:
+    """从本轮搜索/读页结果抽出给模型看的确定性证据正文。"""
+    chunks: list[str] = []
+    for result in results:
+        if not result.success:
+            continue
+        content = tool_routing.web_tool_payload(result)
+        if result.tool_name in _WEB_SEARCH_TOOL_NAMES:
+            digest = str(content.get("digest") or "").strip()
+            if digest:
+                chunks.append(digest[:1800])
+                continue
+            rows = content.get("results")
+            if isinstance(rows, list):
+                lines: list[str] = []
+                for item in rows[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    snippet = str(item.get("snippet") or "").strip()
+                    piece = "：".join(part for part in (title, snippet) if part)
+                    if piece:
+                        lines.append(piece)
+                if lines:
+                    chunks.append("\n".join(lines)[:1800])
+            continue
+        if result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}:
+            title = str(content.get("title") or "").strip()
+            text = str(content.get("text") or "").strip()
+            if text:
+                head = f"《{title}》\n{text}" if title else text
+                chunks.append(head[:1600])
+    return "\n\n----\n\n".join(chunks).strip()
+
+
+def _build_web_search_evidence_packet_message(
+    results: list[ToolExecutionResult],
+) -> ChatMessage | None:
+    """搜/读完成后注入一条明确的「已结束+证据」消息，供最终总结阅读。"""
+    if not _turn_had_successful_web_search(results) and not any(
+        result.success
+        and result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}
+        for result in results
+    ):
+        return None
+    evidence = _extract_web_lookup_evidence_text(results)
+    if len(evidence) < 40:
+        return None
+    return {
+        "role": "user",
+        "content": (
+            "【联网证据】检索/读页已经完成（不是还在查询）。"
+            "请只根据下列证据回答我刚才的问题；不要再说稍等或正在查。\n\n"
+            f"{evidence[:4000]}"
+        ),
+    }
 
 
 def _latest_user_text(messages: list[ChatMessage]) -> str:
@@ -2753,6 +3300,51 @@ def _redact_tool_result_for_model(result: ToolExecutionResult) -> dict[str, Any]
         return data
     if not isinstance(content, dict):
         return data
+
+    # 网页搜索：先解开 MCP 外壳，再保留 digest/长摘要，避免模型只看到空 results。
+    if result.tool_name in {"web__web_search", "web_search"}:
+        payload = tool_routing.unwrap_mcp_tool_payload(content)
+        if not isinstance(payload, dict):
+            payload = {}
+        rows_in = payload.get("results")
+        rows_out: list[dict[str, Any]] = []
+        if isinstance(rows_in, list):
+            for item in rows_in[:8]:
+                if not isinstance(item, dict):
+                    continue
+                rows_out.append(
+                    {
+                        "title": item.get("title"),
+                        "url": item.get("url"),
+                        "snippet": str(item.get("snippet") or "")[:1600],
+                    }
+                )
+        data["content"] = {
+            "query": payload.get("query"),
+            "source": payload.get("source"),
+            "digest": str(payload.get("digest") or "")[:5500],
+            "snippet_chars": payload.get("snippet_chars"),
+            "results": rows_out,
+            "refined_query": payload.get("refined_query"),
+            "is_error": bool(content.get("is_error")),
+        }
+        return data
+
+    if result.tool_name in {"web__fetch_url", "fetch_url", "playwright_get_text"}:
+        payload = tool_routing.unwrap_mcp_tool_payload(content)
+        if isinstance(payload, dict) and (
+            payload.get("text") is not None or payload.get("url") is not None
+        ):
+            data["content"] = {
+                "url": payload.get("url"),
+                "title": payload.get("title"),
+                "text": str(payload.get("text") or "")[:6000],
+                "truncated": payload.get("truncated"),
+                "reader": payload.get("reader"),
+                "auto_fetched": payload.get("auto_fetched"),
+                "is_error": bool(content.get("is_error")),
+            }
+            return data
 
     redacted, image_count = _redact_tool_images_from_content(content)
     if image_count:
@@ -3068,7 +3660,8 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
-_DEDUP_TOOL_NAMES_PER_TURN = frozenset({"web__web_search", "web__fetch_url"})
+_DEDUP_SEARCH_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
+_DEDUP_FETCH_TOOL_NAMES = frozenset({"web__fetch_url", "fetch_url"})
 
 
 @dataclass(frozen=True)
@@ -3119,32 +3712,61 @@ def _try_supplement_missed_memory_tools(
     return None
 
 
+def _normalize_fetch_url_for_dedup(url: object) -> str:
+    return str(url or "").strip().rstrip("/").lower()
+
+
 def _is_duplicate_tool_call(
     call: NativeToolCall,
     execution_results: list[ToolExecutionResult],
 ) -> bool:
-    if call.name not in _DEDUP_TOOL_NAMES_PER_TURN:
+    if call.name in _DEDUP_SEARCH_TOOL_NAMES:
+        return any(
+            result.tool_name in _DEDUP_SEARCH_TOOL_NAMES
+            and result.success
+            and not (isinstance(result.content, dict) and result.content.get("skipped"))
+            for result in execution_results
+        )
+    if call.name in _DEDUP_FETCH_TOOL_NAMES:
+        target = _normalize_fetch_url_for_dedup(call.arguments.get("url"))
+        if not target:
+            return False
+        for result in execution_results:
+            if result.tool_name not in _DEDUP_FETCH_TOOL_NAMES or not result.success:
+                continue
+            if isinstance(result.content, dict) and result.content.get("skipped"):
+                continue
+            existing = ""
+            if isinstance(result.content, dict):
+                existing = _normalize_fetch_url_for_dedup(result.content.get("url"))
+            if existing and existing == target:
+                return True
         return False
-    return any(result.tool_name == call.name and result.success for result in execution_results)
+    return False
 
 
 def _build_duplicate_tool_call_result(call: NativeToolCall) -> ToolExecutionResult:
+    if call.name in _DEDUP_FETCH_TOOL_NAMES:
+        message = "本轮已读取过该网页，请直接根据之前的工具结果作答，不要重复抓取同一 URL。"
+    else:
+        message = "本轮已执行过同名工具，请直接根据之前的工具结果作答，不要重复调用。"
     return ToolExecutionResult(
         tool_name=call.name,
         success=True,
         content={
             "skipped": True,
             "reason": "duplicate_tool_call",
-            "message": "本轮已执行过同名工具，请直接根据之前的工具结果作答，不要重复调用。",
+            "message": message,
         },
         error="",
     )
 
 
 def _summarize_web_search_result(content: object) -> str:
-    if not isinstance(content, dict):
+    payload = tool_routing.unwrap_mcp_tool_payload(content)
+    if not isinstance(payload, dict):
         return "搜索已完成。"
-    results = content.get("results")
+    results = payload.get("results")
     if not isinstance(results, list) or not results:
         return "搜索已完成，但没有找到可用结果。"
     titles: list[str] = []
@@ -3159,9 +3781,10 @@ def _summarize_web_search_result(content: object) -> str:
 
 
 def _summarize_fetch_url_result(content: object) -> str:
-    if not isinstance(content, dict):
+    payload = tool_routing.unwrap_mcp_tool_payload(content)
+    if not isinstance(payload, dict):
         return "网页内容已读取。"
-    title = str(content.get("title", "")).strip()
+    title = str(payload.get("title", "")).strip()
     if title:
         return f"网页已读取：{title}。"
     return "网页内容已读取。"

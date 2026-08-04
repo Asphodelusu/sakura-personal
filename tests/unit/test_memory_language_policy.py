@@ -46,7 +46,7 @@ def test_curator_prompt_treats_intimacy_as_memorable() -> None:
     assert "过程流水账" in text
     assert "今の関係" in text
     assert "更加亲密" in text
-    assert "mood_update 最多一条" in text
+    assert "一次整理最多一条" in text
 
 
 def test_looks_like_third_person_self_detects_common_slips() -> None:

@@ -30,6 +30,10 @@ from app.core.http_client import urlopen_direct_for_loopback
 from app.core.interaction import set_interaction_id
 from app.llm.chat_reply import DEFAULT_TONE
 from app.voice import audio_checks as _audio_checks
+from app.voice.text_language_guard import (
+    has_meaningful_latin_mix,
+    sanitize_tts_text_for_lang,
+)
 from app.voice.tts_settings import ToneReference as _ToneReference
 from app.voice.tts_service import (
     _encode_genie_character_name,
@@ -38,7 +42,6 @@ from app.voice.tts_service import (
 )
 from app.voice.tts_types import TTSCallback, TTSPreparedAudio, _TTSRequest
 
-_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 # 可发音字符:数字/拉丁字母/假名/汉字/谚文(含全角)。纯标点、emoji、符号不算——
 # 这类文本喂给 GPT-SoVITS 归一化后音素为空,会触发服务端 [Errno 22] Invalid argument。
 _VOICEABLE_CHAR_RE = re.compile(
@@ -85,9 +88,12 @@ def _is_voiceable_text(text: str) -> bool:
 
 
 def _resolve_request_text_lang(text: str, configured_text_lang: str) -> str:
-    """英文混入中日韩文本时切到 auto，避免 GPT-SoVITS 按单语 BERT 处理失败。"""
+    """英文混入中日韩文本时切到 auto，避免 GPT-SoVITS 按单语 BERT 处理失败。
+
+    Lv100 / HP 等短标签不算实质英文，避免日文台词被误切到 auto。
+    """
     normalized = configured_text_lang.strip().lower()
-    if normalized in _CJK_TEXT_LANGS and _LATIN_LETTER_RE.search(text):
+    if normalized in _CJK_TEXT_LANGS and has_meaningful_latin_mix(text):
         return "auto_yue" if normalized in {"yue", "all_yue"} else "auto"
     return normalized or "ja"
 
@@ -182,10 +188,11 @@ class GPTSoVITSSynthesisEngine:
                 request.tone,
                 interaction_id=request.interaction_id,
             )
+            synth_text = sanitize_tts_text_for_lang(request.text, settings.text_lang)
             payload = {
-                "text": request.text,
+                "text": synth_text,
                 "text_lang": _resolve_request_text_lang(
-                    request.text,
+                    synth_text,
                     settings.text_lang,
                 ),
                 "ref_audio_path": str(reference.ref_audio_path),

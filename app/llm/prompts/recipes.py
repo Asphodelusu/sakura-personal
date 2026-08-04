@@ -21,13 +21,17 @@ def build_segmented_reply_instruction(
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
     portrait_hints: str | None = None,
+    verbosity_guidance: str | None = None,
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
     rules = [
         "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
         "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
-        "- Sakura 不习惯一次说很多话。日常回复 1-3 个 segment 为宜，每段短而自然，句间可有停顿（……）。",
+        "- Sakura 不习惯一次说很多话，像真人闲聊：默认大约 1-3 个短句 segment；"
+        "当真的对这个话题有兴趣、想多说一点时，可以自然说到 4-6 个短句。"
+        "每段仍要短而口语（单段 ja 尽量不超过约 80 字），句间可有停顿（……）；"
+        "联网查完后也不要写成说明文、演讲或清单——宁可多分几段短句。",
         "- 每段文本的语气标注在 tone 字段中，按情绪的真实走向逐句判断：情绪没有转折时，相邻句可以延续同一个 tone，"
         "不必每句都刻意换一个，那样反而显得情绪来回跳；只有当内容确实出现转折（比如从担心转到安心、从平静转到不满）时才换 tone。"
         "tone 跟她当下真实心情走：不满就用不满，认真就用认真，不必为了稳妥默认成中性。",
@@ -62,6 +66,9 @@ def build_segmented_reply_instruction(
                 "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
             ]
         )
+    guidance = str(verbosity_guidance or "").strip()
+    if guidance:
+        rules.append(guidance)
     return build_segment_protocol(
         tones,
         portraits,
@@ -77,6 +84,7 @@ def build_agent_reply_protocol(
     reply_portraits: list[str] | None = None,
     *,
     portrait_hints: str | None = None,
+    verbosity_guidance: str | None = None,
 ) -> str:
     """与分段回复协议共用同一套分段规则，避免 agent 路径重复维护两套文案。"""
     return build_segmented_reply_instruction(
@@ -85,6 +93,7 @@ def build_agent_reply_protocol(
         include_translation_rules=True,
         include_no_single_segment_rule=True,
         portrait_hints=portrait_hints,
+        verbosity_guidance=verbosity_guidance,
     )
 
 

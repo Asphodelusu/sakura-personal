@@ -10,7 +10,10 @@ from app.core.hf_hub_download import download_hf_snapshot, iter_hf_endpoints
 
 def test_iter_hf_endpoints_prefers_env_override(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("HF_ENDPOINT", "https://custom.example")
-    assert iter_hf_endpoints() == ["https://custom.example"]
+    endpoints = iter_hf_endpoints()
+    assert endpoints[0] == "https://custom.example"
+    assert "https://huggingface.co" in endpoints
+    assert "https://hf-mirror.com" in endpoints
 
 
 def test_iter_hf_endpoints_default_order_without_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]

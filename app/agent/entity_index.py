@@ -91,6 +91,20 @@ class EntityIndex:
                 "INSERT OR REPLACE INTO _meta (key, value) VALUES ('backfilled', '1')"
             )
 
+    def reset(self) -> None:
+        """清空实体→记忆映射并重置回填标记（嵌入迁移后 memory id 全变时用）。"""
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("DELETE FROM entity_memory")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO _meta (key, value) VALUES ('backfilled', '0')"
+                )
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def index_memory(self, memory_id: str, content: str, *, updated_at: str) -> None:
         """写入/更新某条记忆时调用：抠出实体并登记该记忆 id（幂等，可重复调用）。"""
         memory_id = str(memory_id or "").strip()

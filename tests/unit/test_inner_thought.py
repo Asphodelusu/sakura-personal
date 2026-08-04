@@ -7,6 +7,7 @@ from app.agent.inner_thought import (
     InnerThoughtWindow,
     build_inner_thought_fragment,
     format_recent_dialogue,
+    parse_inner_thought_output,
     should_generate_inner_thought,
     _window_labels,
 )
@@ -75,3 +76,24 @@ def test_format_recent_dialogue_keeps_tail() -> None:
 def test_window_labels_align_old_to_new() -> None:
     assert _window_labels(1) == ["今"]
     assert _window_labels(3) == ["前々", "前", "今"]
+
+
+def test_parse_interest_line_and_body() -> None:
+    result = parse_inner_thought_output(
+        "interest: high\nあ、この話題好きだ。もっと話したいな。"
+    )
+    assert result.interest == "high"
+    assert "話題" in result.text
+    assert "interest" not in result.text.lower()
+
+
+def test_parse_interest_chinese_alias() -> None:
+    result = parse_inner_thought_output("兴致: 中\n特に何も。")
+    assert result.interest == "mid"
+    assert "特に何も" in result.text
+
+
+def test_parse_without_interest_keeps_body() -> None:
+    result = parse_inner_thought_output("黙ってしまった。少し不安。")
+    assert result.interest is None
+    assert "不安" in result.text

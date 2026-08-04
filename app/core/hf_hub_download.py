@@ -21,11 +21,20 @@ _DEFAULT_ENDPOINT_ORDER: tuple[str, ...] = (
 
 
 def iter_hf_endpoints() -> list[str]:
-    """返回按优先级排序的 Hub 端点列表。"""
-    override = (os.environ.get("HF_ENDPOINT") or "").strip()
+    """返回按优先级排序的 Hub 端点列表。
+
+    若设置了 HF_ENDPOINT，仍把它放在最前，但会追加官方/镜像作为回退——
+    国内环境常见「只配了镜像、镜像 API 却不可用」导致整条下载链死掉。
+    """
+    override = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/")
+    ordered: list[str] = []
     if override:
-        return [override]
-    return list(_DEFAULT_ENDPOINT_ORDER)
+        ordered.append(override)
+    for endpoint in _DEFAULT_ENDPOINT_ORDER:
+        normalized = endpoint.rstrip("/")
+        if normalized not in {item.rstrip("/") for item in ordered}:
+            ordered.append(endpoint)
+    return ordered
 
 
 def default_hf_endpoint() -> str:
@@ -47,8 +56,11 @@ def download_hf_snapshot(
 
     cache_dir = str(cache_folder)
     last_error: Exception | None = None
+    previous_endpoint = os.environ.get("HF_ENDPOINT")
     for endpoint in iter_hf_endpoints():
         try:
+            # 显式 endpoint 与环境变量对齐，避免 hub 客户端仍读旧 HF_ENDPOINT。
+            os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
             kwargs: dict[str, object] = {
                 "repo_id": repo_id,
                 "cache_dir": cache_dir,
@@ -61,5 +73,10 @@ def download_hf_snapshot(
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             continue
+        finally:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
     assert last_error is not None
     raise last_error

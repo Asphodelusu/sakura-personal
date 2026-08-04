@@ -133,7 +133,7 @@ class TestFinishFallback:
     def test_oversized_duration_clamped_to_max(self, monkeypatch: pytest.MonkeyPatch) -> None:
         root = _make_dir("fallback_long")
         wav = root / "long.wav"
-        _write_wav(wav, frames=16000 * 120)  # 120 秒
+        _write_wav(wav, frames=16000 * 300)  # 300 秒，超过兜底上限
         scheduled: list[int] = []
         monkeypatch.setattr(
             tts_playback.QTimer,

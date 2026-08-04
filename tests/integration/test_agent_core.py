@@ -944,11 +944,11 @@ def test_memory_store_builds_layered_context_with_core_profile() -> None:
 
     context = store.build_memory_context("", mode="tool")
 
-    assert "【常驻档案】" in context
+    assert "【常驻档案" in context
     assert "主人长期偏好中文沟通" in context
     assert "【当前任务记忆】" in context
     assert "【相关长期事实】" in context
-    assert "【协作规则与偏好】" in context
+    assert "【相处习惯与偏好】" in context
     episodic_context = store.build_memory_context("上次", mode="event")
     assert "【过往事件总结】" in episodic_context
 
@@ -2838,7 +2838,7 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
 
     assert "observe_screen" in client.prompts[0]
     assert "主动获取上下文策略" in client.prompts[0]
-    assert "对方话很短含糊" in client.prompts[0] or "对方话很短" in client.prompts[0]
+    assert "不要把看屏当成每轮默认动作" in client.prompts[0]
     assert "不要重复截图" in client.prompts[0]
     assert [progress.reply.translation for progress in progress_replies] == ["我看看。"]
     assert result.actions

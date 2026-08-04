@@ -83,6 +83,8 @@ class CharacterProfile:
     theme_source: CharacterThemeSource = THEME_SOURCE_COMPAT_DEFAULT
     # 角色渲染后端配置（renderer 段原样保留；路径解析交由对应渲染插件处理）。
     renderer_config: dict[str, Any] | None = None
+    # 可选原作/设定 lore 索引（lore/index.json 或 manifest.lore）
+    lore_index_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.theme_settings is None:
@@ -296,6 +298,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         _resolve_package_path(package_dir, backchannel_text) if backchannel_text.strip() else None
     )
     theme_settings, theme_source, _missing_theme = character_theme_from_mapping(raw_data.get("theme"))
+    lore_index_path = _resolve_lore_index_path(package_dir, raw_data)
 
     return CharacterProfile(
         id=character_id,
@@ -314,7 +317,17 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         theme_settings=theme_settings,
         theme_source=theme_source,
         renderer_config=_load_renderer_config(raw_data),
+        lore_index_path=lore_index_path,
     )
+
+
+def _resolve_lore_index_path(package_dir: Path, raw_data: dict[str, Any]) -> Path | None:
+    lore_field = raw_data.get("lore")
+    if isinstance(lore_field, str) and lore_field.strip():
+        candidate = (package_dir / lore_field.strip()).resolve()
+        return candidate if candidate.is_file() else None
+    default = package_dir / "lore" / "index.json"
+    return default if default.is_file() else None
 
 
 def character_theme_from_mapping(data: Any) -> tuple[ThemeSettings, CharacterThemeSource, bool]:

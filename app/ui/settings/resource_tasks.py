@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.agent.memory import DEFAULT_EMBEDDING_MODEL
+from app.agent.memory_rerank import (
+    DEFAULT_RERANKER_MODEL,
+    RERANKER_CATALOG,
+    catalog_entry,
+    reranker_model_cached,
+    selected_reranker_model,
+)
 from app.backchannel.model_cache import (
     DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
     backchannel_model_cache_kwargs,
@@ -202,6 +209,10 @@ class SettingsResourceTaskManager:
             return self.start_memory_download()
         if method == "resources.memory.import":
             return self.start_memory_import(_required_path(params, "path"))
+        if method == "resources.memory_rerank.select":
+            return self.select_memory_rerank(str(params.get("model_id") or ""))
+        if method == "resources.memory_rerank.download":
+            return self.start_memory_rerank_download(str(params.get("model_id") or "") or None)
         raise ValueError(f"未知 Tauri RPC 方法：{method}")
 
     def snapshot(self) -> dict[str, Any]:
@@ -209,6 +220,7 @@ class SettingsResourceTaskManager:
             "tts": self._tts_snapshot(),
             "backchannel": self._backchannel_snapshot(),
             "memory_model": self._memory_model_snapshot(),
+            "memory_rerank": self._memory_rerank_snapshot(),
             "tasks": self._tasks_snapshot(),
         }
 
@@ -315,6 +327,37 @@ class SettingsResourceTaskManager:
         )
         return self.snapshot()
 
+    def select_memory_rerank(self, model_id: str) -> dict[str, Any]:
+        store = self._require_memory_store()
+        store.select_reranker_model(model_id)
+        return self.snapshot()
+
+    def start_memory_rerank_download(self, model_id: str | None = None) -> dict[str, Any]:
+        store = self._require_memory_store()
+        target = (model_id or "").strip() or selected_reranker_model(self.base_dir)
+        entry = catalog_entry(target)
+        size_label = entry.size_label if entry is not None else ""
+
+        def run(task: ResourceTask) -> dict[str, Any]:
+            suffix = f"（{size_label}）" if size_label else ""
+            task.update(
+                stage="download",
+                message=f"正在在线安装记忆精排模型 {target}{suffix}...",
+                progress=20,
+            )
+            result = store.download_reranker_model(target)
+            return _model_result_to_mapping(result)
+
+        self._start_task(
+            ResourceTask(
+                key="memory_rerank",
+                kind="memory_rerank",
+                title="记忆精排模型",
+                runner=run,
+            )
+        )
+        return self.snapshot()
+
     def cancel_task(self, key: str) -> dict[str, Any]:
         task = self._tasks.get(key)
         if task is not None and task.snapshot()["status"] == "running":
@@ -385,10 +428,54 @@ class SettingsResourceTaskManager:
             "available": available,
             "ready": ready,
             "model_name": DEFAULT_EMBEDDING_MODEL,
+            "size_label": "约 2.3GB",
             "error": error,
             "task": (
                 self._tasks.get("memory_model").snapshot()
                 if self._tasks.get("memory_model") is not None
+                else None
+            ),
+        }
+
+    def _memory_rerank_snapshot(self) -> dict[str, Any]:
+        store = self._memory_store
+        available = store is not None
+        error = ""
+        selected = DEFAULT_RERANKER_MODEL
+        ready = False
+        try:
+            selected = selected_reranker_model(self.base_dir)
+            ready = reranker_model_cached(self.base_dir, selected)
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        entry = catalog_entry(selected)
+        catalog = []
+        for item in RERANKER_CATALOG:
+            try:
+                installed = reranker_model_cached(self.base_dir, item.model_id)
+            except Exception:  # noqa: BLE001
+                installed = False
+            catalog.append(
+                {
+                    "model_id": item.model_id,
+                    "label": item.label,
+                    "size_label": item.size_label,
+                    "note": item.note,
+                    "installed": installed,
+                }
+            )
+        return {
+            "available": available,
+            "ready": ready,
+            "optional": True,
+            "model_name": selected,
+            "size_label": entry.size_label if entry is not None else "",
+            "note": entry.note if entry is not None else "",
+            "catalog": catalog,
+            "error": error,
+            "task": (
+                self._tasks.get("memory_rerank").snapshot()
+                if self._tasks.get("memory_rerank") is not None
                 else None
             ),
         }

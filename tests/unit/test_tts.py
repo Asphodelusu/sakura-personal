@@ -133,6 +133,21 @@ def test_tts_mixed_japanese_and_english_uses_auto_lang() -> None:
     assert _resolve_request_text_lang(text, "ja") == "auto"
 
 
+def test_tts_japanese_with_game_stat_tokens_keeps_ja() -> None:
+    # Lv100 不应把整段日文切到 auto（曾导致混简体字时 GPT-SoVITS 400）
+    text = "選ぶサーヴァントはLv100＆スキル3つ10が条件。初週は…"
+
+    assert _resolve_request_text_lang(text, "ja") == "ja"
+
+
+def test_tts_sanitize_replaces_simplified_in_japanese() -> None:
+    from app.voice.text_language_guard import sanitize_tts_text_for_lang
+
+    text = "冠位選定→钻研戦（周回）→認定戦。"
+    assert "鑽" in sanitize_tts_text_for_lang(text, "ja")
+    assert "钻" not in sanitize_tts_text_for_lang(text, "ja")
+
+
 def test_tts_plain_japanese_keeps_configured_lang() -> None:
     text = "でも私、初めて君に会った時、思ったよ。"
 
@@ -1377,7 +1392,7 @@ def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) ->
     assert calls == ["timer", "audio", "player"]
 
     warmup_audio = _runtime_root("warmup_play") / "dummy.wav"
-    _write_silence_wav(warmup_audio, frame_count=1600, frame_rate=16000)
+    _write_tone_wav(warmup_audio, frame_count=1600, frame_rate=16000)
     provider._playback._pending_audio.append((warmup_audio, None, None, None, ""))
     provider._playback._play_next()
 
@@ -1437,8 +1452,8 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
     stopped_root = _runtime_root("stopped_state_finish")
     first_audio = stopped_root / "first.wav"
     second_audio = stopped_root / "second.wav"
-    _write_silence_wav(first_audio, frame_count=1600, frame_rate=16000)
-    _write_silence_wav(second_audio, frame_count=1600, frame_rate=16000)
+    _write_tone_wav(first_audio, frame_count=1600, frame_rate=16000)
+    _write_tone_wav(second_audio, frame_count=1600, frame_rate=16000)
     provider._playback._pending_audio.append(
         (
             first_audio,
@@ -1477,8 +1492,8 @@ def test_tts_provider_finish_fallback_advances_queue_without_player_end_signal(m
     root = _runtime_root("playback_finish_fallback")
     first_audio = root / "first.wav"
     second_audio = root / "second.wav"
-    _write_silence_wav(first_audio, frame_count=1600, frame_rate=16000)
-    _write_silence_wav(second_audio, frame_count=1600, frame_rate=16000)
+    _write_tone_wav(first_audio, frame_count=1600, frame_rate=16000)
+    _write_tone_wav(second_audio, frame_count=1600, frame_rate=16000)
 
     class TimerStub:
         @staticmethod
@@ -1853,6 +1868,19 @@ def _write_silence_wav(path: Path, *, frame_count: int, frame_rate: int) -> None
         wav_file.setsampwidth(2)
         wav_file.setframerate(frame_rate)
         wav_file.writeframes(b"\x00\x00" * frame_count)
+
+
+def _write_tone_wav(path: Path, *, frame_count: int, frame_rate: int) -> None:
+    """写入非静音假音频，供走播放前校验（_verify_generated_audio）的链路测试。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 16-bit PCM：交替 ±1000，峰值远高于静音阈值 32。
+    frame = (1000).to_bytes(2, "little", signed=True) + (-1000).to_bytes(2, "little", signed=True)
+    pcm = frame * (frame_count // 2) + ((1000).to_bytes(2, "little", signed=True) if frame_count % 2 else b"")
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(frame_rate)
+        wav_file.writeframes(pcm)
 
 # === 新增：双后端与播放链路测试 ===
 

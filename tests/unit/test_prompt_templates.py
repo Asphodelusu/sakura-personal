@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 from types import SimpleNamespace
 
 from app.agent.actions import AgentEvent, AgentResult
@@ -31,19 +30,15 @@ def _build_proactive_tool_prompt() -> str:
 
 
 def test_proactive_check_tool_prompt_contains_background_web_rules() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     prompt = _build_proactive_tool_prompt()
 
-    assert "【主动屏幕感知后台 Web 搜索规则】" in prompt
-    assert "web__web_search" in prompt
-    assert "web__fetch_url" in prompt
-    assert "不能把截图本身当作反向图片搜索能力" in prompt
-    assert "不能编造具体身份" in prompt
-    assert "不主动做人肉式识别" in prompt
+    assert "后台 Web 搜索节制" in prompt
+    assert "最多 2 次搜索" in prompt
+    assert "不能当反向图搜" in prompt
+    assert "不搜索私人身份" in prompt
 
 
 def test_proactive_check_tool_prompt_places_web_rules_before_loop_limits() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     prompt = build_screen_awareness_check_tool_system_prompt(
         "角色设定",
         None,
@@ -56,22 +51,18 @@ def test_proactive_check_tool_prompt_places_web_rules_before_loop_limits() -> No
         max_tool_calls_per_turn=6,
     )
 
-    scene_index = prompt.index("【主动屏幕感知场景策略】")
-    web_index = prompt.index("【主动屏幕感知后台 Web 搜索规则】")
+    rules_index = prompt.index("【主动屏幕感知规则】")
     loop_index = prompt.index("当前 Agent 循环：")
 
-    assert scene_index < web_index < loop_index
+    assert rules_index < loop_index
 
 
 def test_proactive_check_tool_prompt_requires_history_and_image_fusion() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     prompt = _build_proactive_tool_prompt()
 
-    assert "recent_conversation 当作最近完整对话历史" in prompt
-    assert "用户和 Sakura 的最近对话" in prompt
-    assert "不只是用来避免 Sakura 自己复读" in prompt
-    assert "把 screen_contexts/visual_contexts 和 recent_conversation 交叉对照" in prompt
-    assert "最终回复至少包含一个来自图片或历史的具体依据" in prompt
+    assert "把 recent_conversation 当作最近完整对话历史" in prompt
+    assert "screen_contexts/visual_contexts 当作当前画面" in prompt
+    assert "回复必须至少包含一个具体依据" in prompt
 
 
 def test_reminder_event_prompt_does_not_include_background_web_research_rules() -> None:
@@ -88,33 +79,30 @@ def test_reminder_event_prompt_does_not_include_background_web_research_rules() 
 
 
 def test_proactive_tool_loop_rules_contains_background_web_research_rules() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     rules = build_screen_awareness_tool_loop_rules()
 
-    assert "【主动屏幕感知后台 Web 搜索规则】" in rules
-    assert "每次主动屏幕感知最多 2 次搜索" in rules
-    assert "最多读取 2 个网页" in rules
+    assert "后台 Web 搜索节制" in rules
+    assert "最多 2 次搜索" in rules
+    assert "2 个网页" in rules
 
 
 def test_segmented_reply_instruction_can_omit_translation_rules() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     instruction = build_segmented_reply_instruction(
         ["中性"],
         ["站立待机"],
         include_translation_rules=False,
     )
 
-    assert "ja 中绝对不要有任何非日语内容" not in instruction
-    assert "ja 和 zh 必须一一对应" not in instruction
-    assert "tone 只能从这些类别中选择：中性" in instruction
+    assert "禁止中文汉字" not in instruction
+    assert "一一对应" not in instruction
+    assert "tone 只能从：中性" in instruction
 
 
 def test_agent_reply_protocol_guides_ja_translation_self_check() -> None:
-    pytest.skip("personal fork — prompts rewritten")
     instruction = build_segmented_reply_instruction(["中性"], ["站立待机"])
 
-    assert "输出前静默自检每个 ja" in instruction
     assert 'ja="原因は Mermaid の構文みたい。"' in instruction
+    assert "一一对应" in instruction
 
 
 def test_prompt_lengths_stay_compact() -> None:
@@ -137,13 +125,21 @@ def test_prompt_lengths_stay_compact() -> None:
     assert len(reminder_prompt) < 700
 
 
-def test_agent_tool_prompt_length_stays_compact() -> None:
+def _bare_runtime() -> AgentRuntime:
+    """绕过 __init__ 的最小 runtime：补上 __init__ 里初始化、被 prompt 构建读取的属性。"""
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.system_prompt = "角色设定"
     runtime.reply_tones = ["中性"]
     runtime.reply_portraits = ["站立待机"]
     runtime.memory = SimpleNamespace(summary=lambda: "无")
     runtime.runtime_loop_settings = RuntimeLoopSettings()
+    runtime._turn_verbosity_guidance = ""
+    runtime.character_profile = None
+    return runtime
+
+
+def test_agent_tool_prompt_length_stays_compact() -> None:
+    runtime = _bare_runtime()
 
     prompt = AgentRuntime._build_tool_system_prompt(
         runtime,
@@ -151,19 +147,14 @@ def test_agent_tool_prompt_length_stays_compact() -> None:
     )
 
     # 静态前缀不再内联记忆/时间/步数（改由运行时上下文消息注入），应更精简。
-    assert len(prompt) < 2800
+    assert len(prompt) < 3000
     assert prompt.count("主动屏幕感知核心规则") == 0
     assert "长期记忆摘要" not in prompt
     assert "这是第 1 步" not in prompt
 
 
 def test_agent_runtime_prompt_patches_apply_to_prompt_builders() -> None:
-    runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.system_prompt = "角色设定"
-    runtime.reply_tones = ["中性"]
-    runtime.reply_portraits = ["站立待机"]
-    runtime.memory = SimpleNamespace(summary=lambda: "无")
-    runtime.runtime_loop_settings = RuntimeLoopSettings()
+    runtime = _bare_runtime()
     runtime.prompt_patches = [
         PromptPatchContribution(
             patch_id="demo",

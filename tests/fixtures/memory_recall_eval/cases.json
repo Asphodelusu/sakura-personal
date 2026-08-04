@@ -1,0 +1,120 @@
+{
+  "cases": [
+    {
+      "id": "distract_food_to_saya",
+      "current_input": "沙耶之歌结局到底在讲什么来着",
+      "recent_user_messages": [
+        "今晚好想吃火锅",
+        "牛肚要多一点"
+      ],
+      "visual_summaries": ["屏幕上在看美食推荐视频"],
+      "expected_ids": ["m_saya", "m_nitroplus"],
+      "forbidden_ids": ["m_hotpot"],
+      "notes": "多话题+视觉噪声：应回到沙耶，而不是火锅"
+    },
+    {
+      "id": "distract_work_to_fgo",
+      "current_input": "冠位戴冠戦的钻研戦怎么周回比较好",
+      "recent_user_messages": [
+        "Cursor 这段 TTS 又报错了",
+        "API timeout 怎么调"
+      ],
+      "visual_summaries": ["Cursor Agents 日志窗口"],
+      "expected_ids": ["m_fgo_crown"],
+      "forbidden_ids": ["m_work_cursor"],
+      "notes": "工作闲聊不应压过 FGO 检索"
+    },
+    {
+      "id": "entity_sofia",
+      "current_input": "索菲亚最近有没有再提到",
+      "recent_user_messages": ["今天天气不错", "要不要喝咖啡"],
+      "visual_summaries": [],
+      "expected_ids": ["m_sofia"],
+      "forbidden_ids": ["m_coffee", "m_weather_complaint"],
+      "notes": "专有名词应压过最近闲聊"
+    },
+    {
+      "id": "anaphora_game",
+      "current_input": "那个游戏后来查清楚了吗",
+      "recent_user_messages": [
+        "帮我搜一下 BRAIN 恐怖脑症候群是什么游戏"
+      ],
+      "visual_summaries": ["正在看 bilibili 首页"],
+      "expected_ids": ["m_brain_game"],
+      "forbidden_ids": [],
+      "notes": "指代需要最近一条，不要屏幕摘要"
+    },
+    {
+      "id": "sleep_habit",
+      "current_input": "我是不是又熬夜了",
+      "recent_user_messages": ["刚通关一局", "好想喝美式"],
+      "visual_summaries": [],
+      "expected_ids": ["m_sleep"],
+      "forbidden_ids": ["m_coffee"],
+      "notes": "作息相关，不应被美式带偏"
+    },
+    {
+      "id": "coffee_pref",
+      "current_input": "早上还是美式吧",
+      "recent_user_messages": ["昨晚雨好大", "心情一般"],
+      "visual_summaries": [],
+      "expected_ids": ["m_coffee"],
+      "forbidden_ids": ["m_weather_complaint"],
+      "notes": "饮品偏好"
+    },
+    {
+      "id": "commitment_lunch",
+      "current_input": "我们周末吃饭约在哪来着",
+      "recent_user_messages": ["这周加班好累", "Cursor 还行"],
+      "visual_summaries": [],
+      "expected_ids": ["m_commitment_lunch"],
+      "forbidden_ids": ["m_work_cursor"],
+      "notes": "约定回忆"
+    },
+    {
+      "id": "mute_while_working",
+      "current_input": "我在写代码，先别吵我，保持安静",
+      "recent_user_messages": ["火锅店排队好长"],
+      "visual_summaries": ["正在全屏写代码"],
+      "expected_ids": ["m_mute_pref"],
+      "forbidden_ids": ["m_hotpot"],
+      "notes": "偏好：工作时安静"
+    },
+    {
+      "id": "nitro_author",
+      "current_input": "虚渊玄那作叫什么来着，就是很猎奇的那部",
+      "recent_user_messages": ["美式喝完了"],
+      "visual_summaries": [],
+      "expected_ids": ["m_nitroplus", "m_saya"],
+      "forbidden_ids": ["m_coffee"],
+      "notes": "作者/作品关联"
+    },
+    {
+      "id": "weather_mood",
+      "current_input": "又阴雨，心情又差了",
+      "recent_user_messages": ["索菲亚发消息了吗"],
+      "visual_summaries": [],
+      "expected_ids": ["m_weather_complaint"],
+      "forbidden_ids": ["m_sofia"],
+      "notes": "天气抱怨记忆；索菲亚是干扰项"
+    },
+    {
+      "id": "hotpot_ok",
+      "current_input": "今晚继续火锅？还是牛肚",
+      "recent_user_messages": ["沙耶之歌太吓人了"],
+      "visual_summaries": [],
+      "expected_ids": ["m_hotpot"],
+      "forbidden_ids": ["m_saya", "m_nitroplus"],
+      "notes": "当前明确吃火锅时，不应被上一轮游戏话题带偏"
+    },
+    {
+      "id": "cursor_work",
+      "current_input": "TTS 在 Cursor 里又卡住了",
+      "recent_user_messages": ["周末吃饭吧"],
+      "visual_summaries": ["美食软件"],
+      "expected_ids": ["m_work_cursor"],
+      "forbidden_ids": ["m_commitment_lunch", "m_hotpot"],
+      "notes": "工作调试 vs 约定/美食噪声"
+    }
+  ]
+}

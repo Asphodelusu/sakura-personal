@@ -48,8 +48,8 @@ _AUDIO_CLEANUP_MAX_ATTEMPTS = 5
 # 宽限期要容得下系统卡顿：过短会在实际播放落后于理论时长时把音频拦腰截断
 _AUDIO_FINISH_FALLBACK_GRACE_MS = 3000
 _AUDIO_FINISH_FALLBACK_MIN_MS = 2000
-# 播放完成兜底的上限：时长无法解析或异常超长时按此值兜底，防止流程永久挂起
-_AUDIO_FINISH_FALLBACK_MAX_MS = 60_000
+# 播放完成兜底上限。联网长答单段常有 30–90s；旧 60s 会在外层兜底提前 stop，听感像「没读完」。
+_AUDIO_FINISH_FALLBACK_MAX_MS = 180_000
 
 def _load_qt_multimedia() -> tuple[type[Any], type[Any]]:
     global QAudioOutput, QMediaPlayer

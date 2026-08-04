@@ -78,21 +78,31 @@ def build_screen_observation_user_message(
     prompt_text = (
         f"{text.strip()}\n\n"
         f"当前屏幕截图信息：{observation.width}x{observation.height}，"
-        f"捕获时间 {observation.captured_at}，屏幕 {observation.screen_name}。"
+        f"捕获时间 {observation.captured_at}，屏幕 {observation.screen_name}。\n"
+        "【忽略自己的界面】桌宠（夜乃樱／立绘）通常在屏幕右下角或边缘；"
+        "那里的对话气泡、日文/中文台词、输入栏都是你自己说的话或自己的 UI，"
+        "不是对方正在看的应用内容。请完全忽略，不要摘抄、不要回答、不要据此自问自答；"
+        "只描述并理解对方正在操作的窗口/页面/游戏等内容。"
     ).strip()
 
     # 附加 UIA 直接读取的窗口文字（免费，不经过 OCR）
+    # 前台若是本进程，读到的就是自家气泡/输入栏，会诱发自问自答，故跳过。
     try:
+        import os
+
+        from app.perception.win32 import get_active_window_pid
         from app.perception.screen_reader import read_active_window
-        uia = read_active_window()
-        if uia.is_accessible and uia.text_content.strip():
-            uia_block = (
-                f"\n\n[UIA 直接读取] 以下文字来自系统无障碍接口，已从屏幕控件直接提取，无需 OCR：\n"
-                f"应用类型：{uia.app_type}\n"
-                f"进程：{uia.process_name}\n"
-                f"{uia.text_content}"
-            )
-            prompt_text += uia_block
+
+        if int(get_active_window_pid() or 0) != int(os.getpid()):
+            uia = read_active_window()
+            if uia.is_accessible and uia.text_content.strip():
+                uia_block = (
+                    f"\n\n[UIA 直接读取] 以下文字来自系统无障碍接口，已从屏幕控件直接提取，无需 OCR：\n"
+                    f"应用类型：{uia.app_type}\n"
+                    f"进程：{uia.process_name}\n"
+                    f"{uia.text_content}"
+                )
+                prompt_text += uia_block
     except Exception:
         pass  # UIA 不可用时静默跳过，截图仍正常发送
 
@@ -114,7 +124,11 @@ def build_screen_observation_user_message(
 
 
 def capture_screen_image(excluded_widget: QWidget | None = None) -> CapturedScreenImage:
-    """截取光标所在屏幕并复制为 QImage，避免后台线程触碰 QPixmap。"""
+    """截取光标所在屏幕并复制为 QImage，避免后台线程触碰 QPixmap。
+
+    不在截图时 hide/show 桌宠（会闪一下，观感差）。自家 UI 靠调用方跳过本进程 UIA、
+    以及观察提示里的忽略说明；excluded_widget 保留形参以兼容现有调用点。
+    """
 
     from PySide6.QtGui import QCursor
     from PySide6.QtWidgets import QApplication

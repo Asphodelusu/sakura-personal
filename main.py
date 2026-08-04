@@ -8,7 +8,7 @@ from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QObject, QProcess, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt, Signal, Slot, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QStyleFactory
 
@@ -62,6 +62,7 @@ from app.ui.subtitle_controller import (
     SPEECH_TYPING_INTERVAL_MS,
     normalize_subtitle_display_speed,
 )
+from app.core.app_restart import resolve_restart_exit_code
 from app.ui.tray_menu import RESTART_EXIT_CODE
 from app.voice.tts_settings import TTSConfigError
 from app.voice.tts_bundle import (
@@ -475,6 +476,8 @@ def main() -> int:
     pet_window = PetWindow(context)
     app.aboutToQuit.connect(pet_window.close_external_tools)
     pet_window.show()
+    # 尽早预热 LLM 握手（与 deferred TTS/插件并行，不挡首帧）。
+    QTimer.singleShot(0, pet_window.start_llm_connection_warmup)
     QTimer.singleShot(0, lambda: _start_tts_migration_or_deferred(BASE_DIR, pet_window))
 
     return app.exec()
@@ -801,15 +804,9 @@ def _start_deferred_startup(base_dir: Path, pet_window: PetWindow) -> None:
 if __name__ == "__main__":
     exit_code = main()
     if exit_code == RESTART_EXIT_CODE:
-        if getattr(sys, "frozen", False):
-            program = sys.executable
-            arguments = [*sys.argv[1:]]
-        else:
-            program = sys.executable
-            arguments = [str(BASE_DIR / "main.py"), *sys.argv[1:]]
-        started, _pid = QProcess.startDetached(program, arguments, str(BASE_DIR))
-        if not started:
+        # bat（SAKURA_LAUNCHER_RESTART=1）负责清屏重跑；否则 startDetached 自拉起。
+        final_code = resolve_restart_exit_code(base_dir=BASE_DIR)
+        if final_code not in (0, RESTART_EXIT_CODE):
             _write_startup_error("Restart", "无法启动新的 Sakura 进程。")
-            raise SystemExit(1)
-        raise SystemExit(0)
+        raise SystemExit(final_code)
     raise SystemExit(exit_code)

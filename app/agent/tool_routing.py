@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
 from app.agent.actions import PendingToolAction
 from app.agent.screen_policy import ScreenPolicy
-from app.agent.tool_policy import BROWSER_SNAPSHOT_TOOL_NAME, ToolPolicy
+from app.agent.tool_policy import (
+    BROWSER_SNAPSHOT_TOOL_NAME,
+    PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+    PLAYWRIGHT_NAVIGATE_TOOL_NAME,
+    ToolPolicy,
+)
 from app.agent.tools import ToolExecutionResult, ToolRegistry
 from app.core.debug_log import debug_log
 from app.llm.api_client import ChatMessage, NativeToolCall
@@ -430,25 +435,785 @@ def _latest_user_is_browser_lookup_request(messages: list[ChatMessage]) -> bool:
 _WEB_SEARCH_TOOL_NAMES = frozenset(
     {"web__web_search", "web_search", "web__fetch_url", "fetch_url"}
 )
+_WEB_SEARCH_ONLY_TOOL_NAMES = frozenset({"web__web_search", "web_search"})
+_WEB_FETCH_TOOL_NAMES = frozenset(
+    {
+        "web__fetch_url",
+        "fetch_url",
+        PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+        "playwright_navigate",
+    }
+)
 _MEMORY_SEARCH_TOOL_NAMES = frozenset({"memory_search"})
 _MEMORY_DETAIL_TOOL_NAMES = frozenset({"memory_detail"})
+
+# 深度资料题：仅靠搜索摘要通常不够，需要再读正文。
+_DEEP_WEB_LOOKUP_MARKERS = (
+    "都讲了什么",
+    "讲了什么",
+    "讲什么",
+    "说了什么",
+    "什么故事",
+    "剧情",
+    "内容",
+    "详细",
+    "深入",
+    "介绍",
+    "是什么",
+    "是谁",
+    "百科",
+    "梗概",
+    "评价",
+    "攻略",
+    "设定",
+)
+# 实时/短答查询：搜一次摘要即可，不必强行读页。
+_SHALLOW_WEB_LOOKUP_MARKERS = (
+    "天气",
+    "气温",
+    "几点",
+    "股价",
+    "汇率",
+    "比分",
+    "开奖",
+    "限行",
+    "油价",
+)
+
+_PREFERRED_FETCH_HOST_HINTS = (
+    "wikipedia",
+    "baike.baidu",
+    "moegirl",
+    "zhihu.com",
+    # bilibili 专栏/动态链经常失效（「页面不存在」），不作为优先读页来源
+    "bangumi.tv",
+    "douban.com",
+    "fandom.com",
+    "gamersky",
+    "3dm",
+    "indienova",
+    "steamcommunity",
+    "store.steampowered",
+    "itch.io",
+)
+_ERROR_PAGE_MARKERS = (
+    "页面不存在",
+    "頁面不存在",
+    "内容不存在",
+    "该页面不存在",
+    "你访问的页面不存在",
+    "访问的页面不存在",
+    "啥都没有",
+    "呜呼，出错",
+    "呜呼~出错",
+    "出错啦",
+    "404 not found",
+    "404错误",
+    "page not found",
+)
+_AVOID_FETCH_HOST_HINTS = (
+    "weibo.com",
+    "twitter.com",
+    "x.com",
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "cndzys.com",
+    "dxy.cn",
+    "xywy.com",
+    "39.net",
+    "docin.com",
+)
+_AVOID_FETCH_PATH_HINTS = (
+    "/video/",
+    "/BV",
+)
+
+
+def _latest_user_is_deep_web_lookup(messages: list[ChatMessage]) -> bool:
+    """作品介绍/剧情/设定等需要正文证据的查询。"""
+    if not _latest_user_is_browser_lookup_request(messages):
+        return False
+    text = (_latest_user_text(messages) or "").lower()
+    if any(marker in text for marker in _SHALLOW_WEB_LOOKUP_MARKERS):
+        return False
+    return any(marker in text for marker in _DEEP_WEB_LOOKUP_MARKERS)
+
+
+def unwrap_mcp_tool_payload(content: Any) -> Any:
+    """解开 MCP bridge 外壳，取出 web_search/fetch_url 的真实 payload。
+
+    bridge 返回形如 {content:[...], text:"{...json...}", structured_content:{...}, is_error:bool}，
+    若直接按顶层 results/digest 读取会得到空结果，模型就会说「搜索结果为空」。
+    """
+    if not isinstance(content, dict):
+        return content
+
+    # 已是业务 payload
+    if isinstance(content.get("results"), list):
+        return content
+    if (
+        "url" in content
+        and ("text" in content or "title" in content)
+        and "is_error" not in content
+        and "structured_content" not in content
+    ):
+        return content
+
+    structured = content.get("structured_content")
+    if isinstance(structured, dict):
+        if isinstance(structured.get("results"), list) or "url" in structured or "digest" in structured:
+            return structured
+
+    candidates: list[str] = []
+    text = content.get("text")
+    if isinstance(text, str) and text.strip():
+        candidates.append(text.strip())
+    items = content.get("content")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                raw = item["text"].strip()
+                if raw:
+                    candidates.append(raw)
+
+    for raw in candidates:
+        if not raw.startswith("{") and not raw.startswith("["):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return content
+
+
+def web_tool_payload(result: ToolExecutionResult) -> dict[str, Any]:
+    """读取工具结果中的业务字典（自动解开 MCP 外壳）。"""
+    content = unwrap_mcp_tool_payload(result.content)
+    return content if isinstance(content, dict) else {}
+
+
+def _mcp_tool_content_is_error(content: Any) -> bool:
+    return isinstance(content, dict) and bool(content.get("is_error"))
+
+
+def _web_search_payload_has_hits(payload: dict[str, Any]) -> bool:
+    rows = payload.get("results")
+    if isinstance(rows, list) and any(isinstance(item, dict) and item.get("title") for item in rows):
+        return True
+    digest = str(payload.get("digest") or "").strip()
+    return len(digest) >= 40
+
+
+def _successful_web_searches(execution_results: list[ToolExecutionResult]) -> list[ToolExecutionResult]:
+    kept: list[ToolExecutionResult] = []
+    for result in execution_results:
+        if result.tool_name not in _WEB_SEARCH_ONLY_TOOL_NAMES or not result.success:
+            continue
+        if not isinstance(result.content, dict):
+            continue
+        if result.content.get("skipped") or _mcp_tool_content_is_error(result.content):
+            continue
+        payload = web_tool_payload(result)
+        if _web_search_payload_has_hits(payload):
+            kept.append(result)
+    return kept
+
+
+def _successful_web_fetches(execution_results: list[ToolExecutionResult]) -> list[ToolExecutionResult]:
+    return [
+        result
+        for result in execution_results
+        if result.tool_name in _WEB_FETCH_TOOL_NAMES
+        and result.success
+        and not (isinstance(result.content, dict) and result.content.get("skipped"))
+        and not _mcp_tool_content_is_error(result.content)
+        and _web_fetch_has_readable_content(result)
+    ]
+
+
+def _web_fetch_has_readable_content(result: ToolExecutionResult) -> bool:
+    content = result.content
+    if isinstance(content, str):
+        return _text_looks_like_readable_page(content)
+    payload = web_tool_payload(result) if isinstance(content, dict) else {}
+    text = str(payload.get("text") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    return _text_looks_like_readable_page(text, title=title)
+
+
+def _text_looks_like_error_page(text: str, *, title: str = "") -> bool:
+    """识别 404 /「页面不存在」等错误壳页（常见于失效 bilibili 专栏）。"""
+    blob = f"{title}\n{text or ''}".strip().lower()
+    if not blob:
+        return True
+    return any(marker.lower() in blob for marker in _ERROR_PAGE_MARKERS)
+
+
+def _text_looks_like_readable_page(text: str, *, title: str = "") -> bool:
+    """过滤二进制垃圾页、空壳页、错误壳页；要求有足够中文/字母正文。"""
+    cleaned = (text or "").strip()
+    if len(cleaned) < 80:
+        return False
+    if _text_looks_like_error_page(cleaned, title=title):
+        return False
+    sample = cleaned[:800]
+    control = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\n\t\r")
+    if control >= 8:
+        return False
+    cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
+    alpha = sum(1 for ch in sample if ch.isalpha())
+    return cjk >= 24 or (cjk + alpha) >= 120
+
+
+def _query_relevance_terms(text: str) -> list[str]:
+    raw = (text or "").strip()
+    terms: list[str] = []
+    for match in re.findall(r"《([^》]{2,40})》", raw):
+        terms.append(match.strip())
+    for match in re.findall(r"[A-Za-z][A-Za-z0-9:_\-]{2,40}", raw):
+        terms.append(match)
+    for match in re.findall(r"[\u4e00-\u9fff]{2,12}", raw):
+        if match in {"是什么", "都讲了", "讲了什么", "搜一下", "介绍一下", "什么", "介绍和攻略"}:
+            continue
+        terms.append(match)
+        # 长串常把「作品名+介绍攻略」粘在一起；截前缀作锚点。
+        if len(match) >= 6:
+            terms.append(match[:6])
+            terms.append(match[:4])
+    # 去重保序
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for term in terms:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(term)
+    return ordered[:12]
+
+
+def _search_snippet_chars(search_results: list[ToolExecutionResult]) -> int:
+    total = 0
+    for result in search_results:
+        content = web_tool_payload(result)
+        if isinstance(content.get("snippet_chars"), int):
+            total += max(0, int(content["snippet_chars"]))
+            continue
+        digest = str(content.get("digest") or "")
+        if digest:
+            total += len(digest)
+            continue
+        rows = content.get("results")
+        if isinstance(rows, list):
+            for item in rows:
+                if isinstance(item, dict):
+                    total += len(str(item.get("snippet") or ""))
+    return total
+
+
+def _search_has_rich_snippets(
+    search_results: list[ToolExecutionResult],
+    *,
+    query: str = "",
+) -> bool:
+    """对题的长摘要已够综合时，不必再赌本地读页。
+
+    注意：跑偏的长文（如医学页）绝不能算 rich，否则会带着错误证据直接收束。
+    """
+    if not query or not _search_results_look_on_topic(search_results, query):
+        return False
+    return _search_snippet_chars(search_results) >= 800
 
 
 def _should_fast_forward_after_web_search(
     messages: list[ChatMessage],
     execution_results: list[ToolExecutionResult],
 ) -> bool:
-    """信息查询在已有网页搜索/抓取结果后应收束工具循环，进入最终总结。
+    """信息查询在证据足够后应收束工具循环，进入最终总结。
 
-    避免模型因「不确定首轮结果是否够用」在同一轮里换关键词反复搜索。
+    简单题：一次成功搜索即可。
+    深度题：优先吃检索长摘要；摘要够厚就收束，读页只是补强。
     """
     if not _latest_user_is_browser_lookup_request(messages):
         return False
     if _latest_user_is_browser_interaction_request(messages):
         return False
+
+    searches = _successful_web_searches(execution_results)
+    fetches = _successful_web_fetches(execution_results)
+    if _latest_user_is_deep_web_lookup(messages):
+        query = _latest_user_text(messages) or ""
+        if fetches:
+            return True
+        if searches and _search_has_rich_snippets(searches, query=query):
+            return True
+        if searches and not _select_urls_for_auto_fetch(searches, max_urls=1, query=query):
+            # 搜到了但没有可抓的公开页，别空转。
+            return True
+        if searches and _has_attempted_auto_web_fetch(execution_results):
+            # 已自动读过页但正文不可用：用现有摘要收束，避免模型换词连搜。
+            return True
+        return False
+
+    return bool(searches or fetches)
+
+
+def _has_attempted_auto_web_fetch(execution_results: list[ToolExecutionResult]) -> bool:
     return any(
-        result.tool_name in _WEB_SEARCH_TOOL_NAMES and result.success
+        result.tool_name in _WEB_FETCH_TOOL_NAMES
+        and isinstance(result.content, dict)
+        and result.content.get("auto_fetched")
         for result in execution_results
+    )
+
+
+def _should_auto_fetch_after_web_search(
+    messages: list[ChatMessage],
+    step_results: list[ToolExecutionResult],
+    execution_results: list[ToolExecutionResult],
+) -> bool:
+    """深度查询且摘要偏薄时，串行打开候选页（边讲边预取下一页）。"""
+    if not _latest_user_is_deep_web_lookup(messages):
+        return False
+    if _latest_user_is_browser_interaction_request(messages):
+        return False
+    if _successful_web_fetches(execution_results):
+        return False
+    step_searches = _successful_web_searches(step_results)
+    if not step_searches:
+        return False
+    query = _latest_user_text(messages) or ""
+    if _search_has_rich_snippets(step_searches, query=query):
+        return False
+    return bool(_select_urls_for_auto_fetch(step_searches, max_urls=3, query=query))
+
+
+def _fetch_page_evidence_chars(result: ToolExecutionResult) -> int:
+    if not result.success:
+        return 0
+    if isinstance(result.content, str):
+        return len(result.content.strip())
+    if not isinstance(result.content, dict):
+        return 0
+    payload = web_tool_payload(result)
+    return len(str(payload.get("text") or "").strip())
+
+
+def _auto_fetch_evidence_enough(
+    kept: list[ToolExecutionResult],
+    *,
+    enough_chars: int = 1600,
+    max_keep: int = 3,
+) -> bool:
+    """已读正文是否足够进入综合（够用即停，不再开后续页）。"""
+    if len(kept) >= max(1, max_keep):
+        return True
+    total = sum(_fetch_page_evidence_chars(item) for item in kept)
+    return total >= max(400, enough_chars)
+
+
+def build_refined_web_search_query(messages: list[ChatMessage]) -> str:
+    """首轮搜源太噪时，换更贴作品页的关键词。"""
+    text = (_latest_user_text(messages) or "").strip()
+    titled = re.findall(r"《([^》]{2,40})》", text)
+    if titled:
+        core = titled[0].strip()
+    else:
+        terms = _query_relevance_terms(text)
+        core = " ".join(terms[:4]).strip()
+    if not core:
+        return ""
+    # 与 web_search_server 内兜底互补：这里给工具循环第二次机会。
+    if re.search(r"brain", core, flags=re.I) and "恐怖脑" in core:
+        return "电気人_denki brain"
+    return f"「{core}」"[:70]
+
+
+def _search_results_look_on_topic(
+    search_results: list[ToolExecutionResult],
+    query: str,
+) -> bool:
+    """标题/摘要已明显命中作品名时，不必为了读页再换词重搜。"""
+    terms = _query_relevance_terms(query)
+    if not terms:
+        return False
+    distinctive = [t for t in terms if len(t) >= 3][:8]
+    if not distinctive:
+        return False
+    for result in search_results:
+        content = web_tool_payload(result)
+        digest = str(content.get("digest") or "")
+        if digest:
+            blob = digest.lower()
+            hits = sum(1 for term in distinctive if term.lower() in blob)
+            if hits >= 2 or (hits >= 1 and any(len(term) >= 4 and term.lower() in blob for term in distinctive)):
+                return True
+        rows = content.get("results")
+        if not isinstance(rows, list):
+            continue
+        for item in rows[:5]:
+            if not isinstance(item, dict):
+                continue
+            blob = f"{item.get('title') or ''}\n{item.get('snippet') or ''}".lower()
+            hits = sum(1 for term in distinctive if term.lower() in blob)
+            if hits >= 2 or (hits >= 1 and any(len(term) >= 4 and term.lower() in blob for term in distinctive)):
+                return True
+    return False
+
+
+def _should_refine_web_search(
+    messages: list[ChatMessage],
+    execution_results: list[ToolExecutionResult],
+) -> bool:
+    """默认关闭自动换词重搜。
+
+    智谱 Web Search 按「请求次数」计费：一次 HTTP=扣 1 次，与返回条数无关。
+    官方推荐单次 search_pro + 更大 count/长摘要；自动 refine 会成倍烧资源包。
+    """
+    _ = messages, execution_results
+    return False
+
+
+def _select_urls_for_auto_fetch(
+    search_results: list[ToolExecutionResult],
+    *,
+    max_urls: int = 2,
+    query: str = "",
+) -> list[str]:
+    """从搜索结果里挑更适合读正文的链接（百科/资料站优先，社交噪音靠后）。"""
+    scored: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    order = 0
+    query_terms = _query_relevance_terms(query)
+    for result in search_results:
+        content = web_tool_payload(result)
+        if not content:
+            continue
+        if not query_terms:
+            query_terms = _query_relevance_terms(str(content.get("query") or ""))
+        rows = content.get("results")
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            seen.add(url)
+            host = url.lower()
+            if any(hint in host for hint in _AVOID_FETCH_PATH_HINTS):
+                continue
+            score = 0
+            if any(hint in host for hint in _PREFERRED_FETCH_HOST_HINTS):
+                score += 5
+            # B 站专栏/动态易失效；视频本来就 avoid。非百科类 bilibili 链接略降权。
+            if "bilibili.com" in host:
+                score -= 2
+            if any(hint in host for hint in _AVOID_FETCH_HOST_HINTS):
+                score -= 6
+            title = str(item.get("title") or "")
+            snippet = str(item.get("snippet") or "")
+            blob = f"{title}\n{snippet}"
+            if any(token in blob for token in ("百科", "维基", "wiki", "剧情", "简介", "攻略", "游戏")):
+                score += 2
+            if query_terms:
+                hits = sum(1 for term in query_terms if term.lower() in blob.lower())
+                score += min(6, hits * 2)
+                if hits == 0:
+                    score -= 4
+            scored.append((score, order, url))
+            order += 1
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    return [url for score, _order, url in scored if score >= 0][: max(0, max_urls)]
+
+
+def _playwright_reader_available(tools: ToolRegistry | None) -> bool:
+    if tools is None:
+        return False
+    return (
+        tools.get(PLAYWRIGHT_NAVIGATE_TOOL_NAME) is not None
+        and tools.get(PLAYWRIGHT_GET_TEXT_TOOL_NAME) is not None
+    )
+
+
+def _read_url_via_playwright(
+    tools: ToolRegistry,
+    url: str,
+    *,
+    max_chars: int = 4000,
+) -> ToolExecutionResult:
+    """用 playwright_browser 插件打开页面并读正文（跳过确认，供自动查阅）。"""
+    try:
+        nav = tools.execute(PLAYWRIGHT_NAVIGATE_TOOL_NAME, {"url": url})
+    except Exception as exc:
+        return ToolExecutionResult(
+            tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+            success=False,
+            content={"url": url, "auto_fetched": True, "reader": "playwright"},
+            error=str(exc),
+        )
+    if not nav.success:
+        return ToolExecutionResult(
+            tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+            success=False,
+            content={"url": url, "auto_fetched": True, "reader": "playwright"},
+            error=nav.error or "navigate_failed",
+        )
+
+    title = ""
+    final_url = url
+    if isinstance(nav.content, dict):
+        title = str(nav.content.get("title") or "").strip()
+        final_url = str(nav.content.get("url") or url).strip() or url
+
+    try:
+        text_result = tools.execute(PLAYWRIGHT_GET_TEXT_TOOL_NAME, {"selector": "body"})
+    except Exception as exc:
+        return ToolExecutionResult(
+            tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+            success=False,
+            content={"url": final_url, "title": title, "auto_fetched": True, "reader": "playwright"},
+            error=str(exc),
+        )
+    if not text_result.success:
+        return ToolExecutionResult(
+            tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+            success=False,
+            content={"url": final_url, "title": title, "auto_fetched": True, "reader": "playwright"},
+            error=text_result.error or "get_text_failed",
+        )
+
+    raw = text_result.content
+    if isinstance(raw, dict):
+        text = str(raw.get("text") or raw.get("result") or "")
+    else:
+        text = str(raw or "")
+    text = re.sub(r"\s+", " ", text).strip()[:max_chars]
+    content = {
+        "url": final_url,
+        "title": title,
+        "text": text,
+        "auto_fetched": True,
+        "reader": "playwright",
+    }
+    if not _text_looks_like_readable_page(text, title=title):
+        # 失效页不要留在可见浏览器里；清到空白页，避免用户看到两个 Error。
+        try:
+            tools.execute(PLAYWRIGHT_NAVIGATE_TOOL_NAME, {"url": "about:blank"})
+        except Exception:
+            pass
+        return ToolExecutionResult(
+            tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+            success=False,
+            content=content,
+            error="unreadable_page_content",
+        )
+    return ToolExecutionResult(
+        tool_name=PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+        success=True,
+        content=content,
+        error="",
+    )
+
+
+def _read_url_via_fetch(url: str, *, max_chars: int = 4000) -> ToolExecutionResult:
+    from app.agent.mcp import web_search_server as web_mod
+
+    try:
+        payload = web_mod.fetch_url(url, max_chars=max_chars)
+        content = payload if isinstance(payload, dict) else {"text": str(payload)}
+        text = str(content.get("text") or "")
+        title = str(content.get("title") or "")
+        merged = {**content, "url": content.get("url") or url, "auto_fetched": True, "reader": "fetch_url"}
+        if not _text_looks_like_readable_page(text, title=title):
+            return ToolExecutionResult(
+                tool_name="web__fetch_url",
+                success=False,
+                content=merged,
+                error="unreadable_page_content",
+            )
+        return ToolExecutionResult(
+            tool_name="web__fetch_url",
+            success=True,
+            content=merged,
+            error="",
+        )
+    except Exception as exc:
+        return ToolExecutionResult(
+            tool_name="web__fetch_url",
+            success=False,
+            content={"url": url, "auto_fetched": True, "reader": "fetch_url"},
+            error=str(exc),
+        )
+
+
+def _read_url_for_deep_lookup(
+    url: str,
+    *,
+    tools: ToolRegistry | None,
+    max_chars: int = 4000,
+    prefer_playwright: bool = True,
+) -> ToolExecutionResult:
+    """优先插件浏览器读页；失败再退回 fetch_url。"""
+    if prefer_playwright and _playwright_reader_available(tools):
+        assert tools is not None
+        result = _read_url_via_playwright(tools, url, max_chars=max_chars)
+        if result.success and _web_fetch_has_readable_content(result):
+            return result
+        fallback = _read_url_via_fetch(url, max_chars=max_chars)
+        if fallback.success and _web_fetch_has_readable_content(fallback):
+            if isinstance(fallback.content, dict):
+                fallback.content["playwright_error"] = result.error or "unreadable"
+            return fallback
+        return result
+    return _read_url_via_fetch(url, max_chars=max_chars)
+
+
+def _execute_auto_web_fetches(
+    urls: list[str],
+    *,
+    step_index: int,
+    max_chars: int = 4000,
+    max_keep: int = 3,
+    enough_chars: int = 1600,
+    on_page: Callable[[int, ToolExecutionResult], None] | None = None,
+    tools: ToolRegistry | None = None,
+) -> list[ToolExecutionResult]:
+    """串行读页：优先 playwright 插件，失败退 fetch_url；够用即停。
+
+    插件是单页会话，不能并行预开下一 URL；旁白回调仍按页触发。
+    无插件时保留 fetch_url 预取，与旁白重叠。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    cleaned = [url.strip() for url in urls if str(url).strip()][:5]
+    if not cleaned:
+        return []
+
+    use_playwright = _playwright_reader_available(tools)
+    debug_log(
+        "AgentRuntime",
+        "深度查询串行读页",
+        {
+            "step_index": step_index,
+            "url_count": len(cleaned),
+            "urls": cleaned,
+            "max_keep": max_keep,
+            "enough_chars": enough_chars,
+            "reader": "playwright" if use_playwright else "fetch_url",
+        },
+    )
+
+    def _read_one(url: str) -> ToolExecutionResult:
+        return _read_url_for_deep_lookup(
+            url,
+            tools=tools,
+            max_chars=max_chars,
+            prefer_playwright=use_playwright,
+        )
+
+    kept: list[ToolExecutionResult] = []
+    failures: list[ToolExecutionResult] = []
+
+    if use_playwright:
+        for url in cleaned:
+            result = _read_one(url)
+            usable = bool(result.success and _web_fetch_has_readable_content(result))
+            if usable:
+                kept.append(result)
+                if on_page is not None:
+                    on_page(len(kept), result)
+                if _auto_fetch_evidence_enough(
+                    kept,
+                    enough_chars=enough_chars,
+                    max_keep=max_keep,
+                ):
+                    break
+            else:
+                failures.append(result)
+        return kept or failures[:1]
+
+    next_url_index = 0
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="web-autofetch") as pool:
+        current_future = pool.submit(_read_one, cleaned[next_url_index])
+        next_url_index += 1
+
+        while current_future is not None:
+            result = current_future.result()
+            usable = bool(result.success and _web_fetch_has_readable_content(result))
+
+            if usable:
+                kept.append(result)
+            else:
+                failures.append(result)
+
+            need_more = (not usable and next_url_index < len(cleaned)) or (
+                usable
+                and not _auto_fetch_evidence_enough(
+                    kept,
+                    enough_chars=enough_chars,
+                    max_keep=max_keep,
+                )
+                and next_url_index < len(cleaned)
+            )
+            prefetch_future = None
+            if need_more:
+                prefetch_future = pool.submit(_read_one, cleaned[next_url_index])
+                next_url_index += 1
+
+            if usable and on_page is not None:
+                on_page(len(kept), result)
+
+            if prefetch_future is None:
+                break
+            current_future = prefetch_future
+
+    if kept:
+        return kept
+    return failures[:1]
+
+
+def build_web_search_progress_texts(result: ToolExecutionResult) -> tuple[str, str]:
+    """返回 (ja, zh) 过程旁白。"""
+    titles: list[str] = []
+    content = web_tool_payload(result)
+    rows = content.get("results")
+    if isinstance(rows, list):
+        for item in rows[:2]:
+            if isinstance(item, dict):
+                title = str(item.get("title") or "").strip()
+                if title:
+                    titles.append(title[:28])
+    if titles:
+        joined_zh = "；".join(titles)
+        return (
+            f"いくつか見つかった。『{titles[0]}』を見てみるね。",
+            f"搜到了：{joined_zh}。我先打开看看。",
+        )
+    return ("ちょっと調べてみたよ。", "我查到一点线索了。")
+
+
+def build_web_fetch_progress_texts(result: ToolExecutionResult, *, index: int) -> tuple[str, str]:
+    if not result.success or not _web_fetch_has_readable_content(result):
+        return ("", "")
+    content = web_tool_payload(result)
+    title = str(content.get("title") or "").strip() or f"资料{index}"
+    text = str(content.get("text") or "").strip().replace("\n", " ")
+    snippet = text[:72] + ("…" if len(text) > 72 else "")
+    if snippet:
+        return (
+            f"『{title[:20]}』には、{snippet}って書いてある。",
+            f"第{index}页《{title[:24]}》里写到：{snippet}",
+        )
+    return (
+        f"『{title[:20]}』を読んだよ。",
+        f"第{index}页《{title[:24]}》我读完了。",
     )
 
 
@@ -903,9 +1668,11 @@ def _build_web_tool_capability_rule(visible_browser_mode: bool) -> str:
             "后台 web__ 搜索/抓取只用于非可见浏览器的轻量公开资料。"
         )
     return (
-        "- 网页搜索策略：web__web_search 支持百度/必应/DDG，可加 site: 限定来源（如 site:zhihu.com）。\n"
-        "- 复杂话题多搜几轮：先粗搜了解概况 → 读一篇关键页面(web__fetch_url) → 从内容中提取关键词 → 用关键词再搜一轮 → 综合回答。\n"
-        "- 社区/论坛类（攻略、评测、八卦）追加'知乎''NGA''贴吧''B站'等社区名重搜。"
+        "- 网页搜索策略：web__web_search 优先智谱检索，返回长摘要 digest；失败才回退百度/必应/DDG。\n"
+        "- 作品/设定/剧情类：先搜一次（max_results 建议 6-8），优先吃 digest/snippet 综合回答；"
+        "只有摘要明显不够且链接像可读文章时，再用 web__fetch_url。反爬/视频页不要死磕。\n"
+        "- 天气/股价等短事实：一次搜索摘要够用就停。\n"
+        "- 社区/论坛类（攻略、评测）可追加'知乎''NGA''贴吧''B站'等社区名重搜。"
     )
 
 
@@ -914,6 +1681,7 @@ def _build_screen_and_desktop_routing_rule(allow_screen_observation: bool) -> st
         return "\n".join(
             [
                 "- 当用户询问当前屏幕内容、可见文字、报错含义、界面状态或“这个是什么意思”时，优先调用 observe_screen；这是 Sakura 内置视觉观察，只用于理解画面和解释，不用于鼠标坐标。",
+                "- 寒暄、打招呼、「喂」、叫名字、闲聊情绪时不要调用 observe_screen；没有明确画面依赖就直接回复。",
                 "- 当用户要求你点击、移动鼠标、输入、切换窗口或操作桌面应用时，不要用 observe_screen 推理坐标；改用 Windows MCP 的 windows__Snapshot / windows__Screenshot 作为操作前观察。",
             ]
         )

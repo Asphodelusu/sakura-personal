@@ -1,0 +1,52 @@
+{
+  "memories": [
+    {
+      "id": "m_saya",
+      "content": "对方玩过《沙耶之歌》，觉得结局很残酷，伦理和感知都被颠覆。"
+    },
+    {
+      "id": "m_fgo_crown",
+      "content": "对方在打 FGO 冠位戴冠戦，关心钻研戦周回和認定戦配置。"
+    },
+    {
+      "id": "m_hotpot",
+      "content": "对方喜欢吃麻辣火锅，尤其偏爱牛肚和鸭血。"
+    },
+    {
+      "id": "m_sofia",
+      "content": "对方提到过索菲亚（ソフィア），是他很在意的人。"
+    },
+    {
+      "id": "m_work_cursor",
+      "content": "对方最近常用 Cursor 写代码，调试 TTS 和 API 配置。"
+    },
+    {
+      "id": "m_sleep",
+      "content": "对方作息不稳定，经常熬夜到凌晨才睡。"
+    },
+    {
+      "id": "m_coffee",
+      "content": "对方早上习惯喝美式咖啡，不加糖。"
+    },
+    {
+      "id": "m_brain_game",
+      "content": "对方问过一款名字像「BRAIN：恐怖脑症候群」的游戏，当时没搜到确切作品。"
+    },
+    {
+      "id": "m_commitment_lunch",
+      "content": "双方约好周末一起吃午饭，地点待定。"
+    },
+    {
+      "id": "m_weather_complaint",
+      "content": "对方抱怨过连续阴雨让心情变差。"
+    },
+    {
+      "id": "m_nitroplus",
+      "content": "对方知道沙耶之歌是 Nitro+ 的虚渊玄作品。"
+    },
+    {
+      "id": "m_mute_pref",
+      "content": "对方写代码或不想被打扰时，希望保持安静，先别吵他。"
+    }
+  ]
+}

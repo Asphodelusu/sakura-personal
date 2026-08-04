@@ -249,6 +249,38 @@ def test_focus_snapshot_is_own_process() -> None:
     assert not FocusSnapshot(hwnd=1, process="x", title="t", pid=0).is_own_process
 
 
+def test_collect_triggers_skips_when_focus_is_own_process() -> None:
+    """前台为本进程时，timer/content 也不应触发评估（防自拍自问自答）。"""
+    obs = _observer(timer_seconds=1.0, content_check_interval=1.0)
+    own = os.getpid()
+    obs._focus_current = FocusSnapshot(
+        hwnd=1, process="sakura.exe", title="Sakura", pid=own, changed_at=1.0
+    )
+    obs._last_timer_check = 0.0
+    obs._next_timer_at = 0.0
+    with patch("app.perception.observer.get_active_window_pid", return_value=own):
+        assert _collect(obs, 100.0) == []
+
+
+def test_do_evaluation_skips_when_foreground_is_own_process() -> None:
+    obs = _observer()
+    own = os.getpid()
+    obs._focus_current = FocusSnapshot(
+        hwnd=1, process="sakura.exe", title="Sakura", pid=own, changed_at=1.0
+    )
+    evaluated: list[tuple[str, bool]] = []
+    obs.on_evaluate = lambda reason, should: evaluated.append((reason, should))
+
+    async def _run() -> None:
+        with patch("app.perception.observer.get_active_window_pid", return_value=own):
+            await obs._do_evaluation(["timer"])
+
+    asyncio.run(_run())
+    assert evaluated
+    assert "本进程" in evaluated[0][0]
+    assert evaluated[0][1] is False
+
+
 def test_own_process_focus_skips_settle_and_timer_reset() -> None:
     """点到 Sakura / 历史 / 日志：不 settle、不重置 next_timer。"""
     obs = _observer(focus_settle_delay=0.1, window_switch_cooldown=0.0)

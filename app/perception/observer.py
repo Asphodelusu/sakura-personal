@@ -292,6 +292,10 @@ on_screen_text の規則：
 注意：
 - 話しかけるかどうかは考えなくていい。
 - visual_summary は事実描写。reaction_hint は感情・反応。役割を混ぜすぎない。
+- 【自分の UI を無視】画面の右下（または端）にいるデスクトップペット（夜乃桜／立絵・吹き出し・入力欄）は自分自身。
+  そこに写っている日本語・中国語のセリフや吹き出しは「相手の画面の内容」ではない。
+  visual_summary / on_screen_text / reaction_hint に自分のセリフを写さない・要約しない・反応の対象にしない。
+  相手が操作しているアプリの中身だけを見る。
 - [观察者上下文] があるとき：すでに知っている画面状況や会話の事実を、改めて「発見」したり蒸し返さない。
   例：上下文に「食事済み」とあれば、「ご飯食べたかな」方向の反応は書かない。
 - トリガーが「同一アプリ内の内容変化」を示すときは、慌てて何度もウィンドウを切り替えた、と誤解しないこと。
@@ -345,6 +349,9 @@ _SPEECH_DECISION_INSTRUCTION = """
 - 摘录に無い原文を、反应提示や想像から補完して書いてはいけない。
 - 摘录が空で、画面摘要も曖昧なときは should_speak=false にするか、具体を決めつけない当たり障りのない一言に留める。
 - 反应提示だけが強くて根拠が薄いときも同様：捏造せず、黙るか曖昧に。
+- 【自分のセリフを相手の画面と混同しない】摘录や摘要に、自分（夜乃桜）の吹き出し・直前の独白・入力欄っぽい文が混ざっていても、
+  それはスクリーン上の「他のアプリの内容」ではない。それに答える・引用する・自問自答しない。
+  疑わしいときは画面の本題（相手のアプリ）だけを見るか、should_speak=false。
 
 should_speak=true の場合：
 - comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
@@ -877,6 +884,17 @@ class ProactiveObserver:
         if now - self._last_user_at < self.config.min_silence_after_user:
             return []
 
+        # 前台是本进程（主窗/气泡/输入栏/历史/日志）时不评估，避免自拍自问自答。
+        # window: 切窗触发此前已跳过；此处一并挡住 timer/content/idle。
+        focus = self._focus_current
+        if focus is not None and focus.is_own_process:
+            return []
+        try:
+            if int(get_active_window_pid() or 0) == int(os.getpid()):
+                return []
+        except Exception:
+            pass
+
         # 焦点触发不走「刚说过话的全局冷却」——分层：开口冷却 ≠ 看屏冷却。
         # timer/content/idle 仍尊重 cooldown_seconds。
         speak_cooldown = bool(
@@ -1140,6 +1158,22 @@ class ProactiveObserver:
     async def _do_evaluation(self, triggers: list[str]) -> None:
         now = time.monotonic()
         self._last_eval_at = now
+
+        # 双重护栏：评估瞬间前台若已切回本进程，直接放弃（截图/UIA 都会读到自家 UI）。
+        focus = self._focus_current
+        if focus is not None and focus.is_own_process:
+            logger.info("ProactiveObserver: skip eval, focus is own process")
+            _observer_gui_log("跳过评估：前台为本进程", {"triggers": triggers})
+            self._safe_on_evaluate("前台为本进程，跳过", False)
+            return
+        try:
+            if int(get_active_window_pid() or 0) == int(os.getpid()):
+                logger.info("ProactiveObserver: skip eval, foreground pid is self")
+                _observer_gui_log("跳过评估：前台为本进程", {"triggers": triggers})
+                self._safe_on_evaluate("前台为本进程，跳过", False)
+                return
+        except Exception:
+            pass
 
         blocked, matched = self.privacy.check_active_window()
         if blocked:

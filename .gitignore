@@ -31,6 +31,7 @@ temp/
 data/chat_history.jsonl
 data/chat_history/
 data/memory/
+data/memory_backup_*/
 data/memory.json
 data/memory_curation_state.json
 data/reminders.json

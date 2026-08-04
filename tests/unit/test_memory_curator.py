@@ -257,7 +257,7 @@ def test_curator_updates_and_deletes_existing_memories() -> None:
     )
     operations = (
         '{"operations":['
-        '{"op":"update","id":"m1","content":"主人搬到了新地址"},'
+        '{"op":"update","id":"m1","content":"主人搬到了新地址","evidence":"我搬家了"},'
         '{"op":"delete","id":"m2"}'
         ']}'
     )
@@ -278,6 +278,7 @@ def test_curator_updates_and_deletes_existing_memories() -> None:
             "importance": 0.5,
             "confidence": 0.75,
             "source": "self_curation",
+            "evidence": "我搬家了",
         }
     ]
     assert store.deleted == [{"id": "m2"}]
@@ -323,6 +324,25 @@ def test_curator_skips_low_confidence_and_sensitive_candidates() -> None:
     assert result.ignored == 2
 
 
+def test_curator_skips_ungrounded_and_transient_candidates() -> None:
+    store = FakeMemoryStore()
+    operations = (
+        '{"operations":['
+        '{"op":"add","content":"他住在火星基地养了三只机械猫","confidence":0.9},'
+        '{"op":"add","content":"当前正在播放周杰伦的晴天","confidence":0.9,'
+        '"evidence":"我在听周杰伦"}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "我在听周杰伦")])
+
+    assert store.created == []
+    assert result.event_counts.get("SKIP_UNGROUNDED", 0) >= 1
+    assert result.event_counts.get("SKIP_TRANSIENT", 0) >= 1
+
+
 def test_curator_merges_similar_memory_in_same_layer() -> None:
     store = FakeMemoryStore(
         existing=[
@@ -356,8 +376,8 @@ def test_curator_chunks_large_history_into_separate_calls() -> None:
     store = FakeMemoryStore()
     api = FakeCurationApiClient(
         [
-            '{"operations":[{"op":"add","content":"第一段事实"}]}',
-            '{"operations":[{"op":"add","content":"第二段事实"}]}',
+            '{"operations":[{"op":"add","content":"记住偏好 0","evidence":"偏好 0"}]}',
+            '{"operations":[{"op":"add","content":"记住偏好 32","evidence":"偏好 32"}]}',
         ]
     )
     curator = MemoryCurator(api, store)
@@ -580,8 +600,8 @@ def test_curator_skips_trivial_and_stale_commitment_add() -> None:
         [
             """{"operations":[
             {"op":"add","content":"嗯呢，可以，我记下了"},
-            {"op":"update","id":"c1","content":"2026年7月31日下午，我兑现了之前「下次由我主动开口邀请」的约定，主动向铭君提出亲密互动并主导了整个过程。约定已完成。"},
-            {"op":"add","content":"2026年7月31日下午，我向铭君承诺，下次亲密互动时会由我主动开口邀请他。我说会再等等。"}
+            {"op":"update","id":"c1","evidence":"你主动来好不好","content":"2026年7月31日下午，我兑现了之前「下次由我主动开口邀请」的约定，主动向铭君提出亲密互动并主导了整个过程。约定已完成。"},
+            {"op":"add","content":"2026年7月31日下午，我向铭君承诺，下次亲密互动时会由我主动开口邀请他。我说会再等等。","evidence":"你主动来好不好"}
             ]}"""
         ]
     )

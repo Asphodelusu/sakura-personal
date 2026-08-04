@@ -23,13 +23,32 @@ from urllib.request import Request, urlopen
 
 
 SERVER_NAME = "sakura-web-search"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 DEFAULT_TIMEOUT_SECONDS = 12
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"
 )
+# Playwright 读页/搜索默认走本机 Edge；可用 SAKURA_PW_CHANNEL=chrome|chromium 覆盖。
+DEFAULT_PW_CHANNEL = "msedge"
+# 读页默认有头（能看到本机 Edge 打开/收起）；搜索仍无头。SAKURA_PW_FETCH_HEADED=0 可关。
+DEFAULT_PW_FETCH_HEADED = True
 MIN_SEARCH_RESULTS_FOR_CONFIDENCE = 2
+
+# 智谱 Web Search（Agent 专用检索）；与 Chat 模型无关，共用 open.bigmodel.cn 的 API Key。
+ZHIPU_WEB_SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
+DEFAULT_ZHIPU_SEARCH_ENGINE = "search_pro"
+_ZHIPU_ENGINE_ALIASES = {
+    "search_std": "search_std",
+    "search-std": "search_std",
+    "search_pro": "search_pro",
+    "search-pro": "search_pro",
+    "search_pro_sogou": "search_pro_sogou",
+    "search-pro-sogou": "search_pro_sogou",
+    "search_pro_quark": "search_pro_quark",
+    "search-pro-quark": "search_pro_quark",
+}
 
 # Playwright engine constants
 PW_BROWSER_ARGS = ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
@@ -45,6 +64,7 @@ import concurrent.futures
 _in_china_cache: bool | None = None
 # Cached Playwright browser (lazy singleton)
 _pw_browser = None
+_pw_headed_browser = None
 _pw_playwright = None
 # Thread pool for running sync Playwright calls inside the asyncio MCP server
 _PW_THREAD_POOL: concurrent.futures.ThreadPoolExecutor | None = None
@@ -69,10 +89,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "web_search",
         "description": (
-            "搜索公开网页，返回标题、链接和摘要。百度/必应/DDG多引擎自动选择。"
-            "社区、论坛、攻略类内容百度引擎效果最佳。"
-            "可用 site:域名 限定范围，如 '艾尔登法环 攻略 site:zhihu.com'。"
-            "若结果不理想，尝试追加'知乎''NGA''B站'等社区名重搜。"
+            "搜索公开网页，返回标题、链接、长摘要 digest。"
+            "优先智谱 Web Search（适合中文资料）；摘要够用时不必再 fetch。"
+            "可用 site:域名 限定范围；社区向可追加'知乎''NGA''B站'重搜。"
         ),
         "inputSchema": {
             "type": "object",
@@ -83,10 +102,10 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "最多返回多少条结果，范围 1-10。",
+                    "description": "最多采用多少条结果写入上下文，范围 1-15；智谱一次请求可召回更多。",
                     "minimum": 1,
-                    "maximum": 10,
-                    "default": 5,
+                    "maximum": 15,
+                    "default": 10,
                 },
             },
             "required": ["query"],
@@ -148,19 +167,18 @@ def _run_fastmcp_server() -> None:
     @mcp.tool(
         name="web_search",
         description=(
-            "搜索公开网页，返回标题、链接和摘要。百度/必应/DDG多引擎自动选择。"
-            "社区、论坛、攻略类内容百度引擎效果最佳。"
-            "可用 site:域名 限定范围，如 '艾尔登法环 攻略 site:zhihu.com'。"
-            "若结果不理想，尝试追加'知乎''NGA''B站'等社区名重搜。"
+            "搜索公开网页，返回标题、链接、长摘要 digest。"
+            "优先智谱 Web Search（适合中文资料）；摘要够用时不必再 fetch。"
+            "可用 site:域名 限定范围；社区向可追加'知乎''NGA''B站'重搜。"
         ),
         structured_output=False,
     )
-    def web_search_tool(query: str, max_results: int = 5) -> dict[str, Any]:
+    def web_search_tool(query: str, max_results: int = 10) -> dict[str, Any]:
         """搜索公开网页。"""
 
         return search_web(
             query=query,
-            max_results=_clamp_int(max_results, default=5, minimum=1, maximum=10),
+            max_results=_clamp_int(max_results, default=10, minimum=1, maximum=15),
         )
 
     @mcp.tool(
@@ -216,7 +234,7 @@ def _handle_tool_call(request_id: Any, params: dict[str, Any]) -> dict[str, Any]
         if name == "web_search":
             payload = search_web(
                 query=_required_string(arguments, "query"),
-                max_results=_clamp_int(arguments.get("max_results"), default=5, minimum=1, maximum=10),
+                max_results=_clamp_int(arguments.get("max_results"), default=10, minimum=1, maximum=15),
             )
         elif name == "fetch_url":
             payload = fetch_url(
@@ -236,14 +254,312 @@ def _handle_tool_call(request_id: Any, params: dict[str, Any]) -> dict[str, Any]
     return _tool_result_response(request_id, payload)
 
 
-def search_web(query: str, max_results: int = 5) -> dict[str, Any]:
+def _repo_root():
+    # app/agent/mcp/web_search_server.py → 仓库根
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[3]
+
+
+def _zhipu_search_engine() -> str:
+    raw = (
+        os.environ.get("SAKURA_ZHIPU_SEARCH_ENGINE")
+        or os.environ.get("ZHIPU_SEARCH_ENGINE")
+        or DEFAULT_ZHIPU_SEARCH_ENGINE
+    ).strip()
+    return _ZHIPU_ENGINE_ALIASES.get(raw, DEFAULT_ZHIPU_SEARCH_ENGINE)
+
+
+def _resolve_zhipu_api_key() -> str:
+    """读取智谱 Key：环境变量优先，否则从 data/config/api.yaml 的 bigmodel 配置档取。"""
+    for env_name in (
+        "SAKURA_ZHIPU_API_KEY",
+        "ZHIPU_API_KEY",
+        "BIGMODEL_API_KEY",
+    ):
+        value = str(os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+
+    try:
+        from pathlib import Path
+
+        api_yaml = _repo_root() / "data" / "config" / "api.yaml"
+        if not api_yaml.is_file():
+            return ""
+        text = api_yaml.read_text(encoding="utf-8")
+        # 轻量解析：优先匹配 open.bigmodel.cn 配置档下的 api_key
+        # 避免引入 PyYAML 依赖（MCP 子进程环境尽量瘦）。
+        profiles: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        in_profiles = False
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if stripped.startswith("api_profiles:"):
+                in_profiles = True
+                current = {}
+                continue
+            if not in_profiles:
+                continue
+            if stripped and not line.startswith(" ") and not line.startswith("-"):
+                # 离开 api_profiles 段
+                if current.get("api_key"):
+                    profiles.append(current)
+                break
+            if stripped.startswith("- id:") or stripped.startswith("-id:"):
+                if current.get("api_key"):
+                    profiles.append(current)
+                current = {}
+                continue
+            if "base_url:" in stripped:
+                current["base_url"] = stripped.split("base_url:", 1)[1].strip().strip("'\"")
+            elif "api_key:" in stripped:
+                current["api_key"] = stripped.split("api_key:", 1)[1].strip().strip("'\"")
+        if current.get("api_key"):
+            profiles.append(current)
+        for profile in profiles:
+            base = str(profile.get("base_url") or "").lower()
+            key = str(profile.get("api_key") or "").strip()
+            if key and ("bigmodel.cn" in base or "zhipuai.cn" in base):
+                return key
+    except Exception:
+        return ""
+    return ""
+
+
+def _search_zhipu_web(
+    query: str,
+    max_results: int,
+    *,
+    api_key: str,
+) -> list[SearchResult]:
+    """调用智谱 /paas/v4/web_search，返回与现有引擎一致的 SearchResult 列表。
+
+    计费：按「HTTP 请求次数」扣资源包，与 count 返回条数无关。
+    官方推荐：单次 search_pro + count(1-50，默认10) + content_size。
+    """
+    engine = _zhipu_search_engine()
+    # 文档建议 query 不超过 70 字符；过长时截断，避免 4xx。
+    search_query = query.strip()
+    if len(search_query) > 70:
+        search_query = search_query[:70]
+    # 官方示例常用 10/15；一次请求多拿几条摘要，比多次换词补搜更省次数。
+    count = max(1, min(int(max_results), 50))
+    if count < 10:
+        count = 10
+    # search_pro_sogou 仅接受 10/20/30/40/50
+    if engine == "search_pro_sogou":
+        for candidate in (10, 20, 30, 40, 50):
+            if count <= candidate:
+                count = candidate
+                break
+        else:
+            count = 50
+
+    payload = {
+        "search_query": search_query,
+        "search_engine": engine,
+        # 跳过意图识别，保证「搜一下 xxx」必定检索（否则可能 SEARCH_NONE 空结果）。
+        "search_intent": False,
+        "count": count,
+        "content_size": "high",
+        "search_recency_filter": "noLimit",
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        ZHIPU_WEB_SEARCH_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {exc.code} {detail}".strip()) from exc
+    except URLError as exc:
+        raise RuntimeError(f"network error: {exc.reason}") from exc
+
+    data = json.loads(raw) if raw.strip() else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("invalid response")
+    if isinstance(data.get("error"), dict):
+        err = data["error"]
+        raise RuntimeError(f"{err.get('code')}: {err.get('message')}")
+
+    rows = data.get("search_result")
+    if not isinstance(rows, list):
+        return []
+
+    results: list[SearchResult] = []
+    seen_urls: set[str] = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        title = _normalize_space(str(item.get("title") or ""))
+        url = str(item.get("link") or "").strip()
+        snippet = _normalize_space(str(item.get("content") or ""))
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if not title:
+            title = url
+        # content_size=high 时摘要本身就很长；勿截成 500，否则深度题只能「标题党」。
+        results.append(SearchResult(title=title, url=url, snippet=snippet[:2500]))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _build_search_digest(results: list[SearchResult], *, max_chars: int = 5500) -> str:
+    """把多条长摘要压成模型易读的证据块（少依赖本地读页）。"""
+    parts: list[str] = []
+    used = 0
+    for index, item in enumerate(results, start=1):
+        block = f"[{index}] {item.title}\nURL: {item.url}\n{item.snippet}".strip()
+        if not block:
+            continue
+        extra = len(block) + (2 if parts else 0)
+        if used + extra > max_chars:
+            remain = max_chars - used - 2
+            if remain >= 120:
+                parts.append(block[:remain] + "…")
+            break
+        parts.append(block)
+        used += extra
+    return "\n\n".join(parts)
+
+
+def _extract_work_title(query: str) -> str:
+    import re
+
+    titled = re.findall(r"《([^》]{2,40})》", query or "")
+    if titled:
+        return titled[0].strip()
+    if re.search(r"\bBRAIN\b", query or "", flags=re.I) and "恐怖脑" in (query or ""):
+        return "BRAIN:恐怖脑症候群"
+    return ""
+
+
+def _enrich_search_query(query: str) -> str:
+    """作品名查询轻量改写：抽出标题本体，去掉「搜一下/是什么」等口语稀释。"""
+    text = (query or "").strip()
+    if not text:
+        return text
+    core = _extract_work_title(text)
+    if core:
+        return core[:70]
+    return text[:70] if len(text) > 70 else text
+
+
+def _results_match_work_title(results: list[SearchResult], core: str) -> bool:
+    """检索结果是否真正命中目标作品名（防止漂到「惧魔症候群」等同名坑）。"""
+    if not core or not results:
+        return False
+    blob = "\n".join(f"{item.title}\n{item.snippet}" for item in results).lower()
+    core_l = core.lower().replace("：", ":")
+    if core_l in blob:
+        return True
+    parts = [part.strip() for part in _re.split(r"[:：]", core) if part.strip()]
+    if len(parts) >= 2:
+        left, right = parts[0].lower(), parts[1]
+        if right.lower() in blob and left in blob:
+            return True
+        # 中文主标题足够长时，单独命中也算（如「恐怖脑症候群」）
+        if len(right) >= 4 and right.lower() in blob:
+            return True
+    return False
+
+
+def _zhipu_fallback_queries(query: str, primary: str) -> list[str]:
+    """首轮跑偏时的补搜词；控制在 1 次额外请求以内优先选最稳的。"""
+    core = _extract_work_title(query) or primary
+    variants: list[str] = []
+    # 经验上：小众同人作品在 B 站标题/作者微博摘要里更完整
+    if _re.search(r"brain", core, flags=_re.I) and "恐怖脑" in core:
+        variants.extend(
+            [
+                # 作者微博摘要含剧情要点；B 站标题页摘要通常过短。
+                "电気人_denki brain",
+                "恶劣的血与爱 brain",
+            ]
+        )
+    variants.append(f"「{core}」")
+    parts = [part.strip() for part in _re.split(r"[:：]", core) if part.strip()]
+    if len(parts) >= 2:
+        variants.append(f"{parts[0]} {parts[1]}")
+    # 去重且去掉与 primary 相同的
+    ordered: list[str] = []
+    seen = {primary.strip().lower()}
+    for item in variants:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(item[:70])
+    return ordered[:2]
+
+
+def _pack_search_results(
+    *,
+    query: str,
+    search_query: str,
+    source: str,
+    results: list[SearchResult],
+    fallback_queries: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "query": query,
+        "search_query": search_query,
+        "source": source,
+        "results": [
+            {"title": item.title, "url": item.url, "snippet": item.snippet}
+            for item in results
+        ],
+        "digest": _build_search_digest(results),
+        "snippet_chars": sum(len(item.snippet) for item in results),
+    }
+    if fallback_queries:
+        payload["fallback_queries"] = fallback_queries
+    return payload
+
+
+def search_web(query: str, max_results: int = 10) -> dict[str, Any]:
     query = query.strip()
     if not query:
         raise ValueError("query 不能为空。")
+    search_query = _enrich_search_query(query)
 
     errors: list[str] = []
 
-    # --- Primary: Playwright engines by IP region ---
+    # --- Primary: 智谱 Web Search API（结构化摘要，稳定且适合中文）---
+    # 官方用法：一次请求拿够条数/长摘要；禁止同轮多次换词补搜（每次 HTTP = 扣 1 次资源包）。
+    zhipu_key = _resolve_zhipu_api_key()
+    if zhipu_key:
+        try:
+            results = _search_zhipu_web(search_query, max_results, api_key=zhipu_key)
+            if results:
+                return _pack_search_results(
+                    query=query,
+                    search_query=search_query,
+                    source=f"Zhipu ({_zhipu_search_engine()})",
+                    results=results,
+                )
+            errors.append("Zhipu: empty results")
+        except Exception as exc:
+            errors.append(f"Zhipu: {exc}")
+
+    # --- Fallback: Playwright engines by IP region ---
     # CN: Baidu (best for Chinese communities) → Bing CN → DDG
     # Non-CN: DDG → Bing → Baidu
     try:
@@ -262,16 +578,14 @@ def search_web(query: str, max_results: int = 5) -> dict[str, Any]:
             ]
         for engine_name, engine_fn in engines:
             try:
-                results = _run_in_thread(engine_fn, query, max_results)
+                results = _run_in_thread(engine_fn, search_query, max_results)
                 if results:
-                    return {
-                        "query": query,
-                        "source": engine_name,
-                        "results": [
-                            {"title": r.title, "url": r.url, "snippet": r.snippet}
-                            for r in results
-                        ],
-                    }
+                    return _pack_search_results(
+                        query=query,
+                        search_query=search_query,
+                        source=engine_name,
+                        results=results,
+                    )
             except Exception as exc:
                 errors.append(f"{engine_name}: {exc}")
     except Exception as exc:
@@ -767,29 +1081,89 @@ def _detect_in_china() -> bool:
     return False
 
 
+def _resolve_pw_channel() -> str | None:
+    """返回 Playwright channel；None 表示内置 Chromium。"""
+    raw = str(os.environ.get("SAKURA_PW_CHANNEL", DEFAULT_PW_CHANNEL) or "").strip().lower()
+    if raw in {"", "chromium", "bundled", "default"}:
+        return None
+    if raw in {"msedge", "edge"}:
+        return "msedge"
+    if raw in {"chrome", "google-chrome"}:
+        return "chrome"
+    return raw
+
+
+def _resolve_pw_fetch_headed() -> bool:
+    raw = str(os.environ.get("SAKURA_PW_FETCH_HEADED", "1" if DEFAULT_PW_FETCH_HEADED else "0")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _ensure_pw_playwright():
+    global _pw_playwright
+    if _pw_playwright is None:
+        from playwright.sync_api import sync_playwright
+        _pw_playwright = sync_playwright().start()
+    return _pw_playwright
+
+
+def _launch_pw_browser(*, headless: bool):
+    """启动本机 Edge（失败则回退内置 Chromium）。"""
+    playwright = _ensure_pw_playwright()
+    channel = _resolve_pw_channel()
+    launch_kwargs: dict[str, Any] = {
+        "headless": headless,
+        "args": list(PW_BROWSER_ARGS),
+    }
+    if channel:
+        launch_kwargs["channel"] = channel
+    try:
+        return playwright.chromium.launch(**launch_kwargs)
+    except Exception:
+        if channel:
+            return playwright.chromium.launch(
+                headless=headless,
+                args=list(PW_BROWSER_ARGS),
+            )
+        raise
+
+
 def _get_pw_browser():
-    """Lazy-init Playwright browser singleton."""
-    global _pw_browser, _pw_playwright
+    """搜索用：无头 Edge，避免搜的时候乱弹窗。"""
+    global _pw_browser
     if _pw_browser is not None:
         return _pw_browser
-    from playwright.sync_api import sync_playwright
-    _pw_playwright = sync_playwright().start()
-    _pw_browser = _pw_playwright.chromium.launch(headless=True, args=PW_BROWSER_ARGS)
+    _pw_browser = _launch_pw_browser(headless=True)
     return _pw_browser
 
 
+def _get_pw_fetch_browser():
+    """读页用：默认有头本机 Edge，打开→抽正文→关页。"""
+    global _pw_headed_browser, _pw_browser
+    if _resolve_pw_fetch_headed():
+        if _pw_headed_browser is not None:
+            return _pw_headed_browser
+        _pw_headed_browser = _launch_pw_browser(headless=False)
+        return _pw_headed_browser
+    return _get_pw_browser()
+
+
 def _close_pw_browser() -> None:
-    global _pw_browser, _pw_playwright, _PW_THREAD_POOL
+    global _pw_browser, _pw_headed_browser, _pw_playwright, _PW_THREAD_POOL
     try:
         if _PW_THREAD_POOL:
             _PW_THREAD_POOL.shutdown(wait=False)
             _PW_THREAD_POOL = None
     except Exception:
         pass
+    for attr in ("_pw_headed_browser", "_pw_browser"):
+        browser = globals().get(attr)
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        globals()[attr] = None
     try:
-        if _pw_browser:
-            _pw_browser.close()
-            _pw_browser = None
         if _pw_playwright:
             _pw_playwright.stop()
             _pw_playwright = None
@@ -1112,18 +1486,21 @@ def _search_baidu_playwright(query: str, max_results: int) -> list[SearchResult]
 
 
 def _fetch_url_playwright(url: str, max_chars: int) -> dict[str, Any]:
-    """Playwright 网页抓取 — 处理 JS 渲染页面。"""
-    browser = _get_pw_browser()
+    """Playwright 读页：默认弹出本机 Edge，抽完正文后关掉标签页。"""
+    headed = _resolve_pw_fetch_headed()
+    browser = _get_pw_fetch_browser()
     ctx = browser.new_context(
         locale="zh-CN",
         user_agent=USER_AGENT,
-        viewport={"width": 1920, "height": 1080},
+        viewport={"width": 1280, "height": 840},
     )
     try:
         page = ctx.new_page()
-        page.route(PW_ROUTE_BLOCK, lambda r: r.abort())
+        # 有头模式少拦资源，页面更像正常浏览；无头仍拦大文件加速。
+        if not headed:
+            page.route(PW_ROUTE_BLOCK, lambda r: r.abort())
         page.goto(url, timeout=PW_FETCH_TIMEOUT, wait_until="domcontentloaded")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(1000 if headed else 800)
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
@@ -1139,6 +1516,9 @@ def _fetch_url_playwright(url: str, max_chars: int) -> dict[str, Any]:
         }""")
         title = page.title() or ""
         final_url = page.url
+        if headed:
+            # 稍留一眼再收起，贴近「打开→读→关」的过程感。
+            page.wait_for_timeout(600)
     finally:
         try:
             ctx.close()
@@ -1153,6 +1533,7 @@ def _fetch_url_playwright(url: str, max_chars: int) -> dict[str, Any]:
         "text": clean[:max_chars],
         "truncated": len(clean) > max_chars,
         "links": [],
+        "headed": headed,
     }
 
 

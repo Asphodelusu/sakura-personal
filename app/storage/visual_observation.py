@@ -266,6 +266,8 @@ def _build_visual_summary_prompt() -> str:
 - 用户可能追问的对象、位置、状态和关键界面元素。
 - 看不清或不确定的文字放入 uncertain_texts，不要强行猜。
 - 遇到 API Key、token、密码、身份证、银行卡等敏感内容，必须打码为 [REDACTED]，并把 sensitive_redacted 设为 true。
+- 【忽略桌宠自身】屏幕右下角或边缘的桌宠立绘、对话气泡、输入栏及其日文/中文台词属于观察者自己的 UI，
+  不要写入 summary / visible_texts / notable_elements，也不要把它们当成「屏幕上需要解读的内容」。
 
 只返回如下 JSON：
 {

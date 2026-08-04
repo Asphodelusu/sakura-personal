@@ -11,12 +11,15 @@ from app.core.debug_log import debug_log
 
 # QAudioSink 写入定时器间隔（毫秒）
 _SINK_WRITE_INTERVAL_MS = 20
-# PCM 全部写入后的排空延迟上限（毫秒）
+# PCM 全部写入后的首轮排空等待上限（毫秒）。
+# 注意：设备缓冲较大时整段 PCM 会很快写完，真实播完时间远长于此；
+# ActiveState 下必须按剩余时长继续复查，不能靠这个上限强制收尾。
 _SINK_DRAIN_MAX_MS = 1000
-# 排空到点但 sink 仍在 ActiveState 时的复查间隔与次数上限
-# （300ms x 20 = 最多再等 6 秒；超过后强制收尾，外层 fallback 定时器仍兜底）
+# 排空到点但 sink 仍在 ActiveState 时的复查间隔；次数按剩余播放时长动态放大。
 _SINK_DRAIN_RECHECK_INTERVAL_MS = 300
-_SINK_DRAIN_RECHECK_MAX = 20
+_SINK_DRAIN_RECHECK_MIN = 20
+# Active 状态下额外宽限，避免刚好在尾音被 stop 截断
+_SINK_ACTIVE_GRACE_MS = 2000
 # 日志限速：每隔 N 次写入记录一次详细日志
 _SINK_LOG_INTERVAL = 50
 
@@ -355,6 +358,19 @@ class AudioSinkPlayer(QObject):
             self.error.emit("音频播放失败：" + str(exc))
             self._finish_once("write_error")
 
+    def _max_active_drain_rechecks(self) -> int:
+        """ActiveState 下最多复查几次：至少保底，并覆盖「剩余时长 + 宽限」。
+
+        旧逻辑固定 20 次（约 6 秒）后强制 stop，长台词在设备大缓冲场景下
+        会在写完 PCM 后约 7 秒被截断，听感就是「超时 / 没读完」。
+        """
+        elapsed_ms = (
+            int((time.perf_counter() - self._started_at) * 1000) if self._started_at > 0 else 0
+        )
+        remaining_ms = max(0, self._duration_ms + _SINK_ACTIVE_GRACE_MS - elapsed_ms)
+        by_duration = remaining_ms // _SINK_DRAIN_RECHECK_INTERVAL_MS + 1
+        return max(_SINK_DRAIN_RECHECK_MIN, by_duration)
+
     @Slot()
     def _finish_if_drained(self) -> None:
         if self._finishing:
@@ -373,24 +389,24 @@ class AudioSinkPlayer(QObject):
         except Exception:
             pass
 
-        # 声卡还在播缓冲里的余音（ActiveState）时不能收，否则会剪掉尾巴；
-        # 复查有次数上限，且外层 fallback 定时器仍兜底，不会因此挂起。
-        if (
-            "ActiveState" in state_name_drain
-            and self._drain_recheck_count < _SINK_DRAIN_RECHECK_MAX
-        ):
-            self._drain_recheck_count += 1
-            debug_log(
-                "TTS",
-                "AudioSink: drain 到点但仍在播放，延后复查",
-                {
-                    "audio_path": str(self._audio_path) if self._audio_path else "",
-                    "sink_state": state_name_drain,
-                    "recheck": self._drain_recheck_count,
-                },
-            )
-            QTimer.singleShot(_SINK_DRAIN_RECHECK_INTERVAL_MS, self._finish_if_drained)
-            return
+        # 声卡还在播缓冲里的余音（ActiveState）时不能收，否则会剪掉长音频后半段。
+        if "ActiveState" in state_name_drain:
+            max_rechecks = self._max_active_drain_rechecks()
+            if self._drain_recheck_count < max_rechecks:
+                self._drain_recheck_count += 1
+                debug_log(
+                    "TTS",
+                    "AudioSink: drain 到点但仍在播放，延后复查",
+                    {
+                        "audio_path": str(self._audio_path) if self._audio_path else "",
+                        "sink_state": state_name_drain,
+                        "recheck": self._drain_recheck_count,
+                        "max_rechecks": max_rechecks,
+                        "duration_ms": self._duration_ms,
+                    },
+                )
+                QTimer.singleShot(_SINK_DRAIN_RECHECK_INTERVAL_MS, self._finish_if_drained)
+                return
 
         debug_log(
             "TTS",

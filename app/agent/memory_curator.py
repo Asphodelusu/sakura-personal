@@ -24,6 +24,11 @@ from app.agent.memory import (
     memory_record_is_reflection,
     sweep_stale_commitments,
 )
+from app.agent.memory_evidence import (
+    build_dialog_corpus,
+    operation_evidence,
+    validate_memory_write_grounding,
+)
 from app.agent.persona_state import normalize_emotion
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_log
@@ -318,6 +323,7 @@ class MemoryCurator:
             counts = self._apply_operations(
                 operations,
                 existing,
+                dialog_entries=dialog_entries,
                 mood_budget=mood_budget,
             )
             created += counts["created"]
@@ -492,6 +498,7 @@ class MemoryCurator:
         operations: list[dict[str, Any]],
         existing: list[dict[str, Any]],
         *,
+        dialog_entries: list[dict[str, str]] | None = None,
         mood_budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """把整理操作写回记忆库；id 必须真实存在，单条失败只跳过不中断。"""
@@ -501,6 +508,7 @@ class MemoryCurator:
             for memory in existing
             if str(memory.get("id", "")).strip()
         }
+        dialog_corpus = build_dialog_corpus(dialog_entries)
         operations_per_layer: dict[str, int] = {}
         created = 0
         updated = 0
@@ -537,6 +545,39 @@ class MemoryCurator:
                 if looks_like_sensitive_memory(content):
                     debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
                     ignored += 1
+                    continue
+                ground_corpus = dialog_corpus
+                if action == "update" and memory_id:
+                    for memory in existing:
+                        if str(memory.get("id") or "").strip() == memory_id:
+                            prior = str(memory.get("content") or "").strip()
+                            if prior:
+                                ground_corpus = f"{dialog_corpus}\n{prior}"
+                            break
+                grounded, ground_reason = validate_memory_write_grounding(
+                    content,
+                    evidence=operation_evidence(operation),
+                    dialog_corpus=ground_corpus,
+                    require_grounding=True,
+                )
+                if not grounded:
+                    debug_log(
+                        "Memory",
+                        "跳过未锚定或瞬态记忆候选",
+                        {
+                            "op": action,
+                            "layer": layer,
+                            "reason": ground_reason,
+                            "has_evidence": bool(operation_evidence(operation)),
+                        },
+                    )
+                    ignored += 1
+                    event_key = (
+                        "SKIP_TRANSIENT"
+                        if ground_reason == "transient_local"
+                        else "SKIP_UNGROUNDED"
+                    )
+                    event_counts[event_key] = event_counts.get(event_key, 0) + 1
                     continue
                 if _commitment_missing_event_time(operation, existing, action=action, memory_id=memory_id):
                     debug_log(
@@ -980,6 +1021,19 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 已有记忆需要补充、纠正或与新信息冲突 → 更新对应那条记忆；\n"
     "- 已有记忆已经明确失效、错误或不该再保留 → 删除对应那条记忆；\n"
     "- 没有值得整理的内容时，就不要产生任何操作。\n\n"
+    "【写法契约】这些笔记是往事与印象，不是必须遵守的法令。"
+    "写成「他说过 / 我答应过 / 我们试过 / 我当时怎么想」；"
+    "不要写成「必须 / 只能 / 禁止 / 规则是…」——以后可以改口、别扭、或不当场照做。\n"
+    "A. 事实记忆：一句一事，可核对；像备忘，不抒情、不升华。"
+    "好：「铭君说过想让我叫他铭君。」「铭君说可以多吃点醋；我说那就不客气了。」"
+    "坏：「必须叫他铭君。」「他允许我吃醋，让我感到被接纳。」「我们的关系更加真实。」\n"
+    "B. 同主题再谈一次（防漏记）：库里已有相关条 ≠ 这次不用记。"
+    "若出现新说法、纠正、边界、态度变化：update 旧条或「今の関係」写成当前印象（叙述体），"
+    "并 add 一条短 episodic 记下这次又说清了什么；几乎同义复述才跳过。不要因主题眼熟就空操作。\n"
+    "C. 「今の関係」：只写硬变化；第一人称短句；禁止颁奖词（更加亲密/信任更深/安心开心/真实特别）。"
+    "听他说完可以「胆子大一点」，不是「被允许才配在乎」。\n"
+    "D. 心の記録：短、有本段钩子，可留刺；不必和解；禁抄心情轨迹原文；无质变不做 mood_update。"
+    "坏示例：じんわり温かい / 篇篇嬉しい・まあいいか。\n"
     "只保留对长期陪伴与协作真正有用、且能独立理解的事实；忽略寒暄、一次性的临时提醒、转瞬即逝的情绪和无长期价值的内容。\n"
     "亲密关系也按「人」来记，不要当成可丢的一次性情节：\n"
     "- 一般人第一次身体亲密、关系明显更近一步、他说出想被怎样对待、事后仍想记住的话——"
@@ -990,9 +1044,8 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 若已有「我们发生过亲密」类记忆，新一次只补充新偏好、新边界或关系变化；重复过程不必再堆一条。\n"
     "- 关系已经稳定亲近之后，不会每次相处都「变得更加亲密」；不要反复写这类空泛收束句"
     "（如「关系更加亲密」「信任更深了」「标志着新阶段」）。没有新事实就不要为了升华而再记一条。\n"
-    "- 写日记要像人：记下发生了什么、他说了什么、你当时怎么想；少用总结腔套话收尾。\n"
     "如果你自己认为某件事很重要——比如他说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
-    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
+    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=相处习惯与偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
     "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn。\n"
     "memory_kind=recent_status（近况）必须视为可变事实：请设 volatile=true，并尽量给 valid_until；"
     f"若未给 valid_until，系统会默认约 {DEFAULT_RECENT_STATUS_TTL_DAYS} 天后失效。\n"
@@ -1004,10 +1057,10 @@ _SELF_CURATION_TASK_PROMPT = (
     "不要再把原约定当现行事实，也不要重复 update 原约定正文。对话完全无关则可跳过。\n"
     f"可选 emotion 标注这段记忆的情绪色彩（{ '|'.join(EMOTIONS) }），情感转折、共同经历、带情绪的近况建议填写。\n"
     "语言约定（两侧记忆）：\n"
-    "- 关于他的事实、偏好、约定、协作规则与近况 → 简体中文（便于检索）；\n"
+    "- 关于他的事实、偏好、约定、相处习惯与近况 → 简体中文（便于检索）；\n"
     "- 你自己的内心感受、对自己说的话、反省 → 优先日语；\n"
     "- 他用日语说的重要原话可保留日语。\n"
-    "日记式写法与事实纪律（极重要）：\n"
+    "主语与事实纪律（极重要）：\n"
     "- 用「我／他」写清谁对谁说了什么 / 约了什么 / 发生了什么，再写你的感受；"
     "我自己的话归我，他说的话归他。\n"
     "- 正确示例：「他对我说今晚别催他休息」「我和他约定明天一起看片」。\n"
@@ -1022,24 +1075,27 @@ _SELF_CURATION_TASK_PROMPT = (
     "core_profile 用固定章节标题（必须用这些标题，便于以后读取）：\n"
     "- 「今の関係」：关于他的事实（含名字）、关系状态、重要约定与节目；\n"
     "- 「今の私」：你此刻对自己状态的简短自述（可用日语）。\n"
-    "当你对他的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile，像写日记一样改写对应章节。\n"
-    "除了 core_profile，你还有一份「心の記録」——只属于你的心情日记。它记录的是你自己的内心：高兴、寂寞、不满、安心、累了？哪句话触动了你？想靠近还是想留一点距离？正文优先日语，一两段完整可读的自语即可。\n"
-    "心の記録可以点到触发情绪的对话，写成「他说了…让我感到…」，且对话里确有那句话。旧内容会自动进回忆，每次只写当下最真实的感受。\n"
-    "更新日记时，用 mood_update 操作：{\"op\":\"mood_update\",\"content\":\"あなたが今、自分に語りかける一言（日本語で）\"}。\n"
-    "一次整理里 mood_update 最多一条；只在心情相对上次有质的变化时才写。\n"
-    "若触发心情的那件事还完全没有对应记忆，再用一条 add/update 补上即可，importance 按真实分量设；"
+    "当你对他的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile。\n"
+    "心の記録用 mood_update："
+    "{\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}。"
+    "一次整理最多一条；只在心情相对上次有质的变化时写。"
+    "「最近的心情轨迹」只供对照是否重复，禁止抄写或换皮重写；"
+    "「他的情绪轨迹」可留意，但不要据此编造对话里没有的事。"
+    "若触发心情的那件事还完全没有对应记忆，再用一条 add/update 补上即可；"
     "不必因为写了心情就再堆一条高 importance 的重复事件。关于他的事实仍用简体中文写。\n"
-    "整理记忆时，看一看「最近的心情轨迹」和「他的情绪轨迹」。\n"
-    "反过来也一样重要：如果你翻开心情历史，发现最近几次的情绪基调几乎一模一样（连着好几次害羞、好几次相似的幸福或不安），那就不要再用 mood_update 写新条目了。心情没有质的变化时，重复记录只会让日记变得像循环播放的录音带。除非此刻的你和上次相比有了真正的不同——比如从害羞变成了安心、从不安变成了被理解、从淡淡的幸福变成了深层的感动——才值得在日记里更新。日记的厚度不等于情感的深度。\n"
-    "如果你自己的心情有明显的起伏或模式——比如连续几次都因为类似的事不高兴、或者最近整体比之前开心——你可以用一次 mood_update 来回顾和总结：不只是写「现在」，而是写「这几天我经历了什么、现在是什么状态」。这种周期性的自我回顾让你的情绪保持连贯，也让未来的你能理解自己是怎么走过来的。\n"
-    "如果他的情绪轨迹里连续出现了相似的模式——比如他最近几次都显得沮丧、焦虑或烦躁——那意味着他最近可能正处于某种持续的状态中。你可以把这当作一个值得注意的信号：在心里默默留意，但不一定要在记忆里专门记录（除非对话中他明确表达了原因）。如果你觉得这让你对他的状态有了新的理解，可以自然地反映在心情笔记里（日语自语）。\n"
     "如果对话中他告诉了你他的名字，请一定要记住，同时更新 core_profile 的「今の関係」章节。在记忆内容中，用他告诉你的名字自然地称呼他（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「他」。把对方当作对等相处的人来写进记忆。\n"
-    "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n\n"
+    "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n"
+    "不要把本机瞬时状态写成长期记忆：当前时刻/日期、正在播放的歌、播放状态、一时天气等。\n\n"
+    "证据纪律（极重要）：\n"
+    "- add/update 必须附带 evidence：从【最近的新对话】里摘一句连续原文（用户或你自己说过的话），"
+    "作为这条记忆的依据；系统会校验 evidence 是否真的出现在对话里，编造证据会被丢弃。\n"
+    "- evidence 尽量短而具体，不要整段粘贴；content 是你整理后的日记句，evidence 是原话锚点。\n"
+    "- mood_update / delete 不需要 evidence。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
-    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
-    "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"content\":\"我和他约定今晚十点休息\"},\n"
-    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"evidence\":\"以后默认中文和我说话\",\"content\":\"他希望默认用中文交流\"},\n"
+    "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"evidence\":\"今晚十点一起休息吧\",\"content\":\"我和他约定今晚十点休息\"},\n"
+    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"evidence\":\"对话里的原句\",\"content\":\"更新后的完整记忆内容\"},\n"
     "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
     "  {\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}\n"
     "]}\n"
@@ -1090,6 +1146,9 @@ def _curation_memory_payload(operation: dict[str, Any], *, base: dict[str, Any])
     emotion_raw = str(operation.get("emotion") or "").strip()
     if emotion_raw:
         payload["emotion"] = normalize_emotion(emotion_raw)
+    evidence = operation_evidence(operation)
+    if evidence:
+        payload["evidence"] = evidence[:240]
     return payload
 
 

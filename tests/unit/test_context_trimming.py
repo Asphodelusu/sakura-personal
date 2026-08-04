@@ -3,10 +3,11 @@ from __future__ import annotations
 from app.llm.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
 
 
-def test_trim_messages_for_model_keeps_recent_window() -> None:
+def test_trim_messages_for_model_keeps_all_short_messages() -> None:
+    # 裁剪按 token 预算记账，不再按消息数硬裁：短消息全部保留，最近一条不丢。
     messages = [{"role": "user", "content": f"msg-{index}"} for index in range(MAX_MODEL_CONTEXT_MESSAGES + 5)]
     trimmed = trim_messages_for_model(messages)
-    assert len(trimmed) == MAX_MODEL_CONTEXT_MESSAGES
+    assert len(trimmed) == len(messages)
     assert trimmed[-1]["content"] == f"msg-{MAX_MODEL_CONTEXT_MESSAGES + 4}"
 
 
