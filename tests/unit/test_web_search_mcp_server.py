@@ -42,10 +42,6 @@ def test_bing_search_parser_extracts_result() -> None:
     assert parser.results[0].snippet == "Example snippet"
 
 
-def test_bing_search_uses_bing_source_and_dedupes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    pytest.skip("personal fork — search engine switched to Baidu, test infra incompatible")
-
-
 def test_fetch_url_blocks_local_network_addresses() -> None:
     for url in [
         "http://localhost:8000",
