@@ -40,8 +40,9 @@ class TestApiSettings:
 
     def test_defaults(self) -> None:
         s = ApiSettings()
-        assert s.base_url == DEFAULT_BASE_URL
-        assert s.model == DEFAULT_MODEL
+        # base_url/model 默认留空：由配置迁移/设置页显式填写，不再内置 OpenAI 官方地址。
+        assert s.base_url == ""
+        assert s.model == ""
         assert s.timeout_seconds == 60
         assert s.api_key == ""
 
@@ -57,9 +58,10 @@ class TestDebugLogSettings:
 
     def test_defaults(self) -> None:
         s = DebugLogSettings()
-        assert s.enabled is False
+        # 本地开发默认开启运行日志（enabled/file），body 级日志默认关。
+        assert s.enabled is True
         assert s.body_enabled is False
-        assert s.file_enabled is False
+        assert s.file_enabled is True
 
     def test_enabled(self) -> None:
         s = DebugLogSettings(enabled=True)

@@ -72,7 +72,7 @@ def test_tts_bundle_downloads_to_part_then_verifies_and_extracts() -> None:
     assert not archive.with_name(f"{archive.name}.part").exists()
     assert work_dir == (root / "tts" / entry.key).resolve()
     assert (work_dir / "api_v2.py").exists()
-    assert statuses == ["verify", "download", "extract", "cleanup"]
+    assert statuses == ["verify", "download", "extract", "install", "cleanup"]
     assert progress[-1] == 100
 
 
@@ -104,13 +104,14 @@ def test_tts_bundle_verifies_cached_archive_with_progress() -> None:
 
     assert work_dir == (root / "tts" / entry.key).resolve()
     assert not archive.exists()
-    assert statuses == ["verify", "extract", "cleanup"]
+    assert statuses == ["verify", "extract", "install", "cleanup"]
     assert 10 in progress
     assert progress[-1] == 100
 
 
-def test_tts_bundle_download_removes_part_on_verification_failure() -> None:
-    root = _runtime_root("bundle_verify_failure")
+def test_tts_bundle_download_keeps_part_for_resume_on_size_mismatch() -> None:
+    """下载不完整（大小不匹配）时保留 .part 供断点续传。"""
+    root = _runtime_root("bundle_size_mismatch")
     payload = b"too-short"
     entry = TTSBundleEntry(
         key="demo",
@@ -126,6 +127,31 @@ def test_tts_bundle_download_removes_part_on_verification_failure() -> None:
         return FakeResponse(payload)
 
     with pytest.raises(RuntimeError, match="文件大小不匹配"):
+        download_and_extract_bundle(entry, root, urlopen=fake_urlopen, extractor=lambda *_args: None)
+
+    archive = root / "tts" / "_dl" / entry.filename
+    assert not archive.exists()
+    assert archive.with_name(f"{archive.name}.part").exists()
+
+
+def test_tts_bundle_download_removes_part_on_sha256_mismatch() -> None:
+    """下载完整但校验失败（sha256 不匹配）时删除 .part，下次重新下载。"""
+    root = _runtime_root("bundle_verify_failure")
+    payload = b"full-size-but-corrupt"
+    entry = TTSBundleEntry(
+        key="demo",
+        label="Demo",
+        filename="demo.7z",
+        download_url="https://example.test/demo.7z",
+        size=len(payload),
+        sha256=hashlib.sha256(b"expected-different-payload").hexdigest(),
+    )
+
+    def fake_urlopen(_request, timeout: int):  # type: ignore[no-untyped-def]
+        assert timeout == 600
+        return FakeResponse(payload)
+
+    with pytest.raises(RuntimeError, match="SHA256 不匹配"):
         download_and_extract_bundle(entry, root, urlopen=fake_urlopen, extractor=lambda *_args: None)
 
     archive = root / "tts" / "_dl" / entry.filename
@@ -233,7 +259,9 @@ def test_tts_bundle_default_provider_work_dir_uses_installed_root(monkeypatch: p
     runtime_python.parent.mkdir(parents=True)
     _write_fake_runtime_python(runtime_python)
 
-    assert default_provider_bundle_work_dir("gpt-sovits", root) == work_dir.resolve()
+    # 显式传 50 系 GPU，避免真实本机探测（4060）把推荐拉到 standard 包。
+    gpus = [GPUInfo("NVIDIA GeForce RTX 5080", 16.0)]
+    assert default_provider_bundle_work_dir("gpt-sovits", root, gpus=gpus) == work_dir.resolve()
 
 
 def test_tts_bundle_default_provider_prefers_short_installed_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,7 +272,8 @@ def test_tts_bundle_default_provider_prefers_short_installed_root(monkeypatch: p
     runtime_python.parent.mkdir(parents=True)
     _write_fake_runtime_python(runtime_python)
 
-    assert default_provider_bundle_work_dir("gpt-sovits", root) == work_dir.resolve()
+    gpus = [GPUInfo("NVIDIA GeForce RTX 5080", 16.0)]
+    assert default_provider_bundle_work_dir("gpt-sovits", root, gpus=gpus) == work_dir.resolve()
 
 
 def test_tts_bundle_detects_and_migrates_legacy_install() -> None:
@@ -483,6 +512,8 @@ def test_list_nvidia_gpus_swallows_which_errors(monkeypatch: pytest.MonkeyPatch)
 
     # 伪造为 Windows，使 GPT-SoVITS 整合包在任意宿主上都判定为兼容，从而让推荐逻辑真正走到 GPU 探测。
     monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
+    # 清掉可能由其他测试填充的真实 GPU 缓存，确保走到 shutil.which 异常路径。
+    monkeypatch.setattr(tts_bundle, "_NVIDIA_GPU_CACHE", None)
 
     def _boom(_name: str):  # type: ignore[no-untyped-def]
         # 模拟非 Windows 宿主上 shutil.which 因 _winapi 缺失抛出的 AttributeError

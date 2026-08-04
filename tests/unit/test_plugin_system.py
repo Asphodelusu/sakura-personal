@@ -81,7 +81,7 @@ class TestPluginCapabilityRegistry:
         reg = PluginCapabilityRegistry()
         reg.register_tool(ToolContribution(name="t1", description="d", parameters={}, handler=None))
         reg.register_tools_tab(ToolsTabContribution(tab_id="tab", title="T", build=lambda p: None))
-        reg.register_settings_panel(SettingsPanelContribution(section_id="s", title="S", build=lambda p: None))
+        reg.register_settings_panel(SettingsPanelContribution(section_id="s", title="S"))
         reg.register_chat_ui_widget(ChatUIWidgetContribution(widget_id="w", build=lambda p: None))
         reg.register_prompt_patch(PromptPatchContribution(patch_id="p", system_prompt_append="append"))
         assert len(reg.tools) == 1
@@ -413,8 +413,7 @@ class TestContributionTypes:
         assert tc.requires_confirmation
 
     def test_settings_panel_contribution(self) -> None:
-        sp = SettingsPanelContribution(section_id="test", title="Test Panel",
-                                       build=lambda p: None, order=50.0)
+        sp = SettingsPanelContribution(section_id="test", title="Test Panel", order=50.0)
         assert sp.section_id == "test"
         assert sp.order == 50.0
 
@@ -473,7 +472,7 @@ def _write_plugin_manifest(
         )
     (plugin_dir / "plugin.yaml").write_text(
         f"""
-api_version: 1
+api_version: 2
 id: {plugin_id}
 name: {plugin_id}
 description: demo 插件介绍

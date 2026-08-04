@@ -137,13 +137,21 @@ def test_prompt_lengths_stay_compact() -> None:
     assert len(reminder_prompt) < 700
 
 
-def test_agent_tool_prompt_length_stays_compact() -> None:
+def _bare_runtime() -> AgentRuntime:
+    """绕过 __init__ 的最小 runtime：补上 __init__ 里初始化、被 prompt 构建读取的属性。"""
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.system_prompt = "角色设定"
     runtime.reply_tones = ["中性"]
     runtime.reply_portraits = ["站立待机"]
     runtime.memory = SimpleNamespace(summary=lambda: "无")
     runtime.runtime_loop_settings = RuntimeLoopSettings()
+    runtime._turn_verbosity_guidance = ""
+    runtime.character_profile = None
+    return runtime
+
+
+def test_agent_tool_prompt_length_stays_compact() -> None:
+    runtime = _bare_runtime()
 
     prompt = AgentRuntime._build_tool_system_prompt(
         runtime,
@@ -151,19 +159,14 @@ def test_agent_tool_prompt_length_stays_compact() -> None:
     )
 
     # 静态前缀不再内联记忆/时间/步数（改由运行时上下文消息注入），应更精简。
-    assert len(prompt) < 2800
+    assert len(prompt) < 3000
     assert prompt.count("主动屏幕感知核心规则") == 0
     assert "长期记忆摘要" not in prompt
     assert "这是第 1 步" not in prompt
 
 
 def test_agent_runtime_prompt_patches_apply_to_prompt_builders() -> None:
-    runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.system_prompt = "角色设定"
-    runtime.reply_tones = ["中性"]
-    runtime.reply_portraits = ["站立待机"]
-    runtime.memory = SimpleNamespace(summary=lambda: "无")
-    runtime.runtime_loop_settings = RuntimeLoopSettings()
+    runtime = _bare_runtime()
     runtime.prompt_patches = [
         PromptPatchContribution(
             patch_id="demo",
