@@ -50,7 +50,9 @@ EXPLICIT_MEMORY_IMPORTANCE = 0.95
 # 单例（同一 base_dir 只需要一个 AccessTracker 实例），初始化本身不涉及锁竞争
 # 热路径，用简单的模块级锁保护"要不要新建实例"这一步就够了。
 _ACCESS_TRACKER_INIT_LOCK = threading.Lock()
-_ACCESS_TRACKER: Any | None = None
+# 按 base_dir 缓存 AccessTracker，支持多角色/多数据目录切换。
+# 之前用单一全局变量只记第一个 base_dir，切目录后返回错误 tracker。
+_ACCESS_TRACKERS: dict[str, Any] = {}
 # 约定/纪念日：event_time 落在今天或明天时主动浮现（不占满检索名额）
 MAX_DUE_COMMITMENT_RECALLS = 2
 DUE_COMMITMENT_DECAY_BOOST = 1.28
@@ -81,24 +83,25 @@ _VOLATILE_BOOST_FACTOR_WEIGHT = 0.55
 
 
 def _get_access_tracker(base_dir: Path | None) -> Any | None:
-    """懒加载同一 base_dir 对应的 AccessTracker 单例；失败时退化为不追踪。"""
-    global _ACCESS_TRACKER
+    """懒加载 base_dir 对应的 AccessTracker；不同目录各自缓存，失败时退化为不追踪。"""
     if base_dir is None:
         return None
-    if _ACCESS_TRACKER is not None:
-        return _ACCESS_TRACKER
+    key = str(base_dir)
+    cached = _ACCESS_TRACKERS.get(key)
+    if cached is not None:
+        return cached
     with _ACCESS_TRACKER_INIT_LOCK:
-        if _ACCESS_TRACKER is None:
+        if key not in _ACCESS_TRACKERS:
             from app.agent.access_tracker import AccessTracker
             from app.storage.paths import StoragePaths
 
             try:
-                _ACCESS_TRACKER = AccessTracker(
+                _ACCESS_TRACKERS[key] = AccessTracker(
                     StoragePaths(base_dir).memory_access_tracker_db()
                 )
             except Exception:
-                return None
-        return _ACCESS_TRACKER
+                _ACCESS_TRACKERS[key] = None
+        return _ACCESS_TRACKERS[key]
 
 
 @dataclass(frozen=True)
