@@ -375,8 +375,8 @@ def _execute_auto_browser_snapshot(
         debug_log("AgentRuntime", "自动浏览器页面文本读取需要确认，已跳过", result.to_dict())
         return result
 
-    # 延迟 import：脱敏函数属于 runtime 的模型消息构建层，模块级互引会成环
-    from app.agent.runtime import _redact_tool_result_for_model
+    # 延迟 import：脱敏函数在 tool_message_builder 叶子模块，函数内引用避免模块级循环
+    from app.agent.tool_message_builder import _redact_tool_result_for_model
 
     debug_log("AgentRuntime", "自动浏览器页面文本读取完成", _redact_tool_result_for_model(prepared))
     return prepared
@@ -1658,8 +1658,8 @@ def _latest_user_explicitly_requests_windows_control(messages: list[ChatMessage]
 
 
 def _messages_text_for_tool_routing(messages: list[ChatMessage]) -> str:
-    # 延迟 import：内容压缩函数属于 runtime 的上下文构建层，模块级互引会成环
-    from app.agent.runtime import _compact_pending_context_content
+    # 延迟 import：内容压缩函数在 tool_message_builder 叶子模块
+    from app.agent.tool_message_builder import _compact_pending_context_content
 
     return "\n".join(_compact_pending_context_content(message.get("content")) for message in messages)
 
