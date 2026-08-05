@@ -56,7 +56,7 @@ def test_finalize_pushes_after_parallel_join() -> None:
         time.sleep(0.05)
         return InnerThoughtResult(text="並行できた", interest="high")
 
-    with patch("app.agent.runtime.generate_inner_thought", side_effect=_slow_thought):
+    with patch("app.agent.context_builder.generate_inner_thought", side_effect=_slow_thought):
         launch = runtime._launch_inner_thought_worker(
             [{"role": "user", "content": "在吗"}],
             _standard_turn(),
@@ -78,7 +78,7 @@ def test_finalize_pushes_after_parallel_join() -> None:
 def test_finalize_without_interest_skips_verbosity_block() -> None:
     runtime = _runtime_with_thought_client()
     with patch(
-        "app.agent.runtime.generate_inner_thought",
+        "app.agent.context_builder.generate_inner_thought",
         return_value=InnerThoughtResult(text="特に何も", interest=None),
     ):
         launch = runtime._launch_inner_thought_worker(
@@ -99,7 +99,7 @@ def test_finalize_fail_open_keeps_window_empty() -> None:
     def _boom(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("flash down")
 
-    with patch("app.agent.runtime.generate_inner_thought", side_effect=_boom):
+    with patch("app.agent.context_builder.generate_inner_thought", side_effect=_boom):
         launch = runtime._launch_inner_thought_worker(
             [{"role": "user", "content": "hi"}],
             _standard_turn(),
@@ -114,7 +114,7 @@ def test_finalize_fail_open_keeps_window_empty() -> None:
 
 def test_second_launch_in_same_turn_is_noop() -> None:
     runtime = _runtime_with_thought_client()
-    with patch("app.agent.runtime.generate_inner_thought", return_value="once"):
+    with patch("app.agent.context_builder.generate_inner_thought", return_value="once"):
         first = runtime._launch_inner_thought_worker(
             [{"role": "user", "content": "a"}],
             _standard_turn(),

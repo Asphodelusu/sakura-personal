@@ -195,7 +195,8 @@ class RoutingLlmClient:
         on_chunk: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> ChatReply:
-        if self._route_allows_local(self._local_settings.chat_route):
+        # 防御：__new__ 构造的测试桩可能没有 _local_settings；生产路径 __init__ 总会设置
+        if getattr(self, "_local_settings", None) is not None and self._route_allows_local(self._local_settings.chat_route):
             local = self._local_client_for(prefer_vision=False)
             if local is not None:
                 try:
@@ -236,7 +237,8 @@ class RoutingLlmClient:
         runtime_context: str = "",
         **kwargs: Any,
     ) -> ChatCompletionTurn:
-        if self._route_allows_local(self._local_settings.chat_route):
+        # 防御：__new__ 构造的测试桩可能没有 _local_settings
+        if getattr(self, "_local_settings", None) is not None and self._route_allows_local(self._local_settings.chat_route):
             local = self._local_client_for(prefer_vision=False)
             if local is not None:
                 try:
