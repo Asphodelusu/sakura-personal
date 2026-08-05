@@ -136,7 +136,10 @@ class BuiltinToolProvider:
             ),
             Tool(
                 name="open_url",
-                description="打开 http 或 https 网页，需要对方确认。",
+                description=(
+                    "打开 http 或 https 网页。该工具会离开聊天窗口；"
+                    "关闭「完整访问权限」时需要对方确认。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {"url": {"type": "string", "description": "URL。"}},
@@ -147,7 +150,10 @@ class BuiltinToolProvider:
             ),
             Tool(
                 name="open_local_folder",
-                description="打开本地文件夹，需要对方确认。",
+                description=(
+                    "打开本地文件夹。该工具会访问桌面环境；"
+                    "关闭「完整访问权限」时需要对方确认。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {"path": {"type": "string", "description": "路径。"}},

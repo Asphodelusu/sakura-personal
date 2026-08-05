@@ -263,7 +263,14 @@ class TestToolPermissionPolicy:
                            risk="medium", confirmation_risk="destructive_file")
         assert policy.requires_confirmation(tool)
 
-    def test_browser_free_access_tool_recognized(self) -> None:
-        policy = ToolPermissionPolicy()
-        assert policy.is_browser_free_access_tool("playwright_navigate")
-        assert not policy.is_browser_free_access_tool("unknown_tool")
+    def test_free_access_exempts_non_high_risk(self) -> None:
+        """free_access 下普通 requires_confirmation 工具（open_url 等）豁免确认。"""
+        policy = ToolPermissionPolicy(free_access_enabled=True)
+        tool = _dummy_tool("open_url", requires_confirmation=True, risk="low")
+        assert not policy.requires_confirmation(tool)
+
+    def test_without_free_access_requires_confirmation(self) -> None:
+        """关闭 free_access 后 requires_confirmation 工具恢复确认。"""
+        policy = ToolPermissionPolicy(free_access_enabled=False)
+        tool = _dummy_tool("open_url", requires_confirmation=True, risk="low")
+        assert policy.requires_confirmation(tool)
