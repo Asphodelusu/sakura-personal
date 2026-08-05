@@ -509,6 +509,38 @@ class ScreenObservationEncodeWorker(QObject):
         self.finished.emit(self.context, observation)
 
 
+class ScreenObservationSummarizeWorker(QObject):
+    """后台 VLM 摘要：把已编码截图发给视觉模型，返回文本描述。"""
+
+    finished = Signal(object, str)   # (context, summary_text)
+    failed = Signal(object, str)     # (context, error_message)
+
+    def __init__(
+        self,
+        observation: ScreenObservation,
+        api_client: object,
+        context: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.observation = observation
+        self.api_client = api_client
+        self.context = context
+
+    @Slot()
+    def run(self) -> None:
+        from app.agent.screen_observation import summarize_screen_observation
+
+        try:
+            summary = summarize_screen_observation(
+                self.observation,
+                self.api_client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self.context, str(exc))
+            return
+        self.finished.emit(self.context, summary or "")
+
+
 # 离开意图：必须是明确道别/暂停观察，不能把「聊睡觉」这类话题词当成 away。
 _AWAY_PHRASES: tuple[str, ...] = (
     "我出去了",
@@ -643,6 +675,8 @@ class PetWindow(QWidget):
         self._tts_pending_provider_closes: list[tuple[TTSProvider, bool]] = []
         self.screen_observation_encode_thread: QThread | None = None
         self.screen_observation_encode_worker: QObject | None = None
+        self.screen_observation_summarize_thread: QThread | None = None
+        self.screen_observation_summarize_worker: QObject | None = None
         self.settings_service = context.settings_service
         self.character_registry = context.character_registry
         self.character_profile = context.character_profile
@@ -729,6 +763,7 @@ class PetWindow(QWidget):
         ).window_size
         self.pending_tool_action: PendingToolAction | None = None
         self.pending_manual_screen_observation: ScreenObservation | None = None
+        self.pending_manual_screen_summary: str = ""
         self.manual_screenshot_overlay: ManualScreenshotOverlay | None = None
         self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
         self.pending_screen_observation_event: AgentEvent | None = None
@@ -3472,9 +3507,6 @@ class PetWindow(QWidget):
         if not intimacy_mode_state.active:
             self._intimacy_was_active = False
             return
-        # 等待对方确认是否结束时，不静默续投抢话
-        if intimacy_mode_state.pending_exit_confirm:
-            return
         # 亲密模式重新激活（从非活跃→活跃）时重置续投计数
         if not getattr(self, "_intimacy_was_active", False):
             self._intimacy_continue_count = 0
@@ -3505,8 +3537,6 @@ class PetWindow(QWidget):
         from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER, intimacy_mode_state
 
         if not intimacy_mode_state.active:
-            return
-        if intimacy_mode_state.pending_exit_confirm:
             return
         if self._intimacy_continue_count >= self._INTIMACY_CONTINUE_MAX:
             return
@@ -3663,18 +3693,27 @@ class PetWindow(QWidget):
             show_themed_warning(self, "截图处理中", "上一张截图还在处理，请稍后再试。")
             return
 
-    def _finish_manual_screen_observation(self, observation: ScreenObservation) -> None:
+    def _finish_manual_screen_observation(
+        self,
+        observation: ScreenObservation | None = None,
+        *,
+        context: dict[str, Any] | None = None,
+        summary: str = "",
+    ) -> None:
+        _ = context
+        if observation is None and not summary:
+            return
         self.pending_manual_screen_observation = observation
+        self.pending_manual_screen_summary = summary
         self._update_manual_screenshot_button()
         debug_log(
             "PetWindow",
             "手动框选截图已附加到下一条消息",
             {
-                "width": observation.width,
-                "height": observation.height,
-                "captured_at": observation.captured_at,
-                "screen_name": observation.screen_name,
-                "image": observation.data_url,
+                "width": observation.width if observation else 0,
+                "height": observation.height if observation else 0,
+                "has_summary": bool(summary),
+                "summary_chars": len(summary),
             },
         )
 
@@ -3689,9 +3728,10 @@ class PetWindow(QWidget):
         self.manual_screenshot_overlay = None
 
     def _clear_manual_screen_observation(self) -> None:
-        if self.pending_manual_screen_observation is None:
+        if self.pending_manual_screen_observation is None and not self.pending_manual_screen_summary:
             return
         self.pending_manual_screen_observation = None
+        self.pending_manual_screen_summary = ""
         self._update_manual_screenshot_button()
         debug_log("PetWindow", "待发送手动截图已清除")
 
@@ -3897,9 +3937,17 @@ class PetWindow(QWidget):
         self._log_interaction_stage("placeholder_reply_shown")
 
         visual_observation_jobs: list[VisualObservationJob] = []
+        manual_summary = self.pending_manual_screen_summary
         if manual_observation is not None:
             visual_id = generate_visual_observation_id()
-            request_user_message = build_screen_observation_user_message(text, manual_observation)
+            # VLM 摘要可用时发纯文本消息，否则降级到原始截图
+            if manual_summary:
+                from app.agent.screen_observation import build_screen_observation_summary_message
+                request_user_message = build_screen_observation_summary_message(
+                    text, manual_summary, manual_observation,
+                )
+            else:
+                request_user_message = build_screen_observation_user_message(text, manual_observation)
             recorded_user_text = append_manual_observation_marker(text, manual_observation, visual_id)
             visual_observation_jobs.append(
                 VisualObservationJob(
@@ -3974,6 +4022,7 @@ class PetWindow(QWidget):
             self._clear_proactive_screen_context_batch("sent_user_message")
         if manual_observation is not None:
             self.pending_manual_screen_observation = None
+            self.pending_manual_screen_summary = ""
             self._update_manual_screenshot_button()
         if visual_observation_jobs:
             self.pending_visual_observation_jobs = [
@@ -4221,8 +4270,11 @@ class PetWindow(QWidget):
     def _finish_chat_screen_observation_followup(
         self,
         context: dict[str, Any],
-        observation: ScreenObservation,
+        observation: ScreenObservation | None = None,
+        *,
+        summary: str = "",
     ) -> None:
+        # summary 为空时 observation 必须可用（降级路径）
         user_message_index = int(context.get("user_message_index", -1))
         text = str(context.get("text", ""))
         if user_message_index < 0 or user_message_index >= len(self.messages):
@@ -4231,8 +4283,20 @@ class PetWindow(QWidget):
             self._resume_screen_observation_followup_cleanup()
             return
 
+        if observation is None:
+            self.screen_observation_followup_in_progress = False
+            self._consume_agent_result(_build_screen_observation_failed_result("截图数据缺失。"))
+            self._resume_screen_observation_followup_cleanup()
+            return
+
+        # VLM 摘要可用时发纯文本消息，否则降级到原始截图
+        if summary:
+            from app.agent.screen_observation import build_screen_observation_summary_message
+            observed_message = build_screen_observation_summary_message(text, summary, observation)
+        else:
+            observed_message = build_screen_observation_user_message(text, observation)
+
         visual_id = generate_visual_observation_id()
-        observed_message = build_screen_observation_user_message(text, observation)
         self.messages[user_message_index] = {
             "role": "user",
             "content": append_observation_marker(text, observation, visual_id),
@@ -4247,8 +4311,6 @@ class PetWindow(QWidget):
                 observation=observation,
             ),
         ]
-        # 截图消息包含 base64，必须作为本次 follow-up 的最后一条消息保留。
-        # 中间进度回复已经展示给用户，不再放入这次入模上下文，避免字符裁剪丢掉截图。
         self.pending_screen_observation_messages = trim_messages_for_model(
             [*self.messages[:user_message_index], observed_message]
         )
@@ -4432,14 +4494,93 @@ class PetWindow(QWidget):
             self.screen_observation_followup_in_progress = False
             return
         kind = context.get("kind")
-        if kind == "chat_followup":
-            self._finish_chat_screen_observation_followup(context, observation)
+        if kind in {"chat_followup", "manual"}:
+            # 编码完成 → 启动 VLM 摘要 → 摘要完成后再构建消息。
+            # 启动失败（摘要线程已占用 / 关闭中）时降级：不带摘要直接走原路径，
+            # 避免 followup_in_progress 卡死或手动截图静默丢失。
+            context["_observation"] = observation
+            if not self._start_screen_observation_summarize(context, observation):
+                debug_log(
+                    "PetWindow",
+                    "VLM 摘要启动失败，降级为原始截图消息",
+                    {"kind": kind},
+                )
+                if kind == "chat_followup":
+                    self._finish_chat_screen_observation_followup(
+                        context, observation=observation, summary=""
+                    )
+                else:
+                    self._finish_manual_screen_observation(
+                        observation=observation, summary=""
+                    )
         elif kind == "event_followup":
             self._finish_event_screen_observation_followup(context, observation)
         elif kind in {"screen_awareness_context", "proactive_context"}:
             self._finish_screen_awareness_context(context, observation)
-        elif kind == "manual":
-            self._finish_manual_screen_observation(observation)
+
+    # ---- VLM 摘要（截图 → 文本，替换原始 image_url） ----
+
+    def _start_screen_observation_summarize(
+        self,
+        context: dict[str, Any],
+        observation: ScreenObservation,
+    ) -> bool:
+        if (
+            getattr(self, "_shutdown_in_progress", False)
+            or self.screen_observation_summarize_thread is not None
+        ):
+            return False
+        worker = ScreenObservationSummarizeWorker(
+            observation,
+            self.api_client,
+            context,
+        )
+        self.resource_manager.spawn_qt_worker(
+            worker,
+            parent=self,
+            owner=self,
+            thread_attr="screen_observation_summarize_thread",
+            worker_attr="screen_observation_summarize_worker",
+            signal_bindings=[
+                (worker.finished, self._handle_screen_observation_summarized),
+                (worker.failed, self._handle_screen_observation_summarize_failed),
+            ],
+            quit_on=[worker.finished, worker.failed],
+        )
+        return True
+
+    @Slot(object, str)
+    def _handle_screen_observation_summarized(
+        self,
+        context: dict[str, Any],
+        summary: str,
+    ) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            self.screen_observation_followup_in_progress = False
+            return
+        kind = context.get("kind")
+        observation: ScreenObservation | None = context.get("_observation")
+        if kind == "chat_followup":
+            self._finish_chat_screen_observation_followup(
+                context,
+                observation=observation,
+                summary=summary,
+            )
+        elif kind == "manual" and observation is not None:
+            self._finish_manual_screen_observation(
+                observation=observation,
+                context=context,
+                summary=summary,
+            )
+
+    @Slot(object, str)
+    def _handle_screen_observation_summarize_failed(
+        self, context: dict[str, Any], _message: str,
+    ) -> None:
+        # VLM 摘要失败 → 降级：不带截图，只用元数据文本消息
+        self._handle_screen_observation_summarized(context, "")
+
+    # ----
 
     @Slot(object, str)
     def _handle_screen_observation_encode_failed(self, context: dict[str, Any], message: str) -> None:

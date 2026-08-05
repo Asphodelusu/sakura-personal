@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -934,7 +935,6 @@ class OpenAICompatibleClient:
                     "last_error": str(last_error),
                 },
             )
-            import random
             base_delay = API_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
             jitter = base_delay * API_RETRY_JITTER * (random.random() * 2 - 1)
             delay = base_delay + jitter

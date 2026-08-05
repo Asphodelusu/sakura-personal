@@ -14,8 +14,10 @@ MAX_MODEL_CONTEXT_MESSAGES = 60
 MAX_MODEL_CONTEXT_TOKENS = 40_000
 # 向后兼容旧常量名，避免外部/测试引用报错。
 MAX_MODEL_CONTEXT_CHARS = MAX_MODEL_CONTEXT_TOKENS
-# 多模态截图在入模裁剪时按固定 token 粗估，避免低估后把 assistant+tool 链裁断。
-ESTIMATED_IMAGE_PART_TOKENS = 1200
+# 多模态截图按 JPEG Q70 / 1280px 典型大小估算。实际 desktop JPEG 60-120KB，
+# base64 编码后 ≈ 80-160KB 文本，按 ASCII ~4 chars/token 折合 20K-40K tokens。
+# 取保守中值 28K，避免低估导致 trimmer 误判预算充裕、实际请求 token 远超预期。
+ESTIMATED_IMAGE_PART_TOKENS = 28_000
 # 始终保持最近 N 个用户发言的上下文不裁剪——确保「刚才说了什么」不会因
 # 消息数或 token 预算耗尽而丢失。DeepSeek V4 前缀缓存场景下多保留几轮
 # 对话对延迟影响极小（TTFT 变化在 100ms 以内）。
@@ -46,18 +48,17 @@ def trim_messages_for_model(messages: list[dict[str, Any]]) -> list[dict[str, An
 
     # Step 2: can we fit more? Walk backwards adding messages until token budget hit.
     # Prefer dialogue over tool messages when budget is tight.
+    # 用累进 total 代替每次全量重算，避免 Step 2 的 O(n²) 行为。
     if keep_from > 0:
         remaining = []
-        remaining_tokens = 0
+        tail_tokens = _estimate_messages_tokens(messages[keep_from:])
         for i in range(keep_from - 1, -1, -1):
             msg = messages[i]
             t = _estimate_message_tokens(msg)
-            current_total = _estimate_messages_tokens(
-                remaining + messages[keep_from:]
-            )
-            if current_total + t > MAX_MODEL_CONTEXT_TOKENS:
+            if tail_tokens + t > MAX_MODEL_CONTEXT_TOKENS:
                 break
             remaining.insert(0, msg)
+            tail_tokens += t
         keep_from -= len(remaining)
 
     recent = list(messages[keep_from:])

@@ -345,7 +345,10 @@ def _should_auto_snapshot_after_browser_navigation(
     )
 
 
-def _execute_auto_browser_snapshot(tools: ToolRegistry, step_index: int) -> ToolExecutionResult:
+def _execute_auto_browser_snapshot(
+    tools: ToolRegistry,
+    step_index: int,
+) -> ToolExecutionResult:
     arguments: dict[str, Any] = {}
     reason = "浏览器导航成功后自动读取页面内容，减少模型往返。"
     debug_log(
@@ -868,13 +871,35 @@ def _should_refine_web_search(
     messages: list[ChatMessage],
     execution_results: list[ToolExecutionResult],
 ) -> bool:
-    """默认关闭自动换词重搜。
+    """首次搜索结果明显不匹配时，换更精准关键词重搜一次。
 
-    智谱 Web Search 按「请求次数」计费：一次 HTTP=扣 1 次，与返回条数无关。
-    官方推荐单次 search_pro + 更大 count/长摘要；自动 refine 会成倍烧资源包。
+    闸门策略（尽量少触发额外请求）：
+    1. 首次搜索必须成功且返回了结果
+    2. 已有成功抓取的页面 → 不重搜（证据已够）
+    3. 首次结果已命中目标作品/关键词 → 不重搜
+    4. build_refined_web_search_query 能产出更精准的关键词 → 才重搜
+
+    智谱 Web Search 按「请求次数」计费，自动 refine 会多 1 次 HTTP。
+    因此只在首次明显跑偏时才触发，不是无条件重搜。
     """
-    _ = messages, execution_results
-    return False
+    searches = _successful_web_searches(execution_results)
+    if not searches:
+        return False
+    if len(searches) > 1:
+        # 已有多轮搜索（模型自己补搜过），不再自动追加
+        return False
+    if _successful_web_fetches(execution_results):
+        # 已成功抓取过页面，证据够用
+        return False
+    first = searches[0]
+    query = str((first.content or {}).get("query") or "")
+    if not query:
+        return False
+    # 首次结果已命中 → 不需要精炼
+    if _search_results_look_on_topic([first], query):
+        return False
+    # 有更精准的关键词可用 → 允许精炼一次
+    return bool(build_refined_web_search_query(messages))
 
 
 def _select_urls_for_auto_fetch(
