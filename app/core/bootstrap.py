@@ -171,6 +171,10 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         character_profile.portrait_choices,
         character_profile=character_profile,
     )
+    # 渐进记忆检索：全量召回时自动注入相关记忆标题索引，引导模型主动深入
+    agent_runtime.set_progressive_memory_enabled(
+        settings_service.load_progressive_memory_settings()
+    )
     runtime_event_log = create_runtime_event_log(base_dir, character_profile)
     visual_observation_store = create_visual_observation_store(base_dir, character_profile)
     debug_log_settings = settings_service.load_debug_log_settings()

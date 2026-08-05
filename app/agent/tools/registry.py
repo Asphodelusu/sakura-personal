@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable
 
 from app.agent.actions import PendingToolAction
@@ -426,6 +428,19 @@ def _tool_matches_keyword(tool: Tool, keyword: str) -> bool:
 
 
 def _normalize_parameters_schema(parameters: dict[str, Any]) -> dict[str, Any]:
+    """把内部 JSON Schema 规范化为 OpenAI 兼容 schema。
+
+    工具参数在运行时不变，规范化结果按参数 JSON 指纹缓存，避免
+    describe_openai_tools 在每轮工具循环里重复做 O(schema) 递归清洗。
+    """
+    return _normalize_parameters_schema_cached(
+        json.dumps(parameters, sort_keys=True, ensure_ascii=False)
+    )
+
+
+@lru_cache(maxsize=256)
+def _normalize_parameters_schema_cached(parameters_json: str) -> dict[str, Any]:
+    parameters = json.loads(parameters_json)
     if not parameters:
         return {"type": "object", "properties": {}, "required": []}
     if parameters.get("type") == "object":

@@ -210,6 +210,24 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     assert system["memory_curation"]["backfill_limit"] == 150
 
 
+def test_settings_service_loads_and_saves_progressive_memory_settings() -> None:
+    root = _runtime_root("yaml_progressive_memory")
+    service = AppSettingsService(root)
+
+    # 默认开启
+    assert service.load_progressive_memory_settings() is True
+
+    # 关闭并落盘
+    service.save_progressive_memory_settings(False)
+    assert service.load_progressive_memory_settings() is False
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["memory"]["progressive_memory"] is False
+
+    # 再开启
+    service.save_progressive_memory_settings(True)
+    assert service.load_progressive_memory_settings() is True
+
+
 def test_settings_service_loads_and_saves_runtime_loop_settings() -> None:
     root = _runtime_root("yaml_runtime_loop")
     service = AppSettingsService(root)

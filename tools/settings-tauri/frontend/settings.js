@@ -75,6 +75,7 @@ const fields = {
   backchannelTtsEnabled: document.getElementById("backchannelTtsEnabled"),
   backchannelResourceCard: document.getElementById("backchannelResourceCard"),
   memoryTriggerTurns: document.getElementById("memoryTriggerTurns"),
+  progressiveMemory: document.getElementById("progressiveMemory"),
   memoryModelResourceCard: document.getElementById("memoryModelResourceCard"),
   memoryRerankResourceCard: document.getElementById("memoryRerankResourceCard"),
   speechFontSize: document.getElementById("speechFontSize"),
@@ -4686,6 +4687,7 @@ function collectMemorySettings() {
       trigger_turns: clampInt(fields.memoryTriggerTurns.value, request.limits.memory_trigger_turns),
       backfill_limit: request.memory.curation.backfill_limit,
     },
+    progressive_memory: fields.progressiveMemory.checked,
   };
 }
 
@@ -4889,6 +4891,7 @@ async function load() {
   fields.backchannelProbability.value = request.system_extra.backchannel.probability;
   fields.backchannelTtsEnabled.checked = request.system_extra.backchannel.tts_enabled;
   fields.memoryTriggerTurns.value = request.memory.curation.trigger_turns;
+  fields.progressiveMemory.checked = request.memory.progressive_memory !== false;
 
   setThemeValues(request.theme);
   themeChanged = false;

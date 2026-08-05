@@ -600,6 +600,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         studio_launcher=lambda character_id: _open_first_run_studio(base_dir, character_id),
         model=getattr(api_settings, "model", None),
         onboarding=True,
+        progressive_memory=settings_service.load_progressive_memory_settings(),
     )
 
     loop = QEventLoop()
@@ -675,6 +676,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
     settings_service.save_runtime_loop_settings(result.runtime_loop)
     settings_service.save_debug_log_settings(result.system_basic.debug_log)
     settings_service.save_memory_curation_settings(result.memory_curation)
+    settings_service.save_progressive_memory_settings(result.progressive_memory)
     if result.theme_changed:
         settings_service.save_theme_settings(result.theme)
     if result_startup_settings != startup_settings:

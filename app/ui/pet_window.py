@@ -6500,6 +6500,7 @@ class PetWindow(QWidget):
             launch_at_login_supported=is_launch_at_login_supported(),
             backchannel_settings=self.settings_service.load_backchannel_settings(),
             memory_curation_settings=self.settings_service.load_memory_curation_settings(),
+            progressive_memory=self.settings_service.load_progressive_memory_settings(),
             memory_store=self.memory_store,
             plugin_settings_contributions=getattr(
                 self.plugin_manager, "settings_panels", []
@@ -6688,6 +6689,7 @@ class PetWindow(QWidget):
         theme = result.theme
         plugins = result.plugins
         memory_curation = result.memory_curation
+        progressive_memory = bool(getattr(result, "progressive_memory", True))
         theme_changed = bool(result.theme_changed)
 
         selected_profile = self.character_profile
@@ -6856,6 +6858,7 @@ class PetWindow(QWidget):
                 self.settings_service.save_memory_curation_settings(
                     result_memory_curation_settings
                 )
+            self.settings_service.save_progressive_memory_settings(progressive_memory)
             if plugins is not None and plugins.settings_by_id:
                 try:
                     apply_tauri_plugin_settings(
@@ -6901,6 +6904,8 @@ class PetWindow(QWidget):
         self._apply_bubble_settings(result_bubble_settings)
         if result_memory_curation_settings is not None:
             self.memory_curation_settings = result_memory_curation_settings
+        # 渐进记忆检索：保存后立即生效到运行时
+        self.agent_runtime.set_progressive_memory_enabled(progressive_memory)
         if theme_changed:
             self._apply_theme_settings(result_theme_settings)
         if screen is not None:
