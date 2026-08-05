@@ -736,6 +736,16 @@ class AppSettingsService:
         }
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_progressive_memory_settings(self) -> bool:
+        """渐进记忆检索开关：全量召回时自动注入相关记忆标题索引，
+        引导模型主动用 memory_detail 深入未读记忆。默认开启。
+        """
+        memory = self._system_section("memory")
+        return _bool_value(memory.get("progressive_memory"), True)
+
+    def save_progressive_memory_settings(self, enabled: bool) -> None:
+        self.save_system_values("memory", {"progressive_memory": bool(enabled)})
+
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
         from app.config.defaults import (
