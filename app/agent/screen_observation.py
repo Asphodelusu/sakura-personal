@@ -254,3 +254,134 @@ def _marker_with_visual_id(marker: str, visual_id: str | None) -> str:
     if marker.endswith("]"):
         return f"{marker[:-1]}，视觉记录 visual_id={visual_id}]"
     return f"{marker}，视觉记录 visual_id={visual_id}"
+
+
+# ---- VLM 摘要：截图 → 文本描述 → 聊天模型 ----
+
+_VLM_SUMMARY_SYSTEM_PROMPT = """\
+你是一个桌面截图描述助手。请仔细观察截图，用中文输出以下信息：
+
+1. 当前打开的应用/窗口是什么
+2. 画面上有哪些主要内容（文字、图片、UI 元素等）
+3. 用户可能正在做什么或看什么
+
+要求：
+- 详细但简洁，重点描述对理解用户当前活动有帮助的信息
+- 如果画面上有文字，尽量摘录关键内容
+- 不要评价画面质量或截图本身
+- 输出纯文本，不要用 JSON 或 Markdown 格式"""
+
+
+def summarize_screen_observation(
+    observation: ScreenObservation,
+    api_client: object,
+    *,
+    cancel_checker: object | None = None,
+    timeout_seconds: float = 30.0,
+) -> str:
+    """调用 VLM 把截图转成文本描述（同步，在后台线程调用）。
+
+    失败时返回空字符串；调用方应把空结果当作「摘要不可用」处理。
+    """
+    from app.llm.api_client import ApiRequestError, OpenAICompatibleClient
+
+    client: OpenAICompatibleClient | None = None
+    # 优先用 vision_api_client（如果 Runtime 暴露了），否则 fallback 到主 client。
+    vision_attr = getattr(api_client, "vision_api_client", None)
+    if vision_attr is not None:
+        client = vision_attr
+    elif isinstance(api_client, OpenAICompatibleClient):
+        client = api_client
+    else:
+        cloud = getattr(api_client, "cloud_client", None)
+        if isinstance(cloud, OpenAICompatibleClient):
+            client = cloud
+
+    if client is None:
+        return ""
+
+    messages: list[dict[str, object]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请描述这张截图。"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": observation.data_url},
+                },
+            ],
+        }
+    ]
+
+    # 用较低温度 + 限制 token，避免 VLM 长篇大论（摘要应在 500-1000 tokens 内）。
+    try:
+        raw = client.complete_raw(
+            _VLM_SUMMARY_SYSTEM_PROMPT,
+            messages,
+            temperature=0.3,
+            max_tokens=_VLM_SUMMARY_MAX_TOKENS,
+            cancel_checker=cancel_checker,
+            task="vision",
+            request_timeout=timeout_seconds,
+        )
+    except (ApiRequestError, TimeoutError, OSError, ValueError) as exc:
+        from app.core.debug_log import debug_log
+        debug_log(
+            "ScreenObservation",
+            "VLM 摘要失败，将回退到纯文本上下文",
+            {"error": str(exc)},
+        )
+        return ""
+    except Exception:
+        return ""
+
+    return (raw or "").strip()
+
+
+_VLM_SUMMARY_MAX_TOKENS = 1024
+
+
+def build_screen_observation_summary_message(
+    text: str,
+    summary: str,
+    observation: ScreenObservation,
+) -> dict[str, object]:
+    """用 VLM 文本摘要代替原始截图，构建纯文本用户消息。
+
+    summary 为空时回退到只含元数据的文本消息（不含截图）。
+    """
+    parts: list[str] = [text.strip()]
+
+    meta = (
+        f"\n\n【屏幕截图】{observation.width}x{observation.height}，"
+        f"捕获时间 {observation.captured_at}，屏幕 {observation.screen_name}。"
+    )
+
+    if summary:
+        parts.append(
+            f"{meta}\n"
+            f"以下为视觉模型对截图的分析描述：\n\n"
+            f"{summary}"
+        )
+    else:
+        parts.append(f"{meta}\n（视觉摘要暂时不可用，请根据对话上下文和已有信息回应用户。）")
+
+    # 附加 UIA 直接读取的窗口文字（免费，不经过 OCR/VLM）
+    try:
+        import os
+        from app.perception.win32 import get_active_window_pid
+        from app.perception.screen_reader import read_active_window
+
+        if int(get_active_window_pid() or 0) != int(os.getpid()):
+            uia = read_active_window()
+            if uia.is_accessible and uia.text_content.strip():
+                parts.append(
+                    f"\n\n[UIA 直接读取] 以下文字来自系统无障碍接口，已从屏幕控件直接提取：\n"
+                    f"应用类型：{uia.app_type}\n"
+                    f"进程：{uia.process_name}\n"
+                    f"{uia.text_content}"
+                )
+    except Exception:
+        pass
+
+    return {"role": "user", "content": "\n\n".join(parts)}

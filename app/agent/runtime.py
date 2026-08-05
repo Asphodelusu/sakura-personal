@@ -677,7 +677,11 @@ class AgentRuntime:
     ) -> str:
         """工具规划轮结束后，用不含 tools 的请求专门合成 JSON segments。"""
         check_cancelled(cancel_checker)
-        text_messages = strip_image_parts_from_messages(working_messages)
+        # 工具循环结束后 working_messages 可能积累了多步 tool 结果，
+        # 必须先裁剪再发最终合成请求，避免超上下文窗口。
+        text_messages = trim_messages_for_model(
+            strip_image_parts_from_messages(working_messages)
+        )
         if web_lookup_completed:
             compose_nudge = (
                 "检索/读页阶段已结束。请阅读上方【联网证据】与 tool 结果，"
@@ -870,7 +874,9 @@ class AgentRuntime:
             {"reason": retry_reason, "raw_content": raw_content},
         )
         repair_messages: list[ChatMessage] = [
-            *strip_image_parts_from_messages(working_messages),
+            *trim_messages_for_model(
+                strip_image_parts_from_messages(working_messages)
+            ),
             {"role": "assistant", "content": raw_content},
             {
                 "role": "user",
@@ -950,8 +956,12 @@ class AgentRuntime:
             if not tone or self.memory is None:
                 return
             self.memory.record_sakura_reply_emotion(tone)
-        except Exception:
-            pass
+        except Exception as exc:
+            debug_log(
+                "AgentRuntime",
+                "记录回复情绪失败",
+                {"tone": tone, "error": str(exc)},
+            )
 
     def _build_final_reply_repair_instruction(self) -> str:
         portraits = [name.strip() for name in self.reply_portraits if str(name).strip()]
@@ -1051,13 +1061,22 @@ class AgentRuntime:
         turn_state: TurnState | None = None
         web_search_nudge_sent = False
         memory_tool_result_cache: dict[tuple[str, tuple[str, ...]], ToolExecutionResult] = {}
+        # 本轮系统自动补充的工具调用（auto snapshot / refine / fetch）。
+        # 它们不是模型在 assistant 消息里声明的，需在 append 前把对应的
+        # tool_call 条目并入 assistant 消息，否则 sanitize_tool_conversation_messages
+        # 会因「无匹配 assistant tool_call」而丢弃其结果。
+        auto_tool_calls: list[dict[str, Any]] = []
         # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
         user_text = _latest_user_text(working_messages)
         if user_text:
             try:
                 self.memory.record_user_emotion(user_text)
-            except Exception:
-                pass
+            except Exception as exc:
+                debug_log(
+                    "AgentRuntime",
+                    "记录用户情绪失败",
+                    {"error": str(exc)},
+                )
         loop_settings = self.runtime_loop_settings
         for step_index in range(loop_settings.max_agent_steps_per_turn):
             check_cancelled(cancel_checker)
@@ -1683,14 +1702,28 @@ class AgentRuntime:
             ]
             if tool_routing._should_auto_snapshot_after_browser_navigation(executed_calls, step_results, self.tools):
                 check_cancelled(cancel_checker)
-                snapshot_result = tool_routing._execute_auto_browser_snapshot(self.tools, step_index)
+                snapshot_result = tool_routing._execute_auto_browser_snapshot(
+                    self.tools,
+                    step_index,
+                )
                 check_cancelled(cancel_checker)
                 step_results.append(snapshot_result)
                 execution_results.append(snapshot_result)
+                # 独立 tool_call_id 而非复用 navigate 的 id（navigate 的结果已消费该 id，
+                # 复用会被 sanitize 丢弃）。必须声明进 assistant 消息的 tool_calls，
+                # 否则 sanitize_tool_conversation_messages 同样丢弃。
+                auto_snapshot_id = f"auto_browser_snapshot_{step_index}"
+                auto_tool_calls.append(
+                    _auto_tool_call_entry(
+                        auto_snapshot_id,
+                        BROWSER_SNAPSHOT_TOOL_NAME,
+                        "{}",
+                    )
+                )
                 tool_messages.extend(
                     _build_tool_messages_for_result(
                         NativeToolCall(
-                            id=f"auto_browser_snapshot_{step_index}",
+                            id=auto_snapshot_id,
                             name=BROWSER_SNAPSHOT_TOOL_NAME,
                             arguments={},
                             arguments_json="{}",
@@ -1733,8 +1766,17 @@ class AgentRuntime:
                         )
                     step_results.append(refined_result)
                     execution_results.append(refined_result)
+                    # 独立 tool_call_id，并声明进 assistant 消息，避免 sanitize 丢弃
+                    auto_refine_id = f"auto_web_search_refine_{step_index}"
+                    auto_tool_calls.append(
+                        _auto_tool_call_entry(
+                            auto_refine_id,
+                            "web__web_search",
+                            json.dumps({"query": refined_query}, ensure_ascii=False),
+                        )
+                    )
                     refined_call = NativeToolCall(
-                        id=f"auto_web_search_refine_{step_index}",
+                        id=auto_refine_id,
                         name="web__web_search",
                         arguments={"query": refined_query},
                         arguments_json="{}",
@@ -1789,8 +1831,16 @@ class AgentRuntime:
                         fetch_url = str(fetch_result.content.get("url") or "")
                         reader = str(fetch_result.content.get("reader") or reader)
                     tool_name = fetch_result.tool_name or "web__fetch_url"
+                    auto_fetch_id = f"auto_web_fetch_{step_index}_{fetch_index}"
+                    auto_tool_calls.append(
+                        _auto_tool_call_entry(
+                            auto_fetch_id,
+                            tool_name,
+                            json.dumps({"url": fetch_url}, ensure_ascii=False),
+                        )
+                    )
                     auto_call = NativeToolCall(
-                        id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                        id=auto_fetch_id,
                         name=tool_name,
                         arguments={"url": fetch_url},
                         arguments_json="{}",
@@ -1846,8 +1896,16 @@ class AgentRuntime:
                         if isinstance(fetch_result.content, dict):
                             fetch_url = str(fetch_result.content.get("url") or "")
                         tool_name = fetch_result.tool_name or "web__fetch_url"
+                        auto_fetch_id = f"auto_web_fetch_{step_index}_{fetch_index}"
+                        auto_tool_calls.append(
+                            _auto_tool_call_entry(
+                                auto_fetch_id,
+                                tool_name,
+                                json.dumps({"url": fetch_url}, ensure_ascii=False),
+                            )
+                        )
                         auto_call = NativeToolCall(
-                            id=f"auto_web_fetch_{step_index}_{fetch_index}",
+                            id=auto_fetch_id,
                             name=tool_name,
                             arguments={"url": fetch_url},
                             arguments_json="{}",
@@ -1934,7 +1992,9 @@ class AgentRuntime:
             if not step_results:
                 break
 
-            working_messages.append(turn.message)
+            working_messages.append(
+                _extend_assistant_with_tool_calls(turn.message, auto_tool_calls)
+            )
             working_messages.extend(tool_messages)
             # 本步若写过记忆，下一步重新执行相关记忆召回。
             if any(
@@ -2337,24 +2397,20 @@ class AgentRuntime:
         if intimacy_mode_state.active:
             if not guide:
                 return None
-            if intimacy_mode_state.pending_exit_confirm:
-                rhythm_hint = (
-                    "\n\n# 节奏工具\n"
-                    "当前已开启亲密节奏模式，对方似乎想结束。"
-                    "先用一两句轻声确认是否现在停（不要冷冰冰盘问）。"
-                    "对方点头确认或再说结束 → 再调用 set_intimacy_mode(on=false)；"
-                    "对方说继续/还要 → 保持开启，不要关闭。"
-                    "在确认前不要擅自 on=false，也不要继续强推亲密进程。"
-                )
-            else:
-                rhythm_hint = (
-                    "\n\n# 节奏工具\n"
-                    "当前已开启亲密节奏模式。"
-                    "若对方说出「结束」「停下」「到此为止」「やめよう」等，"
-                    "先轻声确认是否真的停，不要立刻 set_intimacy_mode(on=false)；"
-                    "等对方点头确认后再关闭。"
-                    "不要仅因气氛变缓或短暂沉默而关闭。"
-                )
+            rhythm_hint = (
+                "\n\n# 节奏工具 — 已开启\n"
+                "你正在亲密节奏模式下，回复更快、可以主动续说。\n\n"
+                "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
+                "出现以下任一信号时立刻退出，不要犹豫：\n"
+                "- 对方语气从亲昵转为日常闲聊（聊吃饭、工作、天气、新闻等）\n"
+                "- 对方说了结束/收尾的话（「好了」「睡吧」「休息吧」「差不多了」「不闹了」等）\n"
+                "- 对方连续两轮未回应身体亲密，话题已明显漂移\n"
+                "- 对方表示累了、困了、要出门、要忙，主动切断互动\n\n"
+                "宁可误退。误退的代价很低——下一轮如果还在亲密中，"
+                "重新 on=true 即可。拖着不退才是问题。\n\n"
+                "## 其他\n"
+                "长时间无人回话会自动关闭，之后若仍在继续需重开。"
+            )
             return PromptSection(
                 section_id="persona.intimacy",
                 body=f"{guide}{rhythm_hint}",
@@ -2366,17 +2422,17 @@ class AgentRuntime:
             return PromptSection(
                 section_id="persona.intimacy_reentry",
                 body=(
-                    "# 节奏工具\n"
-                    "亲密节奏模式已因长时间无用户回话、静默续投耗尽而自动关闭，不会自动恢复。"
-                    "若双方仍在进行、正在准备或刚刚再次进入身体亲密互动，"
-                    "请立刻调用 set_intimacy_mode(on=true) 重新开启；"
-                    "对方已明确结束或话题已回到日常则不要开启。"
+                    "# 节奏工具 — 已自动关闭\n"
+                    "亲密节奏模式因长时间无回话或你主动关闭而结束了。\n"
+                    "若双方仍在亲密互动中、正在准备或刚刚将话题拉回身体亲密，"
+                    "请立刻调用 set_intimacy_mode(on=true) 重新开启。\n"
+                    "若对方当前的话题明显是日常/结束/其他内容，则不要开启。"
                 ),
                 source="character",
                 sensitivity="private",
             )
 
-        # 未开启：只给短入口提示，不注入 guide 正文（避免日常误开时带出私密细则）
+        # 未开启：短入口提示（不注入 guide 正文，避免日常误开带出私密内容）
         if guide:
             return PromptSection(
                 section_id="persona.intimacy_entry",
@@ -2408,10 +2464,7 @@ class AgentRuntime:
         return "插件回复协议补充：\n" + "\n".join(f"- {patch}" for patch in patches)
 
     def _apply_reply_protocol_patches(self, reply_protocol: str) -> str:
-        reply_patch = self._reply_protocol_patch_text()
-        if not reply_patch:
-            return reply_protocol
-        return f"{reply_protocol.strip()}\n\n{reply_patch}"
+        return _apply_patch_text(reply_protocol, self._reply_protocol_patch_text())
 
     def _combine_extra_instructions(self, extra_instructions: str = "") -> str:
         parts = [extra_instructions.strip(), self._reply_protocol_patch_text()]
@@ -2468,13 +2521,17 @@ class AgentRuntime:
             if recent_messages is not None
             else self._turn_verbosity_guidance
         )
-        reply_protocol = self._apply_reply_protocol_patches(
+        # 插件补丁文本只算一次；_apply_reply_protocol_patches 与
+        # _combine_extra_instructions 共用，避免重复拼接同一字符串。
+        _plugin_patch_text = self._reply_protocol_patch_text()
+        reply_protocol = _apply_patch_text(
             build_agent_reply_protocol(
                 self._effective_reply_tones(),
                 self.reply_portraits,
                 portrait_hints=self._portrait_hints() or None,
                 verbosity_guidance=verbosity or None,
-            )
+            ),
+            _plugin_patch_text,
         )
         context_strategy = build_context_acquisition_strategy(
             allow_screen_observation=allow_screen_observation
@@ -2492,6 +2549,9 @@ class AgentRuntime:
                 "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_update、memory_forget",
             ]
         )
+        _combined_extra = "\n".join(
+            part for part in [extra_instructions.strip(), _plugin_patch_text] if part
+        )
         tool_rules = "\n".join(
             [
                 "- 只调用 API tools 列表中真实存在的工具，不臆造工具名。",
@@ -2500,7 +2560,7 @@ class AgentRuntime:
                 browser_page_rule,
                 visible_browser_rule,
                 "- 高风险或需确认的工具会在对方确认后执行；发起时正文要简短说明原因。",
-                self._combine_extra_instructions(extra_instructions),
+                _combined_extra,
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
                 "- 当前时间已在运行时事实中，不要调用 get_current_time。",
                 "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
@@ -2705,6 +2765,44 @@ class AgentRuntime:
             return self.memory.summary()
         except Exception as exc:
             return f"长期记忆读取失败：{exc}"
+
+
+def _apply_patch_text(reply_protocol: str, patch_text: str) -> str:
+    """把 patch_text 追加到 reply_protocol 末尾（如有）。纯函数，供多处复用。"""
+    if not patch_text:
+        return reply_protocol
+    return f"{reply_protocol.strip()}\n\n{patch_text}"
+
+
+def _auto_tool_call_entry(call_id: str, name: str, arguments_json: str) -> dict[str, Any]:
+    """构造 auto 工具调用的 assistant tool_call 条目，供 _extend_assistant_with_tool_calls 使用。"""
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments_json,
+        },
+    }
+
+
+def _extend_assistant_with_tool_calls(
+    turn_message: dict[str, Any],
+    extra_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """把系统自动补充的工具调用声明进 assistant 消息的 tool_calls。
+
+    原因：sanitize_tool_conversation_messages 只保留「assistant 消息 tool_calls 里
+    声明过的 id」对应的 tool 消息。auto snapshot / refine / fetch 不是模型发起的，
+    turn.message 里没有它们的 id，结果会被丢弃。这里把额外 tool_call 条目并入
+    assistant 消息的 tool_calls，使 sanitize 能识别。
+    """
+    if not extra_calls:
+        return turn_message
+    extended = dict(turn_message)
+    existing = list(extended.get("tool_calls") or [])
+    extended["tool_calls"] = existing + list(extra_calls)
+    return extended
 
 
 # 结构化 JSON 回复在括号闭合前几乎总是解析失败：如果每个 delta chunk 都重新对

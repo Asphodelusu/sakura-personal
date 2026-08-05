@@ -12,9 +12,6 @@ from app.agent.builtin_tools import (
     _handle_set_intimacy_mode,
     create_builtin_tool_registry,
     intimacy_mode_state,
-    user_signals_intimacy_end,
-    user_signals_intimacy_exit_confirm,
-    user_signals_intimacy_keep_going,
 )
 from app.llm.prompts.blocks import with_desktop_pet_context
 
@@ -88,17 +85,13 @@ class TestIntimacyModeState:
         assert state.needs_reentry_hint is True
         state.exit()
         assert state.needs_reentry_hint is False
-        assert state.pending_exit_confirm is False
 
-    def test_end_signal_requests_confirm_not_exit(self) -> None:
+    def test_active_exit_does_not_set_reentry_hint(self) -> None:
         state = IntimacyModeState()
         state.enter()
-        state.request_exit_confirm()
-        assert state.active is True
-        assert state.pending_exit_confirm is True
-        state.clear_exit_confirm()
-        assert state.pending_exit_confirm is False
-        assert state.active is True
+        state.exit()
+        assert state.active is False
+        assert state.needs_reentry_hint is False
 
     def test_consume_when_inactive_returns_false(self) -> None:
         state = IntimacyModeState()
@@ -122,41 +115,11 @@ class TestIntimacyModeState:
         assert state.consume_turn() is False
 
 
-class TestUserSignalsIntimacyEnd:
-    def test_end_keywords(self) -> None:
-        assert user_signals_intimacy_end("好了，结束吧") is True
-        assert user_signals_intimacy_end("先这样") is True
-        assert user_signals_intimacy_end("やめよう") is True
-        assert user_signals_intimacy_end("もういい") is True
-
-    def test_non_end_phrases(self) -> None:
-        assert user_signals_intimacy_end("还要继续") is False
-        assert user_signals_intimacy_end("嗯……") is False
-        assert user_signals_intimacy_end(INTIMACY_CONTINUE_MARKER) is False
-        assert user_signals_intimacy_end("") is False
-        assert user_signals_intimacy_end("不要结束") is False
-
-    def test_exit_confirm_soft_yes(self) -> None:
-        assert user_signals_intimacy_exit_confirm("嗯") is True
-        assert user_signals_intimacy_exit_confirm("好") is True
-        assert user_signals_intimacy_exit_confirm("对") is True
-        assert user_signals_intimacy_exit_confirm("好了结束吧") is True
-        assert user_signals_intimacy_exit_confirm("还要……") is False
-        assert user_signals_intimacy_exit_confirm("不要结束") is False
-
-    def test_keep_going(self) -> None:
-        assert user_signals_intimacy_keep_going("继续") is True
-        assert user_signals_intimacy_keep_going("还要") is True
-        assert user_signals_intimacy_keep_going("不要结束") is True
-        assert user_signals_intimacy_keep_going("好了结束吧") is False
-
-
 class TestHandleSetIntimacyMode:
     """_handle_set_intimacy_mode 工具处理器测试。"""
 
     def setup_method(self) -> None:
         intimacy_mode_state.exit()
-        intimacy_mode_state.latest_user_text = ""
 
     def test_turn_on(self) -> None:
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
@@ -164,32 +127,12 @@ class TestHandleSetIntimacyMode:
         assert result == {"intimacy_mode": "on"}
         assert intimacy_mode_state.active is True
 
-    def test_turn_off_refused_without_user_end_signal(self) -> None:
+    def test_turn_off_directly_exits_when_active(self) -> None:
         intimacy_mode_state.enter()
-        intimacy_mode_state.latest_user_text = "还要……"
-        result = _handle_set_intimacy_mode({"on": False})
-        assert result["intimacy_mode"] == "on"
-        assert result.get("refused") is True
-        assert intimacy_mode_state.active is True
-        assert intimacy_mode_state.pending_exit_confirm is False
-
-    def test_turn_off_with_end_starts_pending_confirm(self) -> None:
-        intimacy_mode_state.enter()
-        intimacy_mode_state.latest_user_text = "好了结束吧"
-        result = _handle_set_intimacy_mode({"on": False})
-        assert result["intimacy_mode"] == "on"
-        assert result.get("refused") is True
-        assert result.get("pending_confirm") is True
-        assert intimacy_mode_state.active is True
-        assert intimacy_mode_state.pending_exit_confirm is True
-
-    def test_turn_off_allowed_after_confirm(self) -> None:
-        intimacy_mode_state.enter()
-        intimacy_mode_state.request_exit_confirm()
-        intimacy_mode_state.latest_user_text = "嗯"
         result = _handle_set_intimacy_mode({"on": False})
         assert result == {"intimacy_mode": "off"}
         assert intimacy_mode_state.active is False
+        assert intimacy_mode_state.needs_reentry_hint is False
 
     def test_turn_off_when_already_off(self) -> None:
         result = _handle_set_intimacy_mode({"on": False})
@@ -218,7 +161,7 @@ class TestIntimacyToolBoundaryCopy:
         assert "技术" in text or "工作" in text
         assert "日常" in text
         assert "节奏" in text
-        assert "确认" in text
+        assert "退出" in text
         assert "不开也可以" not in text
 
     def test_registry_uses_boundary_description(self, tmp_path: Path) -> None:
@@ -330,16 +273,8 @@ class TestIntimacyGuidePromptGate:
         assert section is not None
         assert "INTIMACY_GUIDE_MARKER" in section.body
         assert section.section_id == "persona.intimacy"
-        assert "确认" in section.body
-
-    def test_pending_confirm_hint_in_section(self) -> None:
-        runtime = self._runtime_with_guide()
-        intimacy_mode_state.enter()
-        intimacy_mode_state.request_exit_confirm()
-        section = runtime._build_intimacy_section()
-        assert section is not None
-        assert "确认" in section.body
-        assert "继续" in section.body
+        assert "退出" in section.body
+        assert "set_intimacy_mode(on=false)" in section.body
 
     def test_empty_guide_stays_hidden_even_when_active(self) -> None:
         runtime = self._runtime_with_guide("")

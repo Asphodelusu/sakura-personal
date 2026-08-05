@@ -17,15 +17,13 @@ from app.storage.paths import StoragePaths
 
 
 class IntimacyModeState:
-    """身体亲密进行中的对话节奏状态：工具写入、路由读取。
+    """身体亲密进行中的对话节奏状态。只影响回复节奏（非思考模式 + 可选续投）。
 
-    只影响回复节奏（主对话非思考 + 可选续投），不决定能不能写亲密内容。
-
-    存活规则：
-    - 用户正常回话 → 刷新为 8 轮，保持开启
-    - 系统静默续投 → 扣 1 轮；扣尽则自动退出
-    - 用户说结束类话 → 进入待确认（Sakura 先问），确认后才退出
-    - 模型 on=false 仅在待确认且对方已点头后才生效
+    生命周期：
+    - 进入：模型调 set_intimacy_mode(on=true) 或输出中用了亲密/H tone（兜底）
+    - 保持：用户正常回话 → 刷新 8 轮额度；静默续投 → 扣 1 轮
+    - 退出：静默续投耗尽 8 轮 → 自动退出（needs_reentry_hint 提示模型重开）
+            模型主动调 set_intimacy_mode(on=false) → 直接退出
     """
 
     _AUTO_EXIT_TURNS = 8
@@ -33,36 +31,18 @@ class IntimacyModeState:
     def __init__(self) -> None:
         self.active: bool = False
         self._turns_left: int = 0
-        # 轮次耗尽自动退出后：提示模型若互动仍在继续需再次 on=true
         self.needs_reentry_hint: bool = False
-        # 对方说了结束类话，等待口头确认是否真的停
-        self.pending_exit_confirm: bool = False
-        self.latest_user_text: str = ""
 
     def enter(self) -> None:
         self.active = True
         self._turns_left = self._AUTO_EXIT_TURNS
         self.needs_reentry_hint = False
-        self.pending_exit_confirm = False
 
     def exit(self) -> None:
-        """主动关闭（用户确认结束 / 工具获准 on=false）；不留重进提示。"""
+        """模型主动收尾（on=false）：不留重进提示。模型知道是自己关的，若互动还在会主动重开。"""
         self.active = False
         self._turns_left = 0
         self.needs_reentry_hint = False
-        self.pending_exit_confirm = False
-
-    def request_exit_confirm(self) -> None:
-        """用户疑似想结束：先待确认，不立刻关。"""
-        if not self.active:
-            return
-        self.pending_exit_confirm = True
-
-    def clear_exit_confirm(self) -> None:
-        self.pending_exit_confirm = False
-
-    def note_user_text(self, text: str) -> None:
-        self.latest_user_text = (text or "").strip()
 
     def refresh_user_reply(self) -> None:
         """用户回话：刷新存活额度，保持开启。"""
@@ -71,148 +51,25 @@ class IntimacyModeState:
         self._turns_left = self._AUTO_EXIT_TURNS
 
     def consume_turn(self) -> bool:
-        """系统续投消耗一次；返回是否仍活跃。真实用户轮应走 refresh_user_reply。"""
+        """系统续投消耗一次；返回是否仍活跃。"""
         if not self.active:
             return False
         self._turns_left -= 1
         if self._turns_left <= 0:
             self.active = False
+            # 静默续投耗尽：模型不知道被自动关掉，需要提示它若仍在互动则重开
             self.needs_reentry_hint = True
-            self.pending_exit_confirm = False
             return False
         return True
 
 
-# 模块级单例，供 builtin_tools 和 turn_routing 共享
+# 模块级单例
 intimacy_mode_state = IntimacyModeState()
 
-# 与 runtime 中 guide 路径一致：无 guide 时不允许开启节奏模式
 _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
 
 # 系统续投注入的用户标记（不进持久化历史）
 INTIMACY_CONTINUE_MARKER = "（続けて）"
-
-# 用户明确结束亲密节奏的口头信号（中日常见说法；避免过宽误伤）
-_INTIMACY_END_KEYWORDS: tuple[str, ...] = (
-    "结束",
-    "結束",
-    "到此为止",
-    "到此為止",
-    "先这样",
-    "先這樣",
-    "先到这",
-    "先到這",
-    "够了",
-    "夠了",
-    "可以了",
-    "不要了",
-    "不玩了",
-    "停下来",
-    "停下來",
-    "停下",
-    "停止",
-    "打住",
-    "收手",
-    "歇了",
-    "終わり",
-    "終わりに",
-    "やめよう",
-    "やめて",
-    "もういい",
-    "もうやめ",
-    "止めて",
-)
-
-# 待确认阶段：对方点头确认结束（短答整句匹配，避免误伤）
-_INTIMACY_EXIT_CONFIRM_EXACT: frozenset[str] = frozenset(
-    {
-        "嗯",
-        "嗯嗯",
-        "好",
-        "好的",
-        "好吧",
-        "行",
-        "行吧",
-        "对",
-        "对的",
-        "是",
-        "是的",
-        "可以",
-        "确认",
-        "就这样",
-        "就这样吧",
-        "ok",
-        "okay",
-        "はい",
-        "うん",
-        "ええ",
-    }
-)
-
-# 待确认阶段：对方表示还要继续
-_INTIMACY_KEEP_KEYWORDS: tuple[str, ...] = (
-    "继续",
-    "還要",
-    "还要",
-    "不要停",
-    "别停",
-    "別停",
-    "没完",
-    "沒完",
-    "再来",
-    "再來",
-    "不要结束",
-    "不要結束",
-    "先别结束",
-    "先別結束",
-    "不是结束",
-    "不是結束",
-    "还没完",
-    "還沒完",
-    "続けて",
-    "やめない",
-    "まだ",
-)
-
-
-def user_signals_intimacy_keep_going(text: str) -> bool:
-    """用户是否表示还要继续（优先于结束词，避免「不要结束」误判）。"""
-    raw = (text or "").strip()
-    if not raw or raw == INTIMACY_CONTINUE_MARKER:
-        return False
-    lowered = raw.casefold()
-    for kw in _INTIMACY_KEEP_KEYWORDS:
-        if kw.casefold() in lowered:
-            return True
-    return False
-
-
-def user_signals_intimacy_end(text: str) -> bool:
-    """用户是否说出结束类话（触发「先问一句」；不等于已确认退出）。"""
-    raw = (text or "").strip()
-    if not raw or raw == INTIMACY_CONTINUE_MARKER:
-        return False
-    if user_signals_intimacy_keep_going(raw):
-        return False
-    lowered = raw.casefold()
-    for kw in _INTIMACY_END_KEYWORDS:
-        if kw.casefold() in lowered:
-            return True
-    return False
-
-
-def user_signals_intimacy_exit_confirm(text: str) -> bool:
-    """待确认阶段：用户是否点头确认结束。"""
-    raw = (text or "").strip()
-    if not raw or raw == INTIMACY_CONTINUE_MARKER:
-        return False
-    if user_signals_intimacy_keep_going(raw):
-        return False
-    # 再说一遍结束类话 = 确认
-    if user_signals_intimacy_end(raw):
-        return True
-    normalized = raw.casefold().strip("。.！!？?…~～、,， ")
-    return normalized in {s.casefold() for s in _INTIMACY_EXIT_CONFIRM_EXACT}
 
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
@@ -221,14 +78,10 @@ _SET_INTIMACY_MODE_DESCRIPTION = (
     "包括答应一起做、开始靠近/触碰、动手前的准备，或你准备使用 tone「亲密」/「H」。"
     "不要等到已经做到一半才开；准备阶段就要开。"
     "日常闲聊、关心安慰、技术/工作话题、普通撒娇/暧昧试探（尚未准备动手）都不要开启。"
-    "对方说「结束」「停下」「到此为止」「先这样」等时，先轻声确认是否真的停，"
-    "不要立刻 on=false；等对方点头确认（如「嗯」「好」「对」或再说结束）后再关闭。"
-    "若对方说继续/还要，则保持开启。"
-    "不要仅因气氛变缓、短暂停顿或你自己觉得告一段落而关闭。"
-    "关闭或因长时间无用户回话、静默续投耗尽而自动结束后不会自动恢复；"
-    "若身体亲密互动仍在继续或再次开始，必须再次 set_intimacy_mode(on=true)。"
-    "本工具只影响回复节奏与引导注入；"
-    "只要进入准备或身体亲密层面，就应保持或重新开启节奏模式。"
+    "当身体亲密自然结束时，主动调用 set_intimacy_mode(on=false) 收尾，"
+    "不要拖着节奏模式不放；停顿、话题转回日常生活或对方明显结束亲昵行为都是退出信号。"
+    "关闭后不会自动恢复；若互动再次进入亲密，需重新 on=true。"
+    "本工具只影响回复节奏与引导注入。"
 )
 
 
@@ -248,37 +101,9 @@ def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
     if on:
         intimacy_mode_state.enter()
         return {"intimacy_mode": "on"}
-
-    # on=false：已关闭则直接确认；开启中须「结束意向 + 口头确认」
-    if not intimacy_mode_state.active:
-        return {"intimacy_mode": "off"}
-
-    latest = intimacy_mode_state.latest_user_text
-    if intimacy_mode_state.pending_exit_confirm:
-        if user_signals_intimacy_exit_confirm(latest):
-            intimacy_mode_state.exit()
-            return {"intimacy_mode": "off"}
-        return {
-            "intimacy_mode": "on",
-            "refused": True,
-            "pending_confirm": True,
-            "reason": "正在等待对方确认是否结束；先口头问清，确认后再关闭",
-        }
-
-    if user_signals_intimacy_end(latest):
-        intimacy_mode_state.request_exit_confirm()
-        return {
-            "intimacy_mode": "on",
-            "refused": True,
-            "pending_confirm": True,
-            "reason": "对方疑似想结束，请先轻声确认；确认后再调用 on=false",
-        }
-
-    return {
-        "intimacy_mode": "on",
-        "refused": True,
-        "reason": "需要对方明确表示结束，并由你确认后才可关闭节奏模式",
-    }
+    # on=false：直接退出（模型判断亲密互动已自然结束）
+    intimacy_mode_state.exit()
+    return {"intimacy_mode": "off"}
 
 
 def create_builtin_tool_registry(
@@ -426,7 +251,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="open_url",
-                description="打开 http 或 https 网页。该工具会离开聊天窗口，需要对方确认后才能执行。",
+                description="打开 http 或 https 网页。该工具会离开聊天窗口；关闭「完整访问权限」时需要对方确认。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -440,7 +265,7 @@ def create_builtin_tool_registry(
             ),
             Tool(
                 name="open_local_folder",
-                description="打开已存在的本地文件夹。该工具会访问桌面环境，需要对方确认后才能执行。",
+                description="打开已存在的本地文件夹。该工具会访问桌面环境；关闭「完整访问权限」时需要对方确认。",
                 parameters={
                     "type": "object",
                     "properties": {

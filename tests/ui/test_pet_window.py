@@ -435,6 +435,7 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     host.show_history = lambda: None
     host.show_runtime_log = lambda: None
     host.show_settings = lambda: None
+    host._request_app_restart = lambda: None
     host.show()
     app.processEvents()
 
@@ -486,6 +487,7 @@ def test_pet_window_menu_shows_restore_action_when_hidden() -> None:
     host.show_history = lambda: None
     host.show_runtime_log = lambda: None
     host.show_settings = lambda: None
+    host._request_app_restart = lambda: None
 
     menu = PetWindow._build_menu(host)  # type: ignore[arg-type]
     actions = [action for action in menu.actions() if not action.isSeparator()]
@@ -771,7 +773,7 @@ def test_memory_status_does_not_use_tray_balloon(monkeypatch) -> None:  # type: 
         "failed message",
     ]
     assert len(warnings) == 1
-    assert warnings[0][0] == "记忆模型下载失败"
+    assert warnings[0][0] == "记忆模型未就绪"
     assert "发生了什么" in warnings[0][1]
     assert "处理建议" in warnings[0][1]
     assert "诊断信息（截图时请保留）" in warnings[0][1]
@@ -831,7 +833,7 @@ def test_memory_failure_dialog_is_deferred_until_startup_window_is_visible(monke
 
     assert window.subtitle_controller.messages == ["download failed"]
     assert len(warnings) == 1
-    assert warnings[0][0] == "记忆模型下载失败"
+    assert warnings[0][0] == "记忆模型未就绪"
     assert "处理建议" in warnings[0][1]
     assert "download failed" in warnings[0][1]
     assert window.memory_failure_dialog_pending_message == ""
@@ -1184,6 +1186,19 @@ def test_pet_window_registers_runtime_services_in_registry_order() -> None:
     registry.stop_all()
 
     assert order == ["memory", "tts", "mcp", "renderer", "plugins"]
+
+
+def test_message_implies_away_requires_explicit_departure() -> None:
+    from app.ui.pet_window import message_implies_away
+
+    assert message_implies_away("聊睡觉的事情") is None
+    assert message_implies_away("我们说睡眠质量") is None
+    assert message_implies_away("睡不着怎么办") is None
+    assert message_implies_away("今天要睡了吗") is None
+    assert message_implies_away("晚安") == "晚安"
+    assert message_implies_away("我去睡了") == "我去睡了"
+    assert message_implies_away("先走了") == "先走了"
+    assert message_implies_away("别回我") == "别回"
 
 
 def test_shutdown_ignores_late_progress_and_reply() -> None:
@@ -4894,6 +4909,9 @@ def test_reply_history_reload_uses_history_store_entries() -> None:
                 )
             ]
 
+        def load_tail(self, _limit):  # type: ignore[no-untyped-def]
+            return self.load(), False
+
     class MinimalHistoryWindow:
         _load_reply_history_from_store = PetWindow._load_reply_history_from_store
         _normalized_reply_history_index = PetWindow._normalized_reply_history_index
@@ -5463,6 +5481,8 @@ def _build_minimal_manual_screenshot_window(text: str):
         None,
     )
     window._collapse_auto_fit_bubble_height = lambda: None
+    window._cancel_intimacy_continue = lambda: None
+    window._detect_away_from_message = lambda _text: None
     return window, requests, history
 
 

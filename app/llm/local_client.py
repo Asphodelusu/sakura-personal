@@ -2,7 +2,8 @@
 
 Ollama 等本地服务提供 OpenAI 兼容 API，本地端复用 OpenAICompatibleClient。
 当前状态：配置与路由门面已接入，**尚未在 8G 级显存等目标环境完成验证**；
-生产路径默认始终走云端，仅当用户显式选择「始终本地」时才尝试本地端点。
+所有 RouteMode 默认 "cloud"，仅当用户显式设为 "local" 或 "auto"（需 verified）
+才走本地端点，失败时自动回退云端。
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ class LocalLlmSettings:
     timeout_seconds: int = DEFAULT_LOCAL_LLM_TIMEOUT_SECONDS
     vision_route: RouteMode = DEFAULT_LOCAL_LLM_VISION_ROUTE
     background_route: RouteMode = "cloud"
+    chat_route: RouteMode = "cloud"
 
     def normalized(self) -> LocalLlmSettings:
         base_url = str(self.base_url or DEFAULT_LOCAL_LLM_BASE_URL).strip().rstrip("/")
@@ -57,6 +59,7 @@ class LocalLlmSettings:
         background_route = (
             self.background_route if self.background_route in {"cloud", "local", "auto"} else "cloud"
         )
+        chat_route = self.chat_route if self.chat_route in {"cloud", "local", "auto"} else "cloud"
         return LocalLlmSettings(
             enabled=bool(self.enabled),
             base_url=base_url or DEFAULT_LOCAL_LLM_BASE_URL,
@@ -66,6 +69,7 @@ class LocalLlmSettings:
             timeout_seconds=timeout_seconds,
             vision_route=vision_route,
             background_route=background_route,
+            chat_route=chat_route,
         )
 
     @property
@@ -191,6 +195,26 @@ class RoutingLlmClient:
         on_chunk: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> ChatReply:
+        if self._route_allows_local(self._local_settings.chat_route):
+            local = self._local_client_for(prefer_vision=False)
+            if local is not None:
+                try:
+                    return local.chat(
+                        system_prompt,
+                        messages,
+                        reply_tones,
+                        reply_portraits,
+                        cancel_checker=cancel_checker,
+                        runtime_context=runtime_context,
+                        on_chunk=on_chunk,
+                        **kwargs,
+                    )
+                except ApiRequestError as exc:
+                    debug_log(
+                        "LocalLLM",
+                        "本地 chat 失败，回退云端",
+                        {"error": str(exc)},
+                    )
         return self._cloud.chat(
             system_prompt,
             messages,
@@ -212,6 +236,24 @@ class RoutingLlmClient:
         runtime_context: str = "",
         **kwargs: Any,
     ) -> ChatCompletionTurn:
+        if self._route_allows_local(self._local_settings.chat_route):
+            local = self._local_client_for(prefer_vision=False)
+            if local is not None:
+                try:
+                    return local.complete_with_tools(
+                        system_prompt,
+                        messages,
+                        tools=tools,
+                        cancel_checker=cancel_checker,
+                        runtime_context=runtime_context,
+                        **kwargs,
+                    )
+                except ApiRequestError as exc:
+                    debug_log(
+                        "LocalLLM",
+                        "本地 complete_with_tools 失败，回退云端",
+                        {"error": str(exc)},
+                    )
         return self._cloud.complete_with_tools(
             system_prompt,
             messages,
@@ -306,7 +348,9 @@ class RoutingLlmClient:
             route = self._local_settings.background_route
             prefer_vision = False
         else:
-            return self._cloud, "cloud"
+            # 纯文本 default 任务（如记忆策展、JSON 修复等内部调用）
+            route = self._local_settings.chat_route
+            prefer_vision = False
 
         if not self._route_allows_local(route):
             return self._cloud, "cloud"

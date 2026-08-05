@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -494,11 +495,15 @@ class OpenAICompatibleClient:
         messages: list[ChatMessage],
         temperature: float = 0.8,
         *,
+        include_reasoning: bool = False,
         cancel_checker: CancelChecker | None = None,
         runtime_context: str = "",
         **chat_params: Any,
     ):
-        """流式聊天补全，逐块 yield 文本内容。调用方累积后自行解析。"""
+        """流式聊天补全，逐块 yield 文本内容。调用方累积后自行解析。
+
+        include_reasoning=False 时跳过 reasoning_content（默认关闭，避免思考文本
+        混入 JSON 回复导致解析失败）。需要推理文本时显式传 True。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
         request_model = self._resolve_request_model(messages)
@@ -563,9 +568,10 @@ class OpenAICompatibleClient:
                     delta_content = delta.get("content")
                     if isinstance(delta_content, str) and delta_content:
                         yield delta_content
-                    reasoning = delta.get("reasoning_content")
-                    if isinstance(reasoning, str) and reasoning:
-                        yield reasoning
+                    if include_reasoning:
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            yield reasoning
         except (httpx.HTTPStatusError, httpx.ConnectError,
                 httpx.NetworkError, httpx.RemoteProtocolError,
                 httpx.ReadTimeout) as exc:
@@ -929,7 +935,6 @@ class OpenAICompatibleClient:
                     "last_error": str(last_error),
                 },
             )
-            import random
             base_delay = API_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
             jitter = base_delay * API_RETRY_JITTER * (random.random() * 2 - 1)
             delay = base_delay + jitter

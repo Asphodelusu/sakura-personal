@@ -5,6 +5,11 @@
 - free_access 模式的豁免规则
 - 高风险工具的强制确认逻辑
 集中到单一策略类中。
+
+free_access 语义（与 UI「完整访问权限」开关一致）：
+- 开启（默认）：所有非高风险工具豁免确认，直接执行（含 open_url / open_local_folder 等
+  requires_confirmation 工具）；破坏性操作（delete 等）始终确认。
+- 关闭：所有 requires_confirmation 工具都走确认面板。
 """
 
 from __future__ import annotations
@@ -35,18 +40,6 @@ class ToolPermissionPolicy:
         "delete_local_file", "remove_local_file",
     )
 
-    # ---- 浏览器工具 (free_access 可跳过) ----
-
-    BROWSER_FREE_ACCESS_TOOLS: frozenset[str] = frozenset({
-        "playwright_navigate",
-        "playwright_get_text",
-        "playwright_search_web",
-        "playwright_screenshot",
-        "playwright_click",
-        "playwright_fill",
-        "playwright_evaluate",
-    })
-
     # ---- 判断逻辑 ----
 
     def requires_confirmation(self, tool: Tool, arguments: dict[str, Any] | None = None) -> bool:
@@ -65,7 +58,11 @@ class ToolPermissionPolicy:
         return True
 
     def _can_execute_with_free_access(self, tool: Tool) -> bool:
-        """free_access 模式下是否可直接执行。"""
+        """free_access 模式下是否可直接执行。
+
+        当前语义：豁免所有非高风险工具（含打开 URL / 本地文件夹等 requires_confirmation
+        工具）。破坏性操作由 _is_always_high_risk 拦截，始终确认。
+        """
         # 高风险工具始终需要确认
         if self._is_always_high_risk(tool):
             return False
@@ -82,9 +79,3 @@ class ToolPermissionPolicy:
             marker in normalized
             for marker in self.HIGH_RISK_CONFIRMATION_PATTERNS
         )
-
-    # ---- 浏览器工具判断 ----
-
-    def is_browser_free_access_tool(self, name: str) -> bool:
-        """检查是否属于 free_access 可豁免的浏览器工具。"""
-        return name in self.BROWSER_FREE_ACCESS_TOOLS

@@ -108,8 +108,8 @@ class TestContinueDoesNotResetLifetime:
         assert _pet_window_source_contains("_INTIMACY_CONTINUE_MAX = 8"), (
             "静默续投上限应与节奏存活轮次对齐为 8"
         )
-        assert _pet_window_source_contains("pending_exit_confirm"), (
-            "待确认结束时应暂停静默续投"
+        assert not _pet_window_source_contains("pending_exit_confirm"), (
+            "已删除待确认结束机制（模型自管退出），不应再引用 pending_exit_confirm"
         )
 
 
