@@ -318,6 +318,8 @@ class TauriSettingsResult:
     tts: TauriTtsResult = field(default_factory=TauriTtsResult)
     system_extra: TauriSystemExtraResult = field(default_factory=TauriSystemExtraResult)
     memory_curation: MemoryCurationSettings = field(default_factory=MemoryCurationSettings)
+    # 渐进记忆检索开关；默认开启，前端未提交时保持 True
+    progressive_memory: bool = True
     plugins: TauriPluginResult = field(default_factory=TauriPluginResult)
     # ProactiveObserver 运行时配置；缺省空 dict 表示前端未提交（仅改 enabled 走 screen_awareness）。
     proactive: dict[str, Any] = field(default_factory=dict)
@@ -540,6 +542,7 @@ def build_tauri_settings_request(
     button_font_size: int = DEFAULT_BUTTON_FONT_SIZE,
     onboarding: bool = False,
     proactive_config: Mapping[str, Any] | None = None,
+    progressive_memory: bool = True,
 ) -> dict[str, Any]:
     normalized_screen_awareness = screen_awareness_settings.normalized()
     normalized_proactive = normalize_proactive_config_mapping(proactive_config)
@@ -604,7 +607,10 @@ def build_tauri_settings_request(
             bool(launch_at_login_supported),
             backchannel_settings or BackchannelSettings(),
         ),
-        "memory": _memory_to_mapping(memory_curation_settings or MemoryCurationSettings()),
+        "memory": _memory_to_mapping(
+            memory_curation_settings or MemoryCurationSettings(),
+            progressive_memory=progressive_memory,
+        ),
         "plugins": _plugins_to_mapping(base_dir, plugin_settings_contributions),
         "resources": {},
         "theme_defaults": _theme_to_mapping(DEFAULT_THEME_SETTINGS),
@@ -863,6 +869,9 @@ def parse_tauri_settings_payload(
         tts=_tts_from_mapping_required(tts),
         system_extra=_system_extra_from_mapping_required(system_extra),
         memory_curation=_memory_from_mapping_required(memory),
+        progressive_memory=_optional_bool(
+            memory.get("progressive_memory"), default=True
+        ),
         plugins=_plugins_from_mapping_required(plugins),
         proactive=proactive,
     )
@@ -1089,6 +1098,7 @@ class TauriSettingsProcess(QObject):
         onboarding: bool = False,
         persist_handler: Callable[[object, bool], bool] | None = None,
         proactive_config: Mapping[str, Any] | None = None,
+        progressive_memory: bool = True,
     ) -> None:
         super().__init__(parent)
         self.base_dir = Path(base_dir)
@@ -1123,6 +1133,7 @@ class TauriSettingsProcess(QObject):
         self.launch_at_login_supported = bool(launch_at_login_supported)
         self.backchannel_settings = backchannel_settings or BackchannelSettings()
         self.memory_curation_settings = memory_curation_settings or MemoryCurationSettings()
+        self.progressive_memory = bool(progressive_memory)
         self.memory_store = memory_store
         self.plugin_settings_contributions = list(plugin_settings_contributions or [])
         self.studio_launcher = studio_launcher
@@ -1268,6 +1279,7 @@ class TauriSettingsProcess(QObject):
             launch_at_login_supported=self.launch_at_login_supported,
             backchannel_settings=self.backchannel_settings,
             memory_curation_settings=self.memory_curation_settings,
+            progressive_memory=self.progressive_memory,
             plugin_settings_contributions=self.plugin_settings_contributions,
             model=self.model,
             parent_widget=self.parent_widget,
@@ -2189,13 +2201,18 @@ def _system_extra_to_mapping(
     }
 
 
-def _memory_to_mapping(settings: MemoryCurationSettings) -> dict[str, object]:
+def _memory_to_mapping(
+    settings: MemoryCurationSettings,
+    *,
+    progressive_memory: bool = True,
+) -> dict[str, object]:
     return {
         "curation": {
             "enabled": True,
             "trigger_turns": _clamp_int_value(settings.trigger_turns, 1, 50),
             "backfill_limit": max(1, int(settings.backfill_limit)),
         },
+        "progressive_memory": bool(progressive_memory),
         "layers": [
             {"id": layer, "label": MEMORY_LAYER_LABELS.get(layer, layer)}
             for layer in MEMORY_LAYERS
