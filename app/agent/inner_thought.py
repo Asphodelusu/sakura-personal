@@ -339,9 +339,14 @@ def format_recent_dialogue(
     char_budget: int = _RECENT_DIALOGUE_CHAR_BUDGET,
 ) -> str:
     """把最近对话压成短文本（user/assistant 交替）。"""
+    from app.agent.builtin_tools import message_is_intimacy_continue
+
     lines: list[str] = []
     for message in messages:
         if not isinstance(message, dict):
+            continue
+        # 亲密续投是系统信号，不得标成「用户」
+        if message_is_intimacy_continue(message):
             continue
         role = str(message.get("role") or "").strip()
         if role not in {"user", "assistant"}:
@@ -349,7 +354,13 @@ def format_recent_dialogue(
         content = _message_text(message.get("content")).strip()
         if not content:
             continue
-        label = "用户" if role == "user" else "角色"
+        source = str(message.get("source") or "").strip()
+        if role == "user":
+            label = "用户"
+        elif source == "proactive":
+            label = "角色(主动)"
+        else:
+            label = "角色"
         lines.append(f"{label}：{_clip(content, 180)}")
     if not lines:
         return ""

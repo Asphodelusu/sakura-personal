@@ -322,10 +322,13 @@ _SPEECH_DECISION_INSTRUCTION = """
 - [可见文字摘录]：システムが読んだ（または画面から写した）文字。原文引用の唯一のソース
 - [反应提示]：視覚モデルの短い感情ヒント（根拠ではない）
 - [最近の会話]：相手との直近のやりとり（事実の最優先ソース）
+  ラベル：[相手]=ユーザー、[あなた(夜乃桜)]=自分の発言、[あなた(夜乃桜・主動)]=自分の主動発話。混同しないこと。
+- [自分の直前の発話]：ついさっき自分が口にした内容（あれば）
 - [最近の観測履歴]：さっきまでの観測の記録
+- [观察者上下文]：前回までの短時印象（対話の既知事実を含む）
 
 根拠の優先順位（必須）：
-1. 会話事実（[最近の会話]）
+1. 会話事実（[最近の会話] / [自分の直前の発話]）
 2. 可见文字摘录
 3. 画面摘要
 4. 反应提示
@@ -352,6 +355,8 @@ _SPEECH_DECISION_INSTRUCTION = """
 - 【自分のセリフを相手の画面と混同しない】摘录や摘要に、自分（夜乃桜）の吹き出し・直前の独白・入力欄っぽい文が混ざっていても、
   それはスクリーン上の「他のアプリの内容」ではない。それに答える・引用する・自問自答しない。
   疑わしいときは画面の本題（相手のアプリ）だけを見るか、should_speak=false。
+- 【自分の発話を相手の発言と混同しない】[最近の会話] の「あなた」側や [自分の直前の発話] は自分の言葉。
+  相手が言ったことにしない。自分の直前コメントへの返答・復唱・自問自答をしない。
 
 should_speak=true の場合：
 - comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
@@ -469,6 +474,8 @@ class ProactiveObserver:
 
         self._last_proactive_at = 0.0
         self._last_user_at = time.monotonic()
+        # 自己上一句主动发言（决策用，避免把己方台词当成对方）
+        self._last_spoken_text = ""
         # 兼容旧日志字段：始终等于当前焦点标题
         self._last_window_title = ""
         self._focus_current: FocusSnapshot | None = None
@@ -1100,9 +1107,23 @@ class ProactiveObserver:
                 parts.append(chat_ctx)
         except Exception:
             pass
+        last_spoken = (self._last_spoken_text or "").strip()
+        if last_spoken:
+            if len(last_spoken) > 160:
+                last_spoken = last_spoken[:160] + "…"
+            parts.append(
+                "[自分の直前の発話]\n"
+                f"{last_spoken}\n"
+                "※これはあなた（夜乃桜）が先ほど口にした内容。相手の発言ではない。"
+            )
         obs_ctx = self._format_obs_history()
         if obs_ctx:
             parts.append(obs_ctx)
+        # 决策 LLM 看自己上一轮的短时印象（含「対話の既知事実」），
+        # 避免对同一画面/话题重复问。
+        obs_impression = sensory_impression_store.get_for_observer()
+        if obs_impression:
+            parts.append(f"[观察者上下文]\n{obs_impression}")
         user_text = "\n\n".join(parts)
 
         messages = [
@@ -1501,6 +1522,7 @@ class ProactiveObserver:
             translation=str(speech_decision.get("translation", "")).strip(),
             tone=str(speech_decision.get("tone", "")).strip() or "中性",
         )
+        self._last_spoken_text = comment
 
         try:
             self.on_speak(payload)

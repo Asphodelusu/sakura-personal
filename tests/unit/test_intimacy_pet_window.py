@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
-import pytest
+from app.agent.builtin_tools import (
+    build_intimacy_continue_message,
+    latest_is_intimacy_continue,
+    message_is_intimacy_continue,
+)
 
 
 def _pet_window_source_contains(pattern: str) -> bool:
@@ -16,53 +18,101 @@ def _pet_window_source_contains(pattern: str) -> bool:
     return pattern in text
 
 
+def _pet_window_source_content() -> str:
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[2] / "app" / "ui" / "pet_window.py"
+    return src.read_text(encoding="utf-8")
+
+
+def _is_intimacy_continue_turn(messages: list[dict]) -> bool:
+    """与 PetWindow._is_intimacy_continue_turn 对齐的纯函数实现。"""
+    if latest_is_intimacy_continue(messages):
+        return True
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        if role == "assistant":
+            continue
+        return message_is_intimacy_continue(msg)
+    return False
+
+
 class TestIsIntimacyContinueTurn:
-    """_is_intimacy_continue_turn() 逻辑测试（内联实现验证）。"""
+    """_is_intimacy_continue_turn() 逻辑测试。"""
 
-    @staticmethod
-    def _is_intimacy_continue_turn(messages: list[dict]) -> bool:
-        """内联拷贝自 PetWindow._is_intimacy_continue_turn，保持同步。"""
-        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+    def test_continue_turn_detected_system(self) -> None:
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    {"role": "user", "content": "好き"},
+                    {"role": "assistant", "content": "うん…"},
+                    build_intimacy_continue_message(),
+                ]
+            )
+            is True
+        )
 
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                return msg.get("content") == INTIMACY_CONTINUE_MARKER
-        return False
+    def test_continue_turn_detected_legacy_user(self) -> None:
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    {"role": "user", "content": "好き"},
+                    {"role": "assistant", "content": "うん…"},
+                    {"role": "user", "content": "（続けて）"},
+                ]
+            )
+            is True
+        )
 
-    def test_continue_turn_detected(self) -> None:
-        assert self._is_intimacy_continue_turn([
-            {"role": "user", "content": "好き"},
-            {"role": "assistant", "content": "うん…"},
-            {"role": "user", "content": "（続けて）"},
-        ]) is True
+    def test_continue_after_assistant_reply(self) -> None:
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    build_intimacy_continue_message(),
+                    {"role": "assistant", "content": "うん…"},
+                ]
+            )
+            is True
+        )
 
     def test_normal_turn_not_detected(self) -> None:
-        assert self._is_intimacy_continue_turn([
-            {"role": "user", "content": "おはよう"},
-            {"role": "assistant", "content": "おはよう"},
-            {"role": "user", "content": "今日はどう？"},
-        ]) is False
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    {"role": "user", "content": "おはよう"},
+                    {"role": "assistant", "content": "おはよう"},
+                    {"role": "user", "content": "今日はどう？"},
+                ]
+            )
+            is False
+        )
 
     def test_no_user_messages(self) -> None:
-        assert self._is_intimacy_continue_turn([
-            {"role": "assistant", "content": "うん…"},
-        ]) is False
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    {"role": "assistant", "content": "うん…"},
+                ]
+            )
+            is False
+        )
 
     def test_empty_messages(self) -> None:
-        assert self._is_intimacy_continue_turn([]) is False
+        assert _is_intimacy_continue_turn([]) is False
 
     def test_last_user_is_not_continue(self) -> None:
-        assert self._is_intimacy_continue_turn([
-            {"role": "user", "content": "（続けて）"},
-            {"role": "assistant", "content": "うん…"},
-            {"role": "user", "content": "待って"},
-        ]) is False
-
-    def test_system_messages_ignored(self) -> None:
-        assert self._is_intimacy_continue_turn([
-            {"role": "system", "content": "internal"},
-            {"role": "user", "content": "（続けて）"},
-        ]) is True
+        assert (
+            _is_intimacy_continue_turn(
+                [
+                    {"role": "user", "content": "（続けて）"},
+                    {"role": "assistant", "content": "うん…"},
+                    {"role": "user", "content": "待って"},
+                ]
+            )
+            is False
+        )
 
 
 class TestObserverBusyGate:
@@ -100,8 +150,8 @@ class TestContinueDoesNotResetLifetime:
         assert not _pet_window_source_contains("intimacy_mode_state.enter()"), (
             "续投计时器不应再调用 enter()，否则会拖长误开寿命"
         )
-        assert _pet_window_source_contains("INTIMACY_CONTINUE_MARKER"), (
-            "续投标记应使用共享常量 INTIMACY_CONTINUE_MARKER"
+        assert _pet_window_source_contains("build_intimacy_continue_message"), (
+            "续投应使用 build_intimacy_continue_message() 写入 system 信号"
         )
 
     def test_continue_max_is_conservative(self) -> None:
@@ -111,10 +161,3 @@ class TestContinueDoesNotResetLifetime:
         assert not _pet_window_source_contains("pending_exit_confirm"), (
             "已删除待确认结束机制（模型自管退出），不应再引用 pending_exit_confirm"
         )
-
-
-def _pet_window_source_content() -> str:
-    from pathlib import Path
-
-    src = Path(__file__).resolve().parents[2] / "app" / "ui" / "pet_window.py"
-    return src.read_text(encoding="utf-8")

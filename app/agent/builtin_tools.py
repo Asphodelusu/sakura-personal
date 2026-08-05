@@ -68,8 +68,44 @@ intimacy_mode_state = IntimacyModeState()
 
 _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
 
-# 系统续投注入的用户标记（不进持久化历史）
+# 系统续投标记（不进持久化历史）。历史兼容：旧会话可能仍是 role=user + 裸标记。
 INTIMACY_CONTINUE_MARKER = "（続けて）"
+INTIMACY_CONTINUE_ROLE = "system"
+INTIMACY_CONTINUE_SYSTEM_TEXT = (
+    "【系统续投信号／不是对方发言】对方当前沉默。请以夜乃桜身份自然续写亲密互动的下一句。"
+    "本条是系统信号，绝不要当成用户说过的话，不要回答或复述本信号。\n"
+    f"{INTIMACY_CONTINUE_MARKER}"
+)
+
+
+def build_intimacy_continue_message() -> dict[str, str]:
+    """构造亲密静默续投的系统消息（role=system，避免假 user 导致角色串线）。"""
+    return {
+        "role": INTIMACY_CONTINUE_ROLE,
+        "content": INTIMACY_CONTINUE_SYSTEM_TEXT,
+        "source": "intimacy_continue",
+    }
+
+
+def message_is_intimacy_continue(message: dict[str, Any] | None) -> bool:
+    """判断单条消息是否为亲密续投信号（含旧版 user 裸标记）。"""
+    if not isinstance(message, dict):
+        return False
+    if str(message.get("source") or "").strip() == "intimacy_continue":
+        return True
+    content = str(message.get("content") or "")
+    if INTIMACY_CONTINUE_MARKER not in content:
+        return False
+    role = str(message.get("role") or "").strip()
+    return role in {"system", "user"}
+
+
+def latest_is_intimacy_continue(messages: list[Any] | None) -> bool:
+    """对话末条是否为亲密续投信号。"""
+    if not messages:
+        return False
+    last = messages[-1]
+    return message_is_intimacy_continue(last if isinstance(last, dict) else None)
 
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
