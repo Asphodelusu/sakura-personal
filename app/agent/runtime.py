@@ -4,13 +4,9 @@ from pathlib import Path
 
 import json
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
-from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Any, Callable, cast
 
-from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, PendingToolAction
 from app.agent.context_orchestrator import ContextOrchestrator, build_context_request
 from app.agent.memory_recall import MemoryRecallService
 from app.agent.prompt_builder import AgentRuntimePromptMixin
@@ -18,21 +14,7 @@ from app.agent.reply_composer import AgentRuntimeReplyMixin
 from app.agent.context_builder import AgentRuntimeContextMixin
 from app.agent.tool_loop import AgentRuntimeToolLoopMixin
 from app.agent.memory import MemoryStore
-from app.agent.screen_awareness import SCREEN_AWARENESS_IMAGE_DETAIL
-from app.agent.screen_tools import (
-    OBSERVE_SCREEN_TOOL_NAME,
-    SCREEN_OBSERVATION_CAPABILITY,
-    SCREEN_OBSERVATION_DISABLED_ERROR,
-    SCREEN_OBSERVATION_REQUEST_ACTION,
-)
-from app.agent.screen_policy import ScreenPolicy
-from app.agent.session_state_context import (
-    SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES,
-    build_session_state_fragment,
-)
-from app.agent.sensory_context import build_sensory_impression_fragment
 from app.agent.lore import LoreIndex, build_lore_context_fragment, load_lore_index
-from app.agent.local_context import build_media_context_fragment
 from app.agent.inner_thought import (
     InnerThoughtResult,
     InnerThoughtSettings,
@@ -44,14 +26,6 @@ from app.agent.inner_thought import (
     mood_summary_from_store,
     sensory_impression_text,
     should_generate_inner_thought,
-)
-from app.agent.tool_policy import (
-    BROWSER_NAVIGATE_TOOL_NAME,
-    BROWSER_SNAPSHOT_TOOL_NAME,
-    ToolPolicy,
-    WINDOWS_CLICK_TOOL_NAME,
-    WINDOWS_SCREENSHOT_TOOL_NAME,
-    WINDOWS_SNAPSHOT_TOOL_NAME,
 )
 import app.agent.tool_routing as tool_routing
 from app.agent.turn_classifier import classify_turn_depth
@@ -77,10 +51,7 @@ from app.llm.api_client import (
     messages_contain_image,
     strip_image_parts_from_messages,
 )
-from app.llm.context_trimming import trim_messages_for_model
-from app.llm.chat_reply import ChatReply, ChatReplyParseResult, ChatSegment, DEFAULT_TONE, parse_chat_reply, parse_chat_reply_result
 from app.config.character_loader import CharacterProfile, normalize_reply_portraits
-from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_body_enabled, debug_log, summarize_messages
 from app.agent.runtime_limits import (
     MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS,
@@ -92,7 +63,6 @@ from app.agent.runtime_limits import (
     RuntimeLoopSettings,
     normalize_runtime_loop_settings,
 )
-from app.llm.prompts.recipes import build_segmented_reply_instruction
 from app.plugins.models import ContextProviderContribution, PromptPatchContribution
 
 from app.llm.prompts.runtime import PromptRuntime
