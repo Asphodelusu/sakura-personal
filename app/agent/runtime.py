@@ -211,8 +211,8 @@ class AgentRuntime:
         self._prompt_inspection_lock = Lock()
         self.model_vision_enabled = True
         self.autonomous_screen_observation_enabled = True
-        # 渐进记忆检索：在召回结果后追加标题索引 + 工具提示
-        # TODO: 目前仅 set_progressive_memory_enabled() 手动启用，未接入配置/UI 开关
+        # 渐进记忆检索：在召回结果后追加标题索引 + 工具提示。
+        # 默认 False；bootstrap / 设置保存后经 set_progressive_memory_enabled 覆盖。
         self._progressive_memory = False
         self._intimacy_guide = _load_intimacy_guide()
 
@@ -2442,6 +2442,29 @@ class AgentRuntime:
             )
         return None
 
+    def _assemble_recipe_sections(
+        self,
+        middle_sections: list[PromptSection],
+        *,
+        intimacy_focus: bool | None = None,
+    ) -> list[PromptSection]:
+        """统一 recipe 段落组装：persona 开头 + 中间段 + 可选 intimacy 结尾。
+
+        各 prompt recipe（工具循环 / 最终合成 / 主动事件）都遵循
+        「人格段在前、功能段居中、亲密节奏段收尾」的顺序，这里收敛公共部分，
+        避免每处重复拼接 persona 与 intimacy 段落。
+        """
+        if intimacy_focus is None:
+            intimacy_focus = self._intimacy_focus_active()
+        sections = [
+            *self._persona_sections(intimacy_focus=intimacy_focus),
+            *middle_sections,
+        ]
+        intimacy_section = self._build_intimacy_section()
+        if intimacy_section is not None:
+            sections.append(intimacy_section)
+        return sections
+
     def _static_persona_prompt(self) -> str:
         recipe = PromptRecipe("persona", self._persona_sections())
         return self._prompt_runtime().build(recipe).system_prompt
@@ -2580,27 +2603,25 @@ class AgentRuntime:
                 "但只能带出片段里确实有的内容，不能添油加醋。",
             ]
         )
-        sections = [
-            *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
-            PromptSection(
-                "agent.identity",
-                "她手边有一些可以实际使用的工具（如查看屏幕、搜索网页、设置提醒、记住事情）。"
-                "遇到信息不足、需要核实、或工具能帮她把事实看准时，她会自然地先用一下再回应，而不是凭空猜测或用套话敷衍；"
-                "信息已经够用时就直接按下面的回复协议、按人设正常说话。\n"
-                "不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文——那些是她动作背后的机制，不是她会说出口的话。",
-            ),
-            PromptSection(
-                "agent.loop_limits",
-                f"当前 Agent 循环：\n- 每步最多请求 {self.runtime_loop_settings.max_tool_calls_per_step} 个工具，整轮最多 {self.runtime_loop_settings.max_tool_calls_per_turn} 个工具。\n- 工具结果足够、受限、需要确认或同参数失败时，停止循环并自然说明状态。",
-            ),
-            PromptSection("reply.protocol", reply_protocol),
-            PromptSection("context.acquisition", context_strategy),
-            PromptSection("tools.capabilities", capability_rules),
-            PromptSection("tools.rules", tool_rules),
-        ]
-        intimacy_section = self._build_intimacy_section()
-        if intimacy_section is not None:
-            sections.append(intimacy_section)
+        sections = self._assemble_recipe_sections(
+            [
+                PromptSection(
+                    "agent.identity",
+                    "她手边有一些可以实际使用的工具（如查看屏幕、搜索网页、设置提醒、记住事情）。"
+                    "遇到信息不足、需要核实、或工具能帮她把事实看准时，她会自然地先用一下再回应，而不是凭空猜测或用套话敷衍；"
+                    "信息已经够用时就直接按下面的回复协议、按人设正常说话。\n"
+                    "不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文——那些是她动作背后的机制，不是她会说出口的话。",
+                ),
+                PromptSection(
+                    "agent.loop_limits",
+                    f"当前 Agent 循环：\n- 每步最多请求 {self.runtime_loop_settings.max_tool_calls_per_step} 个工具，整轮最多 {self.runtime_loop_settings.max_tool_calls_per_turn} 个工具。\n- 工具结果足够、受限、需要确认或同参数失败时，停止循环并自然说明状态。",
+                ),
+                PromptSection("reply.protocol", reply_protocol),
+                PromptSection("context.acquisition", context_strategy),
+                PromptSection("tools.capabilities", capability_rules),
+                PromptSection("tools.rules", tool_rules),
+            ]
+        )
         return self._prompt_runtime().build(PromptRecipe("agent_tool_loop", sections), snapshot)
 
     def _build_tool_system_prompt(
@@ -2663,17 +2684,15 @@ class AgentRuntime:
             final_instructions = (
                 f"{final_instructions}\n\n{self._turn_verbosity_guidance.strip()}"
             )
-        sections = [
-            *self._persona_sections(intimacy_focus=self._intimacy_focus_active()),
-            PromptSection(
-                "final_reply.instructions",
-                final_instructions,
-            ),
-            PromptSection("reply.patch", self._reply_protocol_patch_text()),
-        ]
-        intimacy_section = self._build_intimacy_section()
-        if intimacy_section is not None:
-            sections.append(intimacy_section)
+        sections = self._assemble_recipe_sections(
+            [
+                PromptSection(
+                    "final_reply.instructions",
+                    final_instructions,
+                ),
+                PromptSection("reply.patch", self._reply_protocol_patch_text()),
+            ]
+        )
         return self._prompt_runtime().build(PromptRecipe("final_reply", sections), snapshot)
 
     def _build_final_reply_prompt(self) -> str:
