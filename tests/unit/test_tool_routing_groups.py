@@ -60,6 +60,19 @@ def test_infer_active_groups_adds_memory_write_for_remember_keywords() -> None:
     assert "memory-write" in groups
 
 
+def test_infer_active_groups_adds_history_for_chat_log_keywords() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "你翻一下聊天记录，我昨天原话是什么"}]
+    groups = infer_active_tool_groups_from_messages(messages)
+    assert "history" in groups
+
+
+def test_infer_active_groups_skips_history_for_memory_style_questions() -> None:
+    messages: list[ChatMessage] = [{"role": "user", "content": "索菲是不是你学生会的朋友？"}]
+    groups = infer_active_tool_groups_from_messages(messages)
+    assert groups == {"core"}
+    assert "history" not in groups
+
+
 def test_infer_active_groups_adds_mcp_for_repeat_search_keywords() -> None:
     messages: list[ChatMessage] = [{"role": "user", "content": "再查一遍天津天气"}]
     groups = infer_active_tool_groups_from_messages(messages)

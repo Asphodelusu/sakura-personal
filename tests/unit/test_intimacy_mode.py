@@ -10,8 +10,11 @@ from app.agent.builtin_tools import (
     IntimacyModeState,
     _SET_INTIMACY_MODE_DESCRIPTION,
     _handle_set_intimacy_mode,
+    apply_intimacy_user_utterance,
     create_builtin_tool_registry,
     intimacy_mode_state,
+    user_confirms_intimacy,
+    user_declines_or_exits_intimacy,
 )
 from app.llm.prompts.blocks import with_desktop_pet_context
 
@@ -64,18 +67,38 @@ class TestIntimacyModeState:
             assert state.consume_turn() is True
         assert state.consume_turn() is False
 
-    def test_auto_exit_then_tool_reenter(self) -> None:
+    def test_auto_exit_then_tool_reenter_via_confirm(self) -> None:
         intimacy_mode_state.exit()
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
-            assert _handle_set_intimacy_mode({"on": True}) == {"intimacy_mode": "on"}
+            result = _handle_set_intimacy_mode({"on": True})
+        assert result["intimacy_mode"] == "pending"
+        intimacy_mode_state.confirm()
         for _ in range(8):
             intimacy_mode_state.consume_turn()
         assert intimacy_mode_state.active is False
         assert intimacy_mode_state.needs_reentry_hint is True
+        intimacy_mode_state.note_user_text("要")
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
-            assert _handle_set_intimacy_mode({"on": True}) == {"intimacy_mode": "on"}
+            result = _handle_set_intimacy_mode({"on": True})
+        assert result == {"intimacy_mode": "on", "confirmed_by_user": True}
         assert intimacy_mode_state.active is True
         assert intimacy_mode_state.needs_reentry_hint is False
+
+    def test_request_confirm_then_user_accepts(self) -> None:
+        state = IntimacyModeState()
+        state.request_confirm()
+        assert state.pending is True
+        assert state.active is False
+        state.confirm()
+        assert state.pending is False
+        assert state.active is True
+
+    def test_request_confirm_then_reject(self) -> None:
+        state = IntimacyModeState()
+        state.request_confirm()
+        state.reject_pending()
+        assert state.pending is False
+        assert state.active is False
 
     def test_voluntary_exit_clears_reentry_hint(self) -> None:
         state = IntimacyModeState()
@@ -121,18 +144,35 @@ class TestHandleSetIntimacyMode:
     def setup_method(self) -> None:
         intimacy_mode_state.exit()
 
-    def test_turn_on(self) -> None:
+    def test_turn_on_enters_pending_without_prior_consent(self) -> None:
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
             result = _handle_set_intimacy_mode({"on": True})
-        assert result == {"intimacy_mode": "on"}
+        assert result["intimacy_mode"] == "pending"
+        assert result.get("ask_first") is True
+        assert intimacy_mode_state.pending is True
+        assert intimacy_mode_state.active is False
+
+    def test_turn_on_enters_when_user_already_confirmed(self) -> None:
+        intimacy_mode_state.note_user_text("要")
+        with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
+            result = _handle_set_intimacy_mode({"on": True})
+        assert result == {"intimacy_mode": "on", "confirmed_by_user": True}
         assert intimacy_mode_state.active is True
+        assert intimacy_mode_state.pending is False
 
     def test_turn_off_directly_exits_when_active(self) -> None:
         intimacy_mode_state.enter()
         result = _handle_set_intimacy_mode({"on": False})
         assert result == {"intimacy_mode": "off"}
         assert intimacy_mode_state.active is False
+        assert intimacy_mode_state.pending is False
         assert intimacy_mode_state.needs_reentry_hint is False
+
+    def test_turn_off_clears_pending(self) -> None:
+        intimacy_mode_state.request_confirm()
+        result = _handle_set_intimacy_mode({"on": False})
+        assert result == {"intimacy_mode": "off"}
+        assert intimacy_mode_state.pending is False
 
     def test_turn_off_when_already_off(self) -> None:
         result = _handle_set_intimacy_mode({"on": False})
@@ -157,12 +197,39 @@ class TestIntimacyToolBoundaryCopy:
     def test_description_mentions_when_not_to_enable(self) -> None:
         text = _SET_INTIMACY_MODE_DESCRIPTION
         assert "身体亲密" in text
-        assert "准备" in text
-        assert "技术" in text or "工作" in text
+        assert "确认" in text
+        assert "摸头" in text or "撒娇" in text
+        assert "冷静" in text
         assert "日常" in text
         assert "节奏" in text
-        assert "退出" in text
         assert "不开也可以" not in text
+
+
+class TestIntimacyConsentClassifiers:
+    def test_confirm_and_decline(self) -> None:
+        assert user_confirms_intimacy("要")
+        assert user_confirms_intimacy("いいよ")
+        assert user_confirms_intimacy("可以继续")
+        assert not user_confirms_intimacy("摸摸我的头")
+        assert not user_confirms_intimacy("呃，好的，你先冷静一下")
+        assert user_declines_or_exits_intimacy("你先冷静一下")
+        assert user_declines_or_exits_intimacy("好了，不闹了")
+        assert user_declines_or_exits_intimacy("先这样吧")
+
+    def test_apply_pending_and_active_exit(self) -> None:
+        intimacy_mode_state.exit()
+        intimacy_mode_state.request_confirm()
+        assert apply_intimacy_user_utterance("要") == "confirmed"
+        assert intimacy_mode_state.active is True
+
+        intimacy_mode_state.exit()
+        intimacy_mode_state.request_confirm()
+        assert apply_intimacy_user_utterance("摸摸头就好") == "rejected_pending"
+        assert intimacy_mode_state.pending is False
+
+        intimacy_mode_state.enter()
+        assert apply_intimacy_user_utterance("你先冷静一下") == "exited"
+        assert intimacy_mode_state.active is False
 
     def test_registry_uses_boundary_description(self, tmp_path: Path) -> None:
         registry = create_builtin_tool_registry(tmp_path)
@@ -234,15 +301,24 @@ class TestIntimacyGuidePromptGate:
         section = runtime._build_intimacy_section()
         assert section is not None
         assert section.section_id == "persona.intimacy_entry"
-        assert "准备" in section.body
+        assert "确认" in section.body
         assert "set_intimacy_mode(on=true)" in section.body
+        assert "INTIMACY_GUIDE_MARKER" not in section.body
+
+    def test_pending_hint_without_guide_body(self) -> None:
+        runtime = self._runtime_with_guide()
+        intimacy_mode_state.request_confirm()
+        section = runtime._build_intimacy_section()
+        assert section is not None
+        assert section.section_id == "persona.intimacy_pending"
+        assert "等待确认" in section.body
         assert "INTIMACY_GUIDE_MARKER" not in section.body
 
     def test_no_entry_hint_without_guide(self) -> None:
         runtime = self._runtime_with_guide("")
         assert runtime._build_intimacy_section() is None
 
-    def test_auto_enter_when_reply_uses_intimacy_tone(self) -> None:
+    def test_intimacy_tone_fallback_enters_pending_and_strips_tone(self) -> None:
         from app.llm.chat_reply import ChatReply, ChatSegment
         from unittest.mock import patch
 
@@ -255,8 +331,9 @@ class TestIntimacyGuidePromptGate:
         )
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
             sealed = runtime._seal_reply_tones(reply)
-        assert intimacy_mode_state.active is True
-        assert sealed.segments[0].tone == "亲密"
+        assert intimacy_mode_state.pending is True
+        assert intimacy_mode_state.active is False
+        assert sealed.segments[0].tone != "亲密"
 
     def test_daily_tones_exclude_intimacy_extras(self) -> None:
         runtime = self._runtime_with_guide()
@@ -276,7 +353,8 @@ class TestIntimacyGuidePromptGate:
         assert section is not None
         assert section.section_id == "persona.intimacy_reentry"
         assert "自动关闭" in section.body
-        assert "再次" in section.body or "重新开启" in section.body
+        assert "set_intimacy_mode(on=true)" in section.body
+        assert "确认" in section.body
         assert "INTIMACY_GUIDE_MARKER" not in section.body
 
     def test_tool_description_mentions_reentry(self) -> None:

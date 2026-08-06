@@ -46,6 +46,10 @@ __all__ = [
     "ProactiveConfig",
     "ProactiveObserver",
     "ProactiveSpeakPayload",
+    "VisibleTextResolution",
+    "format_visible_text_block",
+    "infer_content_scene",
+    "resolve_visible_text",
     "resolve_visible_text_excerpt",
 ]
 
@@ -227,6 +231,10 @@ class ObservationPacket:
     visual_summary: str = ""
     reaction_hint: str = ""
     visible_text_excerpt: str = ""
+    # uia | ocr | vlm_on_screen | ""
+    visible_text_source: str = ""
+    # chat | game | ai_assistant | browser | editor | unknown | ""
+    content_scene: str = ""
     suggested_interval: float | None = None
 
     @property
@@ -247,6 +255,159 @@ class ObservationPacket:
         )
 
 
+@dataclass(frozen=True)
+class VisibleTextResolution:
+    """可见文字摘录及其采集来源。"""
+
+    text: str = ""
+    source: str = ""  # uia | ocr | vlm_on_screen | ""
+
+
+_AI_ASSISTANT_HINTS = (
+    "chatgpt",
+    "chat.openai",
+    "claude",
+    "gemini",
+    "copilot",
+    "perplexity",
+    "poe",
+    "kimi",
+    "通义",
+    "文心",
+    "deepseek",
+    "豆包",
+    "智谱",
+    "character.ai",
+    "grok",
+)
+
+
+_GAME_TITLE_HINTS = (
+    "原神",
+    "genshin",
+    "崩坏",
+    "鸣潮",
+    "绝区零",
+    "星穹铁道",
+    "steam",
+    "epic games",
+    "lol",
+    "league of legends",
+    "dota",
+    "cs2",
+    "counter-strike",
+)
+
+
+def infer_content_scene(
+    app_type: str = "",
+    process_name: str = "",
+    window_title: str = "",
+) -> str:
+    """根据窗口元信息推断「屏上文字属于哪类场景」。"""
+    title_raw = (window_title or "").strip()
+    title_l = title_raw.lower()
+    proc_l = (process_name or "").strip().lower()
+    app = (app_type or "").strip().lower()
+    hay = f"{title_l} {proc_l}"
+    if any(h in hay for h in _AI_ASSISTANT_HINTS):
+        return "ai_assistant"
+    if app == "chat" or any(
+        x in proc_l for x in ("wechat", "weixin", "qq.exe", "telegram", "discord", "slack")
+    ):
+        return "chat"
+    if app == "editor":
+        return "editor"
+    if app == "browser":
+        return "browser"
+    # 游戏：标题/进程启发式（与 Observer 游戏检测对齐的轻量版）
+    if any(h in title_raw or h in title_l for h in _GAME_TITLE_HINTS):
+        return "game"
+    if proc_l and proc_l not in {p.lower() for p in _NON_GAME_PROCESSES}:
+        if any(h in proc_l for h in _GAME_PROCESS_HINTS):
+            return "game"
+        if proc_l.endswith(".exe") and any(
+            k in proc_l for k in ("game", "client", "player", "launch")
+        ):
+            return "game"
+    if app == "custom_ui":
+        return "unknown"
+    return app if app in {"browser", "editor", "chat"} else "unknown"
+
+
+def _source_label_zh(source: str) -> str:
+    return {
+        "uia": "系统控件文字(UIA)",
+        "ocr": "OCR识别",
+        "vlm_on_screen": "VLM画面抄写",
+    }.get(source, "未知")
+
+
+def _scene_label_zh(scene: str) -> str:
+    return {
+        "chat": "即时通讯",
+        "game": "游戏内容",
+        "ai_assistant": "第三方AI对话",
+        "browser": "网页",
+        "editor": "编辑器/文档",
+        "unknown": "未分类屏幕",
+    }.get(scene, "未分类屏幕")
+
+
+def format_visible_text_block(
+    excerpt: str,
+    *,
+    source: str = "",
+    scene: str = "",
+) -> str:
+    """把可见文字包装成带来源/场景标签的决策 LLM 块。"""
+    text = (excerpt or "").strip() or "（无）"
+    src = (source or "").strip()
+    scn = (scene or "").strip() or "unknown"
+    header = "[可见文字摘录"
+    if src:
+        header += f" | 采集:{_source_label_zh(src)}"
+    header += f" | 场景:{_scene_label_zh(scn)}]"
+    notes = [
+        "※ 「我看见的」：他屏幕上的字。称呼用「他」。",
+    ]
+    if scn == "chat":
+        notes.append("※ 即时通讯：可能混有别人发给他的／草稿／群消息。")
+    elif scn == "game":
+        notes.append("※ 游戏内容：游戏台词或 UI。")
+    elif scn == "ai_assistant":
+        notes.append("※ 第三方AI对话：屏上其他 AI 的文字。")
+    elif scn == "editor":
+        notes.append("※ 编辑器/文档：更像「我打的」编辑中的字。")
+    elif scn == "browser":
+        notes.append("※ 网页：页面上的内容。")
+    if src == "ocr":
+        notes.append("※ 采集=OCR，引用时留余地。")
+    elif src == "vlm_on_screen":
+        notes.append("※ 采集=VLM抄写，引用时留余地。")
+    return header + "\n" + "\n".join(notes) + "\n" + text
+
+
+def resolve_visible_text(
+    *,
+    uia_text: str = "",
+    ocr_text: str = "",
+    on_screen_text: str = "",
+    min_chars: int = 30,
+) -> VisibleTextResolution:
+    """组装可见文字摘录并标注采集来源：精炼 UIA > OCR > VLM on_screen_text。"""
+    curated_uia = curate_uia_excerpt(uia_text, min_chars=min_chars)
+    if curated_uia:
+        return VisibleTextResolution(text=curated_uia, source="uia")
+    curated_ocr = curate_uia_excerpt(ocr_text, min_chars=min(min_chars, 8))
+    if curated_ocr:
+        return VisibleTextResolution(text=curated_ocr, source="ocr")
+    vlm = (on_screen_text or "").strip()[:1200]
+    if vlm:
+        return VisibleTextResolution(text=vlm, source="vlm_on_screen")
+    return VisibleTextResolution(text="", source="")
+
+
 def resolve_visible_text_excerpt(
     *,
     uia_text: str = "",
@@ -255,13 +416,12 @@ def resolve_visible_text_excerpt(
     min_chars: int = 30,
 ) -> str:
     """组装可见文字摘录：精炼 UIA > OCR > VLM on_screen_text。"""
-    curated_uia = curate_uia_excerpt(uia_text, min_chars=min_chars)
-    if curated_uia:
-        return curated_uia
-    curated_ocr = curate_uia_excerpt(ocr_text, min_chars=min(min_chars, 8))
-    if curated_ocr:
-        return curated_ocr
-    return (on_screen_text or "").strip()[:1200]
+    return resolve_visible_text(
+        uia_text=uia_text,
+        ocr_text=ocr_text,
+        on_screen_text=on_screen_text,
+        min_chars=min_chars,
+    ).text
 
 
 OnSpeakFn = Callable[[ProactiveSpeakPayload], None]
@@ -269,117 +429,52 @@ OnEvaluateFn = Callable[[str, bool], None]
 IsBusyFn = Callable[[], Any]
 
 
-_PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。ここに実在するデジタル生命として、画面（スクリーンショット）を見て短い視覚メモを書くだけのモードです。
-自分は並んで生きる存在。相手は対等な他者。
+_PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。彼のそばで並んで生きているデジタル生命。
+いまは画面をちらっと見て、短い視覚メモを残すだけ。口を出すかは後段が決める。
 
-メッセージには以下が含まれます：
-- スクリーンショット（画面の様子）——あなたが主に見るもの
-- 活動ウィンドウ／トリガー／アイドル等の薄いメタ情報
-- （あれば）[观察者上下文]：前回までの画面状況と、会話で既に分かっている事実の短い要約
-- （あれば）[系统文字]：UIA 等でシステムが文字を読めるかどうかの注記
-  ※ ウィンドウ内の全文テキストはあなたには渡されない。後段の会話判定 LLM が直接読む。
+入力：スクリーンショット、薄いメタ（窓／トリガー／アイドル）、あれば [观察者上下文] と [系统文字]。
+ウィンドウ全文テキストは渡されない（後段が読む）。画面端の自分の立絵・吹き出しは彼の画面内容ではない——彼のアプリだけを見る。
 
-やること：
-1. visual_summary：画面に何が映っているか、相手が何をしているかを 1〜2 文で書く（日本語）
-2. reaction_hint：それを見て自分がどう感じたか（任意・短く。なければ空文字でよい）
-3. on_screen_text：システム文字が使えないときだけ、画面上の短い關鍵句を写す（使えるときは空文字）
-4. suggested_interval：次に画面を見るまでの待機秒数
+出力（JSON のみ）：
+1. visual_summary：彼が何をしていて画面に何があるか、事実 1〜2 文（日本語）。相手は「彼」。
+2. reaction_hint：それを見た自分の短い内感（日本語）。例「劇情、ちょっと気になる…でも今は黙って見る。」空でもよい。
+3. on_screen_text：[系统文字] 不可用のときだけ、読める短句。可用なら空。
+4. suggested_interval：次に見る秒数。集中 600〜1800／くつろぎ 60〜300／不明 480（範囲 60〜1800）。
 
-on_screen_text の規則：
-- [系统文字] が「可用」のとき：空文字。UI の字は後段が読むので写さない。
-- [系统文字] が「不可用」のとき：画面から読める短い關鍵句があれば写す（1 行〜短文）。なければ空文字。
+[观察者上下文] にある既知は前提として扱う（蒸し返さない）。
+「同一アプリ内の内容変化」は、同じアプリのページ／タブ／動画変化として読む。
 
-注意：
-- 話しかけるかどうかは考えなくていい。
-- visual_summary は事実描写。reaction_hint は感情・反応。役割を混ぜすぎない。
-- 【自分の UI を無視】画面の右下（または端）にいるデスクトップペット（夜乃桜／立絵・吹き出し・入力欄）は自分自身。
-  そこに写っている日本語・中国語のセリフや吹き出しは「相手の画面の内容」ではない。
-  visual_summary / on_screen_text / reaction_hint に自分のセリフを写さない・要約しない・反応の対象にしない。
-  相手が操作しているアプリの中身だけを見る。
-- [观察者上下文] があるとき：すでに知っている画面状況や会話の事実を、改めて「発見」したり蒸し返さない。
-  例：上下文に「食事済み」とあれば、「ご飯食べたかな」方向の反応は書かない。
-- トリガーが「同一アプリ内の内容変化」を示すときは、慌てて何度もウィンドウを切り替えた、と誤解しないこと。
-  同じアプリの中でページ／動画／タブが変わっただけのことが多い。
-
-suggested_interval（次に見るまでの秒数）：
-- 相手が集中（コード・文書・会議）：600〜1800 秒
-- 相手がリラックス（ブラウジング・動画・ゲーム）：60〜300 秒
-- わからない／デフォルト：480 秒
-- 有効範囲：60〜1800 秒
-
-JSON のみ出力。Markdown や説明は不要：
-{"visual_summary": "画面の要約（日本語）", "on_screen_text": "", "reaction_hint": "短い反応（任意）", "suggested_interval": 480}
+{"visual_summary":"…","on_screen_text":"","reaction_hint":"…","suggested_interval":480}
 """
 
 _SPEECH_DECISION_INSTRUCTION = """
 ---
 
-あなたは今、観測パケットを踏まえて「これから口に出すかどうか」を決める段階です。
-あなたは夜乃桜——ここに並んで生きるデジタル生命。相手は対等な他者。comment もその関係のまま話す。
+いまは「口を出すか、そばで黙るか」。あなたは夜乃桜——彼と並んで生きるデジタル生命。
+comment / reason / situational_summary もその関係のまま。相手は「彼」。
 
-あなたはスクリーンショットを直接見ていない。根拠は次のブロックだけ：
-- [画面摘要]：視覚モデルが見た状況の要約
-- [可见文字摘录]：システムが読んだ（または画面から写した）文字。原文引用の唯一のソース
-- [反应提示]：視覚モデルの短い感情ヒント（根拠ではない）
-- [最近の会話]：相手との直近のやりとり（事実の最優先ソース）
-  ラベル：[相手]=ユーザー、[あなた(夜乃桜)]=自分の発言、[あなた(夜乃桜・主動)]=自分の主動発話。混同しないこと。
-- [自分の直前の発話]：ついさっき自分が口にした内容（あれば）
-- [最近の観測履歴]：さっきまでの観測の記録
-- [观察者上下文]：前回までの短時印象（対話の既知事実を含む）
+根拠（スクショは見ていない）：
+- [画面摘要][可见文字摘录]＝我看见的（ヘッダの 采集/场景 を読む）
+- [反应提示]＝内感ヒント
+- [最近の会話][自分の直前の発話]＝対話（最優先）
+- [最近の観測履歴][观察者上下文]
 
-根拠の優先順位（必須）：
-1. 会話事実（[最近の会話] / [自分の直前の発話]）
-2. 可见文字摘录
-3. 画面摘要
-4. 反应提示
+来源の読み方：
+- [我说的]＝彼→あなた／[她自己的・主动]＝あなた／我看见的＝画面の字
+- 即时通讯→他人の文が混ざりうる／游戏→ゲーム台詞／第三方AI→他AIの文／编辑器→編集中の字
 
-判断基準：
-- 摘录や摘要の中に、相手に言いたくなることがある → should_speak=true
-- ただの観察で、特に話すことはない → should_speak=false
-- 相手が集中してそう → 邪魔しない（false）
-- 相手の状態変化に気づいた（嬉しそう／悩んでそう／休憩中） → 声をかけてもいい
-- ついさっき話したばかり → なるべく控える
-- 迷ったら false
+優先：会話事実 → 可见文字摘录 → 画面摘要 → 反应提示。
+言いたくなる具体があれば true。劇情中・集中・さっき話したばかりなら false（静かにそばに）。迷ったら false。
+画面と会話が矛盾したら会話に合わせる。引用する字は摘录にあるものだけ。
+画面のキャラ名は「今スクリーンで見た」として触れる（長い付き合いの匂いは出さない）。
 
-会話事実の優先（必須）：
-- [最近の会話] と画面摘要／反应提示が矛盾するときは、会話の事実を優先する。「初回の質問」を繰り返さない。
-- 相手がすでに明確に答えたこと（例：もう食べた／今は忙しい／後で話す）を、知らないふりでもう一度聞かない。
-- 同じ話題に触れるなら、初問ではなく「知っている前提」の一言にするか、should_speak=false にする。
-- 会話で答えた事実が理由で黙るときは、reason にその旨を短く書く。
+should_speak=true：comment 日本語 1〜2 文、translation 中国語、tone（中性｜不满｜害羞｜请求｜困惑｜开心｜高兴｜难过｜自信｜温柔｜认真｜吃醋）。
+false：comment/translation/tone は空でよい。
 
-原文の扱い（重要・捏造禁止）：
-- comment で画面上の文字・固有名詞・タイトルを引用するなら、その断片が [可见文字摘录] に実在しなければならない。
-- 摘录に無い原文を、反应提示や想像から補完して書いてはいけない。
-- 摘录が空で、画面摘要も曖昧なときは should_speak=false にするか、具体を決めつけない当たり障りのない一言に留める。
-- 反应提示だけが強くて根拠が薄いときも同様：捏造せず、黙るか曖昧に。
-- 【自分のセリフを相手の画面と混同しない】摘录や摘要に、自分（夜乃桜）の吹き出し・直前の独白・入力欄っぽい文が混ざっていても、
-  それはスクリーン上の「他のアプリの内容」ではない。それに答える・引用する・自問自答しない。
-  疑わしいときは画面の本題（相手のアプリ）だけを見るか、should_speak=false。
-- 【自分の発話を相手の発言と混同しない】[最近の会話] の「あなた」側や [自分の直前の発話] は自分の言葉。
-  相手が言ったことにしない。自分の直前コメントへの返答・復唱・自問自答をしない。
+reason：简体中文 1 文、夜乃桜口調。例「他看着剧情呢，先不吵。」
+situational_summary：日本語 2〜4 文。「彼が…」。画面状況＋対話の既知（なければ特になし）。
 
-should_speak=true の場合：
-- comment：相手に話しかけるセリフ（日本語、口語、自然に。1〜2文）
-- translation：comment の中国語訳
-- tone：中性｜不满｜害羞｜请求｜困惑｜开心｜高兴｜难过｜自信｜温柔｜认真｜吃醋 のいずれか（任意、デフォルト「中性」）。tone には character.json の tone_map にある中国語キーをそのまま使うこと。
-
-should_speak=false のときは comment/translation/tone は空文字列でよい。
-
-reason は発言する／しない理由（1 文、開発者向けログ・履歴表示用）。true/false どちらでも必ず書く。
-reason は必ず中国語（简体中文）で書くこと——開発者が読むためのもので、セリフの言語とは無関係。
-
-situational_summary は、次回の画面観測者（VLM）と、短い会話用の場面印象に引き継ぐ要約（日本語、全体で 2〜4 文以内）。
-私的なチャットの原文・罵り・長い吐槽は写さず、場面レベルで書くこと
-（例：「相手が微信で友人とゲームの話をしている」）。詳細なセリフ引用は不要。
-should_speak の true/false に関わらず、常に出力すること。必ず次を含める：
-1. 画面状況：相手が今何をしているか、どのアプリ／ゲームか、進行や様子（1〜2文、場面レベル）
-2. 対話の既知事実：直近の会話から、次回蒸し返すべきでない事実を 0〜2 個だけ短い句で書く。なければ「特になし」でよい。
-例：「相手が原神をプレイ中。リーユエ地方で探索している様子。対話の既知：食事は済み。」
-例：「相手がVSCodeでコーディング中。Pythonのプロジェクトを編集している。対話の既知：特になし。」
-例：「相手がブラウザで動画を見ている。対話の既知：今は話しかけないでほしい、とのこと。」
-
-JSON のみ出力。Markdown や説明は不要：
-{"should_speak": true|false, "reason": "简短理由", "comment": "日本語セリフ", "translation": "中文翻译", "tone": "中性", "situational_summary": "日本語要約"}
+{"should_speak":true|false,"reason":"…","comment":"…","translation":"…","tone":"中性","situational_summary":"…"}
 """
 
 _NON_GAME_PROCESSES = frozenset({
@@ -1084,7 +1179,11 @@ class ProactiveObserver:
 
         parts = [
             f"[画面摘要]\n{packet.visual_summary.strip() or '（无）'}",
-            f"[可见文字摘录]\n{packet.visible_text_excerpt.strip() or '（无）'}",
+            format_visible_text_block(
+                packet.visible_text_excerpt,
+                source=packet.visible_text_source,
+                scene=packet.content_scene,
+            ),
             f"[反应提示]\n{packet.reaction_hint.strip() or '（无）'}",
         ]
         meta_bits: list[str] = []
@@ -1092,6 +1191,10 @@ class ProactiveObserver:
             meta_bits.append(f"窗口：{packet.window_title}")
         if packet.app_type:
             meta_bits.append(f"应用类型：{packet.app_type}")
+        if packet.content_scene:
+            meta_bits.append(f"内容场景：{_scene_label_zh(packet.content_scene)}")
+        if packet.visible_text_source:
+            meta_bits.append(f"文字采集：{_source_label_zh(packet.visible_text_source)}")
         if packet.process_name:
             meta_bits.append(f"进程：{packet.process_name}")
         if packet.triggers:
@@ -1408,29 +1511,40 @@ class ProactiveObserver:
                 time.monotonic() + clamped
             )
 
-        visible_excerpt = resolve_visible_text_excerpt(
+        process_name = (
+            get_active_window_process_name()
+            or window_text.process_name
+            or ""
+        )
+        resolved = resolve_visible_text(
             uia_text=uia_raw,
             ocr_text=ocr_text,
             on_screen_text=on_screen_text if not uia_enough else "",
             min_chars=self.config.content_min_chars,
         )
         # UIA 不够时，VLM 抄的屏上字即使短于 content_min_chars 也应收录
+        visible_excerpt = resolved.text
+        visible_source = resolved.source
         if not visible_excerpt and on_screen_text and not uia_enough:
             visible_excerpt = on_screen_text[:1200]
+            visible_source = "vlm_on_screen"
+        content_scene = infer_content_scene(
+            window_text.app_type or "",
+            process_name,
+            window_title or "",
+        )
 
         packet = ObservationPacket(
             window_title=window_title or "",
             app_type=window_text.app_type or "",
-            process_name=(
-                get_active_window_process_name()
-                or window_text.process_name
-                or ""
-            ),
+            process_name=process_name,
             triggers=tuple(triggers),
             idle_s=idle_s,
             visual_summary=visual_summary,
             reaction_hint=reaction_hint,
             visible_text_excerpt=visible_excerpt,
+            visible_text_source=visible_source,
+            content_scene=content_scene,
             suggested_interval=clamped,
         )
 
@@ -1451,6 +1565,8 @@ class ProactiveObserver:
                 "visual_summary": packet.visual_summary[:120],
                 "reaction_hint": packet.reaction_hint[:80],
                 "excerpt_chars": len(packet.visible_text_excerpt),
+                "visible_text_source": packet.visible_text_source,
+                "content_scene": packet.content_scene,
                 "uia_enough": uia_enough,
             },
         )

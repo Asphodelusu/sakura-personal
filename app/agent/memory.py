@@ -610,6 +610,65 @@ class MemoryStore:
             logger.exception("实体索引查询失败")
             return []
 
+    def _merge_entity_query_hits(
+        self,
+        query: str,
+        memories: list[dict[str, Any]],
+        *,
+        limit: int,
+        include_expired: bool,
+        wait: bool,
+        layer_filter: str | None,
+        category_filter: str,
+        scope: str,
+    ) -> list[dict[str, Any]]:
+        """把查询侧实体点查（含中日别名）并入 memory_search 结果。"""
+        from app.agent.entity_index import extract_entities, find_known_entity_aliases
+        from app.agent.memory_recall import (
+            _ENTITY_QUERY_MATCH_SCORE,
+            _deduplicate_memories,
+            _memories_for_entity_names,
+        )
+
+        entities = extract_entities(query) | find_known_entity_aliases(query)
+        if not entities:
+            return memories
+        extras = _memories_for_entity_names(
+            entities,
+            memories,
+            self,
+            threshold=0.0,
+            limit=max(limit, DEFAULT_MEMORY_LIMIT),
+            include_expired=include_expired,
+            query_match=True,
+            wait=wait,
+        )
+        if not extras:
+            return memories
+        filtered: list[dict[str, Any]] = []
+        for memory in extras:
+            if _memory_is_released(memory):
+                continue
+            if not include_expired and memory_record_is_expired(memory):
+                continue
+            if not _memory_matches_filters(
+                memory,
+                layer=layer_filter,
+                category=category_filter,
+                scope=scope,
+            ):
+                continue
+            item = dict(memory)
+            item["score"] = max(
+                _bounded_float(item.get("score"), default=0.0),
+                _ENTITY_QUERY_MATCH_SCORE,
+            )
+            item["entity_query_match"] = True
+            filtered.append(item)
+        if not filtered:
+            return memories
+        return _deduplicate_memories(list(memories) + filtered)
+
     def ensure_entity_index_backfilled(self, memories: list[dict[str, Any]]) -> None:
         """用已有记忆一次性回填实体索引（供旧记忆补建索引，只在首次调用时真正执行）。
 
@@ -1394,6 +1453,17 @@ class MemoryStore:
                 scope=scope,
             )
         ]
+        if query:
+            memories = self._merge_entity_query_hits(
+                query,
+                memories,
+                limit=limit,
+                include_expired=include_expired,
+                wait=wait,
+                layer_filter=layer_filter,
+                category_filter=category_filter,
+                scope=scope,
+            )
         # 自动召回会在实体扩展后再精排一次，这里可用 skip_rerank 避免双倍开销。
         if query and not bool(arguments.get("skip_rerank")):
             from app.agent.memory_rerank import rerank_memory_candidates
@@ -1403,6 +1473,9 @@ class MemoryStore:
                 memories,
                 base_dir=self.base_dir,
             )
+            from app.agent.memory_recall import _apply_entity_query_match_score_floor
+
+            memories = _apply_entity_query_match_score_floor(memories)
         memories = _rank_memories(memories, query=query)[:limit]
         return {
             "agent_id": scope,
@@ -1574,6 +1647,17 @@ class MemoryStore:
                 scope=scope,
             )
         ]
+        if query:
+            memories = self._merge_entity_query_hits(
+                query,
+                memories,
+                limit=limit,
+                include_expired=include_expired,
+                wait=wait,
+                layer_filter=layer_filter,
+                category_filter=category_filter,
+                scope=scope,
+            )
         memories = _rank_memories(memories, query=query)[:limit]
         index_memories = [_index_record(m) for m in memories]
         return {
@@ -1856,9 +1940,11 @@ class MemoryStore:
     def forget_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
         if _is_core_profile_id(memory_id):
-            previous = self.delete_core_profile()
-            forgotten = previous or {"id": memory_id, "content": ""}
-            return {"forgotten": forgotten, "memory": forgotten, "curation_cache_reset": {"messages": 0, "history": 0}}
+            return {
+                "forgotten": {"id": memory_id, "content": ""},
+                "ok": False,
+                "reason": "core_profile 常驻档案不可删除；如需修改请用 memory_update 改写",
+            }
         try:
             mem = self._get_memory(wait=wait)
         except RuntimeError as exc:
@@ -2097,6 +2183,7 @@ class MemoryStore:
                 # mem.add 会生成新 id；旧 entity_index / access_tracker 键全部失效。
                 # 实体多跳依赖索引，这里强制按新 id 重建；access_tracker 仍可退回 payload 时间戳。
                 self.rebuild_entity_index(imported)
+            self._apply_pending_forget_ids(mem)
             # 仅预热已安装的精排模型；缺失时不下载。
             try:
                 from app.agent.memory_rerank import reranker_model_cached, warm_memory_reranker
@@ -2111,6 +2198,42 @@ class MemoryStore:
             except Exception:  # noqa: BLE001
                 logger.debug("无法启动记忆 reranker 预热线程", exc_info=True)
             return mem
+
+    def _apply_pending_forget_ids(self, mem: Any) -> None:
+        """消费 data/memory/pending_forget_ids.json：删除污染记忆后清空文件。"""
+        path = StoragePaths(self.base_dir).memory_pending_forget_ids()
+        if not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("读取 pending_forget_ids 失败：%s", path)
+            return
+        if not isinstance(raw, list):
+            return
+        ids = [str(item).strip() for item in raw if str(item).strip()]
+        if not ids:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        remaining: list[str] = []
+        for memory_id in ids:
+            try:
+                _delete_memory_idempotently(mem, memory_id)
+                self._remove_memory_entities(memory_id)
+                logger.info("已按 pending_forget_ids 删除记忆：%s", memory_id)
+            except Exception:
+                logger.exception("pending_forget_ids 删除失败：%s", memory_id)
+                remaining.append(memory_id)
+        try:
+            if remaining:
+                atomic_write_text(path, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n")
+            else:
+                path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("写入/清理 pending_forget_ids 失败：%s", path)
 
     def _supports_memory_llm_reload(self, memory: Any | None) -> bool:
         if memory is None:

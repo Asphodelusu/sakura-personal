@@ -60,7 +60,7 @@ from app.agent import (
 from app.agent.memory_curator import (
     MemoryCurationResult,
     MemoryCurationSettings,
-    evaluate_idle_curation_trigger,
+    resolve_idle_curation_trigger,
     seconds_since_iso_timestamp,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
@@ -3447,7 +3447,7 @@ class PetWindow(QWidget):
         for m in reversed(msgs):
             if not isinstance(m, dict):
                 continue
-            # 系统续投信号绝不能标成「相手」
+            # 系统续投信号绝不能标成「我说的」
             if message_is_intimacy_continue(m):
                 continue
             role = m.get("role", "")
@@ -3456,11 +3456,12 @@ class PetWindow(QWidget):
                 continue
             source = str(m.get("source") or "").strip()
             if role == "assistant":
-                name = "あなた(夜乃桜)"
+                name = "她自己的"
                 if source == "proactive":
-                    name = "あなた(夜乃桜・主動)"
+                    name = "她自己的·主动"
             else:
-                name = "相手"
+                # 用户对 Sakura 说的话（打字/语音转写进对话的都算）
+                name = "我说的"
             if len(content) > 120:
                 content = content[:120] + "…"
             lines.append(f"[{name}] {content}")
@@ -3470,7 +3471,11 @@ class PetWindow(QWidget):
         if not lines:
             return ""
         lines.reverse()
-        return "[最近の会話]\n" + "\n".join(lines)
+        legend = (
+            "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
+            "她自己的·主动=你主动开口。称呼用「他」。"
+        )
+        return "[最近の会話]\n" + legend + "\n" + "\n".join(lines)
 
     def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
         """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
@@ -5457,12 +5462,14 @@ class PetWindow(QWidget):
             return
         self._maybe_start_auto_memory_curation()
 
-    def _idle_memory_curation_ready(self) -> bool:
+    def _resolve_idle_memory_curation_trigger(
+        self, *, session_boundary: bool = False
+    ) -> str | None:
         settings = self.memory_curation_settings.normalized()
         silence_seconds = max(0.0, time.perf_counter() - self.last_user_activity_at)
         pending_turns = self.memory_curation_state.pending_turns()
         entries = self.memory_curation_state.unprocessed_entries(self.history_store.load())
-        return evaluate_idle_curation_trigger(
+        return resolve_idle_curation_trigger(
             settings,
             silence_seconds=silence_seconds,
             pending_turns=pending_turns,
@@ -5470,6 +5477,7 @@ class PetWindow(QWidget):
                 self.memory_curation_state.last_curation_at()
             ),
             has_unprocessed_entries=bool(entries),
+            session_boundary=session_boundary,
         )
 
     def _check_memory_reflection(self) -> None:
@@ -5636,23 +5644,37 @@ class PetWindow(QWidget):
         debug_log("Memory", "记忆反思失败", {"error": message})
         mark_reflection_done(self.reflection_state_store, 0)
 
-    def _maybe_start_auto_memory_curation(self) -> None:
+    def _maybe_start_auto_memory_curation(self, *, session_boundary: bool = False) -> None:
         if getattr(self, "startup_initializing", False):
             return
         if not self.memory_curation_settings.enabled:
             return
-        if not self._idle_memory_curation_ready():
+        trigger = self._resolve_idle_memory_curation_trigger(session_boundary=session_boundary)
+        if trigger is None:
             return
         if not self._memory_curation_can_start():
             return
         entries = self.memory_curation_state.unprocessed_entries(self.history_store.load())
         if not entries:
             return
+        pending_turns = self.memory_curation_state.pending_turns()
+        silence_seconds = max(0.0, time.perf_counter() - self.last_user_activity_at)
+        debug_log(
+            "Memory",
+            "自动记忆整理触发",
+            {
+                "trigger": trigger,
+                "session_boundary": session_boundary,
+                "pending_turns": pending_turns,
+                "silence_seconds": int(silence_seconds),
+                "entry_count": len(entries),
+            },
+        )
         self._start_memory_curation(
             entries,
             mode="auto",
             target_history_count=len(self.history_store.load()),
-            consumed_turns=self.memory_curation_state.pending_turns(),
+            consumed_turns=pending_turns,
         )
 
     def _maybe_start_memory_backfill(self) -> None:
@@ -5662,6 +5684,8 @@ class PetWindow(QWidget):
             return
         state = self.memory_curation_state.snapshot()
         if state.get("backfill_completed"):
+            # 跨会话空窗：backfill 已完成时仍尝试补整理上次遗留
+            self._maybe_start_auto_memory_curation(session_boundary=True)
             return
         if not self._memory_curation_can_start():
             QTimer.singleShot(1000, self._maybe_start_memory_backfill)
@@ -5669,6 +5693,7 @@ class PetWindow(QWidget):
         entries = self.history_store.load()
         if not entries:
             self.memory_curation_state.mark_processed(0, backfill_completed=True)
+            self._maybe_start_auto_memory_curation(session_boundary=True)
             return
         limited_entries = entries[-self.memory_curation_settings.backfill_limit :]
         self._start_memory_curation(
@@ -5779,12 +5804,20 @@ class PetWindow(QWidget):
 
     @Slot()
     def _cleanup_memory_curation_worker(self) -> None:
+        was_backfill = self.memory_curation_mode == "backfill"
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
         if getattr(self, "_shutdown_in_progress", False):
             return
-        QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+        # backfill 结束后走会话边界补整理（跳过静默门，仍受冷却约束）
+        if was_backfill:
+            QTimer.singleShot(
+                0,
+                lambda: self._maybe_start_auto_memory_curation(session_boundary=True),
+            )
+        else:
+            QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:
@@ -6717,7 +6750,7 @@ class PetWindow(QWidget):
         theme = result.theme
         plugins = result.plugins
         memory_curation = result.memory_curation
-        progressive_memory = bool(getattr(result, "progressive_memory", True))
+        progressive_memory = bool(getattr(result, "progressive_memory", False))
         theme_changed = bool(result.theme_changed)
 
         selected_profile = self.character_profile

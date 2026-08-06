@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -25,29 +26,53 @@ class IntimacyModeState:
     """身体亲密进行中的对话节奏状态。只影响回复节奏（非思考模式 + 可选续投）。
 
     生命周期：
-    - 进入：模型调 set_intimacy_mode(on=true) 或输出中用了亲密/H tone（兜底）
+    - 请求：模型调 set_intimacy_mode(on=true) 或亲密/H tone 兜底 → pending（先口头确认）
+    - 确认：用户明确答应 → active；含糊/拒绝/收尾 → 清 pending
     - 保持：用户正常回话 → 刷新 8 轮额度；静默续投 → 扣 1 轮
-    - 退出：静默续投耗尽 8 轮 → 自动退出（needs_reentry_hint 提示模型重开）
-            模型主动调 set_intimacy_mode(on=false) → 直接退出
+    - 退出：用户收尾话 / 模型 on=false / 续投耗尽
     """
 
     _AUTO_EXIT_TURNS = 8
 
     def __init__(self) -> None:
         self.active: bool = False
+        self.pending: bool = False
         self._turns_left: int = 0
         self.needs_reentry_hint: bool = False
+        self.last_user_text: str = ""
+
+    def note_user_text(self, text: str) -> None:
+        self.last_user_text = str(text or "").strip()
+
+    def request_confirm(self) -> None:
+        """进入等待确认；不开启续投/guide。"""
+        if self.active:
+            return
+        self.pending = True
+        self.needs_reentry_hint = False
+
+    def confirm(self) -> None:
+        """用户明确答应后真正开启。"""
+        self.pending = False
+        self.enter()
+
+    def reject_pending(self) -> None:
+        """确认被拒或话题岔开：清 pending，不进模式。"""
+        self.pending = False
 
     def enter(self) -> None:
         self.active = True
+        self.pending = False
         self._turns_left = self._AUTO_EXIT_TURNS
         self.needs_reentry_hint = False
 
     def exit(self) -> None:
-        """模型主动收尾（on=false）：不留重进提示。模型知道是自己关的，若互动还在会主动重开。"""
+        """收尾：清 active/pending，不留重进提示。"""
         self.active = False
+        self.pending = False
         self._turns_left = 0
         self.needs_reentry_hint = False
+        self.last_user_text = ""
 
     def refresh_user_reply(self) -> None:
         """用户回话：刷新存活额度，保持开启。"""
@@ -62,6 +87,7 @@ class IntimacyModeState:
         self._turns_left -= 1
         if self._turns_left <= 0:
             self.active = False
+            self.pending = False
             # 静默续投耗尽：模型不知道被自动关掉，需要提示它若仍在互动则重开
             self.needs_reentry_hint = True
             return False
@@ -77,10 +103,72 @@ _INTIMACY_GUIDE_PATH = Path(__file__).resolve().parents[2] / "data" / "intimacy_
 INTIMACY_CONTINUE_MARKER = "（続けて）"
 INTIMACY_CONTINUE_ROLE = "system"
 INTIMACY_CONTINUE_SYSTEM_TEXT = (
-    "【系统续投信号／不是对方发言】对方当前沉默。请以夜乃桜身份自然续写亲密互动的下一句。"
+    "【系统续投信号／不是对方发言】对方当前沉默。"
+    "请以夜乃桜身份推进身体亲密互动的下一步动作或反应；"
+    "不要换说法重复你上一句；若当前已不是身体亲密场景，调用 set_intimacy_mode(on=false)。"
     "本条是系统信号，绝不要当成用户说过的话，不要回答或复述本信号。\n"
     f"{INTIMACY_CONTINUE_MARKER}"
 )
+
+# 用户明确答应进入（pending→active）；拒绝/收尾优先于确认。
+_INTIMACY_CONFIRM_FULL = re.compile(
+    r"^(要|要啊|要的|要吧|好啊|好呀|好的呀|可以|可以啊|可以的|一起|来吧|行|行啊|行吧|"
+    r"继续|嗯嗯|うん|いいよ|お願い)$"
+)
+_INTIMACY_CONFIRM_RE = re.compile(
+    r"(要继续|可以继续|一起做|来吧|做吧|继续吧|过分一点|"
+    r"いいよ|お願い|もっと|触って|して[いいよね]|やろう)",
+    re.IGNORECASE,
+)
+_INTIMACY_EXIT_RE = re.compile(
+    r"(冷静|先这样|不闹了|差不多了|休息吧|睡吧|聊点别的|不要继续|别继续|"
+    r"停下|不行|退出亲密|好了|结束吧|到此为止|"
+    r"やめよう|やめて|待って|もういい|冷却)",
+    re.IGNORECASE,
+)
+
+
+def user_declines_or_exits_intimacy(text: str) -> bool:
+    """明确拒绝确认，或要求退出/降温。"""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    return bool(_INTIMACY_EXIT_RE.search(t))
+
+
+def user_confirms_intimacy(text: str) -> bool:
+    """明确答应进入/继续身体亲密。"""
+    t = str(text or "").strip()
+    if not t or INTIMACY_CONTINUE_MARKER in t:
+        return False
+    if user_declines_or_exits_intimacy(t):
+        return False
+    if _INTIMACY_CONFIRM_FULL.fullmatch(t):
+        return True
+    return bool(_INTIMACY_CONFIRM_RE.search(t))
+
+
+def apply_intimacy_user_utterance(
+    text: str,
+    state: IntimacyModeState | None = None,
+) -> str | None:
+    """根据用户话处理 pending 确认或 active 退出。返回动作名或 None。"""
+    st = state if state is not None else intimacy_mode_state
+    st.note_user_text(text)
+    if st.pending:
+        if user_declines_or_exits_intimacy(text):
+            st.reject_pending()
+            return "rejected_pending"
+        if user_confirms_intimacy(text):
+            st.confirm()
+            return "confirmed"
+        # 含糊/岔开：不当成答应，清 pending，避免误开续投
+        st.reject_pending()
+        return "rejected_pending"
+    if st.active and user_declines_or_exits_intimacy(text):
+        st.exit()
+        return "exited"
+    return None
 
 
 def build_intimacy_continue_message() -> dict[str, str]:
@@ -115,14 +203,21 @@ def latest_is_intimacy_continue(messages: list[Any] | None) -> bool:
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
     "切换身体亲密相关的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
-    "双方已同意、正在准备或即将开始身体亲密时就必须 on=true——"
-    "包括答应一起做、开始靠近/触碰、动手前的准备，或你准备使用 tone「亲密」/「H」。"
-    "不要等到已经做到一半才开；准备阶段就要开。"
-    "日常闲聊、关心安慰、技术/工作话题、普通撒娇/暧昧试探（尚未准备动手）都不要开启。"
-    "当身体亲密自然结束时，主动调用 set_intimacy_mode(on=false) 收尾，"
-    "不要拖着节奏模式不放；停顿、话题转回日常生活或对方明显结束亲昵行为都是退出信号。"
-    "关闭后不会自动恢复；若互动再次进入亲密，需重新 on=true。"
+    "仅在即将进入或正在进行身体亲密（含明确准备动手）时调用 on=true；"
+    "系统会先进入待确认：若对方尚未明确答应，你必须先口头确认"
+    "（如「……再靠近一点，也可以吗？」「要继续吗？不想的话，这样就好。」），"
+    "等对方明确答应后才会真正开启；不要在未确认时动手描写或使用 tone「亲密」/「H」。"
+    "摸头、抱抱、撒娇、口头调情、关心安慰、日常/技术话题都不要开启。"
+    "当身体亲密自然结束或对方降温/收尾时，主动 on=false："
+    "「好了」「不闹了」「先这样」「冷静一下」「休息吧」「聊点别的」等都是退出信号。"
+    "关闭后不会自动恢复；若互动再次进入亲密，需重新 on=true 并再次确认。"
     "本工具只影响回复节奏与引导注入。"
+)
+
+_PENDING_ASK_INSTRUCTION = (
+    "尚未获得对方明确同意。本轮必须先用角色口吻简短确认"
+    "（例如「……再靠近一点，也可以吗？」「要继续吗？不想的话，这样就好。」），"
+    "等对方明确答应后再继续；不要开始动手描写，不要使用 tone「亲密」/「H」。"
 )
 
 
@@ -140,8 +235,18 @@ def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
         intimacy_mode_state.exit()
         return {"intimacy_mode": "off", "available": False}
     if on:
-        intimacy_mode_state.enter()
-        return {"intimacy_mode": "on"}
+        if intimacy_mode_state.active:
+            return {"intimacy_mode": "on"}
+        # 同一轮用户已明确答应 → 直接开启；否则进入 pending，本轮先问
+        if user_confirms_intimacy(intimacy_mode_state.last_user_text):
+            intimacy_mode_state.enter()
+            return {"intimacy_mode": "on", "confirmed_by_user": True}
+        intimacy_mode_state.request_confirm()
+        return {
+            "intimacy_mode": "pending",
+            "ask_first": True,
+            "instruction": _PENDING_ASK_INSTRUCTION,
+        }
     # on=false：直接退出（模型判断亲密互动已自然结束）
     intimacy_mode_state.exit()
     return {"intimacy_mode": "off"}
@@ -325,7 +430,9 @@ def create_builtin_tool_registry(
             Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "搜索 Sakura 的长期记忆。问「认不认识 / 旧事 / 偏好 / 是谁」时默认用本工具，"
+                    "不要先去 history_search 翻聊天记录。"
+                    "仅当运行时已注入的记忆不够用时再调用；"
                     "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
                     "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
@@ -513,9 +620,10 @@ def create_mobile_tool_registry(
     memory: MemoryStore,
     history: HistoryStoreRef | None = None,
 ) -> ToolRegistry:
-    """手机端工具表：记忆读写 + 历史查询 + 本机时间；不含屏幕/桌面/需确认工具。
+    """手机端工具表：记忆读写 + 历史查询；不含屏幕/桌面/需确认工具。
 
     写入仍落到电脑端同一 MemoryStore，与桌面长期记忆共用。
+    当前时间由运行时事实注入，不注册 get_current_time。
     """
     history_ref = history if history is not None else HistoryStoreRef(None)
     registry = ToolRegistry(
@@ -524,7 +632,9 @@ def create_mobile_tool_registry(
             Tool(
                 name="memory_search",
                 description=(
-                    "搜索 Sakura 的长期记忆。仅当运行时已注入的记忆不够用时再调用；"
+                    "搜索 Sakura 的长期记忆。问「认不认识 / 旧事 / 偏好 / 是谁」时默认用本工具，"
+                    "不要先去 history_search 翻聊天记录。"
+                    "仅当运行时已注入的记忆不够用时再调用；"
                     "同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
                     "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
                     "mode='full'（默认）返回完整正文；"
@@ -794,7 +904,9 @@ def _history_tools(history_ref: HistoryStoreRef) -> list[Tool]:
         Tool(
             name="history_search",
             description=(
-                "查询原始对话记录（不是长期记忆）。"
+                "查询原始对话记录（聊天流水，不是长期记忆）。"
+                "默认不要用：问「认不认识 / 旧事 / 偏好 / 是谁」应先 memory_search。"
+                "仅在需要逐字原话、按时间窗翻聊天记录，或对方明确要查「说过什么/聊天记录」时再用。"
                 "可按相对时间（昨天/今天/约N小时前/YYYY-MM-DD 等）和/或关键词定位。"
                 "有时间窗或关键词时按时间正序分页（从对话开头读）；"
                 "返回 total_count/has_more，若 has_more 请用相同条件加 offset 翻页，不要改词重搜。"
@@ -829,7 +941,7 @@ def _history_tools(history_ref: HistoryStoreRef) -> list[Tool]:
                 },
             },
             handler=lambda arguments, _ref=history_ref: handle_history_search(_ref, arguments),
-            group="core",
+            group="history",
         ),
         Tool(
             name="history_read",
@@ -837,6 +949,7 @@ def _history_tools(history_ref: HistoryStoreRef) -> list[Tool]:
                 "以某条对话消息为锚点，读取它前后的原始对话上下文。"
                 "先用 history_search 找到 entry_id，再调用本工具展开。"
                 "这是原始对话记录，不是长期记忆时间线（那是 memory_timeline）。"
+                "仅在已判定需要原话/聊天上下文时使用；一般事实回忆用 memory_*。"
             ),
             parameters={
                 "type": "object",
@@ -857,7 +970,7 @@ def _history_tools(history_ref: HistoryStoreRef) -> list[Tool]:
                 "required": ["entry_id"],
             },
             handler=lambda arguments, _ref=history_ref: handle_history_read(_ref, arguments),
-            group="core",
+            group="history",
         ),
     ]
 

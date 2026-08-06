@@ -7,6 +7,7 @@ from app.agent.runtime import AgentRuntime
 from app.agent.runtime_limits import RuntimeLoopSettings
 from app.llm.chat_reply import parse_chat_reply
 from app.llm.prompt_templates import (
+    build_context_acquisition_strategy,
     build_event_system_prompt,
     build_screen_awareness_check_tool_system_prompt,
     build_screen_awareness_tool_loop_rules,
@@ -36,6 +37,13 @@ def test_proactive_check_tool_prompt_contains_background_web_rules() -> None:
     assert "最多 2 次搜索" in prompt
     assert "不能当反向图搜" in prompt
     assert "不搜索私人身份" in prompt
+
+
+def test_context_acquisition_requires_lookup_before_inventing() -> None:
+    text = build_context_acquisition_strategy(allow_screen_observation=True)
+    assert "memory_search" in text
+    assert "history_search" in text
+    assert "禁止编故事" in text or "禁止凭空" in text
 
 
 def test_proactive_check_tool_prompt_places_web_rules_before_loop_limits() -> None:
@@ -151,6 +159,44 @@ def test_agent_tool_prompt_length_stays_compact() -> None:
     assert prompt.count("主动屏幕感知核心规则") == 0
     assert "长期记忆摘要" not in prompt
     assert "这是第 1 步" not in prompt
+
+
+def test_agent_tool_prompt_avoids_dead_capability_claims() -> None:
+    """提示词不宣称未注册工具 / 不在默认 free-access 下过度承诺确认。"""
+    from app.agent.tools import Tool, ToolRegistry
+
+    runtime = _bare_runtime()
+    runtime.tools = ToolRegistry([])
+    runtime.tools.set_free_access_enabled(True)
+
+    prompt = AgentRuntime._build_tool_system_prompt(
+        runtime,
+        allow_screen_observation=True,
+    )
+    assert "get_current_time" not in prompt
+    assert "不要臆造取时工具" in prompt or "运行时事实" in prompt
+    assert "windows__*" not in prompt or "未启用桌面控制" in prompt
+    assert "桌面控制：窗口、鼠标" not in prompt
+    assert "完整访问已开启" in prompt
+    assert "多数工具会直接执行" in prompt
+
+    runtime.tools.register(
+        Tool(
+            name="windows__Snapshot",
+            description="snap",
+            parameters={},
+            handler=lambda _a: {},
+            group="core",
+        )
+    )
+    runtime.tools.set_free_access_enabled(False)
+    with_windows = AgentRuntime._build_tool_system_prompt(
+        runtime,
+        allow_screen_observation=True,
+    )
+    assert "桌面控制" in with_windows
+    assert "windows__*" in with_windows
+    assert "完整访问已关闭" in with_windows
 
 
 def test_agent_runtime_prompt_patches_apply_to_prompt_builders() -> None:

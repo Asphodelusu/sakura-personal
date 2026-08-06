@@ -178,12 +178,14 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     root = _runtime_root("yaml_memory_curation")
     service = AppSettingsService(root)
 
-    # 默认：启用、静默触发参数、回填上限 200。
+    # 默认：启用、静默触发参数、回填上限 200、轻量档 3/10。
     defaults = service.load_memory_curation_settings()
     assert defaults.enabled is True
     assert defaults.idle_minutes == 12
     assert defaults.min_turns == 2
     assert defaults.backfill_limit == 200
+    assert defaults.light_idle_minutes == 3
+    assert defaults.light_cooldown_minutes == 10
 
     service.save_memory_curation_settings(
         MemoryCurationSettings(
@@ -193,6 +195,8 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
             cooldown_minutes=40,
             long_idle_minutes=45,
             catch_up_turns=15,
+            light_idle_minutes=5,
+            light_cooldown_minutes=12,
             backfill_limit=150,
         )
     )
@@ -202,11 +206,15 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     assert loaded.idle_minutes == 20
     assert loaded.min_turns == 3
     assert loaded.catch_up_turns == 15
+    assert loaded.light_idle_minutes == 5
+    assert loaded.light_cooldown_minutes == 12
     assert loaded.backfill_limit == 150
     system = load_yaml_mapping(service.system_config_path)
     assert system["memory_curation"]["enabled"] is False
     assert system["memory_curation"]["idle_minutes"] == 20
     assert system["memory_curation"]["catch_up_turns"] == 15
+    assert system["memory_curation"]["light_idle_minutes"] == 5
+    assert system["memory_curation"]["light_cooldown_minutes"] == 12
     assert system["memory_curation"]["backfill_limit"] == 150
 
 
@@ -214,18 +222,18 @@ def test_settings_service_loads_and_saves_progressive_memory_settings() -> None:
     root = _runtime_root("yaml_progressive_memory")
     service = AppSettingsService(root)
 
-    # 默认开启
-    assert service.load_progressive_memory_settings() is True
-
-    # 关闭并落盘
-    service.save_progressive_memory_settings(False)
+    # 默认关闭
     assert service.load_progressive_memory_settings() is False
-    system = load_yaml_mapping(service.system_config_path)
-    assert system["memory"]["progressive_memory"] is False
 
-    # 再开启
+    # 开启并落盘
     service.save_progressive_memory_settings(True)
     assert service.load_progressive_memory_settings() is True
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["memory"]["progressive_memory"] is True
+
+    # 再关闭
+    service.save_progressive_memory_settings(False)
+    assert service.load_progressive_memory_settings() is False
 
 
 def test_settings_service_loads_and_saves_runtime_loop_settings() -> None:
