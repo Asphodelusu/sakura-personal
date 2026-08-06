@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 
 from app.agent.builtin_tools import (
-    INTIMACY_CONTINUE_MARKER,
     intimacy_mode_state,
+    latest_is_intimacy_continue,
 )
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -241,9 +241,9 @@ def resolve_turn_plan(
 
     # —— 亲密节奏模式 ——
     # 用户回话刷新 8 轮额度；续投扣次；耗尽自动退出。
+    # 续投为 system 信号（兼容旧版 user 裸标记），不得当成用户回话去 refresh。
     if intimacy_mode_state.active:
-        latest = (_latest_user_text(messages) or "").strip()
-        if latest == INTIMACY_CONTINUE_MARKER:
+        if latest_is_intimacy_continue(messages):
             if intimacy_mode_state.consume_turn():
                 return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
             # 静默续投耗尽 → 自动退出（needs_reentry_hint 已置位）

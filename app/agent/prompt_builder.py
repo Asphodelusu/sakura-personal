@@ -136,6 +136,10 @@ class AgentRuntimePromptMixin:
             rhythm_hint = (
                 "\n\n# 节奏工具 — 已开启\n"
                 "你正在亲密节奏模式下，回复更快、可以主动续说。\n\n"
+                "## 系统续投信号（重要）\n"
+                "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
+                "那是系统提示，绝不是对方说过的话；不要回答、复述或当成用户发言。\n"
+                "收到后续投信号时，以夜乃桜身份自然续写下一句即可。\n\n"
                 "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
                 "出现以下任一信号时立刻退出，不要犹豫：\n"
                 "- 对方语气从亲昵转为日常闲聊（聊吃饭、工作、天气、新闻等）\n"
@@ -305,7 +309,7 @@ class AgentRuntimePromptMixin:
                 web_tool_capability_rule,
                 "- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。",
                 "- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。",
-                "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_update、memory_forget",
+                "- 提醒/记忆/原话：add_reminder、memory_*、history_search、history_read",
             ]
         )
         _combined_extra = "\n".join(
@@ -325,6 +329,7 @@ class AgentRuntimePromptMixin:
                 "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
                 "同轮优先只搜一次；显式回忆类问题最多两次；禁止对同一意图换措辞反复 full 搜索。"
                 "需要概览时用 mode=index，再对感兴趣条目用 memory_detail，不要反复 memory_search。",
+                "- 查原话用 history_search/read（has_more 则 offset 翻页）。",
                 "- 记忆诚实：关于「已经发生过的事实 / 专有名词 / 作品名 / 长期偏好」，"
                 "只依据运行时已注入片段与 memory_search/detail 结果来谈；"
                 "材料里没有就自然承认记不清或没听过，并温和追问。"

@@ -1040,6 +1040,18 @@ def _looks_like_google_ai_studio_auth_error(error_body: str, url: str) -> bool:
     )
 
 
+_INTERNAL_MESSAGE_KEYS = frozenset({"source", "transient"})
+
+
+def _public_chat_message(message: ChatMessage) -> ChatMessage:
+    """去掉本地元数据字段，避免兼容网关因未知键拒收。"""
+    if not isinstance(message, dict):
+        return message
+    if not _INTERNAL_MESSAGE_KEYS.intersection(message):
+        return message
+    return {k: v for k, v in message.items() if k not in _INTERNAL_MESSAGE_KEYS}
+
+
 def _build_chat_completion_payload(
     *,
     model: str,
@@ -1056,7 +1068,7 @@ def _build_chat_completion_payload(
                 "role": "system",
                 "content": system_prompt.strip(),
             },
-            *messages,
+            *[_public_chat_message(m) for m in messages],
         ],
     }
     payload["temperature"] = temperature

@@ -13,6 +13,7 @@ from app.agent.time_awareness import (
     format_local_time_context,
     format_relative_age,
     parse_memory_event_date,
+    parse_relative_time_window,
 )
 from app.llm.api_client import ChatMessage
 from app.storage.chat_history import ChatHistoryEntry
@@ -36,6 +37,96 @@ def test_format_relative_age_buckets() -> None:
     assert format_relative_age((now - timedelta(days=3)).isoformat(), now=now) == "约3天前"
     assert format_relative_age((now - timedelta(days=14)).isoformat(), now=now) == "约2周前"
     assert format_relative_age("not-a-time", now=now) == ""
+
+
+def test_parse_relative_time_window_phrases() -> None:
+    now = datetime(2026, 7, 20, 22, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    assert parse_relative_time_window("", now=now) == (None, None)
+    assert parse_relative_time_window("   ", now=now) == (None, None)
+    assert parse_relative_time_window("不是时间", now=now) is None
+
+    just_now = parse_relative_time_window("刚才", now=now)
+    assert just_now is not None
+    assert just_now[0] is not None and just_now[1] is not None
+    assert just_now[0] < just_now[1]
+
+    today = parse_relative_time_window("今天", now=now)
+    assert today == ("2026-07-20T00:00:00+08:00", "2026-07-20T23:59:59+08:00")
+
+    yesterday = parse_relative_time_window("昨天", now=now)
+    assert yesterday == ("2026-07-19T00:00:00+08:00", "2026-07-19T23:59:59+08:00")
+
+    day_before = parse_relative_time_window("前天", now=now)
+    assert day_before == ("2026-07-18T00:00:00+08:00", "2026-07-18T23:59:59+08:00")
+
+    minutes = parse_relative_time_window("12分钟前", now=now)
+    assert minutes is not None
+    # 中心 21:48，前后各 2 分钟 → 21:46 .. 21:50
+    assert minutes[0] == "2026-07-20T21:46:00+08:00"
+    assert minutes[1] == "2026-07-20T21:50:00+08:00"
+
+    hours = parse_relative_time_window("约2小时前", now=now)
+    assert hours is not None
+    assert hours[0] < hours[1] <= now.isoformat(timespec="seconds")
+
+    days = parse_relative_time_window("约3天前", now=now)
+    assert days == ("2026-07-17T00:00:00+08:00", "2026-07-17T23:59:59+08:00")
+
+    weeks = parse_relative_time_window("约2周前", now=now)
+    assert weeks is not None
+    assert weeks[0] < weeks[1]
+
+    months = parse_relative_time_window("约1个月前", now=now)
+    assert months is not None
+
+    date_only = parse_relative_time_window("2026-07-15", now=now)
+    assert date_only == ("2026-07-15T00:00:00+08:00", "2026-07-15T23:59:59+08:00")
+
+    iso_point = parse_relative_time_window("2026-07-20T18:00:00+08:00", now=now)
+    assert iso_point == ("2026-07-20T18:00:00+08:00", "2026-07-20T22:00:00+08:00")
+
+
+def test_parse_relative_time_window_composed_period_and_clock() -> None:
+    """相对日期 + 时段 + 时间点/区间。"""
+    now = datetime(2026, 7, 20, 22, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    # 用户核心场景：昨晚 1–2 点 → 次日凌晨（含完整问句前缀）
+    night_range = parse_relative_time_window("昨天晚上大约一点到两点", now=now)
+    assert night_range == (
+        "2026-07-20T01:00:00+08:00",
+        "2026-07-20T02:59:59+08:00",
+    )
+    full_ask = parse_relative_time_window(
+        "我昨天晚上大约一点到两点和你聊了什么",
+        now=now,
+    )
+    assert full_ask == night_range
+
+    afternoon = parse_relative_time_window("昨天下午", now=now)
+    assert afternoon == (
+        "2026-07-19T12:00:00+08:00",
+        "2026-07-19T18:00:00+08:00",
+    )
+
+    before_night = parse_relative_time_window("前天晚上十点", now=now)
+    assert before_night == (
+        "2026-07-18T22:00:00+08:00",
+        "2026-07-18T22:59:59+08:00",
+    )
+
+    plain_range = parse_relative_time_window("昨天一点到两点", now=now)
+    # 昨天 + 凌晨区间（1-2点）= 昨夜深夜 = 次日凌晨（2026-07-20 01:00）
+    assert plain_range == (
+        "2026-07-20T01:00:00+08:00",
+        "2026-07-20T02:59:59+08:00",
+    )
+
+    # 2026-07-20 是周一；上周三 = 2026-07-15
+    last_wed = parse_relative_time_window("上周三晚上", now=now)
+    assert last_wed == (
+        "2026-07-15T18:00:00+08:00",
+        "2026-07-15T23:59:59+08:00",
+    )
 
 
 def test_format_duration_and_local_time_context() -> None:

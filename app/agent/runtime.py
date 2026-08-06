@@ -210,6 +210,10 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
         self.history_store = history_store
+        # 工具 handler 闭包此 ref；换角色时 set_history_store 同步更新 .store
+        from app.agent.history_tools import HistoryStoreRef
+
+        self.history_store_ref = HistoryStoreRef(history_store)
         self.prompt_patches = [*prompt_patches] if prompt_patches is not None else []
         self.context_providers = (
             [*context_providers] if context_providers is not None else []
@@ -327,6 +331,16 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
     ) -> None:
         """同步当前角色的聊天历史存储（跨会话续接的数据来源）。"""
         self.history_store = history_store
+        ref = getattr(self, "history_store_ref", None)
+        if ref is not None:
+            ref.store = history_store
+
+    def bind_history_store_ref(self, history_ref: Any) -> None:
+        """让工具侧 HistoryStoreRef 与 runtime 共用同一 holder（换角色可同步）。"""
+        if history_ref is None:
+            return
+        self.history_store_ref = history_ref
+        history_ref.store = self.history_store
 
 
 

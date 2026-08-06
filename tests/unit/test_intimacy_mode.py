@@ -189,6 +189,23 @@ class TestModuleLevelSingleton:
     def test_continue_marker_constant(self) -> None:
         assert INTIMACY_CONTINUE_MARKER == "（続けて）"
 
+    def test_continue_helpers_system_and_legacy(self) -> None:
+        from app.agent.builtin_tools import (
+            build_intimacy_continue_message,
+            latest_is_intimacy_continue,
+            message_is_intimacy_continue,
+        )
+
+        system_msg = build_intimacy_continue_message()
+        assert system_msg["role"] == "system"
+        assert INTIMACY_CONTINUE_MARKER in system_msg["content"]
+        assert message_is_intimacy_continue(system_msg)
+        assert latest_is_intimacy_continue([{"role": "user", "content": "hi"}, system_msg])
+
+        legacy = {"role": "user", "content": INTIMACY_CONTINUE_MARKER}
+        assert message_is_intimacy_continue(legacy)
+        assert not message_is_intimacy_continue({"role": "user", "content": "待って"})
+
 
 class TestIntimacyGuidePromptGate:
     """非亲密模式不得把本地 intimacy guide 注入 system prompt。"""

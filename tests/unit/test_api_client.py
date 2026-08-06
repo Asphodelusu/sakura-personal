@@ -138,6 +138,25 @@ def test_build_chat_payload_drops_unsupported_params() -> None:
     assert payload["messages"][0] == {"role": "system", "content": "system"}
 
 
+def test_build_chat_payload_strips_internal_message_keys() -> None:
+    payload = _build_chat_completion_payload(
+        model="gpt-compatible",
+        system_prompt="sys",
+        messages=[
+            {
+                "role": "system",
+                "content": "续投",
+                "source": "intimacy_continue",
+            },
+            {"role": "assistant", "content": "hi", "source": "proactive"},
+        ],
+        temperature=0.5,
+    )
+
+    assert payload["messages"][1] == {"role": "system", "content": "续投"}
+    assert payload["messages"][2] == {"role": "assistant", "content": "hi"}
+
+
 def test_build_chat_payload_adds_json_keyword_for_json_object_response() -> None:
     payload = _build_chat_completion_payload(
         model="gpt-compatible",

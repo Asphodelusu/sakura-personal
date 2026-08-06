@@ -73,6 +73,22 @@ def test_format_recent_dialogue_keeps_tail() -> None:
     assert "你好" not in text
 
 
+def test_format_recent_dialogue_skips_intimacy_continue() -> None:
+    from app.agent.builtin_tools import build_intimacy_continue_message
+
+    messages = [
+        {"role": "user", "content": "好き"},
+        {"role": "assistant", "content": "うん"},
+        build_intimacy_continue_message(),
+        {"role": "user", "content": "（続けて）"},
+    ]
+    text = format_recent_dialogue(messages, max_turns=6)
+    assert "続けて" not in text
+    assert "好き" in text
+    assert "用户" in text
+    assert "角色" in text
+
+
 def test_window_labels_align_old_to_new() -> None:
     assert _window_labels(1) == ["今"]
     assert _window_labels(3) == ["前々", "前", "今"]

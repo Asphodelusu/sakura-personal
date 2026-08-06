@@ -10,6 +10,13 @@ from pathlib import Path
 from app.core.debug_log import debug_log
 
 
+_HISTORY_COLUMNS = (
+    "id, created_at, role, content, translation, tone, portrait, channel"
+)
+_DIALOGUE_ROLES = ("user", "assistant")
+_MAX_SEARCH_LIMIT = 50
+
+
 @dataclass(frozen=True)
 class ChatHistoryEntry:
     created_at: str
@@ -19,11 +26,21 @@ class ChatHistoryEntry:
     tone: str = ""
     portrait: str = ""
     channel: str = ""
+    id: int = 0
 
     def display_content(self, subtitle_language: str) -> str:
         if self.role == "assistant" and subtitle_language == "zh" and self.translation.strip():
             return self.translation.strip()
         return self.content
+
+
+def _escape_like(keyword: str) -> str:
+    """转义 LIKE 通配符，配合 ESCAPE '\\' 使用。"""
+    return (
+        keyword.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 class ChatHistoryStore:
@@ -84,6 +101,10 @@ class ChatHistoryStore:
             )
             self._conn.execute(
                 "INSERT OR IGNORE INTO _meta (key, value) VALUES ('migrated_from_jsonl', '0')"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_history_created_at "
+                "ON chat_history(created_at)"
             )
 
     def _maybe_migrate_from_jsonl(self) -> None:
@@ -218,8 +239,7 @@ class ChatHistoryStore:
     def load(self) -> list[ChatHistoryEntry]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT created_at, role, content, translation, tone, portrait, channel "
-                "FROM chat_history ORDER BY id ASC"
+                f"SELECT {_HISTORY_COLUMNS} FROM chat_history ORDER BY id ASC"
             ).fetchall()
         return [self._row_to_entry(row) for row in rows]
 
@@ -228,8 +248,7 @@ class ChatHistoryStore:
         # 多取一条用于判断 has_more，避免额外 COUNT 查询
         with self._lock:
             rows = self._conn.execute(
-                "SELECT created_at, role, content, translation, tone, portrait, channel "
-                "FROM chat_history ORDER BY id DESC LIMIT ?",
+                f"SELECT {_HISTORY_COLUMNS} FROM chat_history ORDER BY id DESC LIMIT ?",
                 (limit + 1,),
             ).fetchall()
         has_more = len(rows) > limit
@@ -242,8 +261,8 @@ class ChatHistoryStore:
         """跳过最后 N 条，读取更早的 M 条。返回 (entries, has_more)。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT created_at, role, content, translation, tone, portrait, channel "
-                "FROM chat_history ORDER BY id DESC LIMIT ? OFFSET ?",
+                f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
                 (limit + 1, skip_last),
             ).fetchall()
         has_more = len(rows) > limit
@@ -251,6 +270,149 @@ class ChatHistoryStore:
             rows = rows[:limit]
         rows.reverse()
         return [self._row_to_entry(row) for row in rows], has_more
+
+    def search_between(
+        self,
+        start: str | None = None,
+        end: str | None = None,
+        keyword: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[ChatHistoryEntry], bool, int]:
+        """按时间范围 + 关键词检索对话消息（仅 user/assistant）。
+
+        start/end 为本地时区 ISO 字符串（与 created_at 同格式）；None=不限。
+        - 有时间窗或关键词：按 id ASC 分页（从窗/命中起点读，不丢开头）
+        - 无任何筛选：按 id DESC 分页（最近对话），页内再正序返回
+        返回 (entries, has_more, total_count)。limit 硬封顶 50。
+        """
+        try:
+            capped = max(1, min(int(limit), _MAX_SEARCH_LIMIT))
+        except (TypeError, ValueError):
+            capped = 20
+        try:
+            skip = max(0, int(offset))
+        except (TypeError, ValueError):
+            skip = 0
+        start_text = str(start or "").strip() or None
+        end_text = str(end or "").strip() or None
+        keyword_text = str(keyword or "").strip() or None
+
+        role_placeholders = ", ".join("?" for _ in _DIALOGUE_ROLES)
+        clauses = [f"role IN ({role_placeholders})"]
+        params: list[object] = list(_DIALOGUE_ROLES)
+
+        if start_text is not None:
+            clauses.append("created_at >= ?")
+            params.append(start_text)
+        if end_text is not None:
+            clauses.append("created_at <= ?")
+            params.append(end_text)
+        if keyword_text is not None:
+            escaped = _escape_like(keyword_text)
+            clauses.append(
+                "(content LIKE ? ESCAPE '\\' OR translation LIKE ? ESCAPE '\\')"
+            )
+            like = f"%{escaped}%"
+            params.extend([like, like])
+
+        where = " AND ".join(clauses)
+        # 有筛选：正序扫窗/命中；无筛选：最近优先（DESC 分页）
+        order_asc = start_text is not None or end_text is not None or keyword_text is not None
+        order_sql = "ASC" if order_asc else "DESC"
+        count_sql = f"SELECT COUNT(*) FROM chat_history WHERE {where}"
+        sql = (
+            f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+            f"WHERE {where} ORDER BY id {order_sql} LIMIT ? OFFSET ?"
+        )
+        page_params = [*params, capped, skip]
+
+        with self._lock:
+            total_count = int(self._conn.execute(count_sql, params).fetchone()[0])
+            rows = self._conn.execute(sql, page_params).fetchall()
+
+        if not order_asc:
+            rows = list(reversed(rows))
+        entries = [self._row_to_entry(row) for row in rows]
+        has_more = skip + len(entries) < total_count
+        return entries, has_more, total_count
+
+    def context_around(
+        self,
+        entry_id: int,
+        *,
+        before: int = 3,
+        after: int = 3,
+    ) -> dict:
+        """以消息 id 为锚点，取前后对话上下文（仅 user/assistant）。
+
+        entry_id <= 0 明确失败。返回 shape 对齐 memory_timeline.build_timeline。
+        """
+        try:
+            anchor_id = int(entry_id)
+        except (TypeError, ValueError):
+            anchor_id = 0
+        try:
+            before_n = max(0, min(int(before), 10))
+        except (TypeError, ValueError):
+            before_n = 3
+        try:
+            after_n = max(0, min(int(after), 10))
+        except (TypeError, ValueError):
+            after_n = 3
+
+        if anchor_id <= 0:
+            return {
+                "before": [],
+                "target": None,
+                "after": [],
+                "anchor_id": anchor_id,
+                "error": "entry_id 无效（必须是正整数）。",
+            }
+
+        role_placeholders = ", ".join("?" for _ in _DIALOGUE_ROLES)
+        role_params = list(_DIALOGUE_ROLES)
+
+        with self._lock:
+            target_row = self._conn.execute(
+                f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                f"WHERE id = ? AND role IN ({role_placeholders})",
+                [anchor_id, *role_params],
+            ).fetchone()
+            if target_row is None:
+                return {
+                    "before": [],
+                    "target": None,
+                    "after": [],
+                    "anchor_id": anchor_id,
+                    "hint": "未找到该消息（可能已删除，或不是 user/assistant）。",
+                }
+
+            before_rows: list[sqlite3.Row] = []
+            if before_n > 0:
+                before_rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    f"WHERE id < ? AND role IN ({role_placeholders}) "
+                    "ORDER BY id DESC LIMIT ?",
+                    [anchor_id, *role_params, before_n],
+                ).fetchall()
+                before_rows.reverse()
+
+            after_rows: list[sqlite3.Row] = []
+            if after_n > 0:
+                after_rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    f"WHERE id > ? AND role IN ({role_placeholders}) "
+                    "ORDER BY id ASC LIMIT ?",
+                    [anchor_id, *role_params, after_n],
+                ).fetchall()
+
+        return {
+            "before": [self._row_to_entry(row) for row in before_rows],
+            "target": self._row_to_entry(target_row),
+            "after": [self._row_to_entry(row) for row in after_rows],
+            "anchor_id": anchor_id,
+        }
 
     def clear(self) -> None:
         with self._lock:
@@ -272,4 +434,5 @@ class ChatHistoryStore:
             tone=row["tone"],
             portrait=row["portrait"],
             channel=row["channel"],
+            id=int(row["id"]),
         )

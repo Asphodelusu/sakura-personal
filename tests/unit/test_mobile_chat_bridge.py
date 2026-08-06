@@ -56,6 +56,7 @@ def test_mobile_tool_registry_exposes_memory_write_not_desktop() -> None:
 def test_mobile_channel_prompt_mentions_shared_memory() -> None:
     assert "memory_remember" in MOBILE_CHANNEL_PROMPT_PATCH.system_prompt_append
     assert "长期记忆与电脑端共用" in MOBILE_CHANNEL_PROMPT_PATCH.system_prompt_append
+    assert "history_search" in MOBILE_CHANNEL_PROMPT_PATCH.system_prompt_append
 
 
 def test_mobile_prompt_patches_append_channel_notice() -> None:

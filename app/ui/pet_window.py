@@ -3436,19 +3436,31 @@ class PetWindow(QWidget):
             debug_log("ProactiveObserver", "评估结果写入历史失败", {"error": str(exc)})
 
     def _format_recent_history(self) -> str:
-        """Format last few conversation turns for the observer VLM context."""
+        """Format last few conversation turns for the observer decision LLM."""
+        from app.agent.builtin_tools import message_is_intimacy_continue
+
         msgs = self.messages[-10:]
         if not msgs:
             return ""
         lines: list[str] = []
         count = 0
         for m in reversed(msgs):
+            if not isinstance(m, dict):
+                continue
+            # 系统续投信号绝不能标成「相手」
+            if message_is_intimacy_continue(m):
+                continue
             role = m.get("role", "")
             content = str(m.get("content", "")).strip()
             if not content or role not in ("user", "assistant"):
                 continue
-            name = "Sakura" if role == "assistant" else "相手"
-            # Truncate long messages
+            source = str(m.get("source") or "").strip()
+            if role == "assistant":
+                name = "あなた(夜乃桜)"
+                if source == "proactive":
+                    name = "あなた(夜乃桜・主動)"
+            else:
+                name = "相手"
             if len(content) > 120:
                 content = content[:120] + "…"
             lines.append(f"[{name}] {content}")
@@ -3483,7 +3495,7 @@ class PetWindow(QWidget):
         # 长文按日文句末标点拆分为多段，避免一口气说一大段（与 prompt 约束互补）。
         segments = _split_proactive_comment(payload.text, payload.translation, payload.tone)
         result = AgentResult(reply=ChatReply(segments=segments))
-        self._consume_agent_result(result)
+        self._consume_agent_result(result, message_source="proactive")
 
     def _restart_proactive_observer(self) -> None:
         self._stop_proactive_observer()
@@ -3523,18 +3535,25 @@ class PetWindow(QWidget):
         self._intimacy_continue_count = 0
 
     def _is_intimacy_continue_turn(self) -> bool:
-        """判断当前轮次是否由续投触发（末条 user 消息为続けて）。"""
-        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+        """判断当前轮次是否由系统续投触发（含旧版 user 裸标记）。"""
+        from app.agent.builtin_tools import latest_is_intimacy_continue, message_is_intimacy_continue
 
+        if latest_is_intimacy_continue(self.messages):
+            return True
+        # 回复已写入后：末条可能是 assistant，回看最近一条续投信号
         for msg in reversed(self.messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                return msg.get("content") == INTIMACY_CONTINUE_MARKER
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            if role == "assistant":
+                continue
+            return message_is_intimacy_continue(msg)
         return False
 
     @Slot()
     def _on_intimacy_continue_timer(self) -> None:
         """计时器到期：检查条件，触发续投。"""
-        from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER, intimacy_mode_state
+        from app.agent.builtin_tools import build_intimacy_continue_message, intimacy_mode_state
 
         if not intimacy_mode_state.active:
             return
@@ -3557,11 +3576,10 @@ class PetWindow(QWidget):
 
         # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
         self._intimacy_continue_count += 1
-        text = INTIMACY_CONTINUE_MARKER
         self._begin_interaction("rhythm_continue")
 
-        # 写入内存上下文（保持 user/assistant 交替），但不进持久化历史
-        self.messages.append({"role": "user", "content": text})
+        # 系统信号（role=system），不进持久化历史；勿写成 user 以免角色串线
+        self.messages.append(build_intimacy_continue_message())
         request_messages = trim_messages_for_model([*self.messages])
 
         self._start_chat_worker(request_messages)
@@ -4726,7 +4744,13 @@ class PetWindow(QWidget):
         )
         self._consume_agent_result(result)
 
-    def _consume_agent_result(self, result: AgentResult, record_history: bool = True) -> None:
+    def _consume_agent_result(
+        self,
+        result: AgentResult,
+        record_history: bool = True,
+        *,
+        message_source: str = "",
+    ) -> None:
         self.messages = _without_transient_progress_messages(self.messages)
         reply = result.reply
         self._log_interaction_stage(
@@ -4734,10 +4758,14 @@ class PetWindow(QWidget):
             {
                 "segments": len(reply.segments),
                 "record_history": record_history,
+                "message_source": message_source or "",
             },
         )
         if record_history:
-            self.messages.append({"role": "assistant", "content": reply.text})
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": reply.text}
+            if message_source:
+                assistant_msg["source"] = message_source
+            self.messages.append(assistant_msg)
             self._record_assistant_reply_history(reply, _debug=result._debug)
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)

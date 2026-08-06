@@ -49,3 +49,6 @@ def test_speech_decision_ignores_own_bubble_text() -> None:
     text = _SPEECH_DECISION_INSTRUCTION
     assert "自問自答" in text
     assert "吹き出し" in text
+    assert "自分の直前の発話" in text
+    assert "あなた(夜乃桜)" in text
+    assert "相手の発言ではない" in text or "相手の発言と混同しない" in text

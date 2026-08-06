@@ -468,9 +468,9 @@ def test_intimacy_inactive_is_normal_routing() -> None:
 
 def test_intimacy_continue_exhausted_falls_back() -> None:
     """续投耗尽时 consume_turn 返回 False → 走正常路由。"""
-    from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+    from app.agent.builtin_tools import build_intimacy_continue_message
 
-    messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
+    messages: list[ChatMessage] = [build_intimacy_continue_message()]
     plan = _plan_for(messages, active=True, turns_left=0)
     assert plan.decided_by != "rhythm_focus"
 
@@ -505,9 +505,9 @@ def test_intimacy_user_turn_refreshes_even_with_exit_like_words() -> None:
 
 def test_intimacy_continue_consumes_not_refresh() -> None:
     """系统续投扣轮次，不刷新。"""
-    from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+    from app.agent.builtin_tools import build_intimacy_continue_message
 
-    messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
+    messages: list[ChatMessage] = [build_intimacy_continue_message()]
     request = _request_for(messages)
     settings = _settings()
     recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
@@ -532,6 +532,35 @@ def test_intimacy_continue_consumes_not_refresh() -> None:
     assert plan.client_key == "chat"
     assert plan.decided_by == "rhythm_focus"
     assert plan.generation_params == {"thinking": {"type": "disabled"}}
+    mock_state.consume_turn.assert_called_once()
+    mock_state.refresh_user_reply.assert_not_called()
+
+
+def test_intimacy_continue_legacy_user_marker_consumes() -> None:
+    """旧版 user 裸标记仍按续投扣次，不刷新。"""
+    from app.agent.builtin_tools import INTIMACY_CONTINUE_MARKER
+
+    messages: list[ChatMessage] = [{"role": "user", "content": INTIMACY_CONTINUE_MARKER}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    mock_state = MagicMock()
+    mock_state.active = True
+    mock_state.consume_turn.return_value = True
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    assert plan.decided_by == "rhythm_focus"
     mock_state.consume_turn.assert_called_once()
     mock_state.refresh_user_reply.assert_not_called()
 
