@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """UIA excerpt curation + ObservationPacket text priority."""
 
-from app.perception.observer import resolve_visible_text_excerpt
+from app.perception.observer import (
+    format_visible_text_block,
+    infer_content_scene,
+    resolve_visible_text,
+    resolve_visible_text_excerpt,
+)
 from app.perception.screen_reader import curate_uia_excerpt
 
 
@@ -82,3 +87,41 @@ def test_resolve_prefers_ocr_over_on_screen() -> None:
     )
     assert "OCR" in out
     assert "VLM" not in out
+
+
+def test_resolve_visible_text_tracks_source() -> None:
+    uia = resolve_visible_text(
+        uia_text="This is a sufficiently long UIA body excerpt for the min char gate.",
+        on_screen_text="VLM",
+        min_chars=30,
+    )
+    assert uia.source == "uia"
+    ocr = resolve_visible_text(
+        uia_text="x",
+        ocr_text="OCR captured a long enough game dialogue line right here.",
+        min_chars=30,
+    )
+    assert ocr.source == "ocr"
+    vlm = resolve_visible_text(on_screen_text="VLM phrase", min_chars=30)
+    assert vlm.source == "vlm_on_screen"
+
+
+def test_infer_content_scene_chat_game_ai() -> None:
+    assert infer_content_scene("chat", "WeChat.exe", "微信") == "chat"
+    assert infer_content_scene("", "YuanShen.exe", "原神") == "game"
+    assert (
+        infer_content_scene("browser", "chrome.exe", "ChatGPT - Google Chrome")
+        == "ai_assistant"
+    )
+    assert infer_content_scene("editor", "Code.exe", "main.py") == "editor"
+
+
+def test_format_visible_text_block_labels_provenance() -> None:
+    block = format_visible_text_block(
+        "hello from wechat friend",
+        source="uia",
+        scene="chat",
+    )
+    assert "我看见的" in block
+    assert "即时通讯" in block
+    assert "hello from wechat friend" in block

@@ -11,7 +11,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from app.agent.entity_index import extract_entities
+from app.agent.entity_index import (
+    extract_entities,
+    find_known_entity_aliases,
+    is_known_entity_alias,
+)
 from app.llm.prompts.types import ContextMessage, ContextRequest
 
 
@@ -108,6 +112,14 @@ def rewrite_memory_query_heuristic(request: ContextRequest) -> MemoryQueryPlan:
 
     entity_source = "\n".join(parts)
     entities = _select_query_entities(entity_source)
+    # 静态别名表层（如「索菲」）优先保留，避免中文正则吞成「索菲是你」
+    known = tuple(
+        name
+        for name in sorted(find_known_entity_aliases(entity_source), key=len, reverse=True)
+        if name not in entities
+    )
+    if known:
+        entities = (entities + known)[:MAX_REWRITE_ENTITIES]
     if entities:
         parts.append("关键实体：" + "、".join(entities))
 
@@ -233,8 +245,12 @@ def _select_query_entities(text: str) -> tuple[str, ...]:
         clean = name.strip()
         if not clean or clean in _ENTITY_STOPWORDS:
             continue
-        # 片假名/英文，或较长汉字专名
-        if not (_QUALITY_ENTITY_RE.search(clean) or len(clean) >= 3):
+        # 片假名/英文、较长汉字专名，或静态别名表中的二字中文名（如「索菲」）
+        if not (
+            _QUALITY_ENTITY_RE.search(clean)
+            or len(clean) >= 3
+            or is_known_entity_alias(clean)
+        ):
             continue
         if clean not in ordered:
             ordered.append(clean)

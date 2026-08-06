@@ -133,17 +133,21 @@ def test_builtin_and_mobile_register_history_tools(tmp_path: Path, store: ChatHi
     desktop = create_builtin_tool_registry(tmp_path, memory=memory, history=ref)
     assert desktop.get("history_search") is not None
     assert desktop.get("history_read") is not None
+    assert desktop.get("history_search").group == "history"
+    assert desktop.get("history_read").group == "history"
     result = desktop.get("history_search").handler({"keyword": "不存在的词xyz"})
     assert result["count"] == 0
 
     mobile = create_mobile_tool_registry(memory, ref)
     assert mobile.get("history_search") is not None
     assert mobile.get("history_read") is not None
+    assert mobile.get("history_search").group == "history"
 
 
 def test_builtin_without_history_degrades(tmp_path: Path) -> None:
     registry = create_builtin_tool_registry(tmp_path)
     tool = registry.get("history_search")
     assert tool is not None
+    assert tool.group == "history"
     result = tool.handler({})
     assert "不可用" in result["error"]

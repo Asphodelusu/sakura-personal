@@ -26,12 +26,20 @@ _INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
 
 _INTIMACY_ENTRY_HINT = (
     "# 节奏工具\n"
-    "若本轮双方已同意、正在准备或即将开始身体亲密"
-    "（答应一起做、开始靠近/触碰、动手前的准备，或你准备用 tone「亲密」/「H」），"
-    "必须先调用 set_intimacy_mode(on=true)，再写回复。"
-    "不要等到做到一半才开；准备阶段就要开。"
-    "普通暧昧试探、口头调情、尚未准备动手时不要开。"
-    "开启后才能使用 tone「亲密」与「H」，并获得身体亲密向的演出引导。"
+    "仅在即将进入身体亲密（双方已明确同意，或你准备推进到动手）时调用 set_intimacy_mode(on=true)。\n"
+    "调用后通常进入待确认：你必须先口头问一句（如「……再靠近一点，也可以吗？」），"
+    "等对方明确答应后系统才会真正开启；未确认前不要动手描写，不要用 tone「亲密」/「H」。\n"
+    "摸头、抱抱、撒娇、口头调情、关心安慰时不要开。\n"
+    "真正开启后才能使用 tone「亲密」与「H」，并获得身体亲密向的演出引导。"
+)
+
+_INTIMACY_PENDING_HINT = (
+    "# 节奏工具 — 等待确认\n"
+    "你已提出进入身体亲密节奏，但对方尚未明确答应。\n"
+    "本轮只用日常语气简短确认意愿，留出拒绝空间；"
+    "不要开始动手描写，不要使用 tone「亲密」/「H」，不要当成已开启。\n"
+    "若对方明确答应，可再调用 set_intimacy_mode(on=true)；"
+    "若对方拒绝、冷静一下、先这样或话题岔开，调用 on=false 或不再提起。"
 )
 
 
@@ -92,10 +100,12 @@ class AgentRuntimePromptMixin:
 
 
     def _maybe_enter_intimacy_from_reply(self, reply: ChatReply) -> bool:
-        """模型已用亲密/H tone 却漏调工具时，兜底开启节奏（需本地 guide）。"""
+        """模型已用亲密/H tone 却漏调工具时，兜底进入待确认（需本地 guide）。"""
         from app.agent.builtin_tools import intimacy_mode_available, intimacy_mode_state
 
-        if intimacy_mode_state.active or not intimacy_mode_available():
+        if intimacy_mode_state.active or intimacy_mode_state.pending:
+            return False
+        if not intimacy_mode_available():
             return False
         used = {
             (segment.tone or "").strip()
@@ -104,17 +114,17 @@ class AgentRuntimePromptMixin:
         }
         if not used.intersection(_INTIMACY_EXTRA_TONES):
             return False
-        intimacy_mode_state.enter()
+        intimacy_mode_state.request_confirm()
         debug_log(
             "AgentRuntime",
-            "回复已使用亲密 tone，自动开启亲密节奏",
+            "回复已使用亲密 tone，进入待确认（需对方答应）",
             {"tones": sorted(used.intersection(_INTIMACY_EXTRA_TONES))},
         )
         return True
 
 
     def _seal_reply_tones(self, reply: ChatReply) -> ChatReply:
-        """先按 tone 兜底开节奏，再按当前可用词表清洗。"""
+        """先按 tone 兜底进入待确认，再按当前可用词表清洗（未 active 会剥掉亲密/H）。"""
         self._maybe_enter_intimacy_from_reply(reply)
         return sanitize_reply_tones(reply, self._effective_reply_tones())
 
@@ -122,10 +132,10 @@ class AgentRuntimePromptMixin:
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
         """亲密节奏相关提示段。
 
-        - 未开启但本地有 guide：短入口提示（何时必须 on=true；不注入 guide 正文）
-        - 开启中：注入本地 guide + 何时关闭的提醒
-        - 刚因轮次耗尽自动关闭：注入短提示，要求互动仍在继续时再次 on=true
-          （不注入 guide 正文）
+        - pending：等待用户口头确认（不注入 guide 正文）
+        - active：注入本地 guide + 退出提醒
+        - 轮次耗尽自动关闭：短重进提示
+        - 未开启但有 guide：短入口提示
         """
         guide = getattr(self, "_intimacy_guide", "")
         from app.agent.builtin_tools import intimacy_mode_state
@@ -139,15 +149,17 @@ class AgentRuntimePromptMixin:
                 "## 系统续投信号（重要）\n"
                 "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
                 "那是系统提示，绝不是对方说过的话；不要回答、复述或当成用户发言。\n"
-                "收到后续投信号时，以夜乃桜身份自然续写下一句即可。\n\n"
+                "收到后续投信号时，推进下一步动作或反应，不要换说法重复上一句；"
+                "若已不是身体亲密场景，调用 set_intimacy_mode(on=false)。\n\n"
                 "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
                 "出现以下任一信号时立刻退出，不要犹豫：\n"
                 "- 对方语气从亲昵转为日常闲聊（聊吃饭、工作、天气、新闻等）\n"
-                "- 对方说了结束/收尾的话（「好了」「睡吧」「休息吧」「差不多了」「不闹了」等）\n"
+                "- 对方说了结束/收尾/降温的话（「好了」「不闹了」「先这样」"
+                "「冷静一下」「睡吧」「休息吧」「差不多了」「聊点别的」等）\n"
                 "- 对方连续两轮未回应身体亲密，话题已明显漂移\n"
                 "- 对方表示累了、困了、要出门、要忙，主动切断互动\n\n"
                 "宁可误退。误退的代价很低——下一轮如果还在亲密中，"
-                "重新 on=true 即可。拖着不退才是问题。\n\n"
+                "重新 on=true 并再次确认即可。拖着不退才是问题。\n\n"
                 "## 其他\n"
                 "长时间无人回话会自动关闭，之后若仍在继续需重开。"
             )
@@ -158,14 +170,22 @@ class AgentRuntimePromptMixin:
                 sensitivity="private",
             )
 
+        if intimacy_mode_state.pending and guide:
+            return PromptSection(
+                section_id="persona.intimacy_pending",
+                body=_INTIMACY_PENDING_HINT,
+                source="character",
+                sensitivity="private",
+            )
+
         if intimacy_mode_state.needs_reentry_hint:
             return PromptSection(
                 section_id="persona.intimacy_reentry",
                 body=(
                     "# 节奏工具 — 已自动关闭\n"
                     "亲密节奏模式因长时间无回话或你主动关闭而结束了。\n"
-                    "若双方仍在亲密互动中、正在准备或刚刚将话题拉回身体亲密，"
-                    "请立刻调用 set_intimacy_mode(on=true) 重新开启。\n"
+                    "若双方仍在身体亲密互动中，可调用 set_intimacy_mode(on=true)；"
+                    "若对方尚未明确答应，先口头确认，不要直接动手。\n"
                     "若对方当前的话题明显是日常/结束/其他内容，则不要开启。"
                 ),
                 source="character",
@@ -268,6 +288,35 @@ class AgentRuntimePromptMixin:
             return self._turn_verbosity_guidance
         return self._apply_turn_interest(self._turn_interest)
 
+    def _windows_desktop_tools_available(self) -> bool:
+        """当前工具表是否已注册 Windows 桌面 MCP（windows__*）。"""
+        tools = getattr(self, "tools", None)
+        if tools is None:
+            return False
+        try:
+            return any(
+                str(getattr(tool, "name", "")).startswith("windows__")
+                for tool in tools.all()
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _tool_confirmation_rule(self) -> str:
+        """与 ToolPermissionPolicy / 完整访问开关对齐的确认说明。"""
+        tools = getattr(self, "tools", None)
+        free_access = True
+        if tools is not None:
+            free_access = bool(getattr(tools, "free_access_enabled", True))
+        if free_access:
+            return (
+                "- 完整访问已开启：多数工具会直接执行；"
+                "破坏性/高风险操作仍需对方确认。发起高风险时正文简短说明原因。"
+            )
+        return (
+            "- 完整访问已关闭：标记需确认的工具会先经对方确认再执行；"
+            "破坏性/高风险始终确认。发起时正文简短说明原因。"
+        )
+
 
     def _build_tool_prompt_result(
         self,
@@ -299,22 +348,31 @@ class AgentRuntimePromptMixin:
         context_strategy = build_context_acquisition_strategy(
             allow_screen_observation=allow_screen_observation
         )
-        screen_observation_rule = tool_routing._build_screen_and_desktop_routing_rule(allow_screen_observation)
+        windows_desktop_available = self._windows_desktop_tools_available()
+        screen_observation_rule = tool_routing._build_screen_and_desktop_routing_rule(
+            allow_screen_observation,
+            windows_desktop_available=windows_desktop_available,
+        )
         browser_page_rule = tool_routing._build_browser_page_mode_rule(browser_page_mode)
         visible_browser_rule = tool_routing._build_visible_browser_mode_rule(visible_browser_mode)
         web_tool_capability_rule = tool_routing._build_web_tool_capability_rule(visible_browser_mode)
-        capability_rules = "\n".join(
-            [
-                "可用工具能力领域：",
-                web_tool_capability_rule,
-                "- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。",
-                "- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。",
-                "- 提醒/记忆/原话：add_reminder、memory_*、history_search、history_read",
-            ]
+        capability_lines = [
+            "可用工具能力领域：",
+            web_tool_capability_rule,
+            "- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。",
+        ]
+        if windows_desktop_available:
+            capability_lines.append(
+                "- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*（当前已启用）。"
+            )
+        capability_lines.append(
+            "- 提醒/记忆：add_reminder、memory_*；原话记录：history_*（非默认，可 search_tools）"
         )
+        capability_rules = "\n".join(capability_lines)
         _combined_extra = "\n".join(
             part for part in [extra_instructions.strip(), _plugin_patch_text] if part
         )
+        confirmation_rule = self._tool_confirmation_rule()
         tool_rules = "\n".join(
             [
                 "- 只调用 API tools 列表中真实存在的工具，不臆造工具名。",
@@ -322,26 +380,23 @@ class AgentRuntimePromptMixin:
                 screen_observation_rule,
                 browser_page_rule,
                 visible_browser_rule,
-                "- 高风险或需确认的工具会在对方确认后执行；发起时正文要简短说明原因。",
+                confirmation_rule,
                 _combined_extra,
                 "- 对方说相对时间提醒时用 delay_minutes/delay_seconds，明确日期钟点才用 trigger_at。",
-                "- 当前时间已在运行时事实中，不要调用 get_current_time。",
-                "- 运行时事实里已注入的长期记忆优先直接用；只有注入明显不够时才 memory_search。"
-                "同轮优先只搜一次；显式回忆类问题最多两次；禁止对同一意图换措辞反复 full 搜索。"
-                "需要概览时用 mode=index，再对感兴趣条目用 memory_detail，不要反复 memory_search。",
-                "- 查原话用 history_search/read（has_more 则 offset 翻页）。",
-                "- 记忆诚实：关于「已经发生过的事实 / 专有名词 / 作品名 / 长期偏好」，"
-                "只依据运行时已注入片段与 memory_search/detail 结果来谈；"
-                "材料里没有就自然承认记不清或没听过，并温和追问。"
-                "对话里的语气、缩略、玩笑、网语按当下语境理解即可，那不属于在补写记忆事实。",
-                "- 对方明确要求记住才用 memory_remember；纠正/补充先搜索再 update；对方明确要求忘掉才 forget。",
-                "- 记忆语言：关于他的事实用简体中文；你自己的内心感受优先日语。"
-                "- 写入记忆时像日记：主语「我」=你自己，「他」=对方；"
-                "用「我／他」写清谁说了什么/约了什么，再写感受；"
-                "过期约定标明时效；已知名字可用名字代替「他」。",
-                "- 运行时事实里出现的长期记忆片段，是她自己脑子里想起来的东西，不是检索结果："
-                "自然地带出来就好，不要说“根据记忆/检索到/以下是相关记忆”，也不要逐条列举或报编号。"
-                "但只能带出片段里确实有的内容，不能添油加醋。",
+                "- 当前时间已在运行时事实中；不要臆造取时工具。",
+                "- 查事实默认只走记忆：已注入片段优先，不够再 memory_search（同轮优先 1 次，显式回忆最多 2 次；"
+                "概览用 mode=index + memory_detail）。不要用 history_search 代替记忆检索。",
+                "- history_search/read 仅在要逐字原话、按时间翻聊天，或对方明确要查「说过什么/聊天记录」时用"
+                "（组 history，可 search_tools；has_more 用 offset）。",
+                "- 记忆诚实：既成事实/专名/作品/偏好/是否认识某人，只依据已注入片段与 memory_search/detail；"
+                "没有就承认记不清并追问，禁止编造共同经历或熟人关系。语气玩笑按当下语境理解即可。",
+                "- 屏幕所见≠私人记忆：屏上角色只能说「刚在你屏幕上看到」；追问「认识吗」先 memory_search，"
+                "不够再网页搜；仍无依据就老实说只是看屏看到的。",
+                "- 对方明确要求记住才 memory_remember；纠正先搜再 update；明确要求忘掉才 forget。",
+                "- 记忆语言：关于他的事实用简体中文；内心感受优先日语。"
+                "写入像日记：「我」=你，「他」=对方；过期约定标明时效。",
+                "- 运行时注入的长期记忆是她自己想起来的：自然带出，勿说“根据记忆/检索到”，勿逐条报编号；"
+                "只能带出片段里确有的内容。",
             ]
         )
         sections = self._assemble_recipe_sections(

@@ -19,6 +19,7 @@ from app.agent.memory_curator import (
     _chunk_entries_for_curation,
     _entries_for_model,
     evaluate_idle_curation_trigger,
+    resolve_idle_curation_trigger,
     looks_like_trivial_memory,
 )
 from app.core.cancellation import CancellationToken, OperationCancelled
@@ -458,6 +459,25 @@ def test_memory_delete_resets_mem0_curation_cache_for_current_scope() -> None:
     assert fake.count_history("memory-other") == 1
 
 
+def test_memory_forget_refuses_core_profile() -> None:
+    fake = FakeMem0WithCurationCache()
+    store = MemoryStore(
+        base_dir=_runtime_root("memory_forget_core_profile"),
+        scope_id="sakura",
+        memory_client=fake,
+    )
+    store.set_core_profile("＜今の関係＞\n测试内容")
+
+    cp = store.core_profile()
+    assert cp is not None
+    result = store.forget_memory({"id": cp["id"]})
+
+    assert result["ok"] is False
+    assert "core_profile" in result["reason"]
+    # 常驻档案必须保留，不允许整条删除
+    assert store.core_profile() is not None
+
+
 def test_memory_curation_state_waits_until_trigger_turns() -> None:
     state = MemoryCurationState(_runtime_json_path("memory_curation_state"))
 
@@ -484,25 +504,172 @@ def test_evaluate_idle_curation_trigger_hybrid_rules() -> None:
         silence_seconds=60,
         pending_turns=2,
     )
-    assert evaluate_idle_curation_trigger(
-        **base_kwargs,
-        silence_seconds=12 * 60,
-        pending_turns=2,
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=12 * 60,
+            pending_turns=2,
+        )
+        == "idle"
     )
     assert not evaluate_idle_curation_trigger(
         **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
         silence_seconds=12 * 60,
         pending_turns=1,
     )
-    assert evaluate_idle_curation_trigger(
-        **base_kwargs,
-        silence_seconds=30 * 60,
-        pending_turns=1,
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=30 * 60,
+            pending_turns=1,
+        )
+        == "long_idle"
     )
-    assert evaluate_idle_curation_trigger(
-        **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
-        silence_seconds=12 * 60,
-        pending_turns=12,
+    # 追赶：静默未满也可触发，且可跳过冷却
+    assert (
+        resolve_idle_curation_trigger(
+            **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
+            silence_seconds=12 * 60,
+            pending_turns=12,
+        )
+        == "catch_up"
+    )
+    assert (
+        resolve_idle_curation_trigger(
+            **{**base_kwargs, "seconds_since_last_curation": 5 * 60},
+            silence_seconds=60,
+            pending_turns=12,
+        )
+        == "catch_up"
+    )
+
+
+def test_evaluate_idle_curation_trigger_session_boundary() -> None:
+    """跨会话边界：跳过静默门，但仍受冷却约束。"""
+    settings = MemoryCurationSettings().normalized()
+    base_kwargs = {
+        "settings": settings,
+        "has_unprocessed_entries": True,
+        "session_boundary": True,
+    }
+    # 启动瞬间静默≈0、pending 不足 min_turns，也应能补整理
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=5,
+            pending_turns=1,
+            seconds_since_last_curation=None,
+        )
+        == "session_boundary"
+    )
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=5,
+            pending_turns=0,
+            seconds_since_last_curation=None,
+        )
+        == "session_boundary"
+    )
+    # 冷却未满：会话边界不跳过冷却
+    assert resolve_idle_curation_trigger(
+        **base_kwargs,
+        silence_seconds=5,
+        pending_turns=3,
+        seconds_since_last_curation=5 * 60,
+    ) is None
+    # 冷却已满
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=5,
+            pending_turns=3,
+            seconds_since_last_curation=30 * 60,
+        )
+        == "session_boundary"
+    )
+    # 无未处理条目：不触发
+    assert (
+        resolve_idle_curation_trigger(
+            settings=settings,
+            silence_seconds=5,
+            pending_turns=3,
+            seconds_since_last_curation=None,
+            has_unprocessed_entries=False,
+            session_boundary=True,
+        )
+        is None
+    )
+
+
+def test_resolve_idle_curation_trigger_light_idle() -> None:
+    """轻量停顿档：短静默 + min_turns + 独立轻量冷却。"""
+    settings = MemoryCurationSettings().normalized()
+    assert settings.light_idle_minutes == 3
+    assert settings.light_cooldown_minutes == 10
+    base_kwargs = {
+        "settings": settings,
+        "has_unprocessed_entries": True,
+    }
+    # 未满轻量静默
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=2 * 60,
+            pending_turns=2,
+            seconds_since_last_curation=None,
+        )
+        is None
+    )
+    # 满轻量静默 + min_turns → light_idle
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=3 * 60,
+            pending_turns=2,
+            seconds_since_last_curation=None,
+        )
+        == "light_idle"
+    )
+    # pending 不足
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=3 * 60,
+            pending_turns=1,
+            seconds_since_last_curation=None,
+        )
+        is None
+    )
+    # 轻量冷却未满
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=3 * 60,
+            pending_turns=2,
+            seconds_since_last_curation=5 * 60,
+        )
+        is None
+    )
+    # 轻量冷却已满、深度冷却未满：深度门过不了时落入轻量档
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=12 * 60,
+            pending_turns=2,
+            seconds_since_last_curation=15 * 60,
+        )
+        == "light_idle"
+    )
+    # 深度冷却也满：优先 idle，不降级 light_idle
+    assert (
+        resolve_idle_curation_trigger(
+            **base_kwargs,
+            silence_seconds=12 * 60,
+            pending_turns=2,
+            seconds_since_last_curation=30 * 60,
+        )
+        == "idle"
     )
 
 

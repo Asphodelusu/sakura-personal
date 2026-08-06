@@ -4891,7 +4891,7 @@ async function load() {
   fields.backchannelProbability.value = request.system_extra.backchannel.probability;
   fields.backchannelTtsEnabled.checked = request.system_extra.backchannel.tts_enabled;
   fields.memoryTriggerTurns.value = request.memory.curation.trigger_turns;
-  fields.progressiveMemory.checked = request.memory.progressive_memory !== false;
+  fields.progressiveMemory.checked = request.memory.progressive_memory === true;
 
   setThemeValues(request.theme);
   themeChanged = false;

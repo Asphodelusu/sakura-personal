@@ -215,6 +215,9 @@ def context_acquisition_strategy_block(*, allow_screen_observation: bool) -> Pro
     rules = [
         "- 信息不足、需要核实时，可以用低风险只读工具把事实补清楚，再按人设回应；"
         "单纯寒暄、叫名字、「喂」之类短搭话，直接按人设回话，不要为了找话题去截屏或搜网页。",
+        "- 不确定「认不认识 / 共同经历 / 作品角色是谁」时：先 memory_search，勿先 history_search；"
+        "记忆不够且像公开作品时再网页搜；查不到就承认不知道或刚看见，禁止编故事。"
+        "要逐字原话或对方明确要查「说过什么」时才 history_search。",
     ]
     if allow_screen_observation:
         rules.extend(

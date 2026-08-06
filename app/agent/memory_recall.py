@@ -167,6 +167,18 @@ class MemoryRecallService:
         now = datetime.now().astimezone()
         persona = _resolve_recall_persona(self.memory, query)
         due_commitments = _select_due_commitment_memories(self.memory, now=now)
+        # 查询侧实体点查：用户说「索菲」时直接按别名捞旧「ソフィア」记忆，不依赖首轮向量命中
+        query_entity_hits = _expand_by_query_entities(
+            plan,
+            request.current_input,
+            memories,
+            self.memory,
+            self.threshold,
+            self.limit,
+            include_expired=include_expired,
+        )
+        if query_entity_hits:
+            memories = _deduplicate_memories(memories + query_entity_hits)
         # 实体扩展：从首轮结果中提取专有名词，追加相关记忆
         expanded = _expand_by_entities(
             memories,
@@ -178,11 +190,14 @@ class MemoryRecallService:
         if expanded:
             memories = _deduplicate_memories(memories + expanded)
 
-        # 向量粗捞之后用 cross-encoder 精排；实体 hop 无语义分时也能被正确抬/压。
+        # 向量粗捞之后用 cross-encoder 精排；查询侧实体命中随后保底抬回。
         memories = rerank_memory_candidates(
             query,
             memories if isinstance(memories, list) else [],
             base_dir=self.memory.base_dir,
+        )
+        memories = _apply_entity_query_match_score_floor(
+            memories if isinstance(memories, list) else []
         )
 
         # 回忆强化：只批量点查本轮候选（通常 <=15 条），不管历史累计追踪了多少条，
@@ -601,10 +616,116 @@ def _is_expired(value: Any, now: datetime) -> bool:
         expires_at = expires_at.replace(tzinfo=now.tzinfo)
     return expires_at <= now
 
-# 从实体索引点查到的记忆没有语义相似度分数（不是靠向量搜索命中的），
-# 给一个固定的中性分数：高于去噪阈值、能进入候选池排序，但不与真正的语义
-# 高分命中抢排位——它们是"关联到同一个人/物"的补充线索，不是本轮主查询本身命中的。
-_ENTITY_HOP_SYNTHETIC_SCORE = 0.5
+# 从实体索引点查到的记忆没有语义相似度分数（不是靠向量搜索命中的）。
+# 查询侧点查（用户点名「索菲」）给高合成分，避免被近期中文情景记忆压掉；
+# 多跳 hop 仍用中性分，只作补充线索。
+_ENTITY_HOP_SYNTHETIC_SCORE = 0.55
+_ENTITY_QUERY_MATCH_SCORE = 0.82
+# 精排可能把「中文问句 × 日文设定」打低；查询侧实体命中保底，避免又掉出名单。
+_ENTITY_QUERY_MATCH_RERANK_FLOOR = 0.75
+
+
+def _memories_for_entity_names(
+    entities: set[str],
+    memories: list[dict[str, Any]],
+    memory_store: Any,
+    threshold: float,
+    limit: int,
+    *,
+    include_expired: bool = False,
+    query_match: bool = False,
+    wait: bool = False,
+) -> list[dict[str, Any]]:
+    """按实体名点查索引并取回全文，合成分给未带 score 的条目。"""
+    if not entities:
+        return []
+    existing_ids = {str(m.get("id", "")) for m in memories}
+    try:
+        hop_ids = memory_store.lookup_entity_memory_ids(
+            entities, exclude_ids=existing_ids, limit=limit
+        )
+    except Exception:
+        return []
+    if not hop_ids:
+        return []
+
+    try:
+        response = memory_store.get_memory_detail(
+            {"ids": hop_ids, "include_expired": include_expired},
+            wait=wait,
+        )
+    except Exception:
+        return []
+    extra = response.get("memories", [])
+    if not isinstance(extra, list):
+        return []
+
+    synthetic = _ENTITY_QUERY_MATCH_SCORE if query_match else _ENTITY_HOP_SYNTHETIC_SCORE
+    result = []
+    for m in extra:
+        if str(m.get("id", "")) in existing_ids:
+            continue
+        item = dict(m)
+        if item.get("score") is None or query_match:
+            item["score"] = max(_bounded_float(item.get("score"), default=0.0), synthetic)
+        if query_match:
+            item["entity_query_match"] = True
+        score = _bounded_float(item.get("score"), default=0.0)
+        if score >= threshold:
+            result.append(item)
+    return result
+
+
+def _apply_entity_query_match_score_floor(
+    memories: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """精排后抬回查询侧实体命中，避免中日别名设定被打没。"""
+    if not memories:
+        return memories
+    raised: list[dict[str, Any]] = []
+    changed = False
+    for memory in memories:
+        if not isinstance(memory, dict):
+            continue
+        if memory.get("entity_query_match"):
+            score = _bounded_float(memory.get("score"), default=0.0)
+            if score < _ENTITY_QUERY_MATCH_RERANK_FLOOR:
+                memory = {**memory, "score": _ENTITY_QUERY_MATCH_RERANK_FLOOR}
+                changed = True
+        raised.append(memory)
+    if not changed:
+        return memories
+    raised.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return raised
+
+
+def _expand_by_query_entities(
+    plan: MemoryQueryPlan,
+    current_input: str,
+    memories: list[dict[str, Any]],
+    memory_store: Any,
+    threshold: float,
+    limit: int,
+    *,
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    """用本轮 query / 用户原话里的实体直接点查（含中日别名展开）。"""
+    from app.agent.entity_index import extract_entities, find_known_entity_aliases
+
+    entities: set[str] = {str(e).strip() for e in plan.entities if str(e).strip()}
+    entities |= extract_entities(plan.query or "")
+    entities |= extract_entities(current_input or "")
+    entities |= find_known_entity_aliases(plan.query or "")
+    entities |= find_known_entity_aliases(current_input or "")
+    return _memories_for_entity_names(
+        entities,
+        memories,
+        memory_store,
+        threshold,
+        limit,
+        include_expired=include_expired,
+        query_match=True,
+    )
 
 
 def _expand_by_entities(
@@ -630,40 +751,15 @@ def _expand_by_entities(
     entities: set[str] = set()
     for mem in memories[:5]:  # 只从前5条中提取
         entities |= extract_entities(str(mem.get("content") or ""))
-    if not entities:
-        return []
-
-    existing_ids = {str(m.get("id", "")) for m in memories}
-    try:
-        hop_ids = memory_store.lookup_entity_memory_ids(
-            entities, exclude_ids=existing_ids, limit=limit
-        )
-    except Exception:
-        return []
-    if not hop_ids:
-        return []
-
-    try:
-        response = memory_store.get_memory_detail(
-            {"ids": hop_ids, "include_expired": include_expired},
-            wait=False,
-        )
-    except Exception:
-        return []
-    extra = response.get("memories", [])
-    if not isinstance(extra, list):
-        return []
-
-    result = []
-    for m in extra:
-        if str(m.get("id", "")) in existing_ids:
-            continue
-        if m.get("score") is None:
-            m = {**m, "score": _ENTITY_HOP_SYNTHETIC_SCORE}
-        score = _bounded_float(m.get("score"), default=0.0)
-        if score >= threshold:
-            result.append(m)
-    return result
+    return _memories_for_entity_names(
+        entities,
+        memories,
+        memory_store,
+        threshold,
+        limit,
+        include_expired=include_expired,
+        query_match=False,
+    )
 
 
 def _deduplicate_memories(

@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from app.agent.entity_index import EntityIndex, extract_entities
+from app.agent.entity_index import (
+    EntityIndex,
+    expand_entity_aliases,
+    extract_entities,
+    extract_paren_alias_pairs,
+    is_known_entity_alias,
+)
 
 
 def test_extract_entities_katakana_and_honorifics() -> None:
@@ -42,6 +48,35 @@ def test_index_and_lookup_roundtrip(index: EntityIndex) -> None:
     assert set(hits) == {"m1", "m2"}
     # 按最近更新时间倒序
     assert hits[0] == "m2"
+
+
+def test_lookup_chinese_alias_finds_japanese_only_memory(index: EntityIndex) -> None:
+    """正文只有ソフィア时，用中文「索菲」也应点查到。"""
+    index.index_memory(
+        "m1",
+        "ソフィアは学園の仲間で、生徒会の仕事もよく手伝ってくれる。",
+        updated_at="2026-01-01T00:00:00",
+    )
+    assert "m1" in index.lookup_memory_ids(["索菲"])
+    assert "m1" in index.lookup_memory_ids(["ソフィ"])
+
+
+def test_paren_cooccurrence_indexes_both_names(index: EntityIndex) -> None:
+    index.index_memory(
+        "m1",
+        "铭君告诉我，小诺（ノノ）是我以前的同学。",
+        updated_at="2026-01-01T00:00:00",
+    )
+    assert extract_paren_alias_pairs("小诺（ノノ）") == [("小诺", "ノノ")]
+    assert "m1" in index.lookup_memory_ids(["小诺"])
+    assert "m1" in index.lookup_memory_ids(["ノノ"])
+
+
+def test_expand_entity_aliases_static_group() -> None:
+    expanded = expand_entity_aliases(["索菲"])
+    assert "ソフィア" in expanded
+    assert "Sophie" in expanded
+    assert is_known_entity_alias("索菲")
 
 
 def test_lookup_excludes_ids(index: EntityIndex) -> None:

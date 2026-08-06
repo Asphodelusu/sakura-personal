@@ -738,10 +738,10 @@ class AppSettingsService:
 
     def load_progressive_memory_settings(self) -> bool:
         """渐进记忆检索开关：全量召回时自动注入相关记忆标题索引，
-        引导模型主动用 memory_detail 深入未读记忆。默认开启。
+        引导模型主动用 memory_detail 深入未读记忆。默认关闭。
         """
         memory = self._system_section("memory")
-        return _bool_value(memory.get("progressive_memory"), True)
+        return _bool_value(memory.get("progressive_memory"), False)
 
     def save_progressive_memory_settings(self, enabled: bool) -> None:
         self.save_system_values("memory", {"progressive_memory": bool(enabled)})
@@ -752,6 +752,8 @@ class AppSettingsService:
             DEFAULT_MEMORY_CURATION_CATCH_UP_TURNS,
             DEFAULT_MEMORY_CURATION_COOLDOWN_MINUTES,
             DEFAULT_MEMORY_CURATION_IDLE_MINUTES,
+            DEFAULT_MEMORY_CURATION_LIGHT_COOLDOWN_MINUTES,
+            DEFAULT_MEMORY_CURATION_LIGHT_IDLE_MINUTES,
             DEFAULT_MEMORY_CURATION_LONG_IDLE_MINUTES,
             DEFAULT_MEMORY_CURATION_MIN_TURNS,
             DEFAULT_MEMORY_CURATION_TRIGGER_TURNS,
@@ -776,6 +778,14 @@ class AppSettingsService:
                 DEFAULT_MEMORY_CURATION_LONG_IDLE_MINUTES,
             ),
             catch_up_turns=_int_value(catch_up_turns, DEFAULT_MEMORY_CURATION_CATCH_UP_TURNS),
+            light_idle_minutes=_int_value(
+                memory.get("light_idle_minutes"),
+                DEFAULT_MEMORY_CURATION_LIGHT_IDLE_MINUTES,
+            ),
+            light_cooldown_minutes=_int_value(
+                memory.get("light_cooldown_minutes"),
+                DEFAULT_MEMORY_CURATION_LIGHT_COOLDOWN_MINUTES,
+            ),
             trigger_turns=legacy_trigger,
         ).normalized()
 
@@ -791,6 +801,8 @@ class AppSettingsService:
                 "cooldown_minutes": int(normalized.cooldown_minutes),
                 "long_idle_minutes": int(normalized.long_idle_minutes),
                 "catch_up_turns": int(normalized.catch_up_turns),
+                "light_idle_minutes": int(normalized.light_idle_minutes),
+                "light_cooldown_minutes": int(normalized.light_cooldown_minutes),
             },
         )
 

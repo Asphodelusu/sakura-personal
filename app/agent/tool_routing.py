@@ -67,6 +67,29 @@ _KEYWORD_TOOL_GROUP_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # 原始对话流水；平时默认不进可见工具，需原话/聊天记录时再开
+        "history",
+        (
+            "原话",
+            "原文",
+            "逐字",
+            "聊天记录",
+            "对话记录",
+            "说过什么",
+            "我们聊过",
+            "那天说",
+            "昨天说",
+            "你当时说",
+            "我当时说",
+            "那次我们说",
+            "翻一下记录",
+            "回看对话",
+            "历史消息",
+            "聊天上下文",
+            "对话上下文",
+        ),
+    ),
+    (
         "mcp",
         (
             "搜索",
@@ -1701,21 +1724,40 @@ def _build_web_tool_capability_rule(visible_browser_mode: bool) -> str:
     )
 
 
-def _build_screen_and_desktop_routing_rule(allow_screen_observation: bool) -> str:
+def _build_screen_and_desktop_routing_rule(
+    allow_screen_observation: bool,
+    *,
+    windows_desktop_available: bool = False,
+) -> str:
+    lines: list[str] = []
     if allow_screen_observation:
-        return "\n".join(
+        lines.extend(
             [
                 "- 当用户询问当前屏幕内容、可见文字、报错含义、界面状态或“这个是什么意思”时，优先调用 observe_screen；这是 Sakura 内置视觉观察，只用于理解画面和解释，不用于鼠标坐标。",
                 "- 寒暄、打招呼、「喂」、叫名字、闲聊情绪时不要调用 observe_screen；没有明确画面依赖就直接回复。",
-                "- 当用户要求你点击、移动鼠标、输入、切换窗口或操作桌面应用时，不要用 observe_screen 推理坐标；改用 Windows MCP 的 windows__Snapshot / windows__Screenshot 作为操作前观察。",
             ]
         )
-    return "\n".join(
-        [
-            "- 当前没有可用的 Sakura 内置屏幕理解工具；不要臆造当前屏幕内容。",
-            "- 如果用户要求桌面点击、移动鼠标、输入或窗口操作，并且 Windows MCP 截图工具可用，先用 windows__Snapshot / windows__Screenshot 获取真实桌面状态。",
-        ]
-    )
+        if windows_desktop_available:
+            lines.append(
+                "- 当用户要求点击、移动鼠标、输入、切换窗口或操作桌面应用时，不要用 observe_screen 推理坐标；"
+                "改用已注册的 windows__Snapshot / windows__Screenshot 作为操作前观察。"
+            )
+        else:
+            lines.append(
+                "- 当前未启用桌面控制（Windows MCP）；不要臆造 windows__* 工具，也不要用 observe_screen 推鼠标坐标。"
+            )
+    else:
+        lines.append("- 当前没有可用的 Sakura 内置屏幕理解工具；不要臆造当前屏幕内容。")
+        if windows_desktop_available:
+            lines.append(
+                "- 若用户要求桌面点击、移动鼠标、输入或窗口操作，先用已注册的 "
+                "windows__Snapshot / windows__Screenshot 获取真实桌面状态。"
+            )
+        else:
+            lines.append(
+                "- 当前未启用桌面控制（Windows MCP）；不要臆造 windows__* 或桌面操作能力。"
+            )
+    return "\n".join(lines)
 
 
 def _should_offer_screen_observation(messages: list[ChatMessage]) -> bool:

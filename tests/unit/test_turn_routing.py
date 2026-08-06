@@ -436,10 +436,14 @@ def _plan_for(messages: list[ChatMessage], *, active: bool, turns_left: int = 8)
 
     mock_state = MagicMock()
     mock_state.active = active
+    mock_state.pending = False
     mock_state.needs_reentry_hint = False
     mock_state.consume_turn.return_value = active and turns_left > 0
 
-    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+    with (
+        patch("app.agent.turn_routing.intimacy_mode_state", mock_state),
+        patch("app.agent.turn_routing.apply_intimacy_user_utterance", return_value=None),
+    ):
         return resolve_turn_plan(
             messages,
             request,
@@ -475,18 +479,19 @@ def test_intimacy_continue_exhausted_falls_back() -> None:
     assert plan.decided_by != "rhythm_focus"
 
 
-def test_intimacy_user_turn_refreshes_even_with_exit_like_words() -> None:
-    """用户说「好了结束吧」等词：不再走确认退出，正常刷新 + 亲密路由（模型自管收尾）。"""
+def test_intimacy_user_turn_exit_words_leave_rhythm() -> None:
+    """用户说「好了结束吧」等词：代码侧直接退出亲密节奏，走正常路由。"""
+    from app.agent.builtin_tools import IntimacyModeState
+
     messages: list[ChatMessage] = [{"role": "user", "content": "好了，结束吧"}]
     request = _request_for(messages)
     settings = _settings()
     recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
 
-    mock_state = MagicMock()
-    mock_state.active = True
-    mock_state.needs_reentry_hint = False
+    state = IntimacyModeState()
+    state.enter()
 
-    with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
+    with patch("app.agent.turn_routing.intimacy_mode_state", state):
         plan = resolve_turn_plan(
             messages,
             request,
@@ -497,10 +502,8 @@ def test_intimacy_user_turn_refreshes_even_with_exit_like_words() -> None:
             recall_decision=recall,
         )
 
-    mock_state.refresh_user_reply.assert_called_once()
-    mock_state.exit.assert_not_called()
-    mock_state.consume_turn.assert_not_called()
-    assert plan.decided_by == "rhythm_focus"
+    assert state.active is False
+    assert plan.decided_by != "rhythm_focus"
 
 
 def test_intimacy_continue_consumes_not_refresh() -> None:
@@ -514,7 +517,7 @@ def test_intimacy_continue_consumes_not_refresh() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
-    mock_state.pending_exit_confirm = False
+    mock_state.pending = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -547,6 +550,7 @@ def test_intimacy_continue_legacy_user_marker_consumes() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
+    mock_state.pending = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -574,7 +578,7 @@ def test_intimacy_user_turn_refreshes() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
-    mock_state.pending_exit_confirm = False
+    mock_state.pending = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -602,7 +606,7 @@ def test_intimacy_overrides_classifier_simple() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
-    mock_state.pending_exit_confirm = False
+    mock_state.pending = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):
@@ -633,7 +637,7 @@ def test_intimacy_does_not_block_vision() -> None:
 
     mock_state = MagicMock()
     mock_state.active = True
-    mock_state.pending_exit_confirm = False
+    mock_state.pending = False
     mock_state.consume_turn.return_value = True
 
     with patch("app.agent.turn_routing.intimacy_mode_state", mock_state):

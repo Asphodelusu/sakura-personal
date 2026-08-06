@@ -44,6 +44,8 @@ DEFAULT_AUTO_MEMORY_MIN_TURNS = 2
 DEFAULT_AUTO_MEMORY_COOLDOWN_MINUTES = 25
 DEFAULT_AUTO_MEMORY_LONG_IDLE_MINUTES = 30
 DEFAULT_AUTO_MEMORY_CATCH_UP_TURNS = 12
+DEFAULT_AUTO_MEMORY_LIGHT_IDLE_MINUTES = 3
+DEFAULT_AUTO_MEMORY_LIGHT_COOLDOWN_MINUTES = 10
 MAX_CURATION_CHUNK_MESSAGES = 32
 MAX_CURATION_CHUNK_CHARS = 12000
 # 相邻消息间隔超过此时长，视为新会话段（主题切分优先于字数硬切）
@@ -78,6 +80,9 @@ class MemoryCurationSettings:
     cooldown_minutes: int = DEFAULT_AUTO_MEMORY_COOLDOWN_MINUTES
     long_idle_minutes: int = DEFAULT_AUTO_MEMORY_LONG_IDLE_MINUTES
     catch_up_turns: int = DEFAULT_AUTO_MEMORY_CATCH_UP_TURNS
+    # 轻量档：短静默停顿即整理（独立较短冷却）
+    light_idle_minutes: int = DEFAULT_AUTO_MEMORY_LIGHT_IDLE_MINUTES
+    light_cooldown_minutes: int = DEFAULT_AUTO_MEMORY_LIGHT_COOLDOWN_MINUTES
     # 旧版「每 N 轮」字段，仅用于 YAML 迁移为 catch_up_turns。
     trigger_turns: int = DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
 
@@ -88,6 +93,12 @@ class MemoryCurationSettings:
         long_idle_minutes = max(idle_minutes, min(240, int(self.long_idle_minutes)))
         catch_up_turns = max(min_turns, min(50, int(self.catch_up_turns)))
         backfill_limit = max(1, min(500, int(self.backfill_limit)))
+        # 轻量静默必须严格小于深度静默，避免两档塌缩成同一门槛
+        light_idle_minutes = max(1, min(idle_minutes - 1, int(self.light_idle_minutes)))
+        light_cooldown_minutes = max(
+            3,
+            min(cooldown_minutes, int(self.light_cooldown_minutes)),
+        )
         return MemoryCurationSettings(
             enabled=bool(self.enabled),
             backfill_limit=backfill_limit,
@@ -96,8 +107,71 @@ class MemoryCurationSettings:
             cooldown_minutes=cooldown_minutes,
             long_idle_minutes=long_idle_minutes,
             catch_up_turns=catch_up_turns,
+            light_idle_minutes=light_idle_minutes,
+            light_cooldown_minutes=light_cooldown_minutes,
             trigger_turns=int(self.trigger_turns),
         )
+
+
+def resolve_idle_curation_trigger(
+    settings: MemoryCurationSettings,
+    *,
+    silence_seconds: float,
+    pending_turns: int,
+    seconds_since_last_curation: float | None,
+    has_unprocessed_entries: bool,
+    session_boundary: bool = False,
+) -> str | None:
+    """判定自动整理触发档位。
+
+    返回 trigger 名，不触发则 None：
+    - catch_up：积压轮数兜底（跳过静默与冷却）
+    - session_boundary：跨会话补整理（跳过静默，受深度冷却约束）
+    - idle / long_idle：深度静默档（受深度冷却约束）
+    - light_idle：停顿轻量档（受轻量冷却约束）
+    """
+    normalized = settings.normalized()
+    if not normalized.enabled:
+        return None
+    if not has_unprocessed_entries:
+        return None
+    if pending_turns < 1 and not session_boundary:
+        return None
+
+    catch_up = pending_turns >= normalized.catch_up_turns
+    turns_ok = pending_turns >= normalized.min_turns
+    deep_silence = silence_seconds + 1e-6 >= normalized.idle_minutes * 60
+    light_silence = silence_seconds + 1e-6 >= normalized.light_idle_minutes * 60
+    long_idle_ok = silence_seconds + 1e-6 >= normalized.long_idle_minutes * 60
+
+    def _cooldown_ok(minutes: int) -> bool:
+        if seconds_since_last_curation is None:
+            return True
+        return seconds_since_last_curation + 1e-6 >= minutes * 60
+
+    # 1) 追赶：活跃用户永不触发的兜底
+    if catch_up:
+        return "catch_up"
+
+    # 2) 会话边界：启动/跨会话补整理
+    if session_boundary:
+        if _cooldown_ok(normalized.cooldown_minutes):
+            return "session_boundary"
+        return None
+
+    # 3) 深度静默档
+    if deep_silence and (turns_ok or long_idle_ok):
+        if _cooldown_ok(normalized.cooldown_minutes):
+            if long_idle_ok and not turns_ok:
+                return "long_idle"
+            return "idle"
+        # 深度冷却未满时，允许落入轻量档（若轻量条件也满足）
+
+    # 4) 轻量停顿档：短静默 + 最少轮数 + 轻量冷却
+    if light_silence and turns_ok and _cooldown_ok(normalized.light_cooldown_minutes):
+        return "light_idle"
+
+    return None
 
 
 def evaluate_idle_curation_trigger(
@@ -107,28 +181,20 @@ def evaluate_idle_curation_trigger(
     pending_turns: int,
     seconds_since_last_curation: float | None,
     has_unprocessed_entries: bool,
+    session_boundary: bool = False,
 ) -> bool:
-    """混合静默触发：静默 + 最少轮数/长空闲 + 整理冷却（追赶轮数可跳过冷却）。"""
-    normalized = settings.normalized()
-    if not normalized.enabled:
-        return False
-    if not has_unprocessed_entries or pending_turns < 1:
-        return False
-
-    idle_seconds = normalized.idle_minutes * 60
-    if silence_seconds + 1e-6 < idle_seconds:
-        return False
-
-    long_idle_ok = silence_seconds + 1e-6 >= normalized.long_idle_minutes * 60
-    turns_ok = pending_turns >= normalized.min_turns
-    catch_up = pending_turns >= normalized.catch_up_turns
-    if not (turns_ok or long_idle_ok or catch_up):
-        return False
-
-    if not catch_up and seconds_since_last_curation is not None:
-        if seconds_since_last_curation + 1e-6 < normalized.cooldown_minutes * 60:
-            return False
-    return True
+    """混合静默触发（bool 包装；细节见 resolve_idle_curation_trigger）。"""
+    return (
+        resolve_idle_curation_trigger(
+            settings,
+            silence_seconds=silence_seconds,
+            pending_turns=pending_turns,
+            seconds_since_last_curation=seconds_since_last_curation,
+            has_unprocessed_entries=has_unprocessed_entries,
+            session_boundary=session_boundary,
+        )
+        is not None
+    )
 
 
 def seconds_since_iso_timestamp(value: str | None) -> float | None:
@@ -1090,7 +1156,10 @@ _SELF_CURATION_TASK_PROMPT = (
     "- add/update 必须附带 evidence：从【最近的新对话】里摘一句连续原文（用户或你自己说过的话），"
     "作为这条记忆的依据；系统会校验 evidence 是否真的出现在对话里，编造证据会被丢弃。\n"
     "- evidence 尽量短而具体，不要整段粘贴；content 是你整理后的日记句，evidence 是原话锚点。\n"
-    "- mood_update / delete 不需要 evidence。\n\n"
+    "- mood_update / delete 不需要 evidence。\n"
+    "- 不要把「当前想不起来 / 检索失败 / 我说记不清」沉淀成关于某人的长期事实"
+    "（例如「他告诉我 X 是我的朋友，但我没有这段记忆」）；那是当轮状态，不是可核对的往事。"
+    "若他补充了关于旧识的新说法，应记他告诉你的事实本身，而不是记「我没有记忆」。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
     "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"memory_kind\":\"recent_status\",\"emotion\":\"happy\",\"volatile\":true,\"valid_until\":\"2026-07-20\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"evidence\":\"以后默认中文和我说话\",\"content\":\"他希望默认用中文交流\"},\n"

@@ -318,8 +318,8 @@ class TauriSettingsResult:
     tts: TauriTtsResult = field(default_factory=TauriTtsResult)
     system_extra: TauriSystemExtraResult = field(default_factory=TauriSystemExtraResult)
     memory_curation: MemoryCurationSettings = field(default_factory=MemoryCurationSettings)
-    # 渐进记忆检索开关；默认开启，前端未提交时保持 True
-    progressive_memory: bool = True
+    # 渐进记忆检索开关；默认关闭，前端未提交时保持 False
+    progressive_memory: bool = False
     plugins: TauriPluginResult = field(default_factory=TauriPluginResult)
     # ProactiveObserver 运行时配置；缺省空 dict 表示前端未提交（仅改 enabled 走 screen_awareness）。
     proactive: dict[str, Any] = field(default_factory=dict)
@@ -542,7 +542,7 @@ def build_tauri_settings_request(
     button_font_size: int = DEFAULT_BUTTON_FONT_SIZE,
     onboarding: bool = False,
     proactive_config: Mapping[str, Any] | None = None,
-    progressive_memory: bool = True,
+    progressive_memory: bool = False,
 ) -> dict[str, Any]:
     normalized_screen_awareness = screen_awareness_settings.normalized()
     normalized_proactive = normalize_proactive_config_mapping(proactive_config)
@@ -870,7 +870,7 @@ def parse_tauri_settings_payload(
         system_extra=_system_extra_from_mapping_required(system_extra),
         memory_curation=_memory_from_mapping_required(memory),
         progressive_memory=_optional_bool(
-            memory.get("progressive_memory"), default=True
+            memory.get("progressive_memory"), default=False
         ),
         plugins=_plugins_from_mapping_required(plugins),
         proactive=proactive,
@@ -1098,7 +1098,7 @@ class TauriSettingsProcess(QObject):
         onboarding: bool = False,
         persist_handler: Callable[[object, bool], bool] | None = None,
         proactive_config: Mapping[str, Any] | None = None,
-        progressive_memory: bool = True,
+        progressive_memory: bool = False,
     ) -> None:
         super().__init__(parent)
         self.base_dir = Path(base_dir)
@@ -2204,7 +2204,7 @@ def _system_extra_to_mapping(
 def _memory_to_mapping(
     settings: MemoryCurationSettings,
     *,
-    progressive_memory: bool = True,
+    progressive_memory: bool = False,
 ) -> dict[str, object]:
     return {
         "curation": {

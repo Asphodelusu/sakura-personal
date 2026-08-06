@@ -126,6 +126,10 @@ class StoragePaths:
     def memory_access_tracker_db(self) -> Path:
         return self.memory_dir / "access_tracker.db"
 
+    def memory_pending_forget_ids(self) -> Path:
+        """一次性待删除记忆 id 列表（JSON 字符串数组）；mem0 就绪后消费并清空。"""
+        return self.memory_dir / "pending_forget_ids.json"
+
     def memory_curation_state(self) -> Path:
         return self._data / "memory_curation_state.json"
 
