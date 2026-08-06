@@ -1,5 +1,8 @@
 .vscode/
 
+.nanobot/
+sessions/
+
 .env
 .env.migrated
 

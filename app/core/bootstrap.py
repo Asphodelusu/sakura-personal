@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.agent import AgentRuntime, MemoryStore, ReminderStore, ToolRegistry, create_builtin_tool_registry
+from app.agent.history_tools import HistoryStoreRef
 from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
 from app.agent.mcp.settings import MCPRuntimeSettings
 from app.agent.memory_curator import MemoryCurator, MemoryCurationState
@@ -137,17 +138,19 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     )
     memory_store.preload(wait=False)
     reminder_store = ReminderStore(StoragePaths(base_dir).reminders_store())
+    history_store = create_history_store(base_dir, character_profile)
+    history_ref = HistoryStoreRef(history_store)
     tool_registry = create_builtin_tool_registry(
         base_dir,
         memory_store,
         reminder_store,
+        history=history_ref,
     )
     extension_registry = ExtensionRegistry()
     extension_registry.apply_tools(tool_registry)
     plugin_manager = PluginManager(base_dir=base_dir, resource_registry=resource_registry)
     mcp_settings = settings_service.load_mcp_runtime_settings()
     runtime_loop_settings = settings_service.load_runtime_loop_settings()
-    history_store = create_history_store(base_dir, character_profile)
     agent_runtime = AgentRuntime(
         api_client=api_client,
         vision_api_client=llm_clients.vision,
@@ -165,6 +168,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         character_id=character_profile.id,
         character_name=character_profile.display_name,
     )
+    agent_runtime.bind_history_store_ref(history_ref)
     agent_runtime.update_character(
         system_prompt,
         character_profile.reply_tones,
@@ -286,10 +290,17 @@ def build_deferred_services(
             {"provider": type(tts_provider).__name__},
         )
 
+        history_ref = getattr(context.agent_runtime, "history_store_ref", None)
+        if history_ref is None:
+            history_ref = HistoryStoreRef(context.history_store)
+            context.agent_runtime.bind_history_store_ref(history_ref)
+        else:
+            history_ref.store = context.history_store
         tool_registry = create_builtin_tool_registry(
             base_dir,
             context.memory_store,
             context.reminder_store,
+            history=history_ref,
         )
         tool_registry.set_free_access_enabled(context.tool_registry.free_access_enabled)
         extension_registry = ExtensionRegistry()

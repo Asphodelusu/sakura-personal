@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
+from app.agent.history_tools import (
+    HistoryStoreRef,
+    handle_history_read,
+    handle_history_search,
+)
 from app.agent.memory import MemoryStore
 from app.agent.memory_timeline import DEFAULT_TIMELINE_AFTER, DEFAULT_TIMELINE_BEFORE, build_timeline
 from app.agent.reminders import ReminderStore
@@ -146,6 +151,7 @@ def create_builtin_tool_registry(
     base_dir: Path,
     memory: MemoryStore | None = None,
     reminders: ReminderStore | None = None,
+    history: HistoryStoreRef | None = None,
 ) -> ToolRegistry:
     paths = StoragePaths(base_dir)
     store = TodoStore(paths.tasks_store())
@@ -154,6 +160,8 @@ def create_builtin_tool_registry(
     # base_dir（主链路总会注入 memory，未实际触发），这里一并修正
     memory = memory or MemoryStore(base_dir=base_dir)
     reminders = reminders or ReminderStore(paths.reminders_store())
+    # 不自动建 ChatHistoryStore：registry 不知角色 id；history=None 时工具优雅降级
+    history_ref = history if history is not None else HistoryStoreRef(None)
     registry = ToolRegistry(
         [
             create_screen_observation_tool(),
@@ -313,6 +321,7 @@ def create_builtin_tool_registry(
                 requires_confirmation=True,
                 group="desktop",
             ),
+            *_history_tools(history_ref),
             Tool(
                 name="memory_search",
                 description=(
@@ -500,13 +509,18 @@ def create_builtin_tool_registry(
     return registry
 
 
-def create_mobile_tool_registry(memory: MemoryStore) -> ToolRegistry:
-    """手机端工具表：记忆读写 + 本机时间；不含屏幕/桌面/需确认工具。
+def create_mobile_tool_registry(
+    memory: MemoryStore,
+    history: HistoryStoreRef | None = None,
+) -> ToolRegistry:
+    """手机端工具表：记忆读写 + 历史查询 + 本机时间；不含屏幕/桌面/需确认工具。
 
     写入仍落到电脑端同一 MemoryStore，与桌面长期记忆共用。
     """
+    history_ref = history if history is not None else HistoryStoreRef(None)
     registry = ToolRegistry(
         [
+            *_history_tools(history_ref),
             Tool(
                 name="memory_search",
                 description=(
@@ -772,6 +786,80 @@ class TodoStore:
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def _history_tools(history_ref: HistoryStoreRef) -> list[Tool]:
+    """原始对话历史查询工具（桌面 / 移动端共用定义）。"""
+    return [
+        Tool(
+            name="history_search",
+            description=(
+                "查询原始对话记录（不是长期记忆）。"
+                "可按相对时间（昨天/今天/约N小时前/YYYY-MM-DD 等）和/或关键词定位。"
+                "有时间窗或关键词时按时间正序分页（从对话开头读）；"
+                "返回 total_count/has_more，若 has_more 请用相同条件加 offset 翻页，不要改词重搜。"
+                "无筛选时返回最近若干条。找到 id 后用 history_read 看前后上下文。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "time": {
+                        "type": "string",
+                        "description": (
+                            "可选时间窗：昨天/今天/前天/上周三、昨天下午/昨天晚上、"
+                            "昨天晚上一点到两点、N分钟前/约N小时前、YYYY-MM-DD/ISO。空=不限。"
+                        ),
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "可选结束时间（同 time 格式）。通常只需 time。",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "可选关键词，匹配原文或译文。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "每页条数，默认 20，上限 50。",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "分页偏移，默认 0。has_more 时用上次的 next_offset。",
+                    },
+                },
+            },
+            handler=lambda arguments, _ref=history_ref: handle_history_search(_ref, arguments),
+            group="core",
+        ),
+        Tool(
+            name="history_read",
+            description=(
+                "以某条对话消息为锚点，读取它前后的原始对话上下文。"
+                "先用 history_search 找到 entry_id，再调用本工具展开。"
+                "这是原始对话记录，不是长期记忆时间线（那是 memory_timeline）。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "integer",
+                        "description": "锚点消息 id（来自 history_search）。",
+                    },
+                    "before": {
+                        "type": "integer",
+                        "description": "锚点之前的条数，默认 3，上限 10。",
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "锚点之后的条数，默认 3，上限 10。",
+                    },
+                },
+                "required": ["entry_id"],
+            },
+            handler=lambda arguments, _ref=history_ref: handle_history_read(_ref, arguments),
+            group="core",
+        ),
+    ]
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:
