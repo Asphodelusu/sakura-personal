@@ -54,6 +54,22 @@ def test_load_paths_include_id(store: ChatHistoryStore) -> None:
     assert has_more is False
 
 
+def test_count_and_load_slice_offset(store: ChatHistoryStore) -> None:
+    ids = _seed(
+        store,
+        [
+            ("2026-07-20T10:00:00+08:00", "user", "一", ""),
+            ("2026-07-20T10:01:00+08:00", "assistant", "二", "二"),
+            ("2026-07-20T10:02:00+08:00", "user", "三", ""),
+        ],
+    )
+    assert store.count() == 3
+    sliced = store.load_slice(1)
+    assert [e.id for e in sliced] == ids[1:]
+    limited = store.load_slice(1, limit=1)
+    assert [e.id for e in limited] == ids[1:2]
+
+
 def test_created_at_index_exists(store: ChatHistoryStore) -> None:
     rows = store._conn.execute("PRAGMA index_list('chat_history')").fetchall()
     names = {row["name"] for row in rows}

@@ -112,6 +112,36 @@ def test_portrait_selection_hints_lists_tone_and_emotion_groups() -> None:
     hints = profile.portrait_selection_hints
     assert "tone「害羞」→ portrait「害羞脸红」" in hints
     assert "害羞" in hints
+    # 默认不含冷门全量目录
+    assert "语境合适时可用" not in hints
+
+
+def test_core_portrait_labels_and_full_catalog_hints() -> None:
+    profile = _sakura_like_profile()
+    core = profile.core_portrait_labels(extra=["开心脸红"])
+    assert "站立待机" in core
+    assert "害羞脸红" in core
+    assert "开心脸红" in core
+    # 不在 tone/emotion map 且未 extra 的不应进核心白名单
+    assert "张嘴疑问" not in core
+    full_hints = profile.build_portrait_selection_hints(include_catalog=True)
+    assert "语境合适时可用 portrait「张嘴疑问」" in full_hints
+
+
+def test_prompt_portraits_expand_on_outfit_request() -> None:
+    from unittest.mock import MagicMock
+
+    from app.agent.runtime import AgentRuntime
+    from app.llm.api_client import OpenAICompatibleClient
+
+    runtime = AgentRuntime(MagicMock(spec=OpenAICompatibleClient), "system")
+    runtime.character_profile = _sakura_like_profile()
+    runtime.reply_portraits = list(runtime.character_profile.portrait_choices)
+    slim = runtime._prompt_reply_portraits(current_input="在吗")
+    assert "张嘴疑问" not in slim
+    full = runtime._prompt_reply_portraits(current_input="换个立绘表情看看")
+    assert "张嘴疑问" in full
+    assert runtime._wants_full_portrait_catalog("帮我换装") is True
 
 
 def test_load_tone_portrait_map_falls_back_to_global_table() -> None:

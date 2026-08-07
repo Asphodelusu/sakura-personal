@@ -54,6 +54,11 @@ CURATION_SESSION_GAP_SECONDS = 20 * 60
 CURATION_MEMORY_SNAPSHOT_LIMIT = 500
 # 现有记忆清单注入的字符预算，超出后截断以保护 token 开销。
 CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET = 20000
+# light_idle：详细正文条数 + 索引条数 + 字符预算（远小于全量快照）
+LIGHT_CURATION_DETAIL_LIMIT = 36
+LIGHT_CURATION_INDEX_LIMIT = 100
+LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET = 6000
+LIGHT_CURATION_INDEX_TITLE_CHARS = 48
 # 单次整理允许写回的操作数量上限，避免异常输出放大写入。
 MAX_CURATION_OPERATIONS = 50
 MIN_AUTO_WRITE_CONFIDENCE = 0.55
@@ -248,6 +253,9 @@ class MemoryCurationState:
     def last_curation_at(self) -> str:
         return str(self.snapshot().get("last_curation_at") or "").strip()
 
+    def processed_history_count(self) -> int:
+        return int(self.snapshot()["processed_history_count"])
+
     def increment_pending_turns(self) -> int:
         state = self.snapshot()
         state["pending_turns"] = int(state["pending_turns"]) + 1
@@ -282,6 +290,46 @@ class MemoryCurationState:
         if processed < 0 or processed > len(entries):
             processed = 0
         return entries[processed:]
+
+    def has_unprocessed_in_store(self, store: Any) -> bool:
+        """仅 COUNT，供 60s 轮询判断，避免全量 load。"""
+        count_fn = getattr(store, "count", None)
+        if not callable(count_fn):
+            return False
+        try:
+            total = int(count_fn())
+        except Exception:  # noqa: BLE001
+            return False
+        processed = self.processed_history_count()
+        if processed < 0 or processed > total:
+            return total > 0
+        return total > processed
+
+    def load_unprocessed_from_store(self, store: Any) -> list[ChatHistoryEntry]:
+        """按游标增量读取未整理历史。"""
+        count_fn = getattr(store, "count", None)
+        slice_fn = getattr(store, "load_slice", None)
+        if not callable(count_fn) or not callable(slice_fn):
+            load_fn = getattr(store, "load", None)
+            if not callable(load_fn):
+                return []
+            try:
+                return self.unprocessed_entries(list(load_fn()))
+            except Exception:  # noqa: BLE001
+                return []
+        try:
+            total = int(count_fn())
+        except Exception:  # noqa: BLE001
+            return []
+        processed = self.processed_history_count()
+        if processed < 0 or processed > total:
+            processed = 0
+        if processed >= total:
+            return []
+        try:
+            return list(slice_fn(processed))
+        except Exception:  # noqa: BLE001
+            return []
 
     def _save(self, state: dict[str, Any]) -> None:
         atomic_write_text(
@@ -339,12 +387,15 @@ class MemoryCurator:
         entries: list[ChatHistoryEntry],
         *,
         cancel_checker: CancelChecker | None = None,
+        snapshot_profile: str = "full",
     ) -> MemoryCurationResult:
         if self.api_client is None:
             # 缺少可用模型时无法进行第一人称整理，直接跳过而不报错。
             return MemoryCurationResult(processed_entries=len(entries))
         if not _entries_for_model(entries):
             return MemoryCurationResult(processed_entries=len(entries))
+
+        profile = "light" if str(snapshot_profile or "").strip().lower() == "light" else "full"
 
         # 整理前先确定性关掉过期约定，并收集待一次性复盘的条目。
         just_expired: list[dict[str, Any]] = []
@@ -371,7 +422,7 @@ class MemoryCurator:
             dialog_entries = _entries_for_model(chunk)
             if not dialog_entries:
                 continue
-            # 每个 chunk 整理前重新拉取全量记忆，确保前一段写入的记忆能被后一段对照，避免重复。
+            # 每个 chunk 整理前重新拉取全量记忆；写回校验用全量 id，prompt 可按档位瘦身。
             existing = self._load_existing_memories()
             check_cancelled(cancel_checker)
             review_block = ""
@@ -384,6 +435,7 @@ class MemoryCurator:
                 cancel_checker=cancel_checker,
                 just_expired_commitments_block=review_block,
                 prior_chunk_writes=prior_chunk_writes,
+                snapshot_profile=profile,
             )
             check_cancelled(cancel_checker)
             counts = self._apply_operations(
@@ -511,14 +563,23 @@ class MemoryCurator:
         cancel_checker: CancelChecker | None = None,
         just_expired_commitments_block: str = "",
         prior_chunk_writes: list[str] | None = None,
+        snapshot_profile: str = "full",
     ) -> list[dict[str, Any]]:
         """让模型以第一人称对照已有记忆，产出整理操作；解析失败时视为无操作。"""
 
         system_prompt = self._build_self_curation_system_prompt()
         mood_history_block = self._load_mood_history_text()
         user_emotion_history_block = self._load_user_emotion_history_text()
+        if snapshot_profile == "light":
+            existing_block = _format_existing_memories_light(
+                existing,
+                dialog_entries,
+                base_dir=getattr(self.memory_store, "base_dir", None),
+            )
+        else:
+            existing_block = _format_existing_memories(existing)
         user_prompt = _build_curation_user_prompt(
-            _format_existing_memories(existing),
+            existing_block,
             dialog_entries,
             mood_history_block=mood_history_block,
             user_emotion_history_block=user_emotion_history_block,
@@ -551,6 +612,8 @@ class MemoryCurator:
             "第一人称记忆整理抽取完成",
             {
                 "existing_count": len(existing),
+                "snapshot_profile": snapshot_profile,
+                "prompt_existing_chars": len(existing_block),
                 "dialog_count": len(dialog_entries),
                 "has_mood_history": bool(mood_history_block),
                 "operation_count": len(operations),
@@ -1363,6 +1426,147 @@ def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
             "【独处感想（非事实，禁止据此写成新事实）】\n" + "\n".join(reflection_lines)
         )
     return "\n\n".join(parts)
+
+
+def _format_existing_memories_light(
+    memories: list[dict[str, Any]],
+    dialog_entries: list[dict[str, str]],
+    *,
+    base_dir: Path | None = None,
+) -> str:
+    """light_idle：详细子集 + id 索引，控制单次整理输入体积。"""
+    detail, index_only = _select_light_curation_memories(
+        memories,
+        dialog_entries,
+        base_dir=base_dir,
+    )
+    detail_block = _format_existing_memories(detail)
+    # 压到 light 预算：细节块优先，索引吃剩余
+    if len(detail_block) > LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET:
+        detail_block = detail_block[: LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET - 20] + "\n…(截断)"
+    index_budget = max(0, LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET - len(detail_block) - 80)
+    index_lines: list[str] = []
+    used = 0
+    for memory in index_only:
+        memory_id = str(memory.get("id", "")).strip()
+        content = str(memory.get("content", "")).strip()
+        if not memory_id or not content:
+            continue
+        title = content.replace("\n", " ")[:LIGHT_CURATION_INDEX_TITLE_CHARS]
+        if len(content) > LIGHT_CURATION_INDEX_TITLE_CHARS:
+            title += "…"
+        line = f"- [{memory_id}] {title}"
+        if used + len(line) > index_budget and index_lines:
+            break
+        index_lines.append(line)
+        used += len(line) + 1
+    parts = [
+        "【详细（近期/相关，可直接 update）】\n" + (detail_block or "（暂无）"),
+    ]
+    if index_lines:
+        parts.append(
+            "【索引（仅 id+摘要；确需改写时用 id，勿凭摘要编造正文）】\n"
+            + "\n".join(index_lines)
+        )
+    debug_log(
+        "Memory",
+        "light 整理快照已组装",
+        {
+            "total": len(memories),
+            "detail": len(detail),
+            "index": len(index_lines),
+            "chars": sum(len(p) for p in parts),
+        },
+    )
+    return "\n\n".join(parts)
+
+
+def _select_light_curation_memories(
+    memories: list[dict[str, Any]],
+    dialog_entries: list[dict[str, str]],
+    *,
+    base_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """选出详细注入子集，其余进短索引。"""
+    if not memories:
+        return [], []
+    dialog_text = build_dialog_corpus(dialog_entries).casefold()
+    recent_ids: set[str] = set()
+    if base_dir is not None:
+        try:
+            from app.agent.access_tracker import AccessTracker
+            from app.storage.paths import StoragePaths
+
+            tracker = AccessTracker(StoragePaths(base_dir).memory_access_tracker_db())
+            try:
+                recent_ids = {
+                    mid for mid, _ in tracker.list_recent_accessed(limit=LIGHT_CURATION_DETAIL_LIMIT)
+                }
+            finally:
+                tracker.close()
+        except Exception:  # noqa: BLE001
+            recent_ids = set()
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for memory in memories:
+        memory_id = str(memory.get("id", "")).strip()
+        content = str(memory.get("content", "")).strip()
+        if not memory_id or not content:
+            continue
+        score = 0.0
+        kind = memory_kind_of(memory)
+        if kind in {"commitment", "recent_status"}:
+            score += 40.0
+        if memory_id in recent_ids:
+            score += 35.0
+        if memory_record_is_reflection(memory):
+            score -= 15.0
+        # 与本轮对话的粗关键词重合（用对话侧 token 去正文里找，避免中文整句成一个 token）
+        content_cf = content.casefold()
+        overlap = sum(1 for token in _light_curation_tokens(dialog_text) if token in content_cf)
+        score += min(30.0, overlap * 6.0)
+        updated = str(memory.get("updated_at") or memory.get("created_at") or "")
+        # ISO 时间字符串可直接按字典序近似新鲜度
+        if updated:
+            score += 0.001  # 稳定排序扰动；真正新鲜度靠 updated 二次键
+        scored.append((score, memory))
+
+    scored.sort(
+        key=lambda item: (
+            item[0],
+            str(item[1].get("updated_at") or item[1].get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+    detail = [m for _, m in scored[:LIGHT_CURATION_DETAIL_LIMIT]]
+    detail_ids = {str(m.get("id") or "").strip() for m in detail}
+    index_only = [
+        m
+        for _, m in scored[LIGHT_CURATION_DETAIL_LIMIT : LIGHT_CURATION_DETAIL_LIMIT + LIGHT_CURATION_INDEX_LIMIT]
+        if str(m.get("id") or "").strip() not in detail_ids
+    ]
+    return detail, index_only
+
+
+_LIGHT_TOKEN_RE = re.compile(r"[\w\u3040-\u30ff\u3400-\u9fff]{2,}")
+
+
+def _light_curation_tokens(text: str) -> list[str]:
+    """抽检索词；中文长串拆成 2-gram，避免整句匹配失败。"""
+    out: list[str] = []
+    for tok in _LIGHT_TOKEN_RE.findall(text or ""):
+        piece = tok.casefold()
+        if len(piece) <= 3:
+            out.append(piece)
+            continue
+        # 优先按 2 字窗；拉丁词保留整词
+        if re.fullmatch(r"[a-z0-9_]+", piece):
+            out.append(piece)
+        else:
+            out.extend(piece[i : i + 2] for i in range(0, len(piece) - 1))
+        if len(out) >= 40:
+            break
+    return out[:40]
 
 
 def _dialog_speaker_label(role: str) -> str:

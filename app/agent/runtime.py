@@ -4,6 +4,7 @@ from pathlib import Path
 
 import json
 import time
+from collections import deque
 from threading import Lock
 from typing import Any, Callable, cast
 
@@ -202,6 +203,8 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         self.character_name = character_name.strip()
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
+        # 最近用过的立绘，供日常提示词精简白名单（全量仍在 reply_portraits）
+        self._recent_portraits: deque[str] = deque(maxlen=8)
         self.character_profile: CharacterProfile | None = None
         self._lore_index: LoreIndex | None = None
         self._lore_index_path: str = ""

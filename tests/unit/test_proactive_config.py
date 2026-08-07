@@ -20,9 +20,13 @@ def test_proactive_config_from_dict_empty_matches_defaults() -> None:
     assert loaded.content_min_chars == base.content_min_chars
     assert loaded.content_quiet_seconds == base.content_quiet_seconds
     assert loaded.game_ocr_enabled == base.game_ocr_enabled
+    assert loaded.adaptive_interval_min == base.adaptive_interval_min
+    assert loaded.silent_eval_cooldown_seconds == base.silent_eval_cooldown_seconds
     assert base.focus_settle_delay == 15
     assert base.window_switch_cooldown == 60
     assert base.content_quiet_seconds == 180
+    assert base.adaptive_interval_min == 300
+    assert base.silent_eval_cooldown_seconds == 300
 
 
 def test_proactive_config_from_dict_overrides() -> None:

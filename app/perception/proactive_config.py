@@ -28,8 +28,11 @@ class ProactiveConfig:
     request_timeout: float = 60.0
     eval_temperature: float = 0.7
     max_tokens: int = 1024
-    adaptive_interval_min: float = 60.0
+    # くつろぎ 下限抬到 300s，避免放松态每分钟烧一轮 VLM+决策
+    adaptive_interval_min: float = 300.0
     adaptive_interval_max: float = 1800.0
+    # 决策 LLM 选择不发言 / 失败后，timer/content/idle 的额外冷却（切窗仍可触发）
+    silent_eval_cooldown_seconds: float = 300.0
     away_max_seconds: float = 12 * 3600
 
     @classmethod
@@ -72,6 +75,9 @@ class ProactiveConfig:
             ),
             adaptive_interval_max=float(
                 d.get("adaptive_interval_max", base.adaptive_interval_max)
+            ),
+            silent_eval_cooldown_seconds=float(
+                d.get("silent_eval_cooldown_seconds", base.silent_eval_cooldown_seconds)
             ),
             away_max_seconds=float(d.get("away_max_seconds", base.away_max_seconds)),
         )

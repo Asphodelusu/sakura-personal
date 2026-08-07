@@ -59,6 +59,7 @@ class _RawCompletionClient(Protocol):
         temperature: float = 0.8,
         *,
         request_timeout: float | None = None,
+        max_attempts: int | None = None,
         **chat_params: Any,
     ) -> str: ...
 
@@ -167,6 +168,7 @@ def rewrite_memory_query_llm(
             [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             temperature=0.2,
             request_timeout=request_timeout,
+            max_attempts=1,
             max_tokens=120,
             response_format={"type": "json_object"},
             thinking={"type": "disabled"},

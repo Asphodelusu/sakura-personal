@@ -404,12 +404,14 @@ class OpenAICompatibleClient:
         runtime_context: str = "",
         task: str | None = None,
         request_timeout: float | None = None,
+        max_attempts: int | None = None,
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。
 
         task 仅由 RoutingLlmClient / DualProviderLlmClient 消费，底层直连时忽略。
         request_timeout 仅覆盖本次 HTTP 读/写超时，不重建连接池。
+        max_attempts 覆盖默认重试次数（后台短任务可传 1，避免 8s×3 拖死主路径）。
         """
         _ = task
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
@@ -444,6 +446,7 @@ class OpenAICompatibleClient:
                 "has_image": messages_contain_image(payload["messages"]),
                 "messages": summarize_messages(payload["messages"]),
                 "chat_params": _filter_supported_chat_params(chat_params),
+                "max_attempts": max_attempts,
             },
         )
         try:
@@ -451,6 +454,7 @@ class OpenAICompatibleClient:
                 payload,
                 cancel_checker=cancel_checker,
                 request_timeout=request_timeout,
+                max_attempts=max_attempts,
             )
         except ApiRequestError as exc:
             if (
@@ -475,6 +479,7 @@ class OpenAICompatibleClient:
                     payload,
                     cancel_checker=cancel_checker,
                     request_timeout=request_timeout,
+                    max_attempts=max_attempts,
                 )
             else:
                 raise
@@ -720,6 +725,7 @@ class OpenAICompatibleClient:
         *,
         cancel_checker: CancelChecker | None = None,
         request_timeout: float | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         fallback_payload = dict(payload)
         for param in self._unsupported_chat_params:
@@ -731,6 +737,7 @@ class OpenAICompatibleClient:
                     fallback_payload,
                     cancel_checker=cancel_checker,
                     request_timeout=request_timeout,
+                    max_attempts=max_attempts,
                 )
             except ApiRequestError as exc:
                 if "response_format" in fallback_payload and _is_response_format_unsupported_error(exc):
@@ -773,6 +780,7 @@ class OpenAICompatibleClient:
         *,
         cancel_checker: CancelChecker | None = None,
         request_timeout: float | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         """调用 OpenAI 兼容的 chat/completions 接口并返回 JSON 数据。"""
         check_cancelled(cancel_checker)
@@ -797,6 +805,7 @@ class OpenAICompatibleClient:
                 headers={"Content-Type": "application/json"},
                 cancel_checker=cancel_checker,
                 request_timeout=request_timeout,
+                max_attempts=max_attempts,
             )
             check_cancelled(cancel_checker)
             try:
@@ -824,9 +833,11 @@ class OpenAICompatibleClient:
         headers: dict[str, str] | None = None,
         cancel_checker: CancelChecker | None = None,
         request_timeout: float | None = None,
+        max_attempts: int | None = None,
     ) -> str:
         """使用 httpx 连接池发送 HTTP 请求，支持自动重试。"""
         last_error: BaseException | None = None
+        attempts = MAX_API_RETRY_ATTEMPTS if max_attempts is None else max(1, int(max_attempts))
         # httpx 0.28+：timeout 只能传给 request()/stream()，不能传给 send()
         request_kwargs: dict[str, Any] = {
             "content": content,
@@ -836,7 +847,7 @@ class OpenAICompatibleClient:
             request_kwargs["timeout"] = httpx.Timeout(
                 request_timeout, read=request_timeout
             )
-        for attempt in range(1, MAX_API_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, attempts + 1):
             check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
@@ -860,7 +871,7 @@ class OpenAICompatibleClient:
                     )
                     if (
                         status_code not in {429, 500, 502, 503, 504}
-                        or attempt == MAX_API_RETRY_ATTEMPTS
+                        or attempt == attempts
                     ):
                         raise ApiRequestError(
                             _format_api_http_error(status_code, response_body, url)
@@ -895,7 +906,7 @@ class OpenAICompatibleClient:
                         "error_body": error_body,
                     },
                 )
-                if status_code not in {429, 500, 502, 503, 504} or attempt == MAX_API_RETRY_ATTEMPTS:
+                if status_code not in {429, 500, 502, 503, 504} or attempt == attempts:
                     raise ApiRequestError(_format_api_http_error(status_code, error_body, url)) from exc
                 last_error = exc
             except (httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
@@ -908,7 +919,7 @@ class OpenAICompatibleClient:
                         "error": str(exc),
                     },
                 )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
+                if attempt == attempts:
                     raise ApiRequestError(f"API 请求失败：{exc}") from exc
                 last_error = exc
                 self._close_http()
@@ -921,7 +932,7 @@ class OpenAICompatibleClient:
                         "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                     },
                 )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
+                if attempt == attempts:
                     raise ApiRequestError("API 请求超时。") from exc
                 last_error = exc
 
@@ -930,7 +941,7 @@ class OpenAICompatibleClient:
                 "准备重试请求",
                 {
                     "attempt": attempt,
-                    "max_attempts": MAX_API_RETRY_ATTEMPTS,
+                    "max_attempts": attempts,
                     "delay_seconds": API_RETRY_DELAY_SECONDS * attempt,
                     "last_error": str(last_error),
                 },

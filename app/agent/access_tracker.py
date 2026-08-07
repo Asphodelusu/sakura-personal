@@ -122,6 +122,17 @@ class AccessTracker:
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
+    def list_recent_accessed(self, *, limit: int = 40) -> list[tuple[str, str]]:
+        """按 last_accessed 降序取最近访问的记忆 id（供 light 整理快照）。"""
+        cap = max(1, min(int(limit), 200))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT memory_id, last_accessed FROM memory_access "
+                "ORDER BY last_accessed DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

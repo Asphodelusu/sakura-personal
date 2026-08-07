@@ -708,6 +708,7 @@ class AppSettingsService:
             enabled=_bool_value(section.get("enabled"), True),
             window_size=_int_value(section.get("window_size"), 6),
             timeout_seconds=_int_value(section.get("timeout_seconds"), 8),
+            join_timeout_seconds=_int_value(section.get("join_timeout_seconds"), 3),
             skip_fast_tier=_bool_value(section.get("skip_fast_tier"), True),
             skip_proactive=_bool_value(section.get("skip_proactive"), True),
         ).normalized()
@@ -722,6 +723,7 @@ class AppSettingsService:
                 enabled=bool(getattr(settings, "enabled", True)),
                 window_size=int(getattr(settings, "window_size", 6)),
                 timeout_seconds=int(getattr(settings, "timeout_seconds", 3)),
+                join_timeout_seconds=int(getattr(settings, "join_timeout_seconds", 3)),
                 skip_fast_tier=bool(getattr(settings, "skip_fast_tier", True)),
                 skip_proactive=bool(getattr(settings, "skip_proactive", True)),
             ).normalized()
@@ -731,6 +733,7 @@ class AppSettingsService:
             "enabled": bool(normalized.enabled),
             "window_size": int(normalized.window_size),
             "timeout_seconds": int(normalized.timeout_seconds),
+            "join_timeout_seconds": int(normalized.join_timeout_seconds),
             "skip_fast_tier": bool(normalized.skip_fast_tier),
             "skip_proactive": bool(normalized.skip_proactive),
         }
@@ -919,6 +922,7 @@ def normalize_proactive_config_mapping(raw: Mapping[str, Any] | None) -> dict[st
         "max_tokens": int(cfg.max_tokens),
         "adaptive_interval_min": float(cfg.adaptive_interval_min),
         "adaptive_interval_max": float(cfg.adaptive_interval_max),
+        "silent_eval_cooldown_seconds": float(cfg.silent_eval_cooldown_seconds),
         "away_max_seconds": float(cfg.away_max_seconds),
         "privacy": {
             "blocked_processes": processes,

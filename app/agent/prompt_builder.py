@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import app.agent.tool_routing as tool_routing
 from app.agent.reply_verbosity import decision_from_interest, format_verbosity_guidance
+from app.agent.web_evidence import _latest_user_text
 from app.core.debug_log import debug_log
 from app.llm.api_client import ChatMessage
 from app.llm.chat_reply import ChatReply, sanitize_reply_tones
@@ -333,14 +334,18 @@ class AgentRuntimePromptMixin:
             if recent_messages is not None
             else self._turn_verbosity_guidance
         )
+        current_input = (
+            _latest_user_text(recent_messages) if recent_messages is not None else ""
+        )
+        prompt_portraits = self._prompt_reply_portraits(current_input=current_input)
         # 插件补丁文本只算一次；_apply_reply_protocol_patches 与
         # _combine_extra_instructions 共用，避免重复拼接同一字符串。
         _plugin_patch_text = self._reply_protocol_patch_text()
         reply_protocol = _apply_patch_text(
             build_agent_reply_protocol(
                 self._effective_reply_tones(),
-                self.reply_portraits,
-                portrait_hints=self._portrait_hints() or None,
+                prompt_portraits,
+                portrait_hints=self._portrait_hints(current_input=current_input) or None,
                 verbosity_guidance=verbosity or None,
             ),
             _plugin_patch_text,
@@ -446,7 +451,7 @@ class AgentRuntimePromptMixin:
         proactive_rules = build_proactive_check_tool_system_prefix(
             "",
             self.reply_tones,
-            self.reply_portraits,
+            self._prompt_reply_portraits(),
             max_tool_calls_per_step=self.runtime_loop_settings.max_tool_calls_per_step,
             max_tool_calls_per_turn=self.runtime_loop_settings.max_tool_calls_per_turn,
             extra_instructions=self._combine_extra_instructions(extra_instructions),
@@ -506,7 +511,10 @@ class AgentRuntimePromptMixin:
         snapshot: ContextSnapshot | None = None,
     ):
         event_rules = build_event_system_prompt(
-            "", self.reply_tones, self.reply_portraits, event_type=event_type
+            "",
+            self.reply_tones,
+            self._prompt_reply_portraits(),
+            event_type=event_type,
         )
         sections = [
             *self._persona_sections(),

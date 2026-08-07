@@ -243,6 +243,37 @@ class ChatHistoryStore:
             ).fetchall()
         return [self._row_to_entry(row) for row in rows]
 
+    def count(self) -> int:
+        """当前库中消息条数（含 system 等非对话角色）。"""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM chat_history").fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def load_slice(self, offset: int, *, limit: int | None = None) -> list[ChatHistoryEntry]:
+        """按行偏移读取（0-based，与 processed_history_count 对齐）。"""
+        try:
+            off = max(0, int(offset))
+        except (TypeError, ValueError):
+            off = 0
+        with self._lock:
+            if limit is None:
+                rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    "ORDER BY id ASC LIMIT -1 OFFSET ?",
+                    (off,),
+                ).fetchall()
+            else:
+                try:
+                    capped = max(1, int(limit))
+                except (TypeError, ValueError):
+                    capped = 1
+                rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    "ORDER BY id ASC LIMIT ? OFFSET ?",
+                    (capped, off),
+                ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
     def load_tail(self, limit: int) -> tuple[list[ChatHistoryEntry], bool]:
         """读取最后 N 条记录。返回 (entries, has_more)。"""
         # 多取一条用于判断 has_more，避免额外 COUNT 查询

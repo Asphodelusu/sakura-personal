@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from app.agent.context_orchestrator import ContextOrchestrator, build_context_request
 from app.agent.inner_thought import (
+    DEFAULT_INNER_THOUGHT_JOIN_TIMEOUT_SECONDS,
     InnerThoughtResult,
     InnerThoughtSettings,
     InnerThoughtWindow,
@@ -28,7 +29,7 @@ from app.agent.inner_thought import (
 from app.agent.local_context import build_media_context_fragment
 from app.agent.lore import LoreIndex, build_lore_context_fragment, load_lore_index
 from app.agent.memory import MemoryStore
-from app.agent.memory_recall import MemoryRecallService
+from app.agent.memory_recall import MemoryRecallResult, MemoryRecallService
 from app.agent.prompt_builder import _INTIMACY_EXTRA_TONES
 from app.agent.sensory_context import build_sensory_impression_fragment
 from app.agent.session_state_context import (
@@ -46,7 +47,15 @@ from app.plugins.models import ContextProviderContribution
 class _InnerThoughtLaunch:
     """step0 与记忆召回并行的内心独白任务句柄。"""
 
-    future: Future[str]
+    future: Future[Any]
+    executor: ThreadPoolExecutor
+
+
+@dataclass(frozen=True)
+class _MemoryRecallLaunch:
+    """step0 与独白并行的记忆召回（含 query 改写）任务句柄。"""
+
+    future: Future[Any]
     executor: ThreadPoolExecutor
 
 
@@ -157,9 +166,14 @@ class AgentRuntimeContextMixin:
         """join Flash worker；仅在主线程写入滑动窗口，并接通 interest→篇幅。"""
         if launch is None:
             return
+        settings = self.inner_thought_settings.normalized()
+        join_timeout = float(
+            getattr(settings, "join_timeout_seconds", DEFAULT_INNER_THOUGHT_JOIN_TIMEOUT_SECONDS)
+        )
         result = InnerThoughtResult(text="", interest=None)
+        timed_out = False
         try:
-            raw = launch.future.result()
+            raw = launch.future.result(timeout=join_timeout)
             if isinstance(raw, InnerThoughtResult):
                 result = raw
             elif isinstance(raw, str):
@@ -167,6 +181,14 @@ class AgentRuntimeContextMixin:
                 result = InnerThoughtResult(text=str(raw or "").strip(), interest=None)
             elif raw is not None:
                 result = InnerThoughtResult(text=str(raw).strip(), interest=None)
+        except TimeoutError:
+            timed_out = True
+            debug_log(
+                "InnerThought",
+                "内心独白 join 超时，已跳过",
+                {"join_timeout": join_timeout},
+            )
+            result = InnerThoughtResult(text="", interest=None)
         except Exception as exc:  # noqa: BLE001 — 独白失败不阻断主链路
             debug_log(
                 "InnerThought",
@@ -175,7 +197,8 @@ class AgentRuntimeContextMixin:
             )
             result = InnerThoughtResult(text="", interest=None)
         finally:
-            launch.executor.shutdown(wait=True, cancel_futures=False)
+            # 超时后勿 wait=True，否则仍会被后台 8s HTTP 拖死
+            launch.executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
         if result.text:
             self._inner_thought_window.push(result.text)
             debug_log(
@@ -188,6 +211,58 @@ class AgentRuntimeContextMixin:
                 },
             )
         self._apply_turn_interest(result.interest)
+
+
+    def _launch_memory_recall_worker(
+        self,
+        request: ContextRequest,
+        *,
+        light_mode: bool = False,
+    ) -> _MemoryRecallLaunch:
+        """与独白并行跑 query 改写 + 向量召回。"""
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-recall")
+        future = executor.submit(self.memory_recall.recall, request, light_mode=light_mode)
+        debug_log(
+            "MemoryRecall",
+            "记忆召回已与内心独白并行启动",
+            {"light_mode": light_mode},
+        )
+        return _MemoryRecallLaunch(future=future, executor=executor)
+
+
+    def _finalize_memory_recall_worker(
+        self,
+        launch: _MemoryRecallLaunch | None,
+        *,
+        timeout: float | None = None,
+    ) -> MemoryRecallResult | None:
+        """join 记忆召回；失败 fail-open 返回 None（由调用方走连续性兜底）。"""
+        if launch is None:
+            return None
+        try:
+            if timeout is None:
+                raw = launch.future.result()
+            else:
+                raw = launch.future.result(timeout=timeout)
+            if isinstance(raw, MemoryRecallResult):
+                return raw
+            return None
+        except TimeoutError:
+            debug_log(
+                "MemoryRecall",
+                "记忆召回 join 超时，已跳过",
+                {"timeout": timeout},
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — 召回失败不阻断主链路
+            debug_log(
+                "MemoryRecall",
+                "记忆召回并行任务异常，已跳过",
+                {"error": str(exc)},
+            )
+            return None
+        finally:
+            launch.executor.shutdown(wait=False, cancel_futures=False)
 
 
     def _session_state_fragments(

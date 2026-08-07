@@ -619,6 +619,69 @@ class TestLazyToolGroups:
             ],
         )
 
+    def test_skips_finalize_when_tool_turn_already_has_complete_reply(self) -> None:
+        """规划轮已带合格 JSON，且工具不改变答案 → 跳过二次 pro 合成。"""
+        todo_calls: list[dict] = []
+
+        def add_todo_handler(arguments: dict) -> dict:
+            todo_calls.append(dict(arguments))
+            return {"ok": True, "id": "t1"}
+
+        registry = ToolRegistry(
+            [
+                _dummy_tool(
+                    "add_todo",
+                    group="productivity",
+                    handler=add_todo_handler,
+                ),
+            ]
+        )
+        good = json.dumps(
+            {
+                "segments": [
+                    {"ja": "覚えたよ。", "zh": "记下了。", "tone": "中性", "portrait": "站立待机"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        client = MagicMock(spec=OpenAICompatibleClient)
+        client.resolve_dialogue_params.return_value = (0.8, {})
+        call = NativeToolCall(
+            id="call_todo_1",
+            name="add_todo",
+            arguments={"text": "买牛奶"},
+            arguments_json='{"text":"买牛奶"}',
+        )
+        client.complete_with_tools.return_value = ChatCompletionTurn(
+            content=good,
+            tool_calls=[call],
+            message={
+                "role": "assistant",
+                "content": good,
+                "tool_calls": [
+                    {
+                        "id": "call_todo_1",
+                        "type": "function",
+                        "function": {
+                            "name": "add_todo",
+                            "arguments": '{"text":"买牛奶"}',
+                        },
+                    }
+                ],
+            },
+        )
+        runtime = AgentRuntime(client, _dummy_system_prompt(), tools=registry)
+        with patch.object(runtime.memory_recall, "recall") as recall_mock:
+            recall_mock.return_value = MagicMock(fragments=(), status="ready")
+            result = runtime.handle_user_message(
+                [ChatMessage(role="user", content="帮我记一下买牛奶")]
+            )
+
+        assert result.reply.segments[0].text == "覚えたよ。"
+        assert len(todo_calls) == 1
+        # 只有规划轮 1 次，不应再打 tools=[] 的最终合成
+        assert client.complete_with_tools.call_count == 1
+
     def test_memory_search_success_fast_forwards_without_second_planning(self) -> None:
         search_calls: list[dict] = []
 

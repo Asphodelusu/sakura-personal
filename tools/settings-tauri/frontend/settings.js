@@ -4466,7 +4466,7 @@ function collectScreenAwarenessSettings() {
 
 function collectProactiveSettings() {
   const limits = request.limits || {};
-  const adaptiveMin = clampInt(fields.proactiveAdaptiveMin.value, limits.proactive_adaptive_interval_min || [15, 600]);
+  const adaptiveMin = clampInt(fields.proactiveAdaptiveMin.value, limits.proactive_adaptive_interval_min || [60, 900]);
   const adaptiveMax = Math.max(
     adaptiveMin,
     clampInt(fields.proactiveAdaptiveMax.value, limits.proactive_adaptive_interval_max || [60, 7200]),
@@ -4831,7 +4831,7 @@ async function load() {
   setNumericBounds(fields.proactiveMaxEdge, request.limits.proactive_max_edge);
   fields.proactiveCooldownSeconds.value = proactive.cooldown_seconds ?? 600;
   fields.proactiveTimerSeconds.value = proactive.timer_seconds ?? 480;
-  fields.proactiveAdaptiveMin.value = proactive.adaptive_interval_min ?? 60;
+  fields.proactiveAdaptiveMin.value = proactive.adaptive_interval_min ?? 300;
   fields.proactiveAdaptiveMax.value = proactive.adaptive_interval_max ?? 1800;
   fields.proactiveIdleThreshold.value = proactive.idle_threshold_seconds ?? 600;
   fields.proactiveMinSilence.value = proactive.min_silence_after_user ?? 10;

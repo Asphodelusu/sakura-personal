@@ -439,7 +439,7 @@ _PROACTIVE_SYSTEM_PROMPT = """あなたは夜乃桜。彼のそばで並んで�
 1. visual_summary：彼が何をしていて画面に何があるか、事実 1〜2 文（日本語）。相手は「彼」。
 2. reaction_hint：それを見た自分の短い内感（日本語）。例「劇情、ちょっと気になる…でも今は黙って見る。」空でもよい。
 3. on_screen_text：[系统文字] 不可用のときだけ、読める短句。可用なら空。
-4. suggested_interval：次に見る秒数。集中 600〜1800／くつろぎ 60〜300／不明 480（範囲 60〜1800）。
+4. suggested_interval：次に見る秒数。集中 600〜1800／くつろぎ 300〜600／不明 480（範囲 300〜1800）。
 
 [观察者上下文] にある既知は前提として扱う（蒸し返さない）。
 「同一アプリ内の内容変化」は、同じアプリのページ／タブ／動画変化として読む。
@@ -568,6 +568,7 @@ class ProactiveObserver:
         self.capture = ScreenCapture(max_edge=self.config.max_edge)
 
         self._last_proactive_at = 0.0
+        self._last_silent_eval_at = 0.0
         self._last_user_at = time.monotonic()
         # 自己上一句主动发言（决策用，避免把己方台词当成对方）
         self._last_spoken_text = ""
@@ -587,6 +588,9 @@ class ProactiveObserver:
 
         # 同窗口下次允许因切窗再评估的时刻（跟本次 suggested_interval）
         self._window_eval_ok_at: dict[str, float] = {}
+        # 上轮视觉摘要：同窗无实质变化时可跳过决策 LLM
+        self._last_visual_summary: str = ""
+        self._last_eval_window_title: str = ""
 
         self._last_frame_dhash: int | None = None
         self._last_dedup_skip_at: float = 0.0
@@ -998,10 +1002,15 @@ class ProactiveObserver:
             pass
 
         # 焦点触发不走「刚说过话的全局冷却」——分层：开口冷却 ≠ 看屏冷却。
-        # timer/content/idle 仍尊重 cooldown_seconds。
+        # timer/content/idle 仍尊重 cooldown_seconds，以及「空反应」冷却。
         speak_cooldown = bool(
             self._last_proactive_at
             and now - self._last_proactive_at < self.config.cooldown_seconds
+        )
+        silent_cooldown = bool(
+            self._last_silent_eval_at
+            and now - self._last_silent_eval_at
+            < self.config.silent_eval_cooldown_seconds
         )
         eval_throttle = now - self._last_eval_at < self.config.poll_interval * 1.5
 
@@ -1022,7 +1031,7 @@ class ProactiveObserver:
             # 允许带上已就绪的切窗触发，避免被短节流吞掉。
             return triggers
 
-        if not speak_cooldown:
+        if not speak_cooldown and not silent_cooldown:
             if self._focus_settled_at == 0:
                 timer_target = (
                     self._next_timer_at
@@ -1088,6 +1097,28 @@ class ProactiveObserver:
                 quiet,
                 until - now,
             )
+
+    def _mark_silent_eval(self) -> None:
+        """空反应 / 不发言后进入 silent 冷却，避免 timer 连打决策 LLM。"""
+        self._last_silent_eval_at = time.monotonic()
+
+    def _should_skip_speech_decision(
+        self,
+        packet: ObservationPacket,
+        window_title: str,
+    ) -> bool:
+        """同窗且视觉摘要无实质变化时跳过决策 LLM（切窗/正文变化仍决策）。"""
+        triggers = packet.triggers or ()
+        if any(t == "content" or t.startswith("window:") for t in triggers):
+            return False
+        prev_title = (self._last_eval_window_title or "").strip()
+        prev_summary = (self._last_visual_summary or "").strip()
+        cur_summary = (packet.visual_summary or "").strip()
+        if not prev_title or not prev_summary or not cur_summary:
+            return False
+        if prev_title != (window_title or "").strip():
+            return False
+        return prev_summary == cur_summary
 
     def _invalidate_window_text_cache(self) -> None:
         self._cached_window_text = None
@@ -1573,6 +1604,18 @@ class ProactiveObserver:
 
         # ---- Stage 2: LLM decides whether to speak ----
         speech_decision: dict | None = None
+        skip_speech = self._should_skip_speech_decision(packet, window_title or "")
+        # 先判定再更新，避免「本轮摘要」把自己比成相同
+        self._last_visual_summary = packet.visual_summary
+        self._last_eval_window_title = window_title or ""
+        if skip_speech:
+            reason = "同窗画面无实质变化，跳过发言决策"
+            logger.info("ProactiveObserver: silent (reason: {})", reason)
+            _observer_gui_log(reason)
+            self._mark_silent_eval()
+            self._safe_on_evaluate(reason, False)
+            self._record_observation(window_title, False, reason)
+            return
         if self._speech_decision_configured:
             _observer_gui_log(
                 "正在调用语言模型决定发言",
@@ -1603,6 +1646,7 @@ class ProactiveObserver:
         if speech_decision is None:
             reason = "LLM 发言决策失败或未配置"
             logger.info("ProactiveObserver: silent (reason: {})", reason)
+            self._mark_silent_eval()
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
             return
@@ -1610,6 +1654,7 @@ class ProactiveObserver:
         if not speech_decision.get("should_speak"):
             reason = str(speech_decision.get("reason", "")).strip() or "LLM 选择不发言"
             logger.info("ProactiveObserver: silent (reason: {})", reason)
+            self._mark_silent_eval()
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
             return
@@ -1618,6 +1663,7 @@ class ProactiveObserver:
         if not comment:
             reason = "should_speak=true 但 comment 为空"
             logger.warning("ProactiveObserver: {}", reason)
+            self._mark_silent_eval()
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
             return
@@ -1629,6 +1675,7 @@ class ProactiveObserver:
         self._safe_on_evaluate(reason, True)
 
         self._last_proactive_at = time.monotonic()
+        self._last_silent_eval_at = 0.0
         self._idle_armed = True
 
         self._record_observation(window_title, True, reason, comment)

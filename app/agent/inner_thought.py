@@ -18,6 +18,8 @@ from app.perception.sensory_impression import sensory_impression_store
 DEFAULT_INNER_THOUGHT_WINDOW_SIZE = 6
 # Flash 实测常要 4–6s；过短会误杀已返回的内容
 DEFAULT_INNER_THOUGHT_TIMEOUT_SECONDS = 8
+# 主路径 join 上限：超时后 skip 独白继续；后台 HTTP 仍可能跑完但不挡回复
+DEFAULT_INNER_THOUGHT_JOIN_TIMEOUT_SECONDS = 3
 DEFAULT_INNER_THOUGHT_MAX_CHARS = 200
 DEFAULT_INNER_THOUGHT_MAX_TOKENS = 180
 _RECENT_DIALOGUE_CHAR_BUDGET = 800
@@ -70,6 +72,7 @@ class InnerThoughtSettings:
     enabled: bool = True
     window_size: int = DEFAULT_INNER_THOUGHT_WINDOW_SIZE
     timeout_seconds: int = DEFAULT_INNER_THOUGHT_TIMEOUT_SECONDS
+    join_timeout_seconds: int = DEFAULT_INNER_THOUGHT_JOIN_TIMEOUT_SECONDS
     skip_fast_tier: bool = True
     skip_proactive: bool = True
 
@@ -78,6 +81,7 @@ class InnerThoughtSettings:
             enabled=bool(self.enabled),
             window_size=max(1, min(int(self.window_size), 16)),
             timeout_seconds=max(1, min(int(self.timeout_seconds), 15)),
+            join_timeout_seconds=max(1, min(int(self.join_timeout_seconds), 8)),
             skip_fast_tier=bool(self.skip_fast_tier),
             skip_proactive=bool(self.skip_proactive),
         )
@@ -168,6 +172,8 @@ def generate_inner_thought(
             thinking={"type": "disabled"},
             task="background",
             request_timeout=float(timeout),
+            # 独白失败可跳过；禁止 8s×3 重试拖死主路径 join
+            max_attempts=1,
         )
     except (httpx.TimeoutException, TimeoutError) as exc:
         debug_log(

@@ -640,8 +640,9 @@ def build_tauri_settings_request(
             "proactive_focus_settle_delay": [1, 120],
             "proactive_idle_threshold_seconds": [60, 7200],
             "proactive_max_edge": [640, 3840],
-            "proactive_adaptive_interval_min": [15, 600],
+            "proactive_adaptive_interval_min": [60, 900],
             "proactive_adaptive_interval_max": [60, 7200],
+            "proactive_silent_eval_cooldown_seconds": [60, 1800],
             "max_agent_steps_per_turn": [
                 MIN_AGENT_STEPS_PER_TURN,
                 MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,

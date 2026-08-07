@@ -112,6 +112,42 @@ def test_finalize_fail_open_keeps_window_empty() -> None:
     assert runtime._inner_thought_done_for_turn is True
 
 
+def test_finalize_join_timeout_fail_open() -> None:
+    """主路径 join 超时后跳过独白，不因后台慢请求死等。"""
+    runtime = AgentRuntime(
+        MagicMock(spec=OpenAICompatibleClient),
+        "system",
+        inner_thought_api_client=MagicMock(spec=OpenAICompatibleClient),
+        inner_thought_settings=InnerThoughtSettings(
+            enabled=True,
+            skip_fast_tier=True,
+            join_timeout_seconds=1,
+        ),
+    )
+
+    def _slow_thought(*_args: object, **_kwargs: object) -> InnerThoughtResult:
+        time.sleep(2.5)
+        return InnerThoughtResult(text="遅すぎ", interest="mid")
+
+    started = time.perf_counter()
+    with patch("app.agent.context_builder.generate_inner_thought", side_effect=_slow_thought):
+        launch = runtime._launch_inner_thought_worker(
+            [{"role": "user", "content": "在吗"}],
+            _standard_turn(),
+            proactive_mode=False,
+        )
+        assert launch is not None
+        runtime._finalize_inner_thought_worker(launch)
+        elapsed = time.perf_counter() - started
+        assert runtime._inner_thought_window.items() == ()
+        assert elapsed < 2.0
+        # 回收后台慢任务，避免非守护线程拖住用例结束
+        try:
+            launch.future.result(timeout=3)
+        except Exception:
+            pass
+
+
 def test_second_launch_in_same_turn_is_noop() -> None:
     runtime = _runtime_with_thought_client()
     with patch("app.agent.context_builder.generate_inner_thought", return_value="once"):
