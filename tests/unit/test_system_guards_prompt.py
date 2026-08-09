@@ -53,8 +53,9 @@ def test_memory_honesty_rule_is_positive_framed() -> None:
 
     src = inspect.getsource(AgentRuntime._build_tool_prompt_result)
     assert "流行梗" not in src
-    assert "补写记忆事实" in src
-    assert "只依据运行时已注入片段" in src
+    assert "记忆诚实" in src
+    assert "只依据已注入片段与 memory_search/detail" in src
+    assert "禁止编造共同经历或熟人关系" in src
     assert "按当下语境理解" in src
 
 
