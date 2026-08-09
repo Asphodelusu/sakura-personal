@@ -173,7 +173,7 @@ def validate_memory_write_grounding(
     规则（优于纯 evidence 子串）：
     1. 瞬态本机态 → 拒绝
     2. 提供了 evidence 但不在语料中 → 拒绝（防伪造证据）
-    3. evidence 命中 → 通过
+    3. evidence 命中且能支撑正文 → 通过
     4. 否则软锚定命中 → 通过
     5. require_grounding 且都未命中 → 拒绝
     """
@@ -186,7 +186,12 @@ def validate_memory_write_grounding(
     quote = str(evidence or "").strip()
     if quote:
         if evidence_in_corpus(quote, corpus):
-            return True, "evidence"
+            # 引文必须真实存在，同时正文仍需能被完整对话语料（update 时
+            # 还会包含旧记忆）锚定。只和短引文做词面比较会误杀正常释义，
+            # 例如「我搬家了」整理成「主人搬到了新地址」。
+            if soft_grounded_in_corpus(text, corpus):
+                return True, "evidence"
+            return False, "evidence_content_mismatch"
         return False, "evidence_mismatch"
     if not require_grounding:
         return True, "skipped"
