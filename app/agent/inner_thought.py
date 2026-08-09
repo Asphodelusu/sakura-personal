@@ -382,13 +382,17 @@ def load_character_excerpt(
     system_prompt: str = "",
     budget: int = _CHARACTER_EXCERPT_CHAR_BUDGET,
 ) -> str:
+    # ``system_prompt`` 已由 CharacterLoader 合并 card 与 system_guards；
+    # 独白必须与主模型使用同一份受守卫 persona，不能优先绕回原始 card。
+    if str(system_prompt or "").strip():
+        return _clip(system_prompt, budget)
     if card_path is not None:
         try:
             if card_path.is_file():
                 return _clip(card_path.read_text(encoding="utf-8"), budget)
         except OSError:
             pass
-    return _clip(system_prompt, budget)
+    return ""
 
 
 def mood_summary_from_store(memory: Any) -> str:

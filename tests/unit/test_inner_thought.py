@@ -7,10 +7,24 @@ from app.agent.inner_thought import (
     InnerThoughtWindow,
     build_inner_thought_fragment,
     format_recent_dialogue,
+    load_character_excerpt,
     parse_inner_thought_output,
     should_generate_inner_thought,
     _window_labels,
 )
+
+
+def test_character_excerpt_prefers_guarded_system_prompt(tmp_path) -> None:
+    card_path = tmp_path / "card.md"
+    card_path.write_text("原始角色卡", encoding="utf-8")
+
+    excerpt = load_character_excerpt(
+        card_path=card_path,
+        system_prompt="原始角色卡\n\n# 系统守卫\n不要编造共同经历",
+    )
+
+    assert "系统守卫" in excerpt
+    assert "不要编造共同经历" in excerpt
 
 
 def test_window_keeps_recent_thoughts_in_order() -> None:
