@@ -411,6 +411,53 @@ def show_themed_critical(
     )
 
 
+class SubtitleTranslationWorker(QObject):
+    """后台补全中文字幕；不阻塞 TTS。失败时静默（保留日语原文）。"""
+
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def __init__(
+        self,
+        provider: Any,
+        *,
+        interaction_id: str,
+        texts: list[str],
+        history_ids: list[int],
+        segment_indexes: list[int],
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.interaction_id = interaction_id
+        self.texts = list(texts)
+        self.history_ids = list(history_ids)
+        self.segment_indexes = list(segment_indexes)
+
+    @Slot()
+    def run(self) -> None:
+        payload = {
+            "interaction_id": self.interaction_id,
+            "texts": self.texts,
+            "history_ids": self.history_ids,
+            "segment_indexes": self.segment_indexes,
+            "translations": [],
+        }
+        try:
+            translate = getattr(self.provider, "translate", None)
+            if not callable(translate):
+                self.failed.emit(payload)
+                return
+            translations = translate(self.texts, source_lang="ja", target_lang="zh")
+            if not isinstance(translations, list):
+                self.failed.emit(payload)
+                return
+            payload["translations"] = [str(item or "").strip() for item in translations]
+            self.finished.emit(payload)
+        except Exception as exc:  # noqa: BLE001 — 翻译失败不得影响主回复
+            payload["error"] = str(exc)
+            self.failed.emit(payload)
+
+
 class TTSReadyWarmupWorker(QObject):
     """后台启动并检测 TTS 服务，避免首次朗读承担冷启动。"""
 
@@ -651,6 +698,9 @@ class PetWindow(QWidget):
     # 手机端聊天完成信号
     mobile_chat_completed = Signal(object)
     mobile_chat_requested = Signal(object)
+    # 异步中文字幕回填（worker 线程 → UI 线程）
+    subtitle_translation_finished = Signal(object)
+    subtitle_translation_failed = Signal(object)
 
     def __init__(
         self,
@@ -661,6 +711,8 @@ class PetWindow(QWidget):
         self.plugin_input_text_requested.connect(self._apply_plugin_input_text)
         self.mobile_chat_completed.connect(self._handle_mobile_chat_completed)
         self.mobile_chat_requested.connect(self._enqueue_mobile_chat)
+        self.subtitle_translation_finished.connect(self._on_subtitle_translation_finished)
+        self.subtitle_translation_failed.connect(self._on_subtitle_translation_failed)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -692,6 +744,11 @@ class PetWindow(QWidget):
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
+        # Phase 1：默认不绑定供应商；测试可注入 FakeTranslationProvider。
+        self.translation_provider = getattr(context, "translation_provider", None)
+        self._subtitle_translation_thread: QThread | None = None
+        self._subtitle_translation_worker: QObject | None = None
+        self._pending_subtitle_translation_interaction_id = ""
         self.mobile_chat_bridge = MobileChatBridge(self)
         self._mobile_chat_requests: list[dict[str, Any]] = []
         self._active_mobile_chat_request: dict[str, Any] | None = None
@@ -4217,7 +4274,7 @@ class PetWindow(QWidget):
             return
         reply = result.reply
         self.messages.append({"role": "assistant", "content": reply.text})
-        self._record_assistant_reply_history(reply, _debug=result._debug)
+        history_ids = self._record_assistant_reply_history(reply, _debug=result._debug)
         self._log_interaction_stage("assistant_message_recorded")
         self._emit_plugin_event(
             PLUGIN_EVENT_AI_MESSAGE,
@@ -4238,6 +4295,7 @@ class PetWindow(QWidget):
                 },
             )
         self._show_reply_segments(reply.segments)
+        self._schedule_subtitle_translations(reply.segments, history_ids=history_ids)
         self._apply_pending_action_from_result(result)
 
     def _queue_screen_observation_followup(self, result: AgentResult) -> bool:
@@ -4773,13 +4831,15 @@ class PetWindow(QWidget):
                 "message_source": message_source or "",
             },
         )
+        history_ids: list[int] = []
         if record_history:
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": reply.text}
             if message_source:
                 assistant_msg["source"] = message_source
             self.messages.append(assistant_msg)
-            self._record_assistant_reply_history(reply, _debug=result._debug)
+            history_ids = self._record_assistant_reply_history(reply, _debug=result._debug)
         self._show_reply_segments(reply.segments)
+        self._schedule_subtitle_translations(reply.segments, history_ids=history_ids)
         self._apply_pending_action_from_result(result)
 
     def _apply_pending_action_from_result(self, result: AgentResult) -> None:
@@ -7368,9 +7428,12 @@ class PetWindow(QWidget):
         tone: str = "",
         portrait: str = "",
         _debug: dict | None = None,
-    ) -> None:
+    ) -> int:
         try:
-            self.history_store.append(role, content, translation, tone, portrait, _debug=_debug)
+            entry_id = self.history_store.append(
+                role, content, translation, tone, portrait, _debug=_debug
+            )
+            return int(entry_id or 0)
         except OSError as exc:
             debug_log("History", "写入失败", {"error": str(exc)})
             debug_log(
@@ -7385,20 +7448,27 @@ class PetWindow(QWidget):
                     "error": str(exc),
                 },
             )
+            return 0
 
-    def _record_assistant_reply_history(self, reply: ChatReply, _debug: dict | None = None) -> None:
+    def _record_assistant_reply_history(
+        self, reply: ChatReply, _debug: dict | None = None
+    ) -> list[int]:
         clean_segments = [segment for segment in reply.segments if segment.text.strip()]
         if not clean_segments:
-            return
+            return []
+        history_ids: list[int] = []
         for i, segment in enumerate(clean_segments):
-            self._record_history(
-                "assistant",
-                segment.text,
-                segment.translation,
-                segment.tone,
-                segment.portrait,
-                _debug=_debug if i == 0 else None,
+            history_ids.append(
+                self._record_history(
+                    "assistant",
+                    segment.text,
+                    segment.translation,
+                    segment.tone,
+                    segment.portrait,
+                    _debug=_debug if i == 0 else None,
+                )
             )
+        return history_ids
 
     @Slot()
     def _check_due_reminders(self) -> None:
@@ -7468,6 +7538,189 @@ class PetWindow(QWidget):
             return
         self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)
+
+    def _schedule_subtitle_translations(
+        self,
+        segments: list[ChatSegment],
+        *,
+        history_ids: list[int] | None = None,
+    ) -> None:
+        """缺 zh 的 segment 异步翻译；不阻塞 TTS。无 provider 时跳过。"""
+        from app.ui.subtitle_translation import segments_needing_translation
+
+        provider = getattr(self, "translation_provider", None)
+        if provider is None:
+            return
+        clean = [segment for segment in segments if str(getattr(segment, "text", "") or "").strip()]
+        pending = segments_needing_translation(clean)
+        if not pending:
+            return
+        ids = list(history_ids or [])
+        texts: list[str] = []
+        segment_indexes: list[int] = []
+        pending_history_ids: list[int] = []
+        for index, segment in pending:
+            texts.append(segment.text)
+            segment_indexes.append(index)
+            pending_history_ids.append(ids[index] if index < len(ids) else 0)
+
+        interaction_id = str(getattr(self, "active_interaction_id", "") or "")
+        self._pending_subtitle_translation_interaction_id = interaction_id
+        self._start_subtitle_translation_worker(
+            interaction_id=interaction_id,
+            texts=texts,
+            history_ids=pending_history_ids,
+            segment_indexes=segment_indexes,
+        )
+
+    def _start_subtitle_translation_worker(
+        self,
+        *,
+        interaction_id: str,
+        texts: list[str],
+        history_ids: list[int],
+        segment_indexes: list[int],
+    ) -> None:
+        provider = getattr(self, "translation_provider", None)
+        if provider is None or not texts:
+            return
+        # 简化：同一时刻只跑一条翻译任务；新任务覆盖旧线程引用（旧结果靠 interaction_id 丢弃）。
+        thread = QThread(self)
+        worker = SubtitleTranslationWorker(
+            provider,
+            interaction_id=interaction_id,
+            texts=texts,
+            history_ids=history_ids,
+            segment_indexes=segment_indexes,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.subtitle_translation_finished.emit)
+        worker.failed.connect(self.subtitle_translation_failed.emit)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_subtitle_translation_worker)
+        self._subtitle_translation_thread = thread
+        self._subtitle_translation_worker = worker
+        thread.start()
+        debug_log(
+            "PetWindow",
+            "已调度异步字幕翻译",
+            {
+                "interaction_id": interaction_id,
+                "segment_count": len(texts),
+            },
+        )
+
+    @Slot()
+    def _clear_subtitle_translation_worker(self) -> None:
+        self._subtitle_translation_thread = None
+        self._subtitle_translation_worker = None
+
+    @Slot(object)
+    def _on_subtitle_translation_finished(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        interaction_id = str(payload.get("interaction_id") or "")
+        active_id = str(getattr(self, "active_interaction_id", "") or "")
+        pending_id = str(getattr(self, "_pending_subtitle_translation_interaction_id", "") or "")
+        # 过期 interaction 或已被更新的任务：丢弃。
+        if interaction_id and active_id and interaction_id != active_id:
+            debug_log(
+                "PetWindow",
+                "丢弃过期字幕翻译结果",
+                {"interaction_id": interaction_id, "active_interaction_id": active_id},
+            )
+            return
+        if pending_id and interaction_id and interaction_id != pending_id:
+            debug_log(
+                "PetWindow",
+                "丢弃被替代的字幕翻译结果",
+                {"interaction_id": interaction_id, "pending_id": pending_id},
+            )
+            return
+        texts = payload.get("texts") if isinstance(payload.get("texts"), list) else []
+        translations = (
+            payload.get("translations") if isinstance(payload.get("translations"), list) else []
+        )
+        history_ids = (
+            payload.get("history_ids") if isinstance(payload.get("history_ids"), list) else []
+        )
+        self._apply_subtitle_translations(
+            texts=[str(item or "") for item in texts],
+            translations=[str(item or "") for item in translations],
+            history_ids=[int(item or 0) for item in history_ids],
+        )
+
+    @Slot(object)
+    def _on_subtitle_translation_failed(self, payload: object) -> None:
+        # 失败：保留日语原文，不展示任何系统降级文案。
+        error = ""
+        if isinstance(payload, dict):
+            error = str(payload.get("error") or "")
+        debug_log("PetWindow", "异步字幕翻译失败，保留日语原文", {"error": error})
+
+    def _apply_subtitle_translations(
+        self,
+        *,
+        texts: list[str],
+        translations: list[str],
+        history_ids: list[int],
+    ) -> None:
+        from app.ui.subtitle_translation import (
+            patch_segment_list_by_text,
+            with_segment_translation,
+        )
+
+        if not texts or not translations:
+            return
+        store = getattr(self, "history_store", None)
+        update_translation = getattr(store, "update_translation", None)
+        for index, text in enumerate(texts):
+            if index >= len(translations):
+                break
+            zh = str(translations[index] or "").strip()
+            if not zh:
+                continue
+            ja = str(text or "").strip()
+            if not ja:
+                continue
+            if index < len(history_ids) and callable(update_translation):
+                entry_id = int(history_ids[index] or 0)
+                if entry_id > 0:
+                    try:
+                        update_translation(entry_id, zh)
+                    except Exception as exc:  # noqa: BLE001
+                        debug_log(
+                            "History",
+                            "回填字幕失败",
+                            {"id": entry_id, "error": str(exc)},
+                        )
+            patch_segment_list_by_text(self.reply_history_segments, ja, zh)
+            controller = getattr(self, "subtitle_controller", None)
+            if controller is None:
+                continue
+            patch_segment_list_by_text(getattr(controller, "pending_reply_segments", None), ja, zh)
+            for batch in list(getattr(controller, "queued_reply_segment_batches", []) or []):
+                patch_segment_list_by_text(batch, ja, zh)
+            current = getattr(controller, "current_segment", None)
+            if current is not None and str(current.text or "").strip() == ja:
+                updated = with_segment_translation(current, zh)
+                controller.current_segment = updated
+                # 仅中文字幕模式才刷新显示；日语模式保持不变。
+                if getattr(self, "subtitle_language", "zh") == "zh":
+                    display = updated.display_text("zh")
+                    if display.strip():
+                        # 逐字进行中：更新底层文本；已显示完则立即刷新。
+                        if getattr(controller, "speech_timer", None) is not None and controller.speech_timer.isActive():
+                            controller.speech_text = " ".join(display.split())
+                            # 若已打出部分，继续；否则重启
+                            if controller.speech_index <= 0:
+                                controller.set_speech(display, pulse=False)
+                        else:
+                            controller.set_speech(display, pulse=False, instant=True)
 
     def _load_subtitle_language(self) -> str:
         system_values = self._load_system_config_values("ui")

@@ -38,7 +38,8 @@ _FULL_PORTRAIT_CATALOG_RE = re.compile(
 
 
 _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
-    "missing_translation",
+    # missing_translation：结构化 segments 缺 zh 不再触发二次 Pro；
+    # 纯日语无结构正文仍由 _structured_compose_reason 首轮拉起一次合成。
     "missing_segments",
     "invalid_json",
     "empty",
@@ -60,7 +61,7 @@ _ANSWER_CHANGING_TOOL_NAMES = frozenset({
 })
 
 def _reply_has_display_translation(reply: ChatReply) -> bool:
-    """最终回复需要中文显示文本，避免兼容模型的纯日语正文漏到中文字幕 UI。"""
+    """是否已有中文译文（字幕可直接显示）。缺 zh 时允许后补，不挡采用。"""
 
     text_segments = [segment for segment in reply.segments if segment.text.strip()]
     if not text_segments:
@@ -69,6 +70,12 @@ def _reply_has_display_translation(reply: ChatReply) -> bool:
         segment.translation.strip()
         for segment in text_segments
     )
+
+
+def _reply_has_adoptable_segments(reply: ChatReply) -> bool:
+    """日语正文合格即可采用（tone/portrait 可空）；zh 非门槛。"""
+
+    return any(segment.text.strip() for segment in reply.segments)
 
 
 class AgentRuntimeReplyMixin:
@@ -169,16 +176,21 @@ class AgentRuntimeReplyMixin:
 
 
     def _structured_compose_reason(self, raw_content: str) -> str:
+        from app.llm.chat_reply import _looks_structured_reply
+
         parsed = self._normalize_parsed_reply(parse_chat_reply_result(raw_content))
         if parsed.needs_retry:
             return parsed.reason
+        # 结构化 segments（有 ja）直接采用；缺 zh 不触发二次合成。
+        if _looks_structured_reply(raw_content) and _reply_has_adoptable_segments(parsed.reply):
+            return ""
         if not _reply_has_display_translation(parsed.reply):
             return "missing_translation"
         return ""
 
 
     def _usable_final_reply_content(self, raw_content: str) -> str | None:
-        """正文已是合格 segments（含 zh）则原样返回，否则 None。"""
+        """正文已是可采用的 segments（zh 可缺）则原样返回，否则 None。"""
         text = str(raw_content or "").strip()
         if not text:
             return None
@@ -292,10 +304,11 @@ class AgentRuntimeReplyMixin:
         parsed = parse_chat_reply_result(raw_content)
         parsed = self._normalize_parsed_reply(parsed)
         retry_reason = parsed.reason if parsed.needs_retry else ""
-        if not parsed.needs_retry and _reply_has_display_translation(parsed.reply):
+        # 合格日语 segments 可直接采用；缺 zh 交给异步翻译，不再二次 Pro。
+        if not parsed.needs_retry and _reply_has_adoptable_segments(parsed.reply):
             return parsed
         if not retry_reason:
-            retry_reason = "missing_translation"
+            retry_reason = "missing_segments"
 
         if retry_reason in _STRUCTURED_COMPOSE_RETRY_REASONS:
             debug_log(
@@ -315,7 +328,7 @@ class AgentRuntimeReplyMixin:
                 debug_log("AgentRuntime", "结构化合成失败，回退格式修复", {"error": str(exc)})
             else:
                 composed = self._normalize_parsed_reply(parse_chat_reply_result(composed_content))
-                if not composed.needs_retry and _reply_has_display_translation(composed.reply):
+                if not composed.needs_retry and _reply_has_adoptable_segments(composed.reply):
                     debug_log("AgentRuntime", "结构化合成成功", {"reason": retry_reason})
                     return composed
 
