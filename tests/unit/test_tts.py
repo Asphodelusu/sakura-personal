@@ -333,6 +333,45 @@ def test_tts_provider_close_clears_queue_and_blocks_late_requests() -> None:
     assert [request.text for request in queue._pending_requests] == ["stale"]
 
 
+def test_tts_queue_new_interaction_discards_waiting_plain_requests_from_old_turn() -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    queue = provider._synthesis_queue
+    queue._request_running = True
+    prepared = TTSPreparedAudio(text="prepared")
+    queue._pending_requests.extend(
+        [
+            _TTSRequest(text="old-plain", tone=None, interaction_id="turn-1"),
+            _TTSRequest(
+                text="old-prepared",
+                tone=None,
+                prepared_audio=prepared,
+                interaction_id="turn-1",
+            ),
+        ]
+    )
+
+    queue.submit(_TTSRequest(text="new-plain", tone=None, interaction_id="turn-2"))
+
+    assert [request.text for request in queue._pending_requests] == [
+        "old-prepared",
+        "new-plain",
+    ]
+
+
+def test_tts_queue_bounds_waiting_requests_and_keeps_newest() -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    queue = provider._synthesis_queue
+    queue._request_running = True
+
+    for index in range(100):
+        queue.submit(
+            _TTSRequest(text=f"line-{index}", tone=None, interaction_id="turn-1")
+        )
+
+    assert len(queue._pending_requests) <= 32
+    assert queue._pending_requests[-1].text == "line-99"
+
+
 def test_tts_provider_close_quiesces_before_playback_shutdown(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
     events: list[str] = []

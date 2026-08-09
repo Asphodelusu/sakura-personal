@@ -303,6 +303,41 @@ def test_background_classify_timeout_falls_back() -> None:
     assert len(displayed) == 1
 
 
+def test_background_classify_single_worker_keeps_only_latest_waiting_request() -> None:
+    _qt_app_or_skip()
+    displayed: list[BackchannelChoice] = []
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class _BlockingClassifier:
+        prefers_background = True
+
+        def classify(self, text: str) -> object:
+            calls.append(text)
+            if text == "first":
+                started.set()
+                release.wait(2)
+            return None
+
+    controller = _make_async(displayed, _BlockingClassifier(), timeout_ms=0)
+    controller.schedule("first")
+    controller._on_timeout()
+    assert started.wait(1)
+
+    controller.schedule("second")
+    controller._on_timeout()
+    controller.schedule("latest")
+    controller._on_timeout()
+
+    with controller._thread_group._threads_lock:
+        assert len(controller._thread_group._threads) == 1
+
+    release.set()
+    _spin_until(lambda: calls == ["first", "latest"])
+    assert calls == ["first", "latest"]
+
+
 def test_on_classified_callback_records_trace() -> None:
     from app.backchannel.models import BackchannelLabel
 

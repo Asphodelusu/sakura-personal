@@ -401,6 +401,8 @@ class TTSSynthesisQueue:
     串行；当前在飞线程登记进 RM 的 :class:`ThreadResource`，关闭随 stop_all 收敛。
     """
 
+    _MAX_PENDING_REQUESTS = 32
+
     def __init__(
         self,
         *,
@@ -449,7 +451,28 @@ class TTSSynthesisQueue:
             )
             return
         with self._lock:
+            iid = request.interaction_id.strip()
+            if iid:
+                self._pending_requests = [
+                    pending
+                    for pending in self._pending_requests
+                    if pending.prepared_audio is not None
+                    or not pending.interaction_id.strip()
+                    or pending.interaction_id.strip() == iid
+                ]
             self._pending_requests.append(request)
+            while len(self._pending_requests) > self._MAX_PENDING_REQUESTS:
+                drop_index = next(
+                    (
+                        index
+                        for index, pending in enumerate(self._pending_requests)
+                        if pending.prepared_audio is None
+                    ),
+                    0,
+                )
+                dropped = self._pending_requests.pop(drop_index)
+                if dropped.prepared_audio is not None:
+                    dropped.prepared_audio.failed = True
             pending_count = len(self._pending_requests)
         debug_log(
             "TTS",

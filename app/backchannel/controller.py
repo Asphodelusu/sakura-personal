@@ -74,6 +74,9 @@ class BackchannelController(QObject):
         self._classify_token = 0
         self._inflight_token: int | None = None
         self._inflight_text = ""
+        self._worker_busy = False
+        self._running_token: int | None = None
+        self._waiting_classification: tuple[int, str] | None = None
         self._classify_signals = _ClassifySignals(self)
         self._classify_signals.done.connect(self._on_classify_done)
         self._classify_timeout_timer = QTimer(self)
@@ -131,6 +134,7 @@ class BackchannelController(QObject):
         self._timer.stop()
         self._classify_timeout_timer.stop()
         self._inflight_token = None
+        self._waiting_classification = None
 
     def shutdown(self, timeout: float | None = None) -> bool:
         """停止接收新任务并等待已启动的分类线程结束。
@@ -172,6 +176,15 @@ class BackchannelController(QObject):
         if timeout_ms > 0:
             self._classify_timeout_timer.start(timeout_ms)
 
+        if self._worker_busy:
+            self._waiting_classification = (token, text)
+            return
+        self._start_classification_worker(token, text)
+
+    def _start_classification_worker(self, token: int, text: str) -> None:
+        self._worker_busy = True
+        self._running_token = token
+
         def run_classification() -> None:
             try:
                 label = self._classifier.classify(text)
@@ -188,24 +201,44 @@ class BackchannelController(QObject):
         thread = self._thread_group.spawn(
             run_classification,
             name=f"sakura-backchannel-{token}",
-            daemon=True,
+            daemon=False,
         )
         if thread is None:
             # 关闭与派发窄竞态：线程组进入终态后不保留 pending token。
+            self._worker_busy = False
+            self._running_token = None
             self.cancel()
 
     def _on_classify_done(self, token: int, label: object) -> None:
+        if token == self._running_token:
+            self._worker_busy = False
+            self._running_token = None
+        if token == self._inflight_token:
+            self._inflight_token = None
+            self._classify_timeout_timer.stop()
+            self._finish_classification(self._inflight_text, label)  # type: ignore[arg-type]
+        self._start_waiting_classification()
+
+    def _start_waiting_classification(self) -> None:
+        waiting = self._waiting_classification
+        self._waiting_classification = None
+        if self._shutdown or self._worker_busy or waiting is None:
+            return
+        token, text = waiting
         if token != self._inflight_token:
-            return  # 已被 cancel/超时/新一轮取代
-        self._inflight_token = None
-        self._classify_timeout_timer.stop()
-        self._finish_classification(self._inflight_text, label)  # type: ignore[arg-type]
+            return
+        self._start_classification_worker(token, text)
 
     def _on_classify_timeout(self) -> None:
         if self._inflight_token is None:
             return
         # 丢弃 in-flight 真实结果(token 置空),本轮按无标签落兜底。
+        timed_out_token = self._inflight_token
         self._inflight_token = None
+        if self._waiting_classification is not None:
+            waiting_token, _text = self._waiting_classification
+            if waiting_token == timed_out_token:
+                self._waiting_classification = None
         debug_log("Backchannel", "后台分类超时,本轮按无标签落兜底")
         self._finish_classification(self._inflight_text, None)
 
