@@ -231,6 +231,7 @@ class AgentRuntimeToolLoopMixin:
     ) -> AgentResult:
         """执行 OpenAI 原生 tools/tool_calls 循环。"""
         working_messages: list[ChatMessage] = [*messages]
+        original_current_input = _latest_user_text(working_messages)
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
@@ -309,6 +310,7 @@ class AgentRuntimeToolLoopMixin:
                     available_tools=tool_names,
                     event_payload=self._enrich_event_payload(event_payload),
                     service_status={"memory": memory_status},
+                    current_input=original_current_input,
                 )
                 if step_index == 0:
                     turn_state = self._resolve_turn_state(

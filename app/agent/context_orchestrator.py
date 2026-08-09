@@ -57,16 +57,21 @@ def build_context_request(
     event_payload: dict[str, Any] | None = None,
     service_status: dict[str, str] | None = None,
     current_time: str | None = None,
+    current_input: str | None = None,
 ) -> ContextRequest:
     recent_messages = _recent_context_messages(messages)
-    current_input = next(
-        (item.content for item in reversed(recent_messages) if item.role == "user"),
-        "",
+    resolved_current_input = (
+        current_input
+        if current_input is not None
+        else next(
+            (item.content for item in reversed(recent_messages) if item.role == "user"),
+            "",
+        )
     )
     payload = event_payload or {}
     seconds_since = _optional_float(payload.get("seconds_since_pet_interaction"))
     return ContextRequest(
-        current_input=_truncate(current_input, MAX_CONTEXT_INPUT_CHARS),
+        current_input=_truncate(resolved_current_input, MAX_CONTEXT_INPUT_CHARS),
         source=source if source in {"chat", "event", "confirmed_action"} else "chat",  # type: ignore[arg-type]
         mode=mode if mode in {"normal", "proactive"} else "normal",  # type: ignore[arg-type]
         event_type=event_type.strip(),
