@@ -67,21 +67,35 @@ def _observer_gui_log(message: str, data: Any | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 _UIA_ISOLATE_TIMEOUT = 3.0
+_UIA_TIMEOUT_CIRCUIT_THRESHOLD = 3
+_UIA_TIMEOUT_COOLDOWN_SECONDS = 30.0
 _OCR_ISOLATE_TIMEOUT = 8.0
 _COINIT_APARTMENTTHREADED = 0x2
+
+_uia_worker_lock = threading.Lock()
+_uia_worker_thread: threading.Thread | None = None
+_uia_consecutive_timeouts = 0
+_uia_circuit_open_until = 0.0
 
 # 见 _do_evaluation 中的使用说明：曾尝试启用游戏态 OCR，问题较多，暂停使用。
 _GAME_OCR_HARD_DISABLED = True
 
 
 def _read_window_text_isolated() -> WindowText:
-    """Call read_active_window() in a dedicated thread with COM init."""
+    """Call read_active_window() in a single dedicated thread with COM init."""
     import ctypes as _ctypes
     import queue as _queue
+
+    global _uia_circuit_open_until
+    global _uia_consecutive_timeouts
+    global _uia_worker_thread
 
     result_queue: _queue.Queue[WindowText] = _queue.Queue(maxsize=1)
 
     def _worker() -> None:
+        global _uia_worker_thread
+
+        current_thread = threading.current_thread()
         _ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
         try:
             result_queue.put(read_active_window())
@@ -89,19 +103,39 @@ def _read_window_text_isolated() -> WindowText:
             result_queue.put(WindowText())
         finally:
             _ctypes.windll.ole32.CoUninitialize()
+            with _uia_worker_lock:
+                if _uia_worker_thread is current_thread:
+                    _uia_worker_thread = None
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    with _uia_worker_lock:
+        now = time.monotonic()
+        if _uia_circuit_open_until > now:
+            logger.debug("ProactiveObserver: UIA circuit open; skipping read")
+            return WindowText()
+        if _uia_worker_thread and _uia_worker_thread.is_alive():
+            logger.debug("ProactiveObserver: UIA read already in flight; skipping read")
+            return WindowText()
+        _uia_worker_thread = threading.Thread(target=_worker, daemon=True)
+        _uia_worker_thread.start()
+
     try:
-        return result_queue.get(timeout=_UIA_ISOLATE_TIMEOUT)
+        result = result_queue.get(timeout=_UIA_ISOLATE_TIMEOUT)
+        with _uia_worker_lock:
+            _uia_consecutive_timeouts = 0
+            _uia_circuit_open_until = 0.0
+        return result
     except _queue.Empty:
+        with _uia_worker_lock:
+            _uia_consecutive_timeouts += 1
+            if _uia_consecutive_timeouts >= _UIA_TIMEOUT_CIRCUIT_THRESHOLD:
+                _uia_circuit_open_until = (
+                    time.monotonic() + _UIA_TIMEOUT_COOLDOWN_SECONDS
+                )
         logger.warning(
             "ProactiveObserver: UIA read timed out after {:.0f}s",
             _UIA_ISOLATE_TIMEOUT,
         )
         return WindowText()
-    finally:
-        t.join(timeout=0.5)
 
 
 def _ocr_game_dialogue_isolated() -> str:
