@@ -241,7 +241,7 @@ def resolve_turn_plan(
         return _standard_plan(recall_decision=recall, decided_by="disabled")
 
     # —— 亲密节奏模式 ——
-    # 用户回话：先处理 pending 确认 / 明确退出，再刷新额度；续投扣次。
+    # 用户回话：约定词硬开 / 明确退出，再刷新额度；续投扣次。
     # 续投为 system 信号（兼容旧版 user 裸标记），不得当成用户回话去 refresh。
     if not latest_is_intimacy_continue(messages):
         apply_intimacy_user_utterance(

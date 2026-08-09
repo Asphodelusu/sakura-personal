@@ -25,24 +25,18 @@ from app.llm.prompts.types import ContextSnapshot, PromptRecipe, PromptSection
 _INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
 
 
-_INTIMACY_ENTRY_HINT = (
-    "# 节奏工具\n"
-    "仅在即将进入身体亲密（双方已明确同意，或你准备推进到动手）时调用 set_intimacy_mode(on=true)。\n"
-    "调用后通常进入待确认：你必须先口头问一句（如「……再靠近一点，也可以吗？」），"
-    "等对方明确答应后系统才会真正开启；未确认前不要动手描写，不要用 tone「亲密」/「H」。\n"
-    "摸头、抱抱、撒娇、口头调情、关心安慰时不要开。\n"
-    "真正开启后才能使用 tone「亲密」与「H」，并获得身体亲密向的演出引导。"
-)
+def _intimacy_entry_hint_text() -> str:
+    from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE
 
-_INTIMACY_PENDING_HINT = (
-    "# 节奏工具 — 等待确认\n"
-    "你已提出进入身体亲密节奏，但对方尚未明确答应。\n"
-    "本轮只用日常语气简短确认意愿，留出拒绝空间；"
-    "不要开始动手描写，不要使用 tone「亲密」/「H」，不要当成已开启。\n"
-    "若对方明确答应，可再调用 set_intimacy_mode(on=true)；"
-    "若对方拒绝、冷静一下、先这样或话题岔开，调用 on=false 或不再提起。"
-)
-
+    return (
+        "# 节奏入口\n"
+        f"身体亲密节奏由对方硬开启：对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」时，"
+        "系统会自动开启并注入引导。\n"
+        "你不要猜测要不要开，不要调用 set_intimacy_mode(on=true)。\n"
+        "未开启时不要动手描写，不要用 tone「亲密」/「H」。\n"
+        "摸头、抱抱、撒娇、口头调情、关心安慰时保持日常即可。\n"
+        "开启后才能使用 tone「亲密」与「H」。结束或降温时调用 set_intimacy_mode(on=false)。"
+    )
 
 
 def _apply_patch_text(reply_protocol: str, patch_text: str) -> str:
@@ -100,52 +94,35 @@ class AgentRuntimePromptMixin:
         return tones
 
 
-    def _maybe_enter_intimacy_from_reply(self, reply: ChatReply) -> bool:
-        """模型已用亲密/H tone 却漏调工具时，兜底进入待确认（需本地 guide）。"""
-        from app.agent.builtin_tools import intimacy_mode_available, intimacy_mode_state
-
-        if intimacy_mode_state.active or intimacy_mode_state.pending:
-            return False
-        if not intimacy_mode_available():
-            return False
-        used = {
-            (segment.tone or "").strip()
-            for segment in reply.segments
-            if (segment.tone or "").strip()
-        }
-        if not used.intersection(_INTIMACY_EXTRA_TONES):
-            return False
-        intimacy_mode_state.request_confirm()
-        debug_log(
-            "AgentRuntime",
-            "回复已使用亲密 tone，进入待确认（需对方答应）",
-            {"tones": sorted(used.intersection(_INTIMACY_EXTRA_TONES))},
-        )
-        return True
-
-
     def _seal_reply_tones(self, reply: ChatReply) -> ChatReply:
-        """先按 tone 兜底进入待确认，再按当前可用词表清洗（未 active 会剥掉亲密/H）。"""
-        self._maybe_enter_intimacy_from_reply(reply)
+        """按当前可用词表清洗 tone（未 active 会剥掉亲密/H）。开启不由模型 tone 触发。"""
         return sanitize_reply_tones(reply, self._effective_reply_tones())
 
 
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
         """亲密节奏相关提示段。
 
-        - pending：等待用户口头确认（不注入 guide 正文）
-        - active：注入本地 guide + 退出提醒
-        - 轮次耗尽自动关闭：短重进提示
-        - 未开启但有 guide：短入口提示
+        - active：注入本地 guide + 退出提醒；若本轮约定词硬开则追加入口说明
+        - 轮次耗尽自动关闭：短重进提示（等对方再发约定词）
+        - 未开启但有 guide：短入口说明（告知硬入口，禁止猜开）
         """
         guide = getattr(self, "_intimacy_guide", "")
-        from app.agent.builtin_tools import intimacy_mode_state
+        from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE, intimacy_mode_state
 
         if intimacy_mode_state.active:
             if not guide:
                 return None
+            keyword_note = ""
+            if intimacy_mode_state.opened_by_keyword:
+                keyword_note = (
+                    f"\n\n# 约定入口（本轮已硬开启）\n"
+                    f"对方本轮发送了约定词「{INTIMACY_ENTER_PHRASE}」。"
+                    "亲密节奏已由系统自动开启；对方明确想要进入身体亲密。"
+                    "请直接以夜乃桜身份回应并推进，不要再口头确认意愿，"
+                    "不要调用 set_intimacy_mode(on=true)。\n"
+                )
             rhythm_hint = (
-                "\n\n# 节奏工具 — 已开启\n"
+                f"{keyword_note}\n\n# 节奏 — 已开启\n"
                 "你正在亲密节奏模式下，回复更快、可以主动续说。\n\n"
                 "## 系统续投信号（重要）\n"
                 "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
@@ -159,10 +136,9 @@ class AgentRuntimePromptMixin:
                 "「冷静一下」「睡吧」「休息吧」「差不多了」「聊点别的」等）\n"
                 "- 对方连续两轮未回应身体亲密，话题已明显漂移\n"
                 "- 对方表示累了、困了、要出门、要忙，主动切断互动\n\n"
-                "宁可误退。误退的代价很低——下一轮如果还在亲密中，"
-                "重新 on=true 并再次确认即可。拖着不退才是问题。\n\n"
+                "宁可误退。误退后对方再次发送约定词即可重开。拖着不退才是问题。\n\n"
                 "## 其他\n"
-                "长时间无人回话会自动关闭，之后若仍在继续需重开。"
+                f"长时间无人回话会自动关闭；重开需对方再发「{INTIMACY_ENTER_PHRASE}」。"
             )
             return PromptSection(
                 section_id="persona.intimacy",
@@ -171,23 +147,15 @@ class AgentRuntimePromptMixin:
                 sensitivity="private",
             )
 
-        if intimacy_mode_state.pending and guide:
-            return PromptSection(
-                section_id="persona.intimacy_pending",
-                body=_INTIMACY_PENDING_HINT,
-                source="character",
-                sensitivity="private",
-            )
-
         if intimacy_mode_state.needs_reentry_hint:
             return PromptSection(
                 section_id="persona.intimacy_reentry",
                 body=(
-                    "# 节奏工具 — 已自动关闭\n"
+                    "# 节奏 — 已自动关闭\n"
                     "亲密节奏模式因长时间无回话或你主动关闭而结束了。\n"
-                    "若双方仍在身体亲密互动中，可调用 set_intimacy_mode(on=true)；"
-                    "若对方尚未明确答应，先口头确认，不要直接动手。\n"
-                    "若对方当前的话题明显是日常/结束/其他内容，则不要开启。"
+                    f"重开只能等对方再次整句发送约定词「{INTIMACY_ENTER_PHRASE}」；"
+                    "不要调用 set_intimacy_mode(on=true)，不要自行动手。\n"
+                    "若对方当前话题明显是日常/结束/其他内容，保持日常即可。"
                 ),
                 source="character",
                 sensitivity="private",
@@ -197,7 +165,7 @@ class AgentRuntimePromptMixin:
         if guide:
             return PromptSection(
                 section_id="persona.intimacy_entry",
-                body=_INTIMACY_ENTRY_HINT,
+                body=_intimacy_entry_hint_text(),
                 source="character",
                 sensitivity="private",
             )
