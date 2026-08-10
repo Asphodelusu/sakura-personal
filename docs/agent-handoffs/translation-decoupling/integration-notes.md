@@ -53,10 +53,11 @@
 
 ## Integration Review
 
-- 审查人：
-- 合并方式：
-- 最终 commit：
-- 完整测试：
-- 新日志基线：
-- 是否可 push：
+- 审查人：Claude Code（集成负责人）
+- 合并方式：共享工作区，串行本地提交（4d869f3 Phase1 → ba5a864 benchmark → 79cb0f8 docs routing → 68407b2 集成修复），由集成者统一 push
+- 最终 commit：4d869f3（Phase1）+ ba5a864（benchmark）+ 79cb0f8（docs）+ 68407b2（集成修复：MinimalConsumeWindow 桩补齐）
+- 完整测试：`.\.venv\Scripts\python.exe -m pytest tests/unit tests/ui -q` → **1423 passed, 6 skipped**
+- 新日志基线：待新版本日志测量（missing_translation 二次 Pro 重合成率应显著下降；首句延迟 P50/P90 复测）
+- 是否可 push：可 push（两个 worker + 集成修复全绿）；按协作约束默认不 push，等集成者/用户授权
+- 接口备注：主链 `TranslationProvider`（批量 list[str]→list[str]）与 benchmark provider（单条 str→TranslationResult）不一致，真实 provider 接入见 `provider-adapter-decision.md`（待 Codex 审查）
 
