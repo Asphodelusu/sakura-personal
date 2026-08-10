@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from app.agent.runtime import AgentRuntime
@@ -184,3 +185,25 @@ def test_stale_interaction_translation_is_discarded() -> None:
         },
     )
     window._apply_subtitle_translations.assert_not_called()
+
+
+def test_old_translation_worker_finish_does_not_clear_current_worker() -> None:
+    """旧翻译线程结束时不得清掉后来启动任务的线程/worker 引用。"""
+    from app.ui.pet_window import PetWindow
+
+    old_thread = object()
+    old_worker = object()
+    current_thread = object()
+    current_worker = object()
+    window = SimpleNamespace(
+        _subtitle_translation_thread=current_thread,
+        _subtitle_translation_worker=current_worker,
+    )
+
+    PetWindow._clear_subtitle_translation_worker(window, old_thread, old_worker)
+    assert window._subtitle_translation_thread is current_thread
+    assert window._subtitle_translation_worker is current_worker
+
+    PetWindow._clear_subtitle_translation_worker(window, current_thread, current_worker)
+    assert window._subtitle_translation_thread is None
+    assert window._subtitle_translation_worker is None

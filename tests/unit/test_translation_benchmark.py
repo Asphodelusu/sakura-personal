@@ -11,6 +11,13 @@ import providers
 import run
 
 
+def test_private_benchmark_defaults_to_artifacts_directory():
+    expected = Path(__file__).resolve().parents[2] / "artifacts/agent-benchmarks/translation-decoupling"
+    assert extract.OUT_DIR == expected
+    assert run.OUT_DIR == expected
+    assert run.DATASET == expected / "dataset.jsonl"
+
+
 # ---- 标注规则 ----
 def test_annotate_jealousy():
     labels = extract.annotate("誰と比べてるの？", "", "吃醋", None)

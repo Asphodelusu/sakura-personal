@@ -4,8 +4,8 @@
   .venv/Scripts/python.exe scripts/translation_benchmark/run.py [--limit N] [--providers deepseek_flash qwen] [--workers 5]
 
 输出:
-  data/benchmark/results.json     指标报告
-  data/benchmark/blind_review.md  人工盲评对照文件
+  artifacts/agent-benchmarks/translation-decoupling/results.json
+  artifacts/agent-benchmarks/translation-decoupling/blind_review.md
 """
 from __future__ import annotations
 
@@ -18,8 +18,9 @@ from pathlib import Path
 
 import providers
 
-DATASET = Path("data/benchmark/dataset.jsonl")
-OUT_DIR = Path("data/benchmark")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+OUT_DIR = REPO_ROOT / "artifacts/agent-benchmarks/translation-decoupling"
+DATASET = OUT_DIR / "dataset.jsonl"
 
 
 def pctile(values: list[float], p: int) -> float:

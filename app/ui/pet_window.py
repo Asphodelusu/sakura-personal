@@ -7584,7 +7584,8 @@ class PetWindow(QWidget):
         provider = getattr(self, "translation_provider", None)
         if provider is None or not texts:
             return
-        # 简化：同一时刻只跑一条翻译任务；新任务覆盖旧线程引用（旧结果靠 interaction_id 丢弃）。
+        # 新任务可与尚未退出的旧任务短暂重叠；旧结果靠 interaction_id 丢弃。
+        # 清理时必须核对任务身份，避免旧线程结束后清掉新任务引用。
         thread = QThread(self)
         worker = SubtitleTranslationWorker(
             provider,
@@ -7601,7 +7602,12 @@ class PetWindow(QWidget):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_subtitle_translation_worker)
+        thread.finished.connect(
+            lambda current_thread=thread, current_worker=worker: self._clear_subtitle_translation_worker(
+                current_thread,
+                current_worker,
+            )
+        )
         self._subtitle_translation_thread = thread
         self._subtitle_translation_worker = worker
         thread.start()
@@ -7614,10 +7620,15 @@ class PetWindow(QWidget):
             },
         )
 
-    @Slot()
-    def _clear_subtitle_translation_worker(self) -> None:
-        self._subtitle_translation_thread = None
-        self._subtitle_translation_worker = None
+    def _clear_subtitle_translation_worker(
+        self,
+        thread: QThread,
+        worker: QObject,
+    ) -> None:
+        if self._subtitle_translation_thread is thread:
+            self._subtitle_translation_thread = None
+        if self._subtitle_translation_worker is worker:
+            self._subtitle_translation_worker = None
 
     @Slot(object)
     def _on_subtitle_translation_finished(self, payload: object) -> None:

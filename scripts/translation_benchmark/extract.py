@@ -1,6 +1,7 @@
 """从 Sakura.db 抽取日→中翻译基准数据集（只读，不修改历史库）。
 
-输出: data/benchmark/dataset.jsonl（每条含 ja / zh_reference / tone / labels）
+输出: artifacts/agent-benchmarks/translation-decoupling/dataset.jsonl
+（每条含 ja / zh_reference / tone / labels；本地私有数据，不入库）
 标注为启发式辅助标签，供人工盲评参考，非精确判断。
 """
 from __future__ import annotations
@@ -12,8 +13,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-DB = Path("data/chat_history/Sakura.db")
-OUT_DIR = Path("data/benchmark")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DB = REPO_ROOT / "data/chat_history/Sakura.db"
+OUT_DIR = REPO_ROOT / "artifacts/agent-benchmarks/translation-decoupling"
 
 # ---- 特殊标注启发式规则 ----
 _EXPLICIT_SUBJECT = ("私は", "私が", "僕は", "俺は", "あたしは", "あなた", "あんた", "お前", "君は", "きみは")

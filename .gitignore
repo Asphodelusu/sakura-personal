@@ -29,6 +29,7 @@ characters/
 .mypy_cache/
 .ruff_cache/
 temp/
+artifacts/agent-benchmarks/
 
 *.log
 data/chat_history.jsonl

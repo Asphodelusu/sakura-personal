@@ -40,13 +40,13 @@
 - 状态：完成
 - 分支或 worktree：fix/arch-review（共享工作区，无 worktree）
 - Commit：feat(benchmark): 日→中翻译基准工具（见本批次提交）
-- 修改文件：scripts/translation_benchmark/{extract.py,providers.py,run.py}、tests/unit/test_translation_benchmark.py、data/benchmark/{dataset.jsonl,per_sample_results.json,results.json,blind_review.md}
+- 修改文件：scripts/translation_benchmark/{extract.py,providers.py,run.py}、tests/unit/test_translation_benchmark.py；私有数据与结果仅保存在 ignored 的 `artifacts/agent-benchmarks/translation-decoupling/`
 - 数据集范围：最近 200 条 assistant（Sakura.db chat_history，非空 content+translation；排除 error/system/空翻译）；含 tone 与特殊标注
 - 候选 provider：deepseek-v4-flash（强制 json_object）、qwen3.7-plus（dashscope）；DeepL 无 key 占位、本地 fallback 接口预留
 - P50/P90 与失败率：
   - deepseek_flash：P50 5.9s / P90 9.3s，结构化成功 88%，失败率 12%（全为 JSON 解析失败，需重试/降级兜底）
   - qwen3.7-plus：P50 13.0s / P90 16.4s，结构化成功 99.5%，失败率 0.5%
-- 人工盲评位置：data/benchmark/blind_review.md（200 条，含省略主语/傲娇否定/吃醋/请求/称谓/亲密语气/疑似降级标注）
+- 人工盲评位置：`artifacts/agent-benchmarks/translation-decoupling/blind_review.md`（本机私有、不入库；200 条）
 - 推荐顺序与遗留风险：
   - 推荐 provider 顺序：qwen3.7-plus 优先（结构化成功率 99.5%、翻译质量稳、语气贴合）；deepseek-v4-flash 作为低延迟备选（88% 需重试/降级兜底）
   - 遗留风险：① flash 12% JSON 失败需重试/降级，单次延迟无硬上限；② 独立翻译 P50 6-13s，作异步 sidecar 可接受（不阻塞 TTS），但字幕晚到；③ 亲密语境称谓（パパ/あんた 等）直译 vs 委婉处理需人工校准；④ 历史 translation 存在降级/错位样本（已在数据集标注）
@@ -54,10 +54,9 @@
 ## Integration Review
 
 - 审查人：Claude Code（集成负责人）
-- 合并方式：共享工作区，串行本地提交（4d869f3 Phase1 → ba5a864 benchmark → 79cb0f8 docs routing → 68407b2 集成修复），由集成者统一 push
-- 最终 commit：4d869f3（Phase1）+ ba5a864（benchmark）+ 79cb0f8（docs）+ 68407b2（集成修复：MinimalConsumeWindow 桩补齐）
+- 合并方式：共享工作区，串行本地提交（4d869f3 Phase1 → 578588e benchmark 工具 → f0b7157 docs routing → 36d5acf 集成修复），由集成者统一 push
+- 最终 commit：4d869f3（Phase1）+ 578588e（benchmark 工具，不含私有数据）+ f0b7157（docs）+ 36d5acf（MinimalConsumeWindow 桩补齐）
 - 完整测试：`.\.venv\Scripts\python.exe -m pytest tests/unit tests/ui -q` → **1423 passed, 6 skipped**
 - 新日志基线：待新版本日志测量（missing_translation 二次 Pro 重合成率应显著下降；首句延迟 P50/P90 复测）
-- 是否可 push：可 push（两个 worker + 集成修复全绿）；按协作约束默认不 push，等集成者/用户授权
-- 接口备注：主链 `TranslationProvider`（批量 list[str]→list[str]）与 benchmark provider（单条 str→TranslationResult）不一致，真实 provider 接入见 `provider-adapter-decision.md`（待 Codex 审查）
-
+- 是否可 push：私有 benchmark 数据已从待推送历史移除；最终验证通过后可 push，仍需用户授权
+- 接口备注：主链 `TranslationProvider`（批量 list[str]→list[str]）与 benchmark provider（单条 str→TranslationResult）不一致；Phase 2 裁定见 `provider-adapter-decision.md`
