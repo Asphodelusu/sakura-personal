@@ -53,6 +53,17 @@ def test_valid_evidence_passes() -> None:
     assert reason == "evidence"
 
 
+def test_real_but_unrelated_evidence_does_not_ground_content() -> None:
+    corpus = "我今天喝了咖啡"
+    ok, reason = validate_memory_write_grounding(
+        "他最喜欢的游戏是最终幻想",
+        evidence="我今天喝了咖啡",
+        dialog_corpus=corpus,
+    )
+    assert not ok
+    assert reason == "evidence_content_mismatch"
+
+
 def test_transient_local_memory_rejected() -> None:
     assert looks_like_transient_local_memory("当前本地时间：2026-08-03T00:00:00")
     assert looks_like_transient_local_memory("他正在播放周杰伦的歌")

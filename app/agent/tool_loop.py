@@ -95,7 +95,6 @@ from app.llm.api_client import (
 )
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply, parse_chat_reply_result
 from app.llm.context_trimming import trim_messages_for_model
-from app.llm.prompts.recipes import build_segmented_reply_instruction
 from app.llm.prompts.types import ContextFragment
 
 
@@ -232,6 +231,7 @@ class AgentRuntimeToolLoopMixin:
     ) -> AgentResult:
         """执行 OpenAI 原生 tools/tool_calls 循环。"""
         working_messages: list[ChatMessage] = [*messages]
+        original_current_input = _latest_user_text(working_messages)
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
@@ -255,6 +255,7 @@ class AgentRuntimeToolLoopMixin:
         # tool_call 条目并入 assistant 消息，否则 sanitize_tool_conversation_messages
         # 会因「无匹配 assistant tool_call」而丢弃其结果。
         auto_tool_calls: list[dict[str, Any]] = []
+        last_turn: ChatCompletionTurn | None = None
         # 每轮记录用户情绪（之前只在 build_memory_context 内触发，defer/light 时被跳过）
         user_text = _latest_user_text(working_messages)
         if user_text:
@@ -309,6 +310,7 @@ class AgentRuntimeToolLoopMixin:
                     available_tools=tool_names,
                     event_payload=self._enrich_event_payload(event_payload),
                     service_status={"memory": memory_status},
+                    current_input=original_current_input,
                 )
                 if step_index == 0:
                     turn_state = self._resolve_turn_state(
@@ -317,8 +319,9 @@ class AgentRuntimeToolLoopMixin:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
-                # step0：Flash 独白与记忆召回 fork-join（先 resolve turn_state；join 后再拼 prompt）
-                thought_launch: _InnerThoughtLaunch | None = None
+                # step0：Flash 独白 ∥ 记忆改写/召回 fork-join（先 resolve turn_state；join 后再拼 prompt）
+                thought_launch = None
+                recall_launch = None
                 if step_index == 0:
                     thought_launch = self._launch_inner_thought_worker(
                         working_messages,
@@ -336,7 +339,17 @@ class AgentRuntimeToolLoopMixin:
                             turn_memory_fragments = tuple(light_recall.fragments)
                             memory_status = "rhythm_light"
                         elif turn_state.recall_decision == "recall":
-                            recall = self.memory_recall.recall(request)
+                            # 与独白并行：改写 + 向量检索在独立线程
+                            if step_index == 0:
+                                recall_launch = self._launch_memory_recall_worker(
+                                    request, light_mode=False,
+                                )
+                                recall = self._finalize_memory_recall_worker(recall_launch)
+                                recall_launch = None
+                                if recall is None:
+                                    recall = self.memory_recall.recall(request)
+                            else:
+                                recall = self.memory_recall.recall(request)
                             turn_memory_fragments = list(recall.fragments)
                             memory_status = recall.status
                             # 渐进检索：追加以往记忆的标题索引 + 工具提示
@@ -349,10 +362,23 @@ class AgentRuntimeToolLoopMixin:
                                     turn_memory_fragments.append(progressive)
                             turn_memory_fragments = tuple(turn_memory_fragments)
                         elif turn_state.recall_decision == "light":
-                            # 轻量召回：连续性上下文 + 1-2 条相关情节记忆
-                            light_recall = self.memory_recall.recall(
-                                request, light_mode=True,
-                            )
+                            # 轻量召回：连续性上下文 + 1-2 条相关情节记忆（与独白并行）
+                            if step_index == 0:
+                                recall_launch = self._launch_memory_recall_worker(
+                                    request, light_mode=True,
+                                )
+                                light_recall = self._finalize_memory_recall_worker(
+                                    recall_launch,
+                                )
+                                recall_launch = None
+                                if light_recall is None:
+                                    light_recall = self.memory_recall.recall(
+                                        request, light_mode=True,
+                                    )
+                            else:
+                                light_recall = self.memory_recall.recall(
+                                    request, light_mode=True,
+                                )
                             continuity = self.memory.build_continuity_context()
                             combined = list(light_recall.fragments)
                             if continuity:
@@ -373,7 +399,7 @@ class AgentRuntimeToolLoopMixin:
                             turn_memory_fragments = tuple(combined)
                             memory_status = "light"
                         else:
-                            # defer/skip：仅注入连续性上下文（心情+关系快照）
+                            # defer/skip：仅注入连续性上下文（心情+关系快照）；勿死等独白
                             continuity = self.memory.build_continuity_context()
                             if continuity:
                                 turn_memory_fragments = (
@@ -408,6 +434,8 @@ class AgentRuntimeToolLoopMixin:
                         request = replace(request, service_status={"memory": memory_status})
                 finally:
                     # 召回抛错也要回收线程；窗口写入仅发生在此处（主线程）
+                    if recall_launch is not None:
+                        self._finalize_memory_recall_worker(recall_launch)
                     self._finalize_inner_thought_worker(thought_launch)
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
@@ -451,6 +479,7 @@ class AgentRuntimeToolLoopMixin:
                     cancel_checker=cancel_checker,
                     **dialogue_extra_params,
                 )
+                last_turn = turn
                 if turn.runtime_context_role != prompt_build.inspection.runtime_role:
                     self._record_prompt_inspection(
                         replace(prompt_build.inspection, runtime_role=turn.runtime_context_role)
@@ -1191,6 +1220,21 @@ class AgentRuntimeToolLoopMixin:
                 for result in step_results
             ):
                 memory_needs_refresh = True
+            # 规划轮已带合格完整回复，且工具不会改写答案 → 不必再开下一轮规划
+            if self._tool_loop_reusable_reply(
+                turn, execution_results=execution_results
+            ) is not None:
+                debug_log(
+                    "AgentRuntime",
+                    "工具轮已含完整回复，结束工具循环",
+                    {
+                        "step_index": step_index,
+                        "content_chars": len((turn.content or "").strip()),
+                        "tool_result_count": len(execution_results),
+                        "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
+                    },
+                )
+                break
             if should_fast_forward_final_reply:
                 # 搜/读已完成：把确定性证据包放进上下文，避免终局合成仍处在「还在查」的中间态。
                 evidence_packet = _build_web_search_evidence_packet_message(execution_results)
@@ -1213,16 +1257,49 @@ class AgentRuntimeToolLoopMixin:
         try:
             check_cancelled(cancel_checker)
             final_started_at = time.perf_counter()
-            final_reply = self._finalize_tool_loop_reply(
-                working_messages,
-                context_source=context_source,
-                cancel_checker=cancel_checker,
-                turn_state=turn_state,
-                memory_fragments=turn_memory_fragments,
-                memory_status=memory_status,
-                reuse_memory_fragments=not memory_needs_refresh,
+            reusable = self._tool_loop_reusable_reply(
+                last_turn,
                 execution_results=execution_results,
             )
+            if reusable is not None:
+                # 工具轮已带合格完整回复：跳过二次 pro 合成（省一轮时间+token）
+                snapshot = self._build_single_context_snapshot(
+                    working_messages,
+                    source=context_source,
+                    memory_fragments=turn_memory_fragments if not memory_needs_refresh else None,
+                    memory_status=memory_status if not memory_needs_refresh else None,
+                )
+                prompt_build = self._build_final_reply_result(snapshot)
+                self._record_prompt_inspection(prompt_build.inspection)
+                debug_log(
+                    "AgentRuntime",
+                    "工具轮已含完整回复，跳过最终合成",
+                    {
+                        "content_chars": len(reusable),
+                        "had_tool_calls": bool(last_turn and last_turn.tool_calls),
+                        "tool_result_count": len(execution_results),
+                    },
+                )
+                parsed = self._parse_final_reply_with_retry(
+                    prompt_build.system_prompt,
+                    working_messages,
+                    reusable,
+                    runtime_context=prompt_build.runtime_context,
+                    cancel_checker=cancel_checker,
+                    turn_state=turn_state,
+                )
+                final_reply = self._seal_reply_tones(parsed.reply)
+            else:
+                final_reply = self._finalize_tool_loop_reply(
+                    working_messages,
+                    context_source=context_source,
+                    cancel_checker=cancel_checker,
+                    turn_state=turn_state,
+                    memory_fragments=turn_memory_fragments,
+                    memory_status=memory_status,
+                    reuse_memory_fragments=not memory_needs_refresh,
+                    execution_results=execution_results,
+                )
             check_cancelled(cancel_checker)
         except OperationCancelled:
             raise
@@ -1462,13 +1539,16 @@ class AgentRuntimeToolLoopMixin:
         cancel_checker: CancelChecker | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> ChatReply:
-        """事件回复走结构化 JSON + 格式修复，避免 api_client.chat 直接降级兜底。"""
-        segmented_instruction = build_segmented_reply_instruction(
-            self._effective_reply_tones(),
-            self.reply_portraits,
-            portrait_hints=self._portrait_hints() or None,
+        """事件回复走结构化 JSON + 格式修复，避免 api_client.chat 直接降级兜底。
+
+        event.rules 里已含分段协议；这里只补一句 JSON 约束，不再整段重贴
+        reply.protocol / portrait_hints（避免事件路径多浪费约 2K tokens）。
+        """
+        # 协议已在 _build_event_reply_result 的 event.rules 中；勿再 append 全量立绘提示。
+        json_only_reminder = (
+            "最终回复必须是合法 JSON segments 对象，禁止纯文本、Markdown 或代码块。"
         )
-        full_system_prompt = f"{prompt_build.system_prompt.strip()}\n\n{segmented_instruction}"
+        full_system_prompt = f"{prompt_build.system_prompt.strip()}\n\n{json_only_reminder}"
         dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
         event_temperature = min(dialogue_temperature, 0.5)
         on_chunk = _build_stream_progress_emitter(progress_callback, cancel_checker)

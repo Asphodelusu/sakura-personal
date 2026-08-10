@@ -15,18 +15,18 @@
 
 ## 常用命令
 
-项目使用 `/runtime/python.exe` 的运行环境，以下命令均在该环境下执行：
+源码开发使用 `.venv\Scripts\python.exe` 的运行环境，以下命令均在该环境下执行：
 
 ```powershell
-python main.py
+.\.venv\Scripts\python.exe main.py
 ```
 
 ```powershell
-python -m pytest
+.\.venv\Scripts\python.exe -m pytest
 ```
 
 ```powershell
-python -m pytest tests/unit
+.\.venv\Scripts\python.exe -m pytest tests/unit
 ```
 
 ## 验证要求

@@ -26,8 +26,7 @@ class IntimacyModeState:
     """身体亲密进行中的对话节奏状态。只影响回复节奏（非思考模式 + 可选续投）。
 
     生命周期：
-    - 请求：模型调 set_intimacy_mode(on=true) 或亲密/H tone 兜底 → pending（先口头确认）
-    - 确认：用户明确答应 → active；含糊/拒绝/收尾 → 清 pending
+    - 开启：用户整句发送约定词 → 系统硬开启（不经 LLM 工具）
     - 保持：用户正常回话 → 刷新 8 轮额度；静默续投 → 扣 1 轮
     - 退出：用户收尾话 / 模型 on=false / 续投耗尽
     """
@@ -36,59 +35,61 @@ class IntimacyModeState:
 
     def __init__(self) -> None:
         self.active: bool = False
-        self.pending: bool = False
+        self.pending: bool = False  # 兼容旧字段；硬入口后不再用于开启
         self._turns_left: int = 0
         self.needs_reentry_hint: bool = False
         self.last_user_text: str = ""
+        self.opened_by_keyword: bool = False
 
     def note_user_text(self, text: str) -> None:
         self.last_user_text = str(text or "").strip()
 
     def request_confirm(self) -> None:
-        """进入等待确认；不开启续投/guide。"""
-        if self.active:
-            return
-        self.pending = True
-        self.needs_reentry_hint = False
+        """已废弃：开启改为约定词硬入口，不再进入 pending。"""
+        return
 
     def confirm(self) -> None:
-        """用户明确答应后真正开启。"""
-        self.pending = False
+        """兼容旧调用：等同 enter。"""
         self.enter()
 
     def reject_pending(self) -> None:
-        """确认被拒或话题岔开：清 pending，不进模式。"""
         self.pending = False
 
-    def enter(self) -> None:
+    def enter(self, *, by_keyword: bool = False) -> None:
         self.active = True
         self.pending = False
         self._turns_left = self._AUTO_EXIT_TURNS
         self.needs_reentry_hint = False
+        self.opened_by_keyword = bool(by_keyword)
 
     def exit(self) -> None:
-        """收尾：清 active/pending，不留重进提示。"""
+        """收尾：清 active，不留重进提示。"""
         self.active = False
         self.pending = False
         self._turns_left = 0
         self.needs_reentry_hint = False
         self.last_user_text = ""
+        self.opened_by_keyword = False
 
     def refresh_user_reply(self) -> None:
         """用户回话：刷新存活额度，保持开启。"""
         if not self.active:
             return
         self._turns_left = self._AUTO_EXIT_TURNS
+        # 非约定词的普通回话后，去掉「本轮刚硬开」标记
+        if not user_requests_intimacy_entry(self.last_user_text):
+            self.opened_by_keyword = False
 
     def consume_turn(self) -> bool:
         """系统续投消耗一次；返回是否仍活跃。"""
         if not self.active:
             return False
         self._turns_left -= 1
+        self.opened_by_keyword = False
         if self._turns_left <= 0:
             self.active = False
             self.pending = False
-            # 静默续投耗尽：模型不知道被自动关掉，需要提示它若仍在互动则重开
+            # 静默续投耗尽：提示对方再发约定词重开
             self.needs_reentry_hint = True
             return False
         return True
@@ -110,15 +111,12 @@ INTIMACY_CONTINUE_SYSTEM_TEXT = (
     f"{INTIMACY_CONTINUE_MARKER}"
 )
 
-# 用户明确答应进入（pending→active）；拒绝/收尾优先于确认。
-_INTIMACY_CONFIRM_FULL = re.compile(
-    r"^(要|要啊|要的|要吧|好啊|好呀|好的呀|可以|可以啊|可以的|一起|来吧|行|行啊|行吧|"
-    r"继续|嗯嗯|うん|いいよ|お願い)$"
-)
-_INTIMACY_CONFIRM_RE = re.compile(
-    r"(要继续|可以继续|一起做|来吧|做吧|继续吧|过分一点|"
-    r"いいよ|お願い|もっと|触って|して[いいよね]|やろう)",
-    re.IGNORECASE,
+# 进入亲密节奏的唯一硬入口（整句匹配，可带轻标点）。换词只改这里。
+INTIMACY_ENTER_PHRASE = "贴紧"
+# 旧名兼容
+INTIMACY_CONFIRM_PHRASE = INTIMACY_ENTER_PHRASE
+_INTIMACY_ENTER_TRIM_RE = re.compile(
+    r"^[\s　\"'“”‘’「」『』]+|[\s　\"'“”‘’「」『』！!。.?？…～~]+$"
 )
 _INTIMACY_EXIT_RE = re.compile(
     r"(冷静|先这样|不闹了|差不多了|休息吧|睡吧|聊点别的|不要继续|别继续|"
@@ -129,45 +127,51 @@ _INTIMACY_EXIT_RE = re.compile(
 
 
 def user_declines_or_exits_intimacy(text: str) -> bool:
-    """明确拒绝确认，或要求退出/降温。"""
+    """明确要求退出/降温。"""
     t = str(text or "").strip()
     if not t:
         return False
     return bool(_INTIMACY_EXIT_RE.search(t))
 
 
-def user_confirms_intimacy(text: str) -> bool:
-    """明确答应进入/继续身体亲密。"""
+def user_requests_intimacy_entry(text: str) -> bool:
+    """整句是否为约定硬入口词。"""
     t = str(text or "").strip()
     if not t or INTIMACY_CONTINUE_MARKER in t:
         return False
     if user_declines_or_exits_intimacy(t):
         return False
-    if _INTIMACY_CONFIRM_FULL.fullmatch(t):
-        return True
-    return bool(_INTIMACY_CONFIRM_RE.search(t))
+    normalized = _INTIMACY_ENTER_TRIM_RE.sub("", t).strip()
+    return normalized == INTIMACY_ENTER_PHRASE
+
+
+def user_confirms_intimacy(text: str) -> bool:
+    """兼容旧名：等同约定词硬入口检测。"""
+    return user_requests_intimacy_entry(text)
 
 
 def apply_intimacy_user_utterance(
     text: str,
     state: IntimacyModeState | None = None,
 ) -> str | None:
-    """根据用户话处理 pending 确认或 active 退出。返回动作名或 None。"""
+    """处理约定词硬开 / 收尾退出。返回动作名或 None。"""
     st = state if state is not None else intimacy_mode_state
     st.note_user_text(text)
-    if st.pending:
-        if user_declines_or_exits_intimacy(text):
-            st.reject_pending()
-            return "rejected_pending"
-        if user_confirms_intimacy(text):
-            st.confirm()
-            return "confirmed"
-        # 含糊/岔开：不当成答应，清 pending，避免误开续投
-        st.reject_pending()
-        return "rejected_pending"
-    if st.active and user_declines_or_exits_intimacy(text):
-        st.exit()
-        return "exited"
+    st.pending = False
+
+    if user_requests_intimacy_entry(text):
+        if not intimacy_mode_available():
+            return "unavailable"
+        already = st.active
+        st.enter(by_keyword=True)
+        return "already_on" if already else "entered"
+
+    if user_declines_or_exits_intimacy(text):
+        if st.active:
+            st.exit()
+            return "exited"
+        return None
+
     return None
 
 
@@ -202,22 +206,13 @@ def latest_is_intimacy_continue(messages: list[Any] | None) -> bool:
 
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
-    "切换身体亲密相关的对话节奏（更快回复，并可能在对方沉默时主动续说）。"
-    "仅在即将进入或正在进行身体亲密（含明确准备动手）时调用 on=true；"
-    "系统会先进入待确认：若对方尚未明确答应，你必须先口头确认"
-    "（如「……再靠近一点，也可以吗？」「要继续吗？不想的话，这样就好。」），"
-    "等对方明确答应后才会真正开启；不要在未确认时动手描写或使用 tone「亲密」/「H」。"
-    "摸头、抱抱、撒娇、口头调情、关心安慰、日常/技术话题都不要开启。"
-    "当身体亲密自然结束或对方降温/收尾时，主动 on=false："
+    "关闭身体亲密相关的对话节奏（更快回复、沉默续投、亲密/H tone）。"
+    f"开启不由本工具控制：只有对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」时，"
+    "系统才会自动开启；不要猜测、不要调用 on=true 试图开启。"
+    "当身体亲密自然结束或对方降温/收尾时，调用 on=false："
     "「好了」「不闹了」「先这样」「冷静一下」「休息吧」「聊点别的」等都是退出信号。"
-    "关闭后不会自动恢复；若互动再次进入亲密，需重新 on=true 并再次确认。"
+    f"关闭后不会自动恢复；对方需再次发送「{INTIMACY_ENTER_PHRASE}」。"
     "本工具只影响回复节奏与引导注入。"
-)
-
-_PENDING_ASK_INSTRUCTION = (
-    "尚未获得对方明确同意。本轮必须先用角色口吻简短确认"
-    "（例如「……再靠近一点，也可以吗？」「要继续吗？不想的话，这样就好。」），"
-    "等对方明确答应后再继续；不要开始动手描写，不要使用 tone「亲密」/「H」。"
 )
 
 
@@ -231,23 +226,18 @@ def intimacy_mode_available() -> bool:
 
 def _handle_set_intimacy_mode(arguments: dict[str, Any]) -> dict[str, Any]:
     on = bool(arguments.get("on", False))
-    if on and not intimacy_mode_available():
-        intimacy_mode_state.exit()
-        return {"intimacy_mode": "off", "available": False}
     if on:
+        # 开启已改为约定词硬入口；工具 on=true 不再开启，避免 LLM 误猜。
         if intimacy_mode_state.active:
-            return {"intimacy_mode": "on"}
-        # 同一轮用户已明确答应 → 直接开启；否则进入 pending，本轮先问
-        if user_confirms_intimacy(intimacy_mode_state.last_user_text):
-            intimacy_mode_state.enter()
-            return {"intimacy_mode": "on", "confirmed_by_user": True}
-        intimacy_mode_state.request_confirm()
+            return {"intimacy_mode": "on", "entry": "keyword_only"}
         return {
-            "intimacy_mode": "pending",
-            "ask_first": True,
-            "instruction": _PENDING_ASK_INSTRUCTION,
+            "intimacy_mode": "off",
+            "entry": "keyword_only",
+            "instruction": (
+                f"开启请等对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」；"
+                "系统会自动开启。不要再调用本工具 on=true。"
+            ),
         }
-    # on=false：直接退出（模型判断亲密互动已自然结束）
     intimacy_mode_state.exit()
     return {"intimacy_mode": "off"}
 

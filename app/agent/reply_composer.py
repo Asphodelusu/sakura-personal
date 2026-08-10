@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import app.agent.tool_routing as tool_routing
 from app.agent.prompt_builder import _INTIMACY_EXTRA_TONES
+from app.agent.tools import ToolExecutionResult
 from app.agent.web_evidence import (
     _build_web_search_evidence_packet_message,
     _turn_had_successful_web_search,
@@ -28,16 +30,38 @@ from app.llm.api_client import (
 from app.llm.chat_reply import ChatReply, ChatReplyParseResult, parse_chat_reply_result
 from app.llm.context_trimming import trim_messages_for_model
 
+# 用户明确要换装/姿态时，才把全量立绘目录塞进提示词
+_FULL_PORTRAIT_CATALOG_RE = re.compile(
+    r"(换装|换表情|换个表情|立绘|pose|姿势|拍胸|撩发|摸摸|伸手|表情包|换个脸)",
+    re.I,
+)
+
 
 _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
-    "missing_translation",
+    # missing_translation：结构化 segments 缺 zh 不再触发二次 Pro；
+    # 纯日语无结构正文仍由 _structured_compose_reason 首轮拉起一次合成。
     "missing_segments",
     "invalid_json",
     "empty",
 })
 
+# 这些工具的成功结果通常会改变最终答案；规划轮正文写在结果之前，不能直接复用。
+_ANSWER_CHANGING_TOOL_NAMES = frozenset({
+    "web__web_search",
+    "web_search",
+    "web__fetch_url",
+    "fetch_url",
+    "memory_search",
+    "memory_detail",
+    "observe_screen",
+    "windows__screenshot",
+    "windows__snapshot",
+    "browser__browser_navigate",
+    "browser__browser_snapshot",
+})
+
 def _reply_has_display_translation(reply: ChatReply) -> bool:
-    """最终回复需要中文显示文本，避免兼容模型的纯日语正文漏到中文字幕 UI。"""
+    """是否已有中文译文（字幕可直接显示）。缺 zh 时允许后补，不挡采用。"""
 
     text_segments = [segment for segment in reply.segments if segment.text.strip()]
     if not text_segments:
@@ -46,6 +70,12 @@ def _reply_has_display_translation(reply: ChatReply) -> bool:
         segment.translation.strip()
         for segment in text_segments
     )
+
+
+def _reply_has_adoptable_segments(reply: ChatReply) -> bool:
+    """日语正文合格即可采用（tone/portrait 可空）；zh 非门槛。"""
+
+    return any(segment.text.strip() for segment in reply.segments)
 
 
 class AgentRuntimeReplyMixin:
@@ -146,12 +176,57 @@ class AgentRuntimeReplyMixin:
 
 
     def _structured_compose_reason(self, raw_content: str) -> str:
+        from app.llm.chat_reply import _looks_structured_reply
+
         parsed = self._normalize_parsed_reply(parse_chat_reply_result(raw_content))
         if parsed.needs_retry:
             return parsed.reason
+        # 结构化 segments（有 ja）直接采用；缺 zh 不触发二次合成。
+        if _looks_structured_reply(raw_content) and _reply_has_adoptable_segments(parsed.reply):
+            return ""
         if not _reply_has_display_translation(parsed.reply):
             return "missing_translation"
         return ""
+
+
+    def _usable_final_reply_content(self, raw_content: str) -> str | None:
+        """正文已是可采用的 segments（zh 可缺）则原样返回，否则 None。"""
+        text = str(raw_content or "").strip()
+        if not text:
+            return None
+        if self._structured_compose_reason(text):
+            return None
+        return text
+
+
+    def _tool_loop_reusable_reply(
+        self,
+        turn: ChatCompletionTurn | None,
+        *,
+        execution_results: list[ToolExecutionResult] | None = None,
+    ) -> str | None:
+        """工具循环结束后若已有可用完整回复，返回其原文以跳过二次 pro 合成。
+
+        - 无 tool_calls 且正文合格：直接采用（防御；正常应在循环内早退）
+        - 有 tool_calls 但正文已合格，且没有「会改写答案」的成功工具结果：采用
+          （例如边答边 add_todo；省掉 finalize 那一轮 pro）
+        - 刚跑过搜索/读页/记忆检索等：正文多半写在结果前，仍走合成
+        """
+        if turn is None:
+            return None
+        usable = self._usable_final_reply_content(turn.content or "")
+        if usable is None:
+            return None
+        if not turn.tool_calls:
+            return usable
+        results = execution_results or []
+        if any(
+            bool(getattr(result, "success", False))
+            and str(getattr(result, "tool_name", "") or "") in _ANSWER_CHANGING_TOOL_NAMES
+            for result in results
+        ):
+            return None
+        return usable
 
 
     def _finalize_tool_loop_reply(
@@ -229,10 +304,11 @@ class AgentRuntimeReplyMixin:
         parsed = parse_chat_reply_result(raw_content)
         parsed = self._normalize_parsed_reply(parsed)
         retry_reason = parsed.reason if parsed.needs_retry else ""
-        if not parsed.needs_retry and _reply_has_display_translation(parsed.reply):
+        # 合格日语 segments 可直接采用；缺 zh 交给异步翻译，不再二次 Pro。
+        if not parsed.needs_retry and _reply_has_adoptable_segments(parsed.reply):
             return parsed
         if not retry_reason:
-            retry_reason = "missing_translation"
+            retry_reason = "missing_segments"
 
         if retry_reason in _STRUCTURED_COMPOSE_RETRY_REASONS:
             debug_log(
@@ -252,7 +328,7 @@ class AgentRuntimeReplyMixin:
                 debug_log("AgentRuntime", "结构化合成失败，回退格式修复", {"error": str(exc)})
             else:
                 composed = self._normalize_parsed_reply(parse_chat_reply_result(composed_content))
-                if not composed.needs_retry and _reply_has_display_translation(composed.reply):
+                if not composed.needs_retry and _reply_has_adoptable_segments(composed.reply):
                     debug_log("AgentRuntime", "结构化合成成功", {"reason": retry_reason})
                     return composed
 
@@ -311,11 +387,32 @@ class AgentRuntimeReplyMixin:
         return repaired
 
 
-    def _portrait_hints(self) -> str:
+    def _wants_full_portrait_catalog(self, current_input: str = "") -> bool:
+        return bool(_FULL_PORTRAIT_CATALOG_RE.search(str(current_input or "")))
+
+
+    def _prompt_reply_portraits(self, *, current_input: str = "") -> list[str]:
+        """提示词里的 portrait 白名单：默认精简，换装意图时给全量。"""
+        profile = self.character_profile
+        full_list = [name.strip() for name in self.reply_portraits if str(name).strip()]
+        if profile is None:
+            return full_list
+        if self._wants_full_portrait_catalog(current_input):
+            return full_list or profile.portrait_choices
+        recent = tuple(getattr(self, "_recent_portraits", ()) or ())
+        core = profile.core_portrait_labels(extra=recent)
+        return core or full_list or profile.portrait_choices
+
+
+    def _portrait_hints(self, *, current_input: str = "") -> str:
         profile = self.character_profile
         if profile is None:
             return ""
-        return profile.portrait_selection_hints
+        labels = self._prompt_reply_portraits(current_input=current_input)
+        return profile.build_portrait_selection_hints(
+            include_catalog=self._wants_full_portrait_catalog(current_input),
+            portrait_labels=labels,
+        )
 
 
     def _normalize_parsed_reply(self, parsed: ChatReplyParseResult) -> ChatReplyParseResult:
@@ -337,8 +434,22 @@ class AgentRuntimeReplyMixin:
     def _normalize_reply(self, reply: ChatReply) -> ChatReply:
         profile = self.character_profile
         normalized = reply if profile is None else normalize_reply_portraits(reply, profile)
+        self._remember_recent_portraits(normalized)
         self._record_reply_emotion(normalized)
         return normalized
+
+
+    def _remember_recent_portraits(self, reply: ChatReply) -> None:
+        recent = getattr(self, "_recent_portraits", None)
+        if recent is None:
+            return
+        for segment in reply.segments:
+            label = str(getattr(segment, "portrait", "") or "").strip()
+            if not label:
+                continue
+            if recent and recent[-1] == label:
+                continue
+            recent.append(label)
 
 
     def _record_reply_emotion(self, reply: ChatReply) -> None:
@@ -357,7 +468,8 @@ class AgentRuntimeReplyMixin:
 
 
     def _build_final_reply_repair_instruction(self) -> str:
-        portraits = [name.strip() for name in self.reply_portraits if str(name).strip()]
+        # 修复轮与主提示一致用精简白名单，避免再灌一整份立绘目录
+        portraits = self._prompt_reply_portraits()
         example_portrait = portraits[0] if portraits else "站立待机"
         portrait_rule = (
             f"- portrait 只能从以下选择：{'、'.join(portraits)}。"

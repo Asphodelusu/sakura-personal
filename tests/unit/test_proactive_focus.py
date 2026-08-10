@@ -35,6 +35,7 @@ def _observer(**cfg: object) -> ProactiveObserver:
     obs._last_user_at = 0.0
     obs._last_eval_at = 0.0
     obs._last_proactive_at = 0.0
+    obs._last_silent_eval_at = 0.0
     return obs
 
 
@@ -481,3 +482,75 @@ def test_arm_content_quiet_follows_suggested_when_larger() -> None:
         assert abs(obs._content_quiet_until - 1480.0) < 0.01
         obs._arm_content_quiet(60.0)  # 更短的不缩短已有静默
         assert abs(obs._content_quiet_until - 1480.0) < 0.01
+
+
+def test_silent_eval_cooldown_blocks_timer_not_focus() -> None:
+    obs = _observer(timer_seconds=1.0)
+    obs.config.silent_eval_cooldown_seconds = 100.0
+    obs.config.adaptive_interval_min = 60.0
+    obs._focus_settled_at = 0.0
+    obs._next_timer_at = 0.0
+    obs._last_timer_check = 0.0
+    with patch("app.perception.observer.time.monotonic", return_value=1000.0):
+        obs._mark_silent_eval()
+    # 冷却内：timer 不触发
+    with patch("app.perception.observer.get_idle_seconds", return_value=0.0):
+        triggers = _collect(obs, 1050.0)
+    assert "timer" not in triggers
+    # 切窗仍可触发
+    obs._ready_focus_trigger = "window:A->B"
+    triggers = _collect(obs, 1050.0)
+    assert any(t.startswith("window:") for t in triggers)
+    # 冷却后 timer 可触发
+    obs._ready_focus_trigger = ""
+    obs._last_silent_eval_at = 900.0
+    with patch("app.perception.observer.get_idle_seconds", return_value=0.0):
+        triggers = _collect(obs, 1101.0)
+    assert "timer" in triggers
+
+
+def test_should_skip_speech_decision_same_window_summary() -> None:
+    from app.perception.observer import ObservationPacket
+
+    obs = _observer()
+    obs._last_eval_window_title = "Chrome"
+    obs._last_visual_summary = "彼はブラウザを見ている。"
+    packet = ObservationPacket(
+        window_title="Chrome",
+        process_name="chrome.exe",
+        triggers=("timer",),
+        idle_s=0,
+        visual_summary="彼はブラウザを見ている。",
+        reaction_hint="",
+        visible_text_excerpt="",
+        visible_text_source="",
+        content_scene="",
+        suggested_interval=300.0,
+    )
+    assert obs._should_skip_speech_decision(packet, "Chrome") is True
+    changed = ObservationPacket(
+        window_title="Chrome",
+        process_name="chrome.exe",
+        triggers=("timer",),
+        idle_s=0,
+        visual_summary="彼は動画を見ている。",
+        reaction_hint="",
+        visible_text_excerpt="",
+        visible_text_source="",
+        content_scene="",
+        suggested_interval=300.0,
+    )
+    assert obs._should_skip_speech_decision(changed, "Chrome") is False
+    windowed = ObservationPacket(
+        window_title="Chrome",
+        process_name="chrome.exe",
+        triggers=("window:A->Chrome",),
+        idle_s=0,
+        visual_summary="彼はブラウザを見ている。",
+        reaction_hint="",
+        visible_text_excerpt="",
+        visible_text_source="",
+        content_scene="",
+        suggested_interval=300.0,
+    )
+    assert obs._should_skip_speech_decision(windowed, "Chrome") is False

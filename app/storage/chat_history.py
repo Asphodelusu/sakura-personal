@@ -214,11 +214,12 @@ class ChatHistoryStore:
         portrait: str = "",
         channel: str = "",
         _debug: dict | None = None,
-    ) -> None:
+    ) -> int:
+        """写入一条历史；返回新行 id（供异步字幕回填）。"""
         debug_text = json.dumps(_debug, ensure_ascii=False) if _debug is not None else ""
         created_at = datetime.now().astimezone().isoformat(timespec="seconds")
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT INTO chat_history
                     (created_at, role, content, translation, tone, portrait, channel, debug)
@@ -235,12 +236,60 @@ class ChatHistoryStore:
                     debug_text,
                 ),
             )
+            return int(cursor.lastrowid or 0)
+
+    def update_translation(self, entry_id: int, translation: str) -> bool:
+        """按 id 回填中文字幕；不存在则返回 False。"""
+        try:
+            row_id = int(entry_id)
+        except (TypeError, ValueError):
+            return False
+        text = str(translation or "").strip()
+        if row_id <= 0 or not text:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE chat_history SET translation = ? WHERE id = ?",
+                (text, row_id),
+            )
+            return int(cursor.rowcount or 0) > 0
 
     def load(self) -> list[ChatHistoryEntry]:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_HISTORY_COLUMNS} FROM chat_history ORDER BY id ASC"
             ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
+    def count(self) -> int:
+        """当前库中消息条数（含 system 等非对话角色）。"""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM chat_history").fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def load_slice(self, offset: int, *, limit: int | None = None) -> list[ChatHistoryEntry]:
+        """按行偏移读取（0-based，与 processed_history_count 对齐）。"""
+        try:
+            off = max(0, int(offset))
+        except (TypeError, ValueError):
+            off = 0
+        with self._lock:
+            if limit is None:
+                rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    "ORDER BY id ASC LIMIT -1 OFFSET ?",
+                    (off,),
+                ).fetchall()
+            else:
+                try:
+                    capped = max(1, int(limit))
+                except (TypeError, ValueError):
+                    capped = 1
+                rows = self._conn.execute(
+                    f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                    "ORDER BY id ASC LIMIT ? OFFSET ?",
+                    (capped, off),
+                ).fetchall()
         return [self._row_to_entry(row) for row in rows]
 
     def load_tail(self, limit: int) -> tuple[list[ChatHistoryEntry], bool]:

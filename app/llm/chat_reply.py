@@ -223,9 +223,8 @@ def _build_segment(text: str, tone: Any, translation: str, portrait: Any, *, sup
             True,
         )
 
-    # 译文为空时用原文填充，避免 display_text(“zh”) 无内容可显示
-    safe_translation = translation if translation else text
-    return ChatSegment(text, _clean_tone(tone), safe_translation, _clean_portrait(portrait), suppress_tts=suppress_tts), False
+    # zh 可异步补全：缺译文时保持空串，display_text("zh") 会回退日文原文。
+    return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait), suppress_tts=suppress_tts), False
 
 
 def _clean_tone(value: Any) -> str:

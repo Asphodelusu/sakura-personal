@@ -245,9 +245,10 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
         failed = object()
         cancelled = object()
 
-        def __init__(self, curator, entries):  # type: ignore[no-untyped-def]
+        def __init__(self, curator, entries, *, snapshot_profile="full"):  # type: ignore[no-untyped-def]
             self.curator = curator
             self.entries = entries
+            self.snapshot_profile = snapshot_profile
             captured["worker"] = self
 
     class ResourceManagerStub:
@@ -5008,6 +5009,7 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
         _consume_agent_result = PetWindow._consume_agent_result
 
     window = MinimalConsumeWindow()
+    window._schedule_subtitle_translations = lambda *_args, **_kwargs: None
     segment = ChatSegment("時間だよ。水を飲んで。", "请求", "到时间了，喝水。", "伸手命令")
     shown_segments = []
     applied_results = []
@@ -5457,6 +5459,7 @@ def _build_minimal_manual_screenshot_window(text: str):
         captured_at="2026-05-31T12:00:00+08:00",
         screen_name="manual-selection",
     )
+    window.pending_manual_screen_summary = ""
     window.screen_observation_enabled = True
     window.messages = []
     window.active_interaction_id = ""

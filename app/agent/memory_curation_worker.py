@@ -18,10 +18,13 @@ class MemoryCurationWorker(QObject):
         self,
         curator: MemoryCurator,
         entries: list[ChatHistoryEntry],
+        *,
+        snapshot_profile: str = "full",
     ) -> None:
         super().__init__()
         self.curator = curator
         self.entries = entries
+        self.snapshot_profile = snapshot_profile
         self._cancel_token = CancellationToken()
 
     @Slot()
@@ -35,6 +38,7 @@ class MemoryCurationWorker(QObject):
             result = self.curator.curate_entries(
                 self.entries,
                 cancel_checker=self._cancel_token.throw_if_cancelled,
+                snapshot_profile=self.snapshot_profile,
             )
             self._cancel_token.throw_if_cancelled()
         except OperationCancelled:

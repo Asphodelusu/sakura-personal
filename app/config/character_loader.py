@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -94,26 +95,67 @@ class CharacterProfile:
     def portrait_choices(self) -> list[str]:
         return list(self.expression_portraits)
 
+    def core_portrait_labels(self, *, extra: Sequence[str] = ()) -> list[str]:
+        """日常提示用的精简立绘白名单：默认脸 + tone/emotion 映射 + 最近用过。"""
+        labels: list[str] = []
+        seen: set[str] = set()
+
+        def _add(label: str) -> None:
+            name = str(label or "").strip()
+            if name and name in self.expression_portraits and name not in seen:
+                seen.add(name)
+                labels.append(name)
+
+        _add(self.default_portrait_label())
+        for label in self.tone_portrait_map.values():
+            _add(label)
+        for label in self.emotion_portrait_map.values():
+            _add(label)
+        for label in extra:
+            _add(label)
+        return labels
+
     @property
     def portrait_selection_hints(self) -> str:
-        """供提示词使用的情绪→立绘分组说明。"""
+        """默认不含全量冷门立绘目录（省 token）；全量见 build_portrait_selection_hints。"""
+        return self.build_portrait_selection_hints(include_catalog=False)
+
+    def build_portrait_selection_hints(
+        self,
+        *,
+        include_catalog: bool = False,
+        portrait_labels: Sequence[str] | None = None,
+    ) -> str:
+        """供提示词使用的情绪→立绘说明。
+
+        include_catalog=False 时只给 tone/emotion 映射；True 时再补「语境合适可用」冷门目录。
+        portrait_labels 限定输出范围（与提示词白名单对齐）。
+        """
         if len(self.expression_portraits) <= 1:
+            return ""
+        allowed = (
+            {str(label).strip() for label in portrait_labels if str(label).strip()}
+            if portrait_labels is not None
+            else set(self.expression_portraits)
+        )
+        if not allowed:
             return ""
         lines: list[str] = []
         covered: set[str] = set()
         for tone, label in self.tone_portrait_map.items():
-            if label in self.expression_portraits and label not in covered:
+            if label in self.expression_portraits and label in allowed and label not in covered:
                 lines.append(f"- tone「{tone}」→ portrait「{label}」")
                 covered.add(label)
         for emotion, label in self.emotion_portrait_map.items():
-            if label in self.expression_portraits and label not in covered:
+            if label in self.expression_portraits and label in allowed and label not in covered:
                 hint = _EMOTION_HINT_LABELS.get(emotion, emotion)
                 lines.append(f"- {hint} → portrait「{label}」")
                 covered.add(label)
-        default_label = self.default_portrait_label()
-        for label in self.expression_portraits:
-            if label not in covered and label != default_label:
-                lines.append(f"- 语境合适时可用 portrait「{label}」")
+        if include_catalog:
+            default_label = self.default_portrait_label()
+            for label in self.expression_portraits:
+                if label in allowed and label not in covered and label != default_label:
+                    lines.append(f"- 语境合适时可用 portrait「{label}」")
         return "\n".join(lines)
 
     def default_portrait_label(self) -> str:

@@ -128,6 +128,52 @@ class TestRunnerProtocol:
         assert not MigrationRunner(base, steps=steps).run().failed
         assert MigrationRunner(base, steps=steps).current_version() == 1
 
+    def test_second_file_operation_failure_rolls_back_and_restart_recovers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """同一步骤第二次改名失败时，首个改名及已写目标必须全部回滚。"""
+        base = _make_base("second_operation_rollback")
+        paths = StoragePaths(base)
+        (base / ".env").write_text("MODEL=transaction-model\n", encoding="utf-8")
+        legacy = paths.legacy_chat_history()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(_jsonl_line("2026-01-01T00:00:00", "legacy"), encoding="utf-8")
+
+        from app.config import migration_runner as migration_module
+        from app.config.character_loader import DEFAULT_CHARACTER_ID
+
+        real_rename = migration_module.rename_with_retry
+        rename_calls = 0
+
+        def fail_second_rename(source: Path, target: Path) -> None:
+            nonlocal rename_calls
+            rename_calls += 1
+            if rename_calls == 2:
+                raise OSError("simulated second rename failure")
+            real_rename(source, target)
+
+        monkeypatch.setattr(migration_module, "rename_with_retry", fail_second_rename)
+
+        first = MigrationRunner(base).run()
+
+        assert first.failed
+        assert MigrationRunner(base).current_version() == 0
+        assert (base / ".env").read_text(encoding="utf-8") == "MODEL=transaction-model\n"
+        assert not (base / ".env.migrated").exists()
+        assert legacy.is_file()
+        assert not legacy.with_name(legacy.name + ".migrated").exists()
+        assert not paths.chat_history_for(DEFAULT_CHARACTER_ID).exists()
+        assert not paths.api_config().exists()
+
+        monkeypatch.setattr(migration_module, "rename_with_retry", real_rename)
+        second = MigrationRunner(base).run()
+
+        assert not second.failed
+        assert second.to_version == CURRENT_CONFIG_VERSION
+        assert (base / ".env.migrated").is_file()
+        assert legacy.with_name(legacy.name + ".migrated").is_file()
+
 
 class TestV0ToV1:
     def test_env_imported_archived_and_backed_up(self) -> None:

@@ -5,12 +5,13 @@
 
 执行协议（每个步骤）：
 1. migration.<name>.started 日志
-2. 将该步骤声明的关联文件备份到 data/migration_backup/<时间戳>_<name>/
+2. 创建持久化事务清单，并将该步骤声明的关联文件原状态登记到备份目录
 3. 执行 apply（步骤必须幂等：中断后重跑不得损坏数据）
 4. 成功后才把 config_version 推进到该步骤版本（标记后置：失败不前进，下次启动重试）
 5. migration.<name>.completed / failed 日志
 
-失败处理：当前步骤失败即停止后续步骤，原文件保持原位；
+失败处理：当前步骤失败即按事务清单回滚并停止后续步骤；进程若在迁移中断，
+下次启动会先恢复未完成事务。原文件保持原位；
 迁移失败不阻断应用启动，应用按旧数据形态继续工作。
 """
 
@@ -29,6 +30,8 @@ from app.storage.atomic import atomic_write_text, rename_with_retry
 from app.storage.paths import StoragePaths
 
 CONFIG_VERSION_KEY = "config_version"
+_ACTIVE_TRANSACTION_FILE = ".active_transaction.json"
+_TRANSACTION_MANIFEST_FILE = "transaction.json"
 # 当前代码期望的数据形态版本；新增迁移步骤时同步 +1
 CURRENT_CONFIG_VERSION = 3
 
@@ -40,23 +43,103 @@ class MigrationContext:
     base_dir: Path
     paths: StoragePaths
     backup_dir: Path
+    _entries: dict[str, dict[str, object]] | None = None
+
+    @property
+    def _active_transaction_path(self) -> Path:
+        return self.paths.migration_backup_dir / _ACTIVE_TRANSACTION_FILE
+
+    @property
+    def _manifest_path(self) -> Path:
+        return self.backup_dir / _TRANSACTION_MANIFEST_FILE
+
+    def begin_transaction(self, step: "MigrationStep") -> None:
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self._entries = {}
+        self._write_manifest(step_name=step.name, version=step.version, status="active")
+        atomic_write_text(
+            self._active_transaction_path,
+            json.dumps(
+                {"backup_dir": str(self.backup_dir.relative_to(self.base_dir))},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+            backup=False,
+        )
+
+    def commit_transaction(self, step: "MigrationStep") -> None:
+        self._write_manifest(step_name=step.name, version=step.version, status="completed")
+        self._active_transaction_path.unlink(missing_ok=True)
+
+    def rollback_transaction(self) -> None:
+        entries = self._entries or self._load_manifest_entries(self._manifest_path)
+        for relative_text, entry in reversed(list(entries.items())):
+            target = self.base_dir / Path(relative_text)
+            if bool(entry.get("existed")):
+                backup = self.backup_dir / Path(str(entry["backup"]))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup, target)
+            else:
+                target.unlink(missing_ok=True)
+        self._active_transaction_path.unlink(missing_ok=True)
+
+    def _write_manifest(self, *, step_name: str, version: int, status: str) -> None:
+        atomic_write_text(
+            self._manifest_path,
+            json.dumps(
+                {
+                    "step": step_name,
+                    "version": int(version),
+                    "status": status,
+                    "entries": self._entries or {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+            backup=False,
+        )
+
+    @staticmethod
+    def _load_manifest_entries(manifest_path: Path) -> dict[str, dict[str, object]]:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            raise ValueError("迁移事务清单 entries 无效")
+        return entries
 
     def backup_file(self, path: Path) -> None:
-        """把文件备份到本步骤目录；源不存在时忽略。
+        """在修改前登记文件原状态；源不存在时登记为本轮新建。
 
         base_dir 内文件按相对路径保留目录结构，避免不同数据目录里的同名
-        文件互相覆盖；外部文件回退为按文件名备份。
+        文件互相覆盖。迁移事务仅允许修改 base_dir 内文件。
         """
         source = Path(path)
-        if not source.is_file():
-            return
         try:
             relative_path = source.resolve().relative_to(self.base_dir.resolve())
-        except (OSError, ValueError):
-            relative_path = Path(source.name)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"迁移事务目标不在 base_dir 内: {source}") from exc
+        relative_text = relative_path.as_posix()
+        if self._entries is None:
+            raise RuntimeError("迁移事务尚未开始")
+        if relative_text in self._entries:
+            return
         target = self.backup_dir / relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        existed = source.is_file()
+        if existed:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        self._entries[relative_text] = {
+            "existed": existed,
+            "backup": relative_path.as_posix(),
+        }
+        manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        self._write_manifest(
+            step_name=str(manifest.get("step", "unknown")),
+            version=int(manifest.get("version", 0)),
+            status="active",
+        )
 
 
 @dataclass(frozen=True)
@@ -110,6 +193,7 @@ class MigrationRunner:
 
     def run(self) -> MigrationReport:
         """执行全部待办迁移；任一步骤失败即停止后续步骤。"""
+        self._recover_interrupted_transaction()
         from_version = self.current_version()
         results: list[MigrationResult] = []
         for step in self.pending():
@@ -124,9 +208,16 @@ class MigrationRunner:
                 backup_dir=backup_dir,
             )
             try:
+                context.begin_transaction(step)
+                context.backup_file(self.paths.system_config())
                 step.apply(context)
                 self._write_version(step.version)
+                context.commit_transaction(step)
             except Exception as exc:  # noqa: BLE001 - 迁移失败不允许炸掉启动
+                try:
+                    context.rollback_transaction()
+                except Exception as rollback_exc:  # noqa: BLE001 - 保留清单供下次启动恢复
+                    exc = RuntimeError(f"{exc}; rollback failed: {rollback_exc}")
                 debug_log(
                     "Migration",
                     f"migration.{step.name}.failed",
@@ -144,6 +235,28 @@ class MigrationRunner:
             from_version=from_version,
             to_version=self.current_version(),
             results=tuple(results),
+        )
+
+    def _recover_interrupted_transaction(self) -> None:
+        active_path = self.paths.migration_backup_dir / _ACTIVE_TRANSACTION_FILE
+        if not active_path.is_file():
+            return
+        data = json.loads(active_path.read_text(encoding="utf-8"))
+        relative_backup = Path(str(data.get("backup_dir", "")))
+        backup_dir = (self.base_dir / relative_backup).resolve()
+        backup_root = self.paths.migration_backup_dir.resolve()
+        if backup_dir == backup_root or backup_root not in backup_dir.parents:
+            raise ValueError("迁移事务清单 backup_dir 无效")
+        context = MigrationContext(
+            base_dir=self.base_dir,
+            paths=self.paths,
+            backup_dir=backup_dir,
+        )
+        context.rollback_transaction()
+        debug_log(
+            "Migration",
+            "migration.interrupted.recovered",
+            {"backup_dir": str(backup_dir)},
         )
 
     def _write_version(self, version: int) -> None:
@@ -195,7 +308,9 @@ def _migrate_dotenv(context: MigrationContext) -> None:
         for key in _parse_env_keys(env_path)
         if key not in migrated
     ]
-    rename_with_retry(env_path, env_path.with_name(env_path.name + _ENV_MIGRATED_SUFFIX))
+    archived_env = env_path.with_name(env_path.name + _ENV_MIGRATED_SUFFIX)
+    context.backup_file(archived_env)
+    rename_with_retry(env_path, archived_env)
     debug_log(
         "Migration",
         "migration.v0_to_v1.env.applied",
@@ -228,6 +343,7 @@ def _migrate_legacy_single_chat_history(context: MigrationContext) -> None:
         return
     target = context.paths.chat_history_for(DEFAULT_CHARACTER_ID)
     context.backup_file(legacy_path)
+    context.backup_file(target)
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy_path, target)
@@ -237,7 +353,9 @@ def _migrate_legacy_single_chat_history(context: MigrationContext) -> None:
             {"target": str(target)},
         )
     # 归档旧文件（已备份 + 已拆分/目标已存在），避免每次启动重复判断
-    rename_with_retry(legacy_path, legacy_path.with_name(legacy_path.name + _ENV_MIGRATED_SUFFIX))
+    archived_legacy = legacy_path.with_name(legacy_path.name + _ENV_MIGRATED_SUFFIX)
+    context.backup_file(archived_legacy)
+    rename_with_retry(legacy_path, archived_legacy)
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +434,10 @@ def _merge_variant_files_in_dir(
         for variant in variants:
             context.backup_file(canonical)
             context.backup_file(variant)
+            archived_variant = variant.with_name(variant.name + _ENV_MIGRATED_SUFFIX)
+            context.backup_file(archived_variant)
             _merge_jsonl(variant, canonical)
-            rename_with_retry(variant, variant.with_name(variant.name + _ENV_MIGRATED_SUFFIX))
+            rename_with_retry(variant, archived_variant)
             debug_log(
                 "Migration",
                 "migration.v1_to_v2.variant.merged",

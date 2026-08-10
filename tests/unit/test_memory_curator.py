@@ -13,11 +13,14 @@ from datetime import datetime, timedelta, timezone
 from app.agent.memory import MemoryStore, commitment_is_stale, sweep_stale_commitments
 from app.agent.memory_curator import (
     DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
+    LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET,
     MemoryCurationSettings,
     MemoryCurationState,
     MemoryCurator,
     _chunk_entries_for_curation,
     _entries_for_model,
+    _format_existing_memories,
+    _format_existing_memories_light,
     evaluate_idle_curation_trigger,
     resolve_idle_curation_trigger,
     looks_like_trivial_memory,
@@ -492,6 +495,26 @@ def test_memory_curation_state_waits_until_trigger_turns() -> None:
     assert state.pending_turns() == DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
 
 
+def test_memory_curation_state_store_cursor_avoids_full_scan(tmp_path: Path) -> None:
+    from app.storage.chat_history import ChatHistoryStore
+
+    store = ChatHistoryStore(tmp_path / "cursor.jsonl", assistant_name="桜")
+    try:
+        for index in range(5):
+            store.append("user", f"消息{index}")
+        state = MemoryCurationState(tmp_path / "curation_state.json")
+        state.mark_processed(3)
+        assert state.has_unprocessed_in_store(store) is True
+        unprocessed = state.load_unprocessed_from_store(store)
+        assert len(unprocessed) == 2
+        assert unprocessed[0].content == "消息3"
+        state.mark_processed(5)
+        assert state.has_unprocessed_in_store(store) is False
+        assert state.load_unprocessed_from_store(store) == []
+    finally:
+        store.close()
+
+
 def test_evaluate_idle_curation_trigger_hybrid_rules() -> None:
     settings = MemoryCurationSettings().normalized()
     base_kwargs = {
@@ -600,6 +623,50 @@ def test_evaluate_idle_curation_trigger_session_boundary() -> None:
         )
         is None
     )
+
+
+def test_format_existing_memories_light_is_smaller_than_full() -> None:
+    memories = [
+        {
+            "id": f"m{i}",
+            "content": f"这是一条用于测试体积的长期记忆正文，编号 {i}。" * 8,
+            "layer": "semantic",
+            "updated_at": f"2026-07-{(i % 28) + 1:02d}T12:00:00+08:00",
+        }
+        for i in range(80)
+    ]
+    # 让部分记忆与对话相关，确保进入详细区
+    memories[0]["content"] = "他喜欢在周末看电影，尤其是科幻片。"
+    dialog = [{"role": "user", "content": "周末想看电影吗"}]
+    full = _format_existing_memories(memories)
+    light = _format_existing_memories_light(memories, dialog)
+    assert "【详细" in light
+    assert "【索引" in light
+    assert len(light) < len(full)
+    assert len(light) <= LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET + 200
+    assert "科幻片" in light
+
+
+def test_curate_entries_light_profile_passes_slim_snapshot() -> None:
+    existing = [
+        {
+            "id": f"m{i}",
+            "content": f"旧记忆条目 {i}：" + ("详情内容。" * 20),
+            "layer": "semantic",
+            "updated_at": f"2026-06-{(i % 28) + 1:02d}T10:00:00+08:00",
+        }
+        for i in range(60)
+    ]
+    store = FakeMemoryStore(existing=existing)
+    api = FakeCurationApiClient(['{"operations":[]}'])
+    curator = MemoryCurator(api, store)
+    curator.curate_entries(
+        [_entry("user", "随便聊两句")],
+        snapshot_profile="light",
+    )
+    user_prompt = api.calls[0]["messages"][0]["content"]
+    assert "【详细" in user_prompt
+    assert len(user_prompt) < len(_format_existing_memories(existing)) + 2000
 
 
 def test_resolve_idle_curation_trigger_light_idle() -> None:
