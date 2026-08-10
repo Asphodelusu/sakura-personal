@@ -5009,6 +5009,7 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
         _consume_agent_result = PetWindow._consume_agent_result
 
     window = MinimalConsumeWindow()
+    window._schedule_subtitle_translations = lambda *_args, **_kwargs: None
     segment = ChatSegment("時間だよ。水を飲んで。", "请求", "到时间了，喝水。", "伸手命令")
     shown_segments = []
     applied_results = []
