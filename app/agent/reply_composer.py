@@ -27,7 +27,12 @@ from app.llm.api_client import (
     NativeToolCall,
     strip_image_parts_from_messages,
 )
-from app.llm.chat_reply import ChatReply, ChatReplyParseResult, parse_chat_reply_result
+from app.llm.chat_reply import (
+    ChatReply,
+    ChatReplyParseResult,
+    _try_load_json,
+    parse_chat_reply_result,
+)
 from app.llm.context_trimming import trim_messages_for_model
 
 # 用户明确要换装/姿态时，才把全量立绘目录塞进提示词
@@ -76,6 +81,12 @@ def _reply_has_adoptable_segments(reply: ChatReply) -> bool:
     """日语正文合格即可采用（tone/portrait 可空）；zh 非门槛。"""
 
     return any(segment.text.strip() for segment in reply.segments)
+
+
+def _raw_contains_json_object(raw_content: str) -> bool:
+    """正文能否抽出 JSON 对象。纯文本回退不得走缺 zh 直通。"""
+    data, _repaired = _try_load_json(str(raw_content or ""))
+    return isinstance(data, dict)
 
 
 class AgentRuntimeReplyMixin:
@@ -176,13 +187,11 @@ class AgentRuntimeReplyMixin:
 
 
     def _structured_compose_reason(self, raw_content: str) -> str:
-        from app.llm.chat_reply import _looks_structured_reply
-
         parsed = self._normalize_parsed_reply(parse_chat_reply_result(raw_content))
         if parsed.needs_retry:
             return parsed.reason
-        # 结构化 segments（有 ja）直接采用；缺 zh 不触发二次合成。
-        if _looks_structured_reply(raw_content) and _reply_has_adoptable_segments(parsed.reply):
+        # 解析后已有可采用日语 segments 时直接采用；缺 zh 交给异步字幕翻译。
+        if _reply_has_adoptable_segments(parsed.reply) and _raw_contains_json_object(raw_content):
             return ""
         if not _reply_has_display_translation(parsed.reply):
             return "missing_translation"

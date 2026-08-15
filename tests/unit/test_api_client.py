@@ -138,6 +138,64 @@ def test_build_chat_payload_drops_unsupported_params() -> None:
     assert payload["messages"][0] == {"role": "system", "content": "system"}
 
 
+def test_kimi_k26_omits_temperature_on_first_payload() -> None:
+    """kimi-k2.6 首次请求就必须省略 temperature，不能等 400 后再学习。"""
+    payload = _build_chat_completion_payload(
+        model="kimi-k2.6",
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.8,
+        chat_params={"thinking": {"type": "disabled"}, "temperature": 0.6},
+    )
+
+    assert "temperature" not in payload
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "stream" not in payload
+
+
+def test_kimi_k27_code_still_sends_temperature() -> None:
+    """不要误伤 K2.7 Code：仍发送配置温度。"""
+    payload = _build_chat_completion_payload(
+        model="kimi-k2.7-code",
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.7,
+        chat_params={"thinking": {"type": "enabled"}},
+    )
+
+    assert payload["temperature"] == 0.7
+    assert payload["thinking"] == {"type": "enabled"}
+
+
+def test_complete_with_tools_kimi_k26_omits_temperature_keeps_thinking(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="kimi-k2.6",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        captured.update(payload)
+        return {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    client.complete_with_tools(
+        "system",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.8,
+        thinking={"type": "disabled"},
+    )
+
+    assert "temperature" not in captured
+    assert captured.get("thinking") == {"type": "disabled"}
+    assert "stream" not in captured
+    assert captured.get("stream") is not True
+
+
 def test_build_chat_payload_strips_internal_message_keys() -> None:
     payload = _build_chat_completion_payload(
         model="gpt-compatible",
