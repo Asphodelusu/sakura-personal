@@ -28,10 +28,9 @@
 
 ## Codex integration review
 
-- status: pending
-- diff review:
-- targeted verification:
-- full verification:
-- runtime verification:
-- final decision:
-
+- status: code and automated-test review complete; runtime follow-up pending
+- diff review: 文件范围符合合同；主 Chat 未改流式路径。K2.6 在 payload 构建层省略 temperature，thinking 参数保留；可解析的日语 JSON segments 缺 zh 时绕过二次 compose，纯文本/坏 JSON仍保留修复路径。
+- targeted verification: `.\.venv\Scripts\python.exe -m pytest tests/unit/test_api_client.py tests/unit/test_reply_translation_decouple.py -q` → 59 passed
+- full verification: `.\.venv\Scripts\python.exe -m pytest tests/unit tests/ui -q` → 1430 passed, 6 skipped
+- runtime verification: 待重启 Sakura 后实聊 5–10 轮，确认普通无工具回复不再因 `missing_translation` 二次请求 Kimi，并记录首句延迟。
+- final decision: 当前 K2.6 主槽位修复可进入实机验证；未发现阻塞 push 的自动化回归。后续单独处理 K2.7 Code 同样不应发送 temperature 的官方兼容差异，不扩大本批次范围。
