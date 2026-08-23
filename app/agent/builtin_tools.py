@@ -27,11 +27,11 @@ class IntimacyModeState:
 
     生命周期：
     - 开启：用户整句发送约定词 → 系统硬开启（不经 LLM 工具）
-    - 保持：用户正常回话 → 刷新 8 轮额度；静默续投 → 扣 1 轮
-    - 退出：用户收尾话 / 模型 on=false / 续投耗尽
+    - 保持：用户正常回话 → 刷新 3 轮额度；静默续投 → 扣 1 轮
+    - 退出：用户收尾话 / 模型 on=false / 第三轮续投完成后 UI 过期
     """
 
-    _AUTO_EXIT_TURNS = 8
+    _AUTO_EXIT_TURNS = 3
 
     def __init__(self) -> None:
         self.active: bool = False
@@ -80,18 +80,25 @@ class IntimacyModeState:
         if not user_requests_intimacy_entry(self.last_user_text):
             self.opened_by_keyword = False
 
-    def consume_turn(self) -> bool:
-        """系统续投消耗一次；返回是否仍活跃。"""
+    def expire_after_silence(self) -> None:
+        """第三轮续投回复完成后由 UI 调用；生成前不得提前失活。"""
         if not self.active:
+            return
+        self.active = False
+        self.pending = False
+        self._turns_left = 0
+        self.opened_by_keyword = False
+        self.needs_reentry_hint = True
+
+    def consume_turn(self) -> bool:
+        """系统续投消耗一次；返回是否仍活跃。第三轮仍保持 active。"""
+        if not self.active:
+            return False
+        if self._turns_left <= 0:
+            self.expire_after_silence()
             return False
         self._turns_left -= 1
         self.opened_by_keyword = False
-        if self._turns_left <= 0:
-            self.active = False
-            self.pending = False
-            # 静默续投耗尽：提示对方再发约定词重开
-            self.needs_reentry_hint = True
-            return False
         return True
 
 
@@ -105,32 +112,44 @@ INTIMACY_CONTINUE_MARKER = "（続けて）"
 INTIMACY_CONTINUE_ROLE = "system"
 INTIMACY_CONTINUE_SYSTEM_TEXT = (
     "【系统续投信号／不是对方发言】对方当前沉默。"
-    "请以夜乃桜身份推进身体亲密互动的下一步动作或反应；"
-    "不要换说法重复你上一句；若当前已不是身体亲密场景，调用 set_intimacy_mode(on=false)。"
+    "根据当前姿势、呼吸和对方最后的反应自然回应；不要把沉默当成同意升级。"
+    "可以放缓、短暂确认或自然收束，不要仅换说法重复上一句。"
+    "若当前已不是身体亲密场景，调用 set_intimacy_mode(on=false)。"
     "本条是系统信号，绝不要当成用户说过的话，不要回答或复述本信号。\n"
     f"{INTIMACY_CONTINUE_MARKER}"
 )
 
-# 进入亲密节奏的唯一硬入口（整句匹配，可带轻标点）。换词只改这里。
+# 进入/退出亲密节奏的成对硬控制词（整句匹配，可带轻标点）。换词只改这里。
 INTIMACY_ENTER_PHRASE = "贴紧"
+INTIMACY_EXIT_PHRASE = "苹果"
 # 旧名兼容
 INTIMACY_CONFIRM_PHRASE = INTIMACY_ENTER_PHRASE
-_INTIMACY_ENTER_TRIM_RE = re.compile(
+_INTIMACY_CONTROL_TRIM_RE = re.compile(
     r"^[\s　\"'“”‘’「」『』]+|[\s　\"'“”‘’「」『』！!。.?？…～~]+$"
 )
 _INTIMACY_EXIT_RE = re.compile(
     r"(冷静|先这样|不闹了|差不多了|休息吧|睡吧|聊点别的|不要继续|别继续|"
-    r"停下|不行|退出亲密|好了|结束吧|到此为止|"
-    r"やめよう|やめて|待って|もういい|冷却)",
+    r"停下|退出亲密|结束吧|到此为止|我不舒服|"
+    r"やめよう|やめて|冷却)",
     re.IGNORECASE,
 )
 
 
+def _normalize_intimacy_control_phrase(text: str) -> str:
+    return _INTIMACY_CONTROL_TRIM_RE.sub("", str(text or "").strip()).strip()
+
+
+def user_requests_intimacy_exit(text: str) -> bool:
+    return _normalize_intimacy_control_phrase(text) == INTIMACY_EXIT_PHRASE
+
+
 def user_declines_or_exits_intimacy(text: str) -> bool:
-    """明确要求退出/降温。"""
+    """安全词整句退出，或明确要求退出/降温。"""
     t = str(text or "").strip()
     if not t:
         return False
+    if user_requests_intimacy_exit(t):
+        return True
     return bool(_INTIMACY_EXIT_RE.search(t))
 
 
@@ -141,8 +160,7 @@ def user_requests_intimacy_entry(text: str) -> bool:
         return False
     if user_declines_or_exits_intimacy(t):
         return False
-    normalized = _INTIMACY_ENTER_TRIM_RE.sub("", t).strip()
-    return normalized == INTIMACY_ENTER_PHRASE
+    return _normalize_intimacy_control_phrase(t) == INTIMACY_ENTER_PHRASE
 
 
 def user_confirms_intimacy(text: str) -> bool:
@@ -175,12 +193,13 @@ def apply_intimacy_user_utterance(
     return None
 
 
-def build_intimacy_continue_message() -> dict[str, str]:
+def build_intimacy_continue_message() -> dict[str, Any]:
     """构造亲密静默续投的系统消息（role=system，避免假 user 导致角色串线）。"""
     return {
         "role": INTIMACY_CONTINUE_ROLE,
         "content": INTIMACY_CONTINUE_SYSTEM_TEXT,
         "source": "intimacy_continue",
+        "_sakura_transient_progress": True,
     }
 
 

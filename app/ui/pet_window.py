@@ -3333,6 +3333,13 @@ class PetWindow(QWidget):
             refill_backchannel_audio = getattr(self, "_prepare_backchannel_audio_cache", None)
             if callable(refill_backchannel_audio):
                 refill_backchannel_audio()
+        elif (
+            outcome in {"empty_reply", "error", "speaking_timeout"}
+            and self._next_intimacy_continue_delay_ms() is None
+        ):
+            # 第三轮续投已发出：失败/超时也必须 expire，避免预算用尽后一直 active。
+            # helper 非 None 时不走这里，以免在第三轮 prompt/tone 选择前过期。
+            self._schedule_intimacy_continue()
 
     # ------------------------------------------------------------------
     # Proactive screen observer (desktop-kanojo style)
@@ -3576,27 +3583,39 @@ class PetWindow(QWidget):
     # 亲密模式自动续投
     # ------------------------------------------------------------------
 
-    # 用户沉默时最多续投轮数；与 IntimacyModeState._AUTO_EXIT_TURNS 对齐，
-    # 续投会扣节奏存活，扣尽后自动退出亲密节奏。
-    _INTIMACY_CONTINUE_MAX = 8
-    _INTIMACY_CONTINUE_DELAY_MS = 20_000
+    # 用户沉默时最多续投 3 轮：20s / 35s / 60s。第三轮回复播完后再 expire。
+    _INTIMACY_CONTINUE_DELAYS_MS = (20_000, 35_000, 60_000)
+
+    def _next_intimacy_continue_delay_ms(self) -> int | None:
+        index = int(getattr(self, "_intimacy_continue_count", 0))
+        if index < 0 or index >= len(self._INTIMACY_CONTINUE_DELAYS_MS):
+            return None
+        return self._INTIMACY_CONTINUE_DELAYS_MS[index]
 
     def _schedule_intimacy_continue(self) -> None:
         """亲密模式回复完成后，启动续投计时器。"""
         from app.agent.builtin_tools import intimacy_mode_state
 
         if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
             self._intimacy_was_active = False
             return
         # 亲密模式重新激活（从非活跃→活跃）时重置续投计数
         if not getattr(self, "_intimacy_was_active", False):
             self._intimacy_continue_count = 0
             self._intimacy_was_active = True
+        delay_ms = self._next_intimacy_continue_delay_ms()
+        if delay_ms is None:
+            # 第三轮续投回复已播完：此时才过期，避免提前切走 prompt/tone。
+            intimacy_mode_state.expire_after_silence()
+            self._cancel_intimacy_continue()
+            self._intimacy_was_active = False
+            return
         if self._intimacy_continue_timer is None:
             self._intimacy_continue_timer = QTimer(self)
             self._intimacy_continue_timer.setSingleShot(True)
             self._intimacy_continue_timer.timeout.connect(self._on_intimacy_continue_timer)
-        self._intimacy_continue_timer.start(self._INTIMACY_CONTINUE_DELAY_MS)
+        self._intimacy_continue_timer.start(delay_ms)
 
     def _cancel_intimacy_continue(self) -> None:
         if self._intimacy_continue_timer is not None:
@@ -3625,8 +3644,9 @@ class PetWindow(QWidget):
         from app.agent.builtin_tools import build_intimacy_continue_message, intimacy_mode_state
 
         if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
             return
-        if self._intimacy_continue_count >= self._INTIMACY_CONTINUE_MAX:
+        if self._next_intimacy_continue_delay_ms() is None:
             return
         # TTS 还在播 → 等 2 秒再试（包括 active_interaction / subtitle 活跃一并重试）
         if self.active_interaction_id:
@@ -3962,6 +3982,10 @@ class PetWindow(QWidget):
             return
         self._cancel_intimacy_continue()
         text = self.input_edit.text().strip()
+        from app.agent.builtin_tools import user_declines_or_exits_intimacy
+
+        if user_declines_or_exits_intimacy(text):
+            self._remove_transient_progress_messages()
         manual_observation = self.pending_manual_screen_observation
         self._log_interaction_stage(
             "send_message_enter",
@@ -4254,6 +4278,10 @@ class PetWindow(QWidget):
             self.messages = _without_transient_progress_messages(self.messages)
             return
         self.messages = _without_transient_progress_messages(self.messages)
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
         self._log_interaction_stage(
             "agent_result_received",
             {

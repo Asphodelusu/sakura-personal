@@ -5,8 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from app.agent.builtin_tools import (
     INTIMACY_ENTER_PHRASE,
+    INTIMACY_EXIT_PHRASE,
     INTIMACY_CONTINUE_MARKER,
     IntimacyModeState,
     _SET_INTIMACY_MODE_DESCRIPTION,
@@ -16,6 +19,7 @@ from app.agent.builtin_tools import (
     intimacy_mode_state,
     user_declines_or_exits_intimacy,
     user_requests_intimacy_entry,
+    user_requests_intimacy_exit,
 )
 from app.llm.prompts.blocks import with_desktop_pet_context
 
@@ -39,22 +43,26 @@ class TestIntimacyModeState:
     def test_user_reply_refreshes_instead_of_consuming(self) -> None:
         state = IntimacyModeState()
         state.enter()
-        assert state._AUTO_EXIT_TURNS == 8
-        for _ in range(3):
+        assert state._AUTO_EXIT_TURNS == 3
+        for _ in range(2):
             assert state.consume_turn() is True
-        assert state._turns_left == 5
+        assert state._turns_left == 1
         state.refresh_user_reply()
         assert state.active is True
-        assert state._turns_left == 8
+        assert state._turns_left == 3
 
-    def test_continue_consume_auto_exits_at_eight(self) -> None:
+    def test_third_continuation_stays_active_until_expire_after_silence(self) -> None:
         state = IntimacyModeState()
         state.enter()
-        for _ in range(7):
+        for _ in range(3):
             assert state.consume_turn() is True
             assert state.active is True
-        assert state.consume_turn() is False
+        assert state._turns_left == 0
+        state.expire_after_silence()
         assert state.active is False
+        assert state.pending is False
+        assert state._turns_left == 0
+        assert state.opened_by_keyword is False
         assert state.needs_reentry_hint is True
 
     def test_reenter_resets_counter(self) -> None:
@@ -62,17 +70,21 @@ class TestIntimacyModeState:
         state.enter()
         for _ in range(3):
             state.consume_turn()
+        state.expire_after_silence()
         state.enter()
         assert state.needs_reentry_hint is False
-        for _ in range(7):
+        for _ in range(3):
             assert state.consume_turn() is True
-        assert state.consume_turn() is False
+            assert state.active is True
+        state.expire_after_silence()
+        assert state.active is False
 
     def test_auto_exit_then_keyword_reenter(self) -> None:
         intimacy_mode_state.exit()
         intimacy_mode_state.enter()
-        for _ in range(8):
+        for _ in range(3):
             intimacy_mode_state.consume_turn()
+        intimacy_mode_state.expire_after_silence()
         assert intimacy_mode_state.active is False
         assert intimacy_mode_state.needs_reentry_hint is True
         with patch("app.agent.builtin_tools.intimacy_mode_available", return_value=True):
@@ -93,8 +105,9 @@ class TestIntimacyModeState:
     def test_voluntary_exit_clears_reentry_hint(self) -> None:
         state = IntimacyModeState()
         state.enter()
-        for _ in range(8):
+        for _ in range(3):
             state.consume_turn()
+        state.expire_after_silence()
         assert state.needs_reentry_hint is True
         state.exit()
         assert state.needs_reentry_hint is False
@@ -123,9 +136,11 @@ class TestIntimacyModeState:
         state.enter()
         state.enter()
         state.enter()
-        for _ in range(7):
+        for _ in range(3):
             assert state.consume_turn() is True
-        assert state.consume_turn() is False
+            assert state.active is True
+        state.expire_after_silence()
+        assert state.active is False
 
 
 class TestHandleSetIntimacyMode:
@@ -179,6 +194,23 @@ class TestIntimacyToolBoundaryCopy:
 
 
 class TestIntimacyConsentClassifiers:
+    def test_paired_control_phrases(self) -> None:
+        assert INTIMACY_ENTER_PHRASE == "贴紧"
+        assert INTIMACY_EXIT_PHRASE == "苹果"
+
+    @pytest.mark.parametrize("text", ["苹果", "苹果。", "『苹果』"])
+    def test_safe_word_exits_as_whole_utterance(self, text: str) -> None:
+        assert user_requests_intimacy_exit(text) is True
+
+    @pytest.mark.parametrize("text", ["我买了苹果", "苹果很好吃", "太好了", "准备好了", "好了吗"])
+    def test_safe_word_and_ambiguous_phrases_do_not_false_exit(self, text: str) -> None:
+        assert user_requests_intimacy_exit(text) is False
+        assert user_declines_or_exits_intimacy(text) is False
+
+    @pytest.mark.parametrize("text", ["停下", "不要继续", "我不舒服", "やめて"])
+    def test_explicit_refusal_exits_without_safe_word(self, text: str) -> None:
+        assert user_declines_or_exits_intimacy(text) is True
+
     def test_keyword_and_decline(self) -> None:
         assert INTIMACY_ENTER_PHRASE == "贴紧"
         assert user_requests_intimacy_entry("贴紧")
@@ -249,6 +281,8 @@ class TestModuleLevelSingleton:
         system_msg = build_intimacy_continue_message()
         assert system_msg["role"] == "system"
         assert INTIMACY_CONTINUE_MARKER in system_msg["content"]
+        assert system_msg["_sakura_transient_progress"] is True
+        assert "根据当前姿势、呼吸和对方最后的反应自然回应" in system_msg["content"]
         assert message_is_intimacy_continue(system_msg)
         assert latest_is_intimacy_continue([{"role": "user", "content": "hi"}, system_msg])
 
@@ -329,8 +363,9 @@ class TestIntimacyGuidePromptGate:
     def test_reentry_hint_after_auto_exit_without_guide_body(self) -> None:
         runtime = self._runtime_with_guide()
         intimacy_mode_state.enter()
-        for _ in range(8):
+        for _ in range(3):
             intimacy_mode_state.consume_turn()
+        intimacy_mode_state.expire_after_silence()
         section = runtime._build_intimacy_section()
         assert section is not None
         assert section.section_id == "persona.intimacy_reentry"

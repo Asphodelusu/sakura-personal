@@ -6750,3 +6750,74 @@ def test_character_theme_round_trip_never_stores_visual_effect_mode() -> None:
     assert restored.primary_color == "#123456"
     assert source == "package"
     assert missing is False
+
+
+def test_intimacy_continue_messages_cleared_on_exit_before_request() -> None:
+    """三轮续投信号在退出后走既有 transient 清理，不得进入下一轮 request snapshot。"""
+    from app.agent.builtin_tools import (
+        INTIMACY_EXIT_PHRASE,
+        build_intimacy_continue_message,
+        intimacy_mode_state,
+        message_is_intimacy_continue,
+    )
+    from app.ui.pet_window import PetWindow
+
+    class MinimalExitWindow:
+        send_message = PetWindow.send_message
+        _show_waiting_reply_placeholder = PetWindow._show_waiting_reply_placeholder
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+        _record_user_message = PetWindow._record_user_message
+        _cancel_intimacy_continue = PetWindow._cancel_intimacy_continue
+        _remove_transient_progress_messages = PetWindow._remove_transient_progress_messages
+
+    intimacy_mode_state.exit()
+    intimacy_mode_state.enter()
+    requests: list[list] = []
+    window = MinimalExitWindow()
+    window.input_edit = _DummyEditableInput(INTIMACY_EXIT_PHRASE)
+    window.worker_thread = None
+    window.pending_manual_screen_observation = None
+    window.pending_manual_screen_summary = ""
+    window.screen_observation_enabled = False
+    window.messages = [
+        {"role": "user", "content": "贴紧"},
+        {"role": "assistant", "content": "うん"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "1"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "2"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "3"},
+    ]
+    window.active_interaction_id = ""
+    window.startup_initializing = False
+    window.character_profile = type("CharacterProfile", (), {"id": "sakura", "display_name": "Sakura"})()
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.subtitle_controller = _DummySubtitleController()
+    window.bubble_auto_hide = _DummyBubbleAutoHide()
+    window._intimacy_continue_timer = None
+    window._intimacy_continue_count = 3
+    window._mark_user_activity = lambda: None
+    window._begin_interaction = lambda _source: setattr(window, "active_interaction_id", "exit-test")
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._end_interaction = lambda _outcome: None
+    window._set_pending_tool_action = lambda _action: None
+    window._record_history = lambda *_args: None
+    window._clear_proactive_screen_context_batch = lambda _reason: None
+    window._start_chat_worker = requests.append
+    window._update_manual_screenshot_button = lambda: None
+    window._collapse_auto_fit_bubble_height = lambda: None
+    window._detect_away_from_message = lambda _text: None
+
+    try:
+        window.send_message("return_pressed")
+        assert requests, "退出发送应进入 request snapshot"
+        assert not any(message_is_intimacy_continue(m) for m in window.messages)
+        assert not any(message_is_intimacy_continue(m) for m in requests[0] if isinstance(m, dict))
+    finally:
+        intimacy_mode_state.exit()
