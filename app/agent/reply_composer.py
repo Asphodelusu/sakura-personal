@@ -50,19 +50,21 @@ _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
     "empty",
 })
 
-# 这些工具的成功结果通常会改变最终答案；规划轮正文写在结果之前，不能直接复用。
-_ANSWER_CHANGING_TOOL_NAMES = frozenset({
-    "web__web_search",
-    "web_search",
-    "web__fetch_url",
-    "fetch_url",
-    "memory_search",
-    "memory_detail",
-    "observe_screen",
-    "windows__screenshot",
-    "windows__snapshot",
-    "browser__browser_navigate",
-    "browser__browser_snapshot",
+# 仅这些确定性的写入/打开动作允许复用工具执行前已经写好的正文。
+# 未知、读取、搜索和失败工具一律继续规划，避免把中间稿误当最终回答。
+_REPLY_PRESERVING_TOOL_NAMES = frozenset({
+    "set_intimacy_mode",
+    "add_todo",
+    "complete_todo",
+    "add_reminder",
+    "cancel_reminder",
+    "write_note",
+    "open_url",
+    "open_local_folder",
+    "memory_remember",
+    "memory_update",
+    "memory_forget",
+    "memory_let_go",
 })
 
 def _reply_has_display_translation(reply: ChatReply) -> bool:
@@ -229,9 +231,10 @@ class AgentRuntimeReplyMixin:
         if not turn.tool_calls:
             return usable
         results = execution_results or []
-        if any(
-            bool(getattr(result, "success", False))
-            and str(getattr(result, "tool_name", "") or "") in _ANSWER_CHANGING_TOOL_NAMES
+        if not results or any(
+            not bool(getattr(result, "success", False))
+            or str(getattr(result, "tool_name", "") or "")
+            not in _REPLY_PRESERVING_TOOL_NAMES
             for result in results
         ):
             return None

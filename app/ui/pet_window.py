@@ -4178,9 +4178,9 @@ class PetWindow(QWidget):
         if not reply.text.strip() and not reply.translation.strip():
             return
         stage = str(progress.stage or "")
-        # 仅联网搜索空档旁白上气泡/TTS。工具规划中间稿（observe_screen 等）
-        # 不当成回复字幕，避免「字出来了却迟迟不送正式 TTS」的错觉。
-        if not stage.startswith("web_"):
+        # 仅「我查查」上气泡/TTS。搜到标题摘要会打断上一句；读页摘要走最终回答。
+        # 工具规划中间稿（observe_screen 等）也不当成回复字幕。
+        if stage != "web_planning":
             return
         self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
@@ -4221,7 +4221,7 @@ class PetWindow(QWidget):
             subtitle_controller = getattr(self, "subtitle_controller", None)
             if subtitle_controller is not None:
                 subtitle_controller.set_speech(bubble_text, pulse=True)
-        # 「我查查 / 搜到了」等短旁白：搜索等待空档播 TTS；读页长摘要仍 suppress_tts。
+        # 「我查查」：搜索等待空档播 TTS。搜到标题 / 读页摘要不上气泡。
         if (
             segment is not None
             and not segment.suppress_tts
@@ -4620,7 +4620,7 @@ class PetWindow(QWidget):
             return False
         worker = ScreenObservationSummarizeWorker(
             observation,
-            self.api_client,
+            getattr(self, "agent_runtime", None) or self.api_client,
             context,
         )
         self.resource_manager.spawn_qt_worker(

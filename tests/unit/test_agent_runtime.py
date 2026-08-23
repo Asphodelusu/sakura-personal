@@ -408,9 +408,9 @@ class TestProactiveEventFlow:
 
 
 def test_web_wait_progress_lines_are_spoken() -> None:
-    """「我查查 / 搜到了打开看看」进 TTS；读页摘要旁白仍静音。"""
+    """「我查查」进 TTS；搜到标题摘要 / 读页旁白都不开口。"""
     assert _progress_reply_suppress_tts("web_planning") is False
-    assert _progress_reply_suppress_tts("web_search") is False
+    assert _progress_reply_suppress_tts("web_search") is True
     assert _progress_reply_suppress_tts("web_fetch") is True
 
 

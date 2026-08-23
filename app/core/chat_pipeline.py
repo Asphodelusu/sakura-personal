@@ -132,7 +132,7 @@ class ChatPipeline:
         for job in visual_observation_jobs:
             check_cancelled(cancel_checker)
             record = summarize_visual_observation(
-                self.agent_runtime.api_client,
+                getattr(self.agent_runtime, "vision_api_client", None),
                 job,
                 cancel_checker=cancel_checker,
             )

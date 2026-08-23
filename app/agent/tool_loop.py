@@ -829,23 +829,6 @@ class AgentRuntimeToolLoopMixin:
                     )
                 )
                 if (
-                    call.name in {"web__web_search", "web_search"}
-                    and prepared.success
-                    and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
-                ):
-                    ja, zh = tool_routing.build_web_search_progress_texts(prepared)
-                    _emit_progress_reply(
-                        progress_callback,
-                        ja=ja,
-                        zh=zh,
-                        stage="web_search",
-                        metadata={
-                            "step_index": step_index,
-                            "tool_names": [call.name],
-                        },
-                        cancel_checker=cancel_checker,
-                    )
-                elif (
                     call.name in {"web__fetch_url", "fetch_url"}
                     and prepared.success
                     and not (isinstance(prepared.content, dict) and prepared.content.get("skipped"))
@@ -1012,20 +995,6 @@ class AgentRuntimeToolLoopMixin:
                             payload=_redact_tool_result_for_model(refined_result),
                         )
                     )
-                    if refined_result.success:
-                        ja, zh = tool_routing.build_web_search_progress_texts(refined_result)
-                        _emit_progress_reply(
-                            progress_callback,
-                            ja=ja or "もう少し絞って調べてみる。",
-                            zh=zh or "我再换个更准的关键词查一下。",
-                            stage="web_search",
-                            metadata={
-                                "step_index": step_index,
-                                "tool_names": ["web__web_search"],
-                                "refined": True,
-                            },
-                            cancel_checker=cancel_checker,
-                        )
 
             if tool_routing._should_auto_fetch_after_web_search(
                 working_messages,

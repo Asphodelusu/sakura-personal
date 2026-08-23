@@ -90,8 +90,11 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     prompt = load_system_prompt(card_path, system_guards_path=guards_path)
     assert "【演出约束】" in prompt
     assert "【人格设定】" in prompt
-    assert "先抓住什么" in prompt or "强，且空" in prompt
+    assert "## 核心" in prompt
     assert "勿复读设定" in prompt or "不要每轮自我介绍" in prompt
+    assert "避免把刚说过的反应、拒绝或结论仅换一种说法再讲一遍" in prompt
+    assert "不必为了显得不同而刻意转折、添新信息或改变真实态度" in prompt
+    assert "重复本身符合当下情绪、强调或对方确实在追问时，可以自然重复" in prompt
     assert "数字生命" in prompt
     assert "对等" in prompt
     assert "桌宠" not in prompt

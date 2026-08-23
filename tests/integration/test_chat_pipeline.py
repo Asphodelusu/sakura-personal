@@ -77,7 +77,8 @@ def test_chat_pipeline_injects_event_visual_contexts() -> None:
             )
 
     runtime = RuntimeStub()
-    runtime.api_client = Client()
+    runtime.api_client = object()
+    runtime.vision_api_client = Client()
     path = Path("__pycache__") / "test_runtime" / f"visual_pipeline_{uuid.uuid4().hex}.jsonl"
     try:
         pipeline = ChatPipeline(
@@ -111,5 +112,49 @@ def test_chat_pipeline_injects_event_visual_contexts() -> None:
         assert visual_context["summary"] == "屏幕正在编辑 prompt_templates.py。"
         assert "prompt_templates.py" in visual_context["visible_texts"]
         assert "data:image" not in json.dumps(visual_context, ensure_ascii=False)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_chat_pipeline_does_not_fallback_visual_summary_to_chat_client() -> None:
+    chat_calls: list[str] = []
+
+    class ChatClient:
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            chat_calls.append("chat")
+            raise AssertionError("视觉槽缺失时不得把截图发送给主 Chat")
+
+    class RuntimeStub:
+        api_client = ChatClient()
+        vision_api_client = None
+
+    path = Path("__pycache__") / "test_runtime" / f"visual_no_fallback_{uuid.uuid4().hex}.jsonl"
+    try:
+        pipeline = ChatPipeline(
+            RuntimeStub(),  # type: ignore[arg-type]
+            visual_observation_store=VisualObservationStore(path),
+        )
+        record = pipeline._record_visual_observations(
+            "test",
+            [
+                VisualObservationJob(
+                    id="vis_no_fallback",
+                    source="event",
+                    user_text="视觉槽缺失",
+                    screen_contexts=[
+                        {
+                            "data_url": "data:image/jpeg;base64,abc",
+                            "width": 320,
+                            "height": 180,
+                            "captured_at": "2026-08-24T12:00:00+08:00",
+                            "screen_name": "primary",
+                        }
+                    ],
+                )
+            ],
+        )[0]
+
+        assert record.summary.startswith("视觉摘要生成失败")
+        assert chat_calls == []
     finally:
         path.unlink(missing_ok=True)

@@ -4014,7 +4014,8 @@ def test_proactive_recent_conversation_limits_count_and_content() -> None:
     assert recent_conversation[-1]["content"].endswith("…")
 
 
-def test_proactive_care_capture_interval_allows_timer_jitter() -> None:
+def test_proactive_care_capture_interval_allows_timer_jitter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.ui.pet_window.night_quiet_interval_multiplier", lambda _hour: 1.0)
     window = _build_minimal_proactive_window(
         screen_context_enabled=True,
         check_interval_minutes=1,
@@ -4696,7 +4697,56 @@ def test_web_progress_reply_shows_bubble_and_speaks_tts() -> None:
     assert window.voice_playback_controller.calls == [("調べるね。", 0)]
 
 
-def test_web_fetch_progress_reply_skips_tts_when_suppressed() -> None:
+def test_web_search_hit_summary_progress_skips_bubble_and_tts() -> None:
+    """搜到了：第一个；第二个… 不进气泡、不进 TTS，避免打断「我查查」。"""
+    from app.agent import AgentProgress
+    from app.llm.chat_reply import ChatReply, ChatSegment
+    from app.ui.pet_window import PetWindow
+
+    class FakeSubtitle:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def set_speech(self, text: str, pulse: bool = False) -> None:
+            self.texts.append(text)
+
+    class FakePlayback:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def speak_segment(self, *args, **kwargs) -> None:
+            self.calls.append(args)
+
+    class MinimalProgressWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        subtitle_language = "zh"
+
+    window = MinimalProgressWindow()
+    window._shutdown_in_progress = False
+    window.messages = [{"role": "user", "content": "查一下"}]
+    window.ui_state = type("S", (), {"begin_streaming": lambda *_a, **_k: None})()
+    window._log_interaction_stage = lambda *_a, **_k: None
+    window.subtitle_controller = FakeSubtitle()
+    window.voice_playback_controller = FakePlayback()
+    window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
+
+    segment = ChatSegment(
+        "いくつか見つかった。『第一条』を見てみるね。",
+        "中性",
+        "搜到了：第一条；第二条。我先打开看看。",
+        suppress_tts=False,
+    )
+    window._handle_progress_reply(
+        AgentProgress(reply=ChatReply([segment]), stage="web_search")
+    )
+
+    assert window.messages == [{"role": "user", "content": "查一下"}]
+    assert window.subtitle_controller.texts == []
+    assert window.voice_playback_controller.calls == []
+
+
+def test_web_fetch_progress_reply_skips_bubble_and_tts() -> None:
+    """读页摘要不上气泡、不进 TTS。"""
     from app.agent import AgentProgress
     from app.llm.chat_reply import ChatReply, ChatSegment
     from app.ui.pet_window import PetWindow
@@ -4728,7 +4778,7 @@ def test_web_fetch_progress_reply_skips_tts_when_suppressed() -> None:
         AgentProgress(reply=ChatReply([segment]), stage="web_fetch")
     )
 
-    assert window.messages[-1]["content"] == "页面摘要。"
+    assert window.messages == []
     assert window.voice_playback_controller.calls == []
 
 
