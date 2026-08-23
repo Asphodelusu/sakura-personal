@@ -229,7 +229,7 @@ _SET_INTIMACY_MODE_DESCRIPTION = (
     f"开启不由本工具控制：只有对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」时，"
     "系统才会自动开启；不要猜测、不要调用 on=true 试图开启。"
     "当身体亲密自然结束或对方降温/收尾时，调用 on=false："
-    "「好了」「不闹了」「先这样」「冷静一下」「休息吧」「聊点别的」等都是退出信号。"
+    f"安全词「{INTIMACY_EXIT_PHRASE}」或明确的停下、不要继续、不适等表达会立即退出。"
     f"关闭后不会自动恢复；对方需再次发送「{INTIMACY_ENTER_PHRASE}」。"
     "本工具只影响回复节奏与引导注入。"
 )

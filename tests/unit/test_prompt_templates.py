@@ -111,6 +111,35 @@ def test_agent_reply_protocol_guides_ja_translation_self_check() -> None:
 
     assert 'ja="原因は Mermaid の構文みたい。"' in instruction
     assert "一一对应" in instruction
+    assert "suppress_tts=true" in instruction
+    assert "只显示，不朗读" in instruction
+
+
+def test_intimacy_entry_prompt_distinguishes_overall_entry_from_ongoing_consent() -> None:
+    from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE, intimacy_mode_state
+
+    runtime = object.__new__(AgentRuntime)
+    runtime._intimacy_guide = "PRIVATE_GUIDE_MARKER"
+    intimacy_mode_state.exit()
+    intimacy_mode_state.enter(by_keyword=True)
+    intimacy_mode_state.note_user_text(INTIMACY_ENTER_PHRASE)
+    try:
+        section = runtime._build_intimacy_section()
+        assert section is not None
+        assert "不必机械地再问一次相同的总体许可" in section.body
+        assert "沉默不代表同意升级" in section.body
+        assert "安全词「苹果」" in section.body
+        assert "不要再口头确认意愿" not in section.body
+        assert "推进下一步动作" not in section.body
+    finally:
+        intimacy_mode_state.exit()
+
+
+def test_intimacy_tool_copy_uses_safe_word_not_ambiguous_exit_example() -> None:
+    from app.agent.builtin_tools import _SET_INTIMACY_MODE_DESCRIPTION
+
+    assert "苹果" in _SET_INTIMACY_MODE_DESCRIPTION
+    assert "好了" not in _SET_INTIMACY_MODE_DESCRIPTION
 
 
 def test_prompt_lengths_stay_compact() -> None:

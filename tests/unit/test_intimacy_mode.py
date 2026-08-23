@@ -189,7 +189,7 @@ class TestIntimacyToolBoundaryCopy:
         assert "身体亲密" in text
         assert INTIMACY_ENTER_PHRASE in text
         assert "on=true" in text
-        assert "冷静" in text
+        assert "苹果" in text
         assert "节奏" in text
 
 

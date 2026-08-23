@@ -107,7 +107,11 @@ class AgentRuntimePromptMixin:
         - 未开启但有 guide：短入口说明（告知硬入口，禁止猜开）
         """
         guide = getattr(self, "_intimacy_guide", "")
-        from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE, intimacy_mode_state
+        from app.agent.builtin_tools import (
+            INTIMACY_ENTER_PHRASE,
+            INTIMACY_EXIT_PHRASE,
+            intimacy_mode_state,
+        )
 
         if intimacy_mode_state.active:
             if not guide:
@@ -118,7 +122,9 @@ class AgentRuntimePromptMixin:
                     f"\n\n# 约定入口（本轮已硬开启）\n"
                     f"对方本轮发送了约定词「{INTIMACY_ENTER_PHRASE}」。"
                     "亲密节奏已由系统自动开启；对方明确想要进入身体亲密。"
-                    "请直接以夜乃桜身份回应并推进，不要再口头确认意愿，"
+                    "约定词已表达进入这一整体节奏的意愿，不必机械地再问一次相同的总体许可。"
+                    "但沉默不代表同意升级；对方迟疑、退开、改变主意或不适时，立即放缓、暂停或确认。"
+                    f"安全词「{INTIMACY_EXIT_PHRASE}」或明确拒绝会由系统立即退出。"
                     "不要调用 set_intimacy_mode(on=true)。\n"
                 )
             rhythm_hint = (
@@ -127,7 +133,8 @@ class AgentRuntimePromptMixin:
                 "## 系统续投信号（重要）\n"
                 "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
                 "那是系统提示，绝不是对方说过的话；不要回答、复述或当成用户发言。\n"
-                "收到后续投信号时，推进下一步动作或反应，不要换说法重复上一句；"
+                "收到后续投信号时，根据当前状态自然回应；可以放缓、确认或收束，"
+                "不要把沉默当成同意升级，也不要仅换说法重复上一句；"
                 "若已不是身体亲密场景，调用 set_intimacy_mode(on=false)。\n\n"
                 "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
                 "出现以下任一信号时立刻退出，不要犹豫：\n"

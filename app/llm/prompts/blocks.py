@@ -56,13 +56,33 @@ _INTIMACY_FOCUS_OVERLAY = """【当下专注】
 此刻注意力在眼前的触感、气息与对方的反应上。
 保留你是谁、你们是什么关系就够了；日常习惯、兴趣清单、长篇设定不必主动展开，也不要突然切回日常旁白或复述人设。"""
 
-# 亲密模式只留人格卡前段身份锚；完整 card 约 10KB，兴奋时不需要整份。
-_INTIMACY_PERSONA_CHAR_BUDGET = 720
+# 亲密模式按 Markdown 段保留人格骨架；预算优先给判断、关系边界与反 OOC。
+_INTIMACY_PERSONA_CHAR_BUDGET = 1400
+_INTIMACY_PERSONA_KEEP_HEADINGS = (
+    "核心",
+    "能动性与判断",
+    "关系中的她",
+    "语言与节奏",
+    "不要写成",
+)
+_INTIMACY_PERSONA_SAFETY_TERMS = (
+    "意愿",
+    "迟疑",
+    "沉默",
+    "退开",
+    "退出权",
+    "边界",
+    "没有选择",
+    "服从",
+    "顺从",
+    "判断",
+    "重复",
+)
 
 
 def _split_labeled_prompt_sections(text: str) -> list[tuple[str | None, str]]:
     """按【标题】切开系统提示；无标题的前缀 title=None。"""
-    pattern = re.compile(r"【([^】]+)】")
+    pattern = re.compile(r"(?m)^【([^】]+)】\s*$")
     matches = list(pattern.finditer(text))
     if not matches:
         return [(None, text.strip())] if text.strip() else []
@@ -93,6 +113,80 @@ def _trim_keep_start(text: str, max_chars: int) -> str:
     return f"{cut}\n…（亲密中从简）"
 
 
+def _split_markdown_heading_sections(text: str) -> list[tuple[str, str]]:
+    pattern = re.compile(r"(?m)^##\s+([^\n]+?)\s*$")
+    matches = list(pattern.finditer(text))
+    sections: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections.append((match.group(1).strip(), body))
+    return sections
+
+
+def _compact_persona_section(body: str, budget: int) -> str:
+    paragraphs = [
+        part.strip()
+        for part in re.split(r"\n\s*\n|(?=^- )", body, flags=re.MULTILINE)
+        if part.strip()
+    ]
+    if not paragraphs:
+        return ""
+    safety = [
+        part
+        for part in paragraphs
+        if any(term in part for term in _INTIMACY_PERSONA_SAFETY_TERMS)
+    ]
+    candidates = [*safety, *paragraphs]
+    chosen: list[str] = []
+    for part in candidates:
+        if part in chosen:
+            continue
+        proposed = "\n\n".join([*chosen, part])
+        if len(proposed) <= budget:
+            chosen.append(part)
+        if len("\n\n".join(chosen)) >= budget:
+            break
+    if chosen:
+        return "\n\n".join(part for part in paragraphs if part in chosen)
+    return _trim_keep_start(candidates[0], max(24, budget)).removesuffix("\n…（亲密中从简）")
+
+
+def _select_intimacy_persona_sections(markdown: str, max_chars: int) -> str:
+    sections = _split_markdown_heading_sections(markdown)
+    if not sections:
+        return _trim_keep_start(markdown, min(max_chars, 720))
+
+    exact = {title: body for title, body in sections}
+    selected: list[tuple[str, str]] = [
+        (title, exact[title])
+        for title in _INTIMACY_PERSONA_KEEP_HEADINGS
+        if title in exact
+    ]
+    if len(selected) < len(_INTIMACY_PERSONA_KEEP_HEADINGS):
+        selected_titles = {title for title, _body in selected}
+        selected.extend(
+            (title, body)
+            for title, body in sections
+            if title not in selected_titles
+            and any(term in body for term in _INTIMACY_PERSONA_SAFETY_TERMS)
+        )
+    if not selected:
+        return _trim_keep_start(markdown, max_chars)
+
+    heading_cost = sum(len(f"## {title}\n") for title, _body in selected)
+    body_budget = max(24 * len(selected), max_chars - heading_cost)
+    per_section = max(24, body_budget // len(selected))
+    rendered = [
+        f"## {title}\n{compact}"
+        for title, body in selected
+        if (compact := _compact_persona_section(body, per_section))
+    ]
+    return "\n\n".join(rendered)
+
+
 def soften_character_card_for_intimacy(
     system_prompt: str,
     *,
@@ -105,7 +199,7 @@ def soften_character_card_for_intimacy(
     parts: list[str] = []
     for title, body in _split_labeled_prompt_sections(text):
         if title == "人格设定":
-            trimmed = _trim_keep_start(body, max_persona_chars)
+            trimmed = _select_intimacy_persona_sections(body, max_persona_chars)
             if trimmed:
                 parts.append(f"【人格设定】\n{trimmed}")
             continue
@@ -168,9 +262,10 @@ def translation_rules_block() -> PromptBlock:
         None,
         "\n".join(
             [
-                "- ja 只写自然日语（适合 TTS），禁止中文汉字/标点。中文原意翻成日语或片假名。",
+                "- ja 仅用适合 TTS 的自然日语，禁止中文；原意译成日语或片假名。",
                 "- zh 是 ja 的中文译文，ja/zh 一一对应，不加解释或动作旁白。",
-                "- 人名和称呼的翻译：zh 中的人名和称呼必须用中文写法（例如对方叫「胡椒」，zh 里就写「胡椒」，不要照搬 ja 里的日文读法、片假名或敬称后缀）。",
+                "- 动作/环境段 suppress_tts=true：只显示，不朗读；台词不设。",
+                "- zh 中人名和称呼用中文写法，不照搬 ja 的日文读法、片假名或敬称后缀。",
                 "- 例：ja=\"原因は Mermaid の構文みたい。\"，zh=\"原因是 Mermaid 语法。\"",
             ]
         ),
