@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from app.agent.memory import MemoryStore, commitment_is_stale, sweep_stale_commitments
 from app.agent.memory_curator import (
     DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
+    LIGHT_CURATION_DETAIL_LIMIT,
     LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET,
     MemoryCurationSettings,
     MemoryCurationState,
@@ -21,6 +22,7 @@ from app.agent.memory_curator import (
     _entries_for_model,
     _format_existing_memories,
     _format_existing_memories_light,
+    _select_light_curation_memories,
     evaluate_idle_curation_trigger,
     resolve_idle_curation_trigger,
     looks_like_trivial_memory,
@@ -645,6 +647,73 @@ def test_format_existing_memories_light_is_smaller_than_full() -> None:
     assert len(light) < len(full)
     assert len(light) <= LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET + 200
     assert "科幻片" in light
+
+
+def _unrelated_ordinary_memories(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"m{i:02d}",
+            "content": "普通日常记录，与当前对话无关。",
+            "layer": "semantic",
+            "updated_at": f"2026-01-01T00:{i:02d}:00+08:00",
+        }
+        for i in range(count)
+    ]
+
+
+def _stale_core_profile_memory() -> dict[str, Any]:
+    return {
+        "id": "core_profile:sakura",
+        "content": "＜今の関係＞\n我们是对等的恋人。",
+        "layer": "core_profile",
+        "updated_at": "2019-01-01T00:00:00+08:00",
+    }
+
+
+def test_select_light_curation_pins_low_score_old_core_in_detail() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    detail, _index_only = _select_light_curation_memories(memories, dialog)
+
+    assert any(item["id"] == core["id"] for item in detail)
+
+
+def test_select_light_curation_detail_stays_within_limit_when_core_is_pinned() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    detail, _index_only = _select_light_curation_memories(memories, dialog)
+
+    assert len(detail) <= LIGHT_CURATION_DETAIL_LIMIT
+    assert len(detail) == LIGHT_CURATION_DETAIL_LIMIT
+    ordinary_ids = [item["id"] for item in detail if item.get("layer") != "core_profile"]
+    assert ordinary_ids == [f"m{i:02d}" for i in range(39, 4, -1)]
+
+
+def test_select_light_curation_excludes_core_from_index_only() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    _detail, index_only = _select_light_curation_memories(memories, dialog)
+
+    assert all(item["id"] != core["id"] for item in index_only)
+    assert all(item.get("layer") != "core_profile" for item in index_only)
+
+
+def test_select_light_curation_without_core_keeps_existing_order() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    memories = _unrelated_ordinary_memories(40)
+
+    detail, index_only = _select_light_curation_memories(memories, dialog)
+
+    assert [item["id"] for item in detail] == [f"m{i:02d}" for i in range(39, 3, -1)]
+    assert [item["id"] for item in index_only] == [f"m{i:02d}" for i in range(3, -1, -1)]
+    assert len(detail) == LIGHT_CURATION_DETAIL_LIMIT
+    assert len(index_only) == 4
 
 
 def test_curate_entries_light_profile_passes_slim_snapshot() -> None:

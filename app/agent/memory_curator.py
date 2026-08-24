@@ -12,6 +12,7 @@ from app.backchannel.models import EMOTIONS
 from app.agent.memory import (
     DEFAULT_MEMORY_CONFIDENCE,
     DEFAULT_MEMORY_IMPORTANCE,
+    MEMORY_LAYER_CORE_PROFILE,
     MEMORY_LAYER_SEMANTIC,
     MEMORY_LAYERS,
     MemoryStore,
@@ -1538,12 +1539,32 @@ def _select_light_curation_memories(
         ),
         reverse=True,
     )
-    detail = [m for _, m in scored[:LIGHT_CURATION_DETAIL_LIMIT]]
-    detail_ids = {str(m.get("id") or "").strip() for m in detail}
+    ordered = [memory for _, memory in scored]
+    core = next(
+        (
+            memory
+            for memory in ordered
+            if str(memory.get("layer") or "") == MEMORY_LAYER_CORE_PROFILE
+        ),
+        None,
+    )
+    if core is None:
+        detail = ordered[:LIGHT_CURATION_DETAIL_LIMIT]
+        remainder = ordered[LIGHT_CURATION_DETAIL_LIMIT:]
+    else:
+        others = [
+            memory
+            for memory in ordered
+            if str(memory.get("layer") or "") != MEMORY_LAYER_CORE_PROFILE
+        ]
+        detail = [core, *others[: LIGHT_CURATION_DETAIL_LIMIT - 1]]
+        remainder = others[LIGHT_CURATION_DETAIL_LIMIT - 1 :]
+    detail_ids = {str(memory.get("id") or "").strip() for memory in detail}
     index_only = [
-        m
-        for _, m in scored[LIGHT_CURATION_DETAIL_LIMIT : LIGHT_CURATION_DETAIL_LIMIT + LIGHT_CURATION_INDEX_LIMIT]
-        if str(m.get("id") or "").strip() not in detail_ids
+        memory
+        for memory in remainder[:LIGHT_CURATION_INDEX_LIMIT]
+        if str(memory.get("id") or "").strip() not in detail_ids
+        and str(memory.get("layer") or "") != MEMORY_LAYER_CORE_PROFILE
     ]
     return detail, index_only
 
