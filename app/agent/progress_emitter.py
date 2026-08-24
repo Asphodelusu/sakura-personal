@@ -78,10 +78,9 @@ def _emit_progress_from_content(
 def _progress_reply_suppress_tts(stage: str) -> bool:
     """过程旁白是否静音。
 
-    「我查查」「搜到了…我先打开看看」落在搜索/开页等待空档，短句可播；
-    读页摘要等较长旁白仍静音，避免和最终回答抢麦。
+    只让「我查查」开口；搜到标题摘要会和这句抢麦，读页长摘要也不播。
     """
-    return stage not in {"web_planning", "web_search"}
+    return stage != "web_planning"
 
 
 def _emit_progress_reply(

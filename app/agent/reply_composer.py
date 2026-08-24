@@ -27,7 +27,12 @@ from app.llm.api_client import (
     NativeToolCall,
     strip_image_parts_from_messages,
 )
-from app.llm.chat_reply import ChatReply, ChatReplyParseResult, parse_chat_reply_result
+from app.llm.chat_reply import (
+    ChatReply,
+    ChatReplyParseResult,
+    _try_load_json,
+    parse_chat_reply_result,
+)
 from app.llm.context_trimming import trim_messages_for_model
 
 # 用户明确要换装/姿态时，才把全量立绘目录塞进提示词
@@ -45,19 +50,21 @@ _STRUCTURED_COMPOSE_RETRY_REASONS = frozenset({
     "empty",
 })
 
-# 这些工具的成功结果通常会改变最终答案；规划轮正文写在结果之前，不能直接复用。
-_ANSWER_CHANGING_TOOL_NAMES = frozenset({
-    "web__web_search",
-    "web_search",
-    "web__fetch_url",
-    "fetch_url",
-    "memory_search",
-    "memory_detail",
-    "observe_screen",
-    "windows__screenshot",
-    "windows__snapshot",
-    "browser__browser_navigate",
-    "browser__browser_snapshot",
+# 仅这些确定性的写入/打开动作允许复用工具执行前已经写好的正文。
+# 未知、读取、搜索和失败工具一律继续规划，避免把中间稿误当最终回答。
+_REPLY_PRESERVING_TOOL_NAMES = frozenset({
+    "set_intimacy_mode",
+    "add_todo",
+    "complete_todo",
+    "add_reminder",
+    "cancel_reminder",
+    "write_note",
+    "open_url",
+    "open_local_folder",
+    "memory_remember",
+    "memory_update",
+    "memory_forget",
+    "memory_let_go",
 })
 
 def _reply_has_display_translation(reply: ChatReply) -> bool:
@@ -76,6 +83,12 @@ def _reply_has_adoptable_segments(reply: ChatReply) -> bool:
     """日语正文合格即可采用（tone/portrait 可空）；zh 非门槛。"""
 
     return any(segment.text.strip() for segment in reply.segments)
+
+
+def _raw_contains_json_object(raw_content: str) -> bool:
+    """正文能否抽出 JSON 对象。纯文本回退不得走缺 zh 直通。"""
+    data, _repaired = _try_load_json(str(raw_content or ""))
+    return isinstance(data, dict)
 
 
 class AgentRuntimeReplyMixin:
@@ -176,13 +189,11 @@ class AgentRuntimeReplyMixin:
 
 
     def _structured_compose_reason(self, raw_content: str) -> str:
-        from app.llm.chat_reply import _looks_structured_reply
-
         parsed = self._normalize_parsed_reply(parse_chat_reply_result(raw_content))
         if parsed.needs_retry:
             return parsed.reason
-        # 结构化 segments（有 ja）直接采用；缺 zh 不触发二次合成。
-        if _looks_structured_reply(raw_content) and _reply_has_adoptable_segments(parsed.reply):
+        # 解析后已有可采用日语 segments 时直接采用；缺 zh 交给异步字幕翻译。
+        if _reply_has_adoptable_segments(parsed.reply) and _raw_contains_json_object(raw_content):
             return ""
         if not _reply_has_display_translation(parsed.reply):
             return "missing_translation"
@@ -220,9 +231,10 @@ class AgentRuntimeReplyMixin:
         if not turn.tool_calls:
             return usable
         results = execution_results or []
-        if any(
-            bool(getattr(result, "success", False))
-            and str(getattr(result, "tool_name", "") or "") in _ANSWER_CHANGING_TOOL_NAMES
+        if not results or any(
+            not bool(getattr(result, "success", False))
+            or str(getattr(result, "tool_name", "") or "")
+            not in _REPLY_PRESERVING_TOOL_NAMES
             for result in results
         ):
             return None

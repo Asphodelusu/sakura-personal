@@ -312,6 +312,252 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
     assert worker.curator.memory_store.scope_id == "old-character"  # type: ignore[attr-defined]
 
 
+def _core_candidate_payload(**overrides):  # type: ignore[no-untyped-def]
+    payload = {
+        "kind": "explicit",
+        "target_section": "今の関係",
+        "subject_key": "relationship.identity",
+        "claim": "我们明确确认了恋人关系。",
+        "user_excerpt": "我们是恋人吧。",
+        "assistant_excerpt": "嗯，是恋人。",
+        "batch_id": "curation_fictional_ui",
+        "confidence": 0.95,
+        "observed_at": "2026-08-24T12:00:00+00:00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _maintainer_window(tmp_path, *, busy=False, settings_enabled=True):  # type: ignore[no-untyped-def]
+    from app.agent.core_profile_maintainer import CoreMaintainerSettings
+    from app.agent.memory_curator import MemoryCurationResult
+    from app.ui.pet_window import PetWindow
+
+    captured: dict[str, object] = {}
+
+    class ProfileStub:
+        id = "Sakura"
+        display_name = "Sakura"
+
+    class SettingsServiceStub:
+        def load_core_maintainer_settings(self):  # type: ignore[no-untyped-def]
+            return CoreMaintainerSettings(enabled=settings_enabled)
+
+    class MemoryStateStub:
+        def __init__(self) -> None:
+            self.marked: list[tuple[int, int]] = []
+
+        def mark_processed(self, count, *, consumed_turns=0, backfill_completed=None):  # type: ignore[no-untyped-def]
+            self.marked.append((count, consumed_turns))
+
+    class ScopedStoreStub:
+        def __init__(self, scope_id: str) -> None:
+            self.scope_id = scope_id
+
+    class MemoryStoreStub:
+        def scoped(self, scope_id: str) -> ScopedStoreStub:
+            return ScopedStoreStub(scope_id)
+
+    class CuratorStub:
+        api_client = object()
+
+    class WorkerStub:
+        finished = object()
+        failed = object()
+        cancelled = object()
+
+        def __init__(self, maintainer, scope_id, trigger=None):  # type: ignore[no-untyped-def]
+            self.maintainer = maintainer
+            self.scope_id = scope_id
+            self.trigger = trigger
+            captured["worker"] = self
+
+    class ResourceManagerStub:
+        def spawn_qt_worker(self, worker, **kwargs):  # type: ignore[no-untyped-def]
+            captured["spawned_worker"] = worker
+            captured["spawn_kwargs"] = kwargs
+
+    class MinimalWindow:
+        _handle_memory_curation_finished = PetWindow._handle_memory_curation_finished
+        _persist_and_maybe_schedule_core_maintainer = (
+            PetWindow._persist_and_maybe_schedule_core_maintainer
+        )
+        _start_core_profile_maintainer = PetWindow._start_core_profile_maintainer
+        _core_candidate_queue = PetWindow._core_candidate_queue
+        _core_maintainer_state_store = PetWindow._core_maintainer_state_store
+        _core_maintainer_settings = PetWindow._core_maintainer_settings
+        _snapshot_core_profile_maintainer = PetWindow._snapshot_core_profile_maintainer
+        _handle_core_profile_maintainer_finished = PetWindow._handle_core_profile_maintainer_finished
+        _handle_core_profile_maintainer_failed = PetWindow._handle_core_profile_maintainer_failed
+        _handle_core_profile_maintainer_cancelled = PetWindow._handle_core_profile_maintainer_cancelled
+        _cleanup_core_profile_maintainer_worker = PetWindow._cleanup_core_profile_maintainer_worker
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = False
+    window.base_dir = tmp_path
+    window.character_profile = ProfileStub()
+    window.settings_service = SettingsServiceStub()
+    window.memory_store = MemoryStoreStub()
+    window.memory_curator = CuratorStub()
+    window.memory_curation_state = MemoryStateStub()
+    window.memory_curation_mode = "auto"
+    window.memory_curation_target_history_count = 2
+    window.memory_curation_consumed_turns = 1
+    window.resource_manager = ResourceManagerStub()
+    window.core_profile_maintainer_thread = object() if busy else None
+    window.core_profile_maintainer_worker = None
+    captured["window"] = window
+    captured["result_type"] = MemoryCurationResult
+    captured["worker_stub"] = WorkerStub
+    return captured
+
+
+def test_curation_finished_persists_candidates_then_schedules_maintainer(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](  # type: ignore[misc]
+            created=1,
+            core_candidates=(_core_candidate_payload(),),
+        )
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].kind == "explicit"
+    assert window.memory_curation_state.marked == [(2, 1)]
+    worker = captured["worker"]
+    assert worker.scope_id == "Sakura"
+    assert worker.trigger is not None
+    assert worker.trigger.kind == "explicit"
+    assert captured["spawn_kwargs"]["thread_attr"] == "core_profile_maintainer_thread"
+    assert captured["spawn_kwargs"]["thread_attr"] != "memory_curation_thread"
+    assert "run_once" not in captured
+
+
+def test_curation_finished_does_not_schedule_ineligible_observed(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](  # type: ignore[misc]
+            core_candidates=(
+                _core_candidate_payload(
+                    kind="observed",
+                    target_section="今の私",
+                    subject_key="relationship.trust",
+                    claim="我开始更愿意把不安说出来。",
+                    confidence=0.85,
+                    batch_id="curation_observed_one",
+                ),
+            )
+        )
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].status == "pending"
+    assert "worker" not in captured
+    assert window.memory_curation_state.marked == [(2, 1)]
+
+
+def test_maintainer_busy_defers_and_keeps_candidates(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path, busy=True)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](core_candidates=(_core_candidate_payload(),))  # type: ignore[misc]
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].status == "pending"
+    assert "spawned_worker" not in captured
+    assert window.memory_curation_state.marked == [(2, 1)]
+
+
+def test_maintainer_persist_failure_does_not_fail_curation(tmp_path, monkeypatch) -> None:
+    import app.ui.pet_window as pet_window_module
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+
+    def boom(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(pet_window_module, "persist_core_candidates", boom)
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](core_candidates=(_core_candidate_payload(),))  # type: ignore[misc]
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    assert window.memory_curation_state.marked == [(2, 1)]
+    assert "spawned_worker" not in captured
+
+
+def test_snapshot_core_maintainer_uses_scoped_store_and_current_client(tmp_path) -> None:
+    from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    first_client = object()
+    second_client = object()
+    window.memory_curator.api_client = first_client
+
+    first = window._snapshot_core_profile_maintainer()
+    window.memory_curator.api_client = second_client
+    window.settings_service.load_core_maintainer_settings = (  # type: ignore[method-assign]
+        lambda: CoreMaintainerSettings(enabled=False, normal_cooldown_hours=12)
+    )
+    second = window._snapshot_core_profile_maintainer()
+
+    assert first.memory_store.scope_id == "Sakura"
+    assert first.api_client._client is first_client
+    assert first.settings.enabled is True
+    assert second.api_client._client is second_client
+    assert second.settings.enabled is False
+    assert second.settings.normal_cooldown_hours == 12
+    assert first.api_client._client is not second.api_client._client
+
+
+def test_cleanup_core_profile_maintainer_clears_worker_attrs(tmp_path) -> None:
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    window.core_profile_maintainer_thread = object()
+    window.core_profile_maintainer_worker = object()
+    window._cleanup_core_profile_maintainer_worker()
+    assert window.core_profile_maintainer_thread is None
+    assert window.core_profile_maintainer_worker is None
+
+
 def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
     from app.ui.pet_window import PetWindow
 
@@ -4014,7 +4260,8 @@ def test_proactive_recent_conversation_limits_count_and_content() -> None:
     assert recent_conversation[-1]["content"].endswith("…")
 
 
-def test_proactive_care_capture_interval_allows_timer_jitter() -> None:
+def test_proactive_care_capture_interval_allows_timer_jitter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.ui.pet_window.night_quiet_interval_multiplier", lambda _hour: 1.0)
     window = _build_minimal_proactive_window(
         screen_context_enabled=True,
         check_interval_minutes=1,
@@ -4696,7 +4943,56 @@ def test_web_progress_reply_shows_bubble_and_speaks_tts() -> None:
     assert window.voice_playback_controller.calls == [("調べるね。", 0)]
 
 
-def test_web_fetch_progress_reply_skips_tts_when_suppressed() -> None:
+def test_web_search_hit_summary_progress_skips_bubble_and_tts() -> None:
+    """搜到了：第一个；第二个… 不进气泡、不进 TTS，避免打断「我查查」。"""
+    from app.agent import AgentProgress
+    from app.llm.chat_reply import ChatReply, ChatSegment
+    from app.ui.pet_window import PetWindow
+
+    class FakeSubtitle:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def set_speech(self, text: str, pulse: bool = False) -> None:
+            self.texts.append(text)
+
+    class FakePlayback:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def speak_segment(self, *args, **kwargs) -> None:
+            self.calls.append(args)
+
+    class MinimalProgressWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        subtitle_language = "zh"
+
+    window = MinimalProgressWindow()
+    window._shutdown_in_progress = False
+    window.messages = [{"role": "user", "content": "查一下"}]
+    window.ui_state = type("S", (), {"begin_streaming": lambda *_a, **_k: None})()
+    window._log_interaction_stage = lambda *_a, **_k: None
+    window.subtitle_controller = FakeSubtitle()
+    window.voice_playback_controller = FakePlayback()
+    window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
+
+    segment = ChatSegment(
+        "いくつか見つかった。『第一条』を見てみるね。",
+        "中性",
+        "搜到了：第一条；第二条。我先打开看看。",
+        suppress_tts=False,
+    )
+    window._handle_progress_reply(
+        AgentProgress(reply=ChatReply([segment]), stage="web_search")
+    )
+
+    assert window.messages == [{"role": "user", "content": "查一下"}]
+    assert window.subtitle_controller.texts == []
+    assert window.voice_playback_controller.calls == []
+
+
+def test_web_fetch_progress_reply_skips_bubble_and_tts() -> None:
+    """读页摘要不上气泡、不进 TTS。"""
     from app.agent import AgentProgress
     from app.llm.chat_reply import ChatReply, ChatSegment
     from app.ui.pet_window import PetWindow
@@ -4728,7 +5024,7 @@ def test_web_fetch_progress_reply_skips_tts_when_suppressed() -> None:
         AgentProgress(reply=ChatReply([segment]), stage="web_fetch")
     )
 
-    assert window.messages[-1]["content"] == "页面摘要。"
+    assert window.messages == []
     assert window.voice_playback_controller.calls == []
 
 
@@ -6700,3 +6996,74 @@ def test_character_theme_round_trip_never_stores_visual_effect_mode() -> None:
     assert restored.primary_color == "#123456"
     assert source == "package"
     assert missing is False
+
+
+def test_intimacy_continue_messages_cleared_on_exit_before_request() -> None:
+    """三轮续投信号在退出后走既有 transient 清理，不得进入下一轮 request snapshot。"""
+    from app.agent.builtin_tools import (
+        INTIMACY_EXIT_PHRASE,
+        build_intimacy_continue_message,
+        intimacy_mode_state,
+        message_is_intimacy_continue,
+    )
+    from app.ui.pet_window import PetWindow
+
+    class MinimalExitWindow:
+        send_message = PetWindow.send_message
+        _show_waiting_reply_placeholder = PetWindow._show_waiting_reply_placeholder
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+        _record_user_message = PetWindow._record_user_message
+        _cancel_intimacy_continue = PetWindow._cancel_intimacy_continue
+        _remove_transient_progress_messages = PetWindow._remove_transient_progress_messages
+
+    intimacy_mode_state.exit()
+    intimacy_mode_state.enter()
+    requests: list[list] = []
+    window = MinimalExitWindow()
+    window.input_edit = _DummyEditableInput(INTIMACY_EXIT_PHRASE)
+    window.worker_thread = None
+    window.pending_manual_screen_observation = None
+    window.pending_manual_screen_summary = ""
+    window.screen_observation_enabled = False
+    window.messages = [
+        {"role": "user", "content": "贴紧"},
+        {"role": "assistant", "content": "うん"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "1"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "2"},
+        build_intimacy_continue_message(),
+        {"role": "assistant", "content": "3"},
+    ]
+    window.active_interaction_id = ""
+    window.startup_initializing = False
+    window.character_profile = type("CharacterProfile", (), {"id": "sakura", "display_name": "Sakura"})()
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.subtitle_controller = _DummySubtitleController()
+    window.bubble_auto_hide = _DummyBubbleAutoHide()
+    window._intimacy_continue_timer = None
+    window._intimacy_continue_count = 3
+    window._mark_user_activity = lambda: None
+    window._begin_interaction = lambda _source: setattr(window, "active_interaction_id", "exit-test")
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._end_interaction = lambda _outcome: None
+    window._set_pending_tool_action = lambda _action: None
+    window._record_history = lambda *_args: None
+    window._clear_proactive_screen_context_batch = lambda _reason: None
+    window._start_chat_worker = requests.append
+    window._update_manual_screenshot_button = lambda: None
+    window._collapse_auto_fit_bubble_height = lambda: None
+    window._detect_away_from_message = lambda _text: None
+
+    try:
+        window.send_message("return_pressed")
+        assert requests, "退出发送应进入 request snapshot"
+        assert not any(message_is_intimacy_continue(m) for m in window.messages)
+        assert not any(message_is_intimacy_continue(m) for m in requests[0] if isinstance(m, dict))
+    finally:
+        intimacy_mode_state.exit()

@@ -19,11 +19,15 @@ def test_memory_language_instructions_are_bilingual() -> None:
 
 def test_curator_prompt_uses_unified_core_profile_sections() -> None:
     text = _SELF_CURATION_TASK_PROMPT
+    assert "core_candidate" in text
+    assert "禁止 add/update/delete core_profile" in text
+    assert '"layer":"core_profile"' not in text
     assert "今の関係" in text
+    assert "あなたについて知っていること" in text
     assert "今の私" in text
+    assert "大切な約束と境界" in text
     assert "两侧记忆" in text or "语言约定" in text
     assert "関係の記録" not in text
-    assert "あなたについて知っていること" not in text
 
 
 def test_curator_prompt_requires_fact_discipline() -> None:

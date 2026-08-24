@@ -115,7 +115,8 @@ def test_chat_worker_records_visual_observation_before_reply() -> None:
             )
 
     class Runtime:
-        api_client = Client()
+        api_client = object()
+        vision_api_client = Client()
 
         def handle_user_message(self, _messages, progress_callback=None, cancel_checker=None):  # type: ignore[no-untyped-def]
             if cancel_checker is not None:

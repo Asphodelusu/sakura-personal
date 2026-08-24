@@ -470,13 +470,82 @@ def test_intimacy_inactive_is_normal_routing() -> None:
     assert plan.decided_by != "rhythm_focus"
 
 
-def test_intimacy_continue_exhausted_falls_back() -> None:
-    """续投耗尽时 consume_turn 返回 False → 走正常路由。"""
+def test_intimacy_continue_exhausted_is_suppressed() -> None:
+    """续投耗尽时必须成为 no-op，不能落入普通模型路由。"""
     from app.agent.builtin_tools import build_intimacy_continue_message
 
     messages: list[ChatMessage] = [build_intimacy_continue_message()]
     plan = _plan_for(messages, active=True, turns_left=0)
-    assert plan.decided_by != "rhythm_focus"
+    assert plan.suppress_generation is True
+    assert plan.decided_by == "rhythm_exhausted"
+
+
+def test_intimacy_continue_exhausted_keeps_active_without_reentry() -> None:
+    """耗尽续投被抑制，intimacy_mode 保持 active/sleep，不生成 reentry。"""
+    from app.agent.builtin_tools import IntimacyModeState, build_intimacy_continue_message
+
+    messages: list[ChatMessage] = [build_intimacy_continue_message()]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    state = IntimacyModeState()
+    state.enter()
+    for _ in range(3):
+        assert state.consume_turn() is True
+    epoch_before = getattr(state, "continuation_epoch", None)
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    assert plan.suppress_generation is True
+    assert plan.decided_by == "rhythm_exhausted"
+    assert state.active is True
+    assert state.needs_reentry_hint is False
+    assert getattr(state, "continuation_epoch", None) == epoch_before
+
+
+def test_intimacy_user_message_after_sleep_resets_cycle() -> None:
+    """休眠后真实用户消息刷新周期并回到 intimacy 路由。"""
+    from app.agent.builtin_tools import IntimacyModeState
+
+    messages: list[ChatMessage] = [{"role": "user", "content": "ね……"}]
+    request = _request_for(messages)
+    settings = _settings()
+    recall = resolve_recall_decision(messages, request, proactive_mode=False, settings=settings)
+
+    state = IntimacyModeState()
+    state.enter()
+    for _ in range(3):
+        assert state.consume_turn() is True
+    epoch_before = getattr(state, "continuation_epoch", None)
+
+    with patch("app.agent.turn_routing.intimacy_mode_state", state):
+        plan = resolve_turn_plan(
+            messages,
+            request,
+            proactive_mode=False,
+            has_vision_client=False,
+            chat_fast_configured=True,
+            settings=settings,
+            recall_decision=recall,
+        )
+
+    assert plan.decided_by == "rhythm_focus"
+    assert state.active is True
+    assert state._turns_left == 3
+    assert state.needs_reentry_hint is False
+    epoch_after = getattr(state, "continuation_epoch", None)
+    assert epoch_after is not None
+    assert epoch_after != epoch_before
 
 
 def test_intimacy_user_turn_exit_words_leave_rhythm() -> None:

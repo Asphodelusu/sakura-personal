@@ -119,6 +119,7 @@ class TestRuntimeLimits:
         assert MAX_EVENT_RECENT_CONVERSATION_MESSAGES > 0
         assert MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS > 0
 
+
     def test_runtime_loop_settings_are_used_in_prompt(self) -> None:
         runtime = AgentRuntime(
             _dummy_api_client(),
@@ -408,9 +409,9 @@ class TestProactiveEventFlow:
 
 
 def test_web_wait_progress_lines_are_spoken() -> None:
-    """「我查查 / 搜到了打开看看」进 TTS；读页摘要旁白仍静音。"""
+    """「我查查」进 TTS；搜到标题摘要 / 读页旁白都不开口。"""
     assert _progress_reply_suppress_tts("web_planning") is False
-    assert _progress_reply_suppress_tts("web_search") is False
+    assert _progress_reply_suppress_tts("web_search") is True
     assert _progress_reply_suppress_tts("web_fetch") is True
 
 
@@ -801,3 +802,25 @@ class TestMissedMemoryToolSupplement:
         assert supplement.continue_loop is False
         assert supplement.results[0].tool_name == "memory_remember"
         assert supplement.results[0].success is True
+
+
+def test_exhausted_intimacy_continue_does_not_call_model() -> None:
+    from app.agent.builtin_tools import (
+        build_intimacy_continue_message,
+        intimacy_mode_state,
+    )
+
+    client = _dummy_api_client()
+    runtime = AgentRuntime(client, _dummy_system_prompt())
+    intimacy_mode_state.exit()
+    intimacy_mode_state.enter()
+    for _ in range(3):
+        assert intimacy_mode_state.consume_turn() is True
+    client.reset_mock()
+    try:
+        result = runtime.handle_user_message([build_intimacy_continue_message()])
+    finally:
+        intimacy_mode_state.exit()
+
+    assert result.reply.segments == []
+    client.complete_with_tools.assert_not_called()

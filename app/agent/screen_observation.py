@@ -272,6 +272,23 @@ _VLM_SUMMARY_SYSTEM_PROMPT = """\
 - 输出纯文本，不要用 JSON 或 Markdown 格式"""
 
 
+def _resolve_vision_complete_client(api_client: object) -> object | None:
+    """只接受显式视觉槽或直接传入的视觉 client，不回退主 Chat cloud。"""
+    if api_client is None:
+        return None
+    vision_attr = getattr(api_client, "vision_api_client", None)
+    if vision_attr is not None:
+        return vision_attr
+    from app.llm.api_client import OpenAICompatibleClient
+
+    if isinstance(api_client, OpenAICompatibleClient):
+        return api_client
+    complete_raw = getattr(api_client, "complete_raw", None)
+    if callable(complete_raw) and not hasattr(api_client, "cloud_client"):
+        return api_client
+    return None
+
+
 def summarize_screen_observation(
     observation: ScreenObservation,
     api_client: object,
@@ -283,20 +300,9 @@ def summarize_screen_observation(
 
     失败时返回空字符串；调用方应把空结果当作「摘要不可用」处理。
     """
-    from app.llm.api_client import ApiRequestError, OpenAICompatibleClient
+    from app.llm.api_client import ApiRequestError
 
-    client: OpenAICompatibleClient | None = None
-    # 优先用 vision_api_client（如果 Runtime 暴露了），否则 fallback 到主 client。
-    vision_attr = getattr(api_client, "vision_api_client", None)
-    if vision_attr is not None:
-        client = vision_attr
-    elif isinstance(api_client, OpenAICompatibleClient):
-        client = api_client
-    else:
-        cloud = getattr(api_client, "cloud_client", None)
-        if isinstance(cloud, OpenAICompatibleClient):
-            client = cloud
-
+    client = _resolve_vision_complete_client(api_client)
     if client is None:
         return ""
 

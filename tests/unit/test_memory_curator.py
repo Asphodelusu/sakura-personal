@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from app.agent.memory import MemoryStore, commitment_is_stale, sweep_stale_commitments
 from app.agent.memory_curator import (
     DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
+    LIGHT_CURATION_DETAIL_LIMIT,
     LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET,
     MemoryCurationSettings,
     MemoryCurationState,
@@ -21,6 +23,7 @@ from app.agent.memory_curator import (
     _entries_for_model,
     _format_existing_memories,
     _format_existing_memories_light,
+    _select_light_curation_memories,
     evaluate_idle_curation_trigger,
     resolve_idle_curation_trigger,
     looks_like_trivial_memory,
@@ -647,6 +650,73 @@ def test_format_existing_memories_light_is_smaller_than_full() -> None:
     assert "科幻片" in light
 
 
+def _unrelated_ordinary_memories(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"m{i:02d}",
+            "content": "普通日常记录，与当前对话无关。",
+            "layer": "semantic",
+            "updated_at": f"2026-01-01T00:{i:02d}:00+08:00",
+        }
+        for i in range(count)
+    ]
+
+
+def _stale_core_profile_memory() -> dict[str, Any]:
+    return {
+        "id": "core_profile:sakura",
+        "content": "＜今の関係＞\n我们是对等的恋人。",
+        "layer": "core_profile",
+        "updated_at": "2019-01-01T00:00:00+08:00",
+    }
+
+
+def test_select_light_curation_pins_low_score_old_core_in_detail() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    detail, _index_only = _select_light_curation_memories(memories, dialog)
+
+    assert any(item["id"] == core["id"] for item in detail)
+
+
+def test_select_light_curation_detail_stays_within_limit_when_core_is_pinned() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    detail, _index_only = _select_light_curation_memories(memories, dialog)
+
+    assert len(detail) <= LIGHT_CURATION_DETAIL_LIMIT
+    assert len(detail) == LIGHT_CURATION_DETAIL_LIMIT
+    ordinary_ids = [item["id"] for item in detail if item.get("layer") != "core_profile"]
+    assert ordinary_ids == [f"m{i:02d}" for i in range(39, 4, -1)]
+
+
+def test_select_light_curation_excludes_core_from_index_only() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    core = _stale_core_profile_memory()
+    memories = [core, *_unrelated_ordinary_memories(LIGHT_CURATION_DETAIL_LIMIT + 4)]
+
+    _detail, index_only = _select_light_curation_memories(memories, dialog)
+
+    assert all(item["id"] != core["id"] for item in index_only)
+    assert all(item.get("layer") != "core_profile" for item in index_only)
+
+
+def test_select_light_curation_without_core_keeps_existing_order() -> None:
+    dialog = [{"role": "user", "content": "今天天气怎么样"}]
+    memories = _unrelated_ordinary_memories(40)
+
+    detail, index_only = _select_light_curation_memories(memories, dialog)
+
+    assert [item["id"] for item in detail] == [f"m{i:02d}" for i in range(39, 3, -1)]
+    assert [item["id"] for item in index_only] == [f"m{i:02d}" for i in range(3, -1, -1)]
+    assert len(detail) == LIGHT_CURATION_DETAIL_LIMIT
+    assert len(index_only) == 4
+
+
 def test_curate_entries_light_profile_passes_slim_snapshot() -> None:
     existing = [
         {
@@ -865,6 +935,210 @@ def test_curator_mood_budget_one_per_run() -> None:
     assert store.mood_updates == ["今日は少し安心した。"]
 
 
+def _core_candidate_op(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "op": "core_candidate",
+        "kind": "explicit",
+        "target_section": "今の関係",
+        "subject_key": "relationship.identity",
+        "claim": "我们明确确认了恋人关系。",
+        "user_excerpt": "我们是恋人吧。",
+        "assistant_excerpt": "嗯，是恋人。",
+        "batch_id": "curation_fictional_batch",
+        "confidence": 0.95,
+        "observed_at": "2026-05-31T12:00:00+08:00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_curator_core_profile_write_becomes_candidate_without_core_write() -> None:
+    store = FakeMemoryStore(existing=[{"id": "core_profile:sakura", "layer": "core_profile", "content": "旧档案"}])
+    operation = _core_candidate_op(op="add", layer="core_profile", content="我们明确确认了恋人关系。")
+    api = FakeCurationApiClient([json.dumps({"operations": [operation]}, ensure_ascii=False)])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries(
+        [
+            _entry("user", "我们是恋人吧。"),
+            ChatHistoryEntry("2026-05-31T12:01:00+08:00", "assistant", "嗯，是恋人。"),
+        ]
+    )
+
+    assert store.created == []
+    assert store.updated == []
+    assert store.deleted == []
+    assert result.created == 0
+    assert len(result.core_candidates) == 1
+    candidate = result.core_candidates[0]
+    assert candidate["kind"] == "explicit"
+    assert candidate["target_section"] == "今の関係"
+    assert candidate["subject_key"] == "relationship.identity"
+    assert candidate["claim"] == "我们明确确认了恋人关系。"
+    assert candidate["user_excerpt"] == "我们是恋人吧。"
+    assert candidate["assistant_excerpt"] == "嗯，是恋人。"
+    assert candidate["batch_id"] == "curation_fictional_batch"
+    assert candidate["confidence"] == pytest.approx(0.95)
+
+
+def test_curator_accepts_core_candidate_and_keeps_ordinary_memory_ops() -> None:
+    store = FakeMemoryStore()
+    operations = [
+        {
+            "op": "add",
+            "layer": "semantic",
+            "content": "他默认用中文和我说话。",
+            "evidence": "以后默认中文和我说话",
+            "confidence": 0.9,
+        },
+        _core_candidate_op(),
+        {
+            "op": "add",
+            "layer": "episodic",
+            "content": "我们确认了是恋人。",
+            "evidence": "我们是恋人吧。",
+            "confidence": 0.88,
+        },
+    ]
+    api = FakeCurationApiClient([json.dumps({"operations": operations}, ensure_ascii=False)])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries(
+        [
+            _entry("user", "以后默认中文和我说话"),
+            _entry("user", "我们是恋人吧。"),
+            ChatHistoryEntry("2026-05-31T12:01:00+08:00", "assistant", "嗯，是恋人。"),
+        ]
+    )
+
+    assert result.created == 2
+    assert [item["layer"] for item in store.created] == ["semantic", "episodic"]
+    assert len(result.core_candidates) == 1
+    assert result.core_candidates[0]["kind"] == "explicit"
+    assert store.updated == []
+
+
+def test_curator_one_sided_proposal_is_not_explicit() -> None:
+    store = FakeMemoryStore()
+    api = FakeCurationApiClient(
+        [
+            json.dumps(
+                {
+                    "operations": [
+                        _core_candidate_op(
+                            user_excerpt="做我恋人吧。",
+                            assistant_excerpt="",
+                            claim="他单方面向我告白。",
+                        )
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "做我恋人吧。")])
+
+    assert store.created == []
+    if result.core_candidates:
+        assert result.core_candidates[0]["kind"] == "observed"
+        assert result.core_candidates[0]["assistant_excerpt"] == ""
+    else:
+        assert result.core_candidates == ()
+
+
+def test_curator_ignores_transient_jealousy_and_intimacy_candidates() -> None:
+    store = FakeMemoryStore()
+    operations = [
+        _core_candidate_op(
+            kind="observed",
+            target_section="今の私",
+            subject_key="mood.jealousy",
+            claim="我今晚吃醋了，但明天就会好。",
+            user_excerpt="你是不是更在意别人？",
+            assistant_excerpt="我今晚有点吃醋。",
+            confidence=0.86,
+        ),
+        _core_candidate_op(
+            kind="observed",
+            target_section="今の関係",
+            subject_key="transient.intimacy",
+            claim="今晚有一次性亲密，不应当成长期关系定义。",
+            user_excerpt="今晚亲热一次就好。",
+            assistant_excerpt="今晚这样就好。",
+            confidence=0.84,
+        ),
+    ]
+    api = FakeCurationApiClient([json.dumps({"operations": operations}, ensure_ascii=False)])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries(
+        [
+            _entry("user", "你是不是更在意别人？"),
+            ChatHistoryEntry("2026-05-31T12:01:00+08:00", "assistant", "我今晚有点吃醋。"),
+            _entry("user", "今晚亲热一次就好。"),
+            ChatHistoryEntry("2026-05-31T12:02:00+08:00", "assistant", "今晚这样就好。"),
+        ]
+    )
+
+    assert result.core_candidates == ()
+    assert store.created == []
+    assert store.updated == []
+
+
+def test_curator_rejects_payloads_outside_queue_contract() -> None:
+    store = FakeMemoryStore()
+    operations = [
+        _core_candidate_op(target_section="未知章节"),
+        _core_candidate_op(subject_key=""),
+        _core_candidate_op(kind="guess"),
+        {"op": "add", "layer": "core_profile", "content": "直接改档案", "evidence": "我们是恋人吧。"},
+        {"op": "update", "id": "core_profile:sakura", "layer": "core_profile", "content": "还是直接改"},
+        {"op": "delete", "id": "core_profile:sakura"},
+    ]
+    api = FakeCurationApiClient([json.dumps({"operations": operations}, ensure_ascii=False)])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries(
+        [
+            _entry("user", "我们是恋人吧。"),
+            ChatHistoryEntry("2026-05-31T12:01:00+08:00", "assistant", "嗯，是恋人。"),
+        ]
+    )
+
+    assert result.core_candidates == ()
+    assert store.created == []
+    assert store.updated == []
+    assert store.deleted == []
+
+
+def test_curator_bounds_core_candidates_per_run() -> None:
+    store = FakeMemoryStore()
+    operations = [
+        _core_candidate_op(
+            subject_key=f"relationship.identity.{index}",
+            claim=f"虚构关系认识候选 {index}。",
+            user_excerpt=f"用户证据{index}",
+            assistant_excerpt=f"我的回应{index}",
+            batch_id=f"curation_bound_{index}",
+        )
+        for index in range(8)
+    ]
+    api = FakeCurationApiClient([json.dumps({"operations": operations}, ensure_ascii=False)])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries(
+        [
+            _entry("user", "用户证据0"),
+            ChatHistoryEntry("2026-05-31T12:01:00+08:00", "assistant", "我的回应0"),
+        ]
+    )
+
+    assert len(result.core_candidates) == 5
+    assert store.created == []
+
+
 def _entry(role: str, content: str) -> ChatHistoryEntry:
     return ChatHistoryEntry(
         created_at="2026-05-31T12:00:00+08:00",
@@ -908,6 +1182,9 @@ class FakeMemoryStore:
 
     def list_memories(self, *, limit: int) -> list[dict[str, Any]]:
         return list(self.existing)[: max(1, int(limit))]
+
+    def ensure_entity_index_backfilled(self, memories) -> None:  # type: ignore[no-untyped-def]
+        return None
 
     def mood_history(self) -> list[dict[str, Any]]:
         return []

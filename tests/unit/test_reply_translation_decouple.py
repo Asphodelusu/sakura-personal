@@ -75,6 +75,55 @@ def test_missing_translation_currently_triggers_second_pro_compose() -> None:
     assert result.reply.segments[0].translation == "我确认了北京天气。"
 
 
+def test_ja_only_segments_do_not_call_compose_structured_final_reply() -> None:
+    """合同：合法 ja-only segments 不得调用 _compose_structured_final_reply。"""
+    raw = json.dumps(
+        {
+            "segments": [
+                {
+                    "ja": "おはよう。",
+                    "tone": "开心",
+                    "portrait": "站立待机",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt())
+    runtime._compose_structured_final_reply = MagicMock(
+        side_effect=AssertionError("ja-only segments must not compose")
+    )
+
+    assert runtime._structured_compose_reason(raw) == ""
+    resolved = runtime._resolve_final_reply_content(
+        raw,
+        system_prompt=_dummy_system_prompt(),
+        working_messages=[],
+        runtime_context="",
+    )
+    assert resolved == raw
+    runtime._compose_structured_final_reply.assert_not_called()
+
+
+def test_adoptable_json_with_prose_prefix_does_not_compose() -> None:
+    """解析已抽出可采用日语时，即使前后有废话也不二次合成。"""
+    raw = '了解。\n{"ja": "おはよう。", "tone": "开心", "portrait": "站立待机"}'
+    runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt())
+    runtime._compose_structured_final_reply = MagicMock(
+        side_effect=AssertionError("adoptable Japanese JSON must not compose")
+    )
+
+    assert runtime._structured_compose_reason(raw) == ""
+    resolved = runtime._resolve_final_reply_content(
+        raw,
+        system_prompt=_dummy_system_prompt(),
+        working_messages=[],
+        runtime_context="",
+    )
+    assert resolved == raw
+    runtime._compose_structured_final_reply.assert_not_called()
+
+
 def test_structured_segments_missing_zh_accepted_without_second_pro() -> None:
     """目标：首轮 JSON segments 仅有 ja/tone/portrait 时直接采用，不启动第二次 Pro。"""
     client = _dummy_api_client()

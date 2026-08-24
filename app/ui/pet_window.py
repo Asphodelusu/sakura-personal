@@ -64,6 +64,12 @@ from app.agent.memory_curator import (
     seconds_since_iso_timestamp,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
+from app.agent.core_profile_maintainer_worker import (
+    CoreMaintainerCompletionAdapter,
+    CoreProfileMaintainerWorker,
+    maintainer_admission_indicates_work,
+    persist_core_candidates,
+)
 from app.agent.memory_reflector import (
     MemoryReflector,
     ReflectionStateStore,
@@ -794,6 +800,8 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        self.core_profile_maintainer_thread: QThread | None = None
+        self.core_profile_maintainer_worker: CoreProfileMaintainerWorker | None = None
         self.drag_anchor: QPoint | None = None
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
@@ -871,6 +879,7 @@ class PetWindow(QWidget):
         # 亲密模式自动续投
         self._intimacy_continue_timer: QTimer | None = None
         self._intimacy_continue_count: int = 0
+        self._intimacy_continue_epoch: int = 0
         self.active_interaction_started_at: float | None = None
         self.active_interaction_last_at: float | None = None
         # UI 统一状态源：thinking/streaming/speaking/error 的唯一权威
@@ -3333,6 +3342,12 @@ class PetWindow(QWidget):
             refill_backchannel_audio = getattr(self, "_prepare_backchannel_audio_cache", None)
             if callable(refill_backchannel_audio):
                 refill_backchannel_audio()
+        elif (
+            outcome in {"empty_reply", "error", "speaking_timeout"}
+            and self._next_intimacy_continue_delay_ms() is None
+        ):
+            # 第三轮续投已发出：失败/超时也进入静默休眠，取消 timer 但保持 active。
+            self._schedule_intimacy_continue()
 
     # ------------------------------------------------------------------
     # Proactive screen observer (desktop-kanojo style)
@@ -3576,27 +3591,54 @@ class PetWindow(QWidget):
     # 亲密模式自动续投
     # ------------------------------------------------------------------
 
-    # 用户沉默时最多续投轮数；与 IntimacyModeState._AUTO_EXIT_TURNS 对齐，
-    # 续投会扣节奏存活，扣尽后自动退出亲密节奏。
-    _INTIMACY_CONTINUE_MAX = 8
-    _INTIMACY_CONTINUE_DELAY_MS = 20_000
+    # 用户沉默时最多续投 3 轮：20s / 35s / 60s。第三轮回复播完后静默休眠。
+    _INTIMACY_CONTINUE_DELAYS_MS = (20_000, 35_000, 60_000)
+
+    def _next_intimacy_continue_delay_ms(self) -> int | None:
+        index = int(getattr(self, "_intimacy_continue_count", 0))
+        if index < 0 or index >= len(self._INTIMACY_CONTINUE_DELAYS_MS):
+            return None
+        return self._INTIMACY_CONTINUE_DELAYS_MS[index]
 
     def _schedule_intimacy_continue(self) -> None:
         """亲密模式回复完成后，启动续投计时器。"""
         from app.agent.builtin_tools import intimacy_mode_state
 
         if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
             self._intimacy_was_active = False
             return
         # 亲密模式重新激活（从非活跃→活跃）时重置续投计数
         if not getattr(self, "_intimacy_was_active", False):
             self._intimacy_continue_count = 0
             self._intimacy_was_active = True
+        epoch = int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0)
+        observed = int(getattr(self, "_intimacy_continue_epoch", 0) or 0)
+        if epoch != observed:
+            self._intimacy_continue_count = 0
+            self._intimacy_continue_epoch = epoch
+        delay_ms = self._next_intimacy_continue_delay_ms()
+        if delay_ms is None:
+            # 第三轮续投回复已播完：静默休眠，只停 timer，保持 active。
+            if self._intimacy_continue_timer is not None:
+                self._intimacy_continue_timer.stop()
+            return
+        self._intimacy_continue_timer_epoch = epoch
+        generation = int(getattr(self, "_intimacy_continue_timer_generation", 0)) + 1
+        self._intimacy_continue_timer_generation = generation
         if self._intimacy_continue_timer is None:
             self._intimacy_continue_timer = QTimer(self)
             self._intimacy_continue_timer.setSingleShot(True)
-            self._intimacy_continue_timer.timeout.connect(self._on_intimacy_continue_timer)
-        self._intimacy_continue_timer.start(self._INTIMACY_CONTINUE_DELAY_MS)
+        timeout_signal = getattr(self._intimacy_continue_timer, "timeout", None)
+        if timeout_signal is not None:
+            try:
+                timeout_signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            timeout_signal.connect(
+                lambda captured=generation: self._on_intimacy_continue_timer(captured)
+            )
+        self._intimacy_continue_timer.start(delay_ms)
 
     def _cancel_intimacy_continue(self) -> None:
         if self._intimacy_continue_timer is not None:
@@ -3620,13 +3662,21 @@ class PetWindow(QWidget):
         return False
 
     @Slot()
-    def _on_intimacy_continue_timer(self) -> None:
+    def _on_intimacy_continue_timer(self, scheduled_generation: int | None = None) -> None:
         """计时器到期：检查条件，触发续投。"""
         from app.agent.builtin_tools import build_intimacy_continue_message, intimacy_mode_state
 
         if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
             return
-        if self._intimacy_continue_count >= self._INTIMACY_CONTINUE_MAX:
+        current_generation = int(getattr(self, "_intimacy_continue_timer_generation", 0))
+        if scheduled_generation is not None and scheduled_generation != current_generation:
+            return
+        scheduled_epoch = int(getattr(self, "_intimacy_continue_timer_epoch", -1))
+        current_epoch = int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0)
+        if scheduled_epoch != current_epoch:
+            return
+        if self._next_intimacy_continue_delay_ms() is None:
             return
         # TTS 还在播 → 等 2 秒再试（包括 active_interaction / subtitle 活跃一并重试）
         if self.active_interaction_id:
@@ -3641,6 +3691,11 @@ class PetWindow(QWidget):
             return
         if self.speech_timer.isActive():
             self._intimacy_continue_timer.start(2000)
+            return
+
+        # busy 检查期间用户可能已开始新周期；提交续投前再做一次最终校验。
+        current_epoch = int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0)
+        if scheduled_epoch != current_epoch or not intimacy_mode_state.active:
             return
 
         # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
@@ -3960,8 +4015,11 @@ class PetWindow(QWidget):
     def send_message(self, source: str = "direct_call") -> None:
         if getattr(self, "startup_initializing", False):
             return
-        self._cancel_intimacy_continue()
         text = self.input_edit.text().strip()
+        from app.agent.builtin_tools import user_declines_or_exits_intimacy
+
+        if user_declines_or_exits_intimacy(text):
+            self._remove_transient_progress_messages()
         manual_observation = self.pending_manual_screen_observation
         self._log_interaction_stage(
             "send_message_enter",
@@ -3994,6 +4052,9 @@ class PetWindow(QWidget):
             if self.active_interaction_id:
                 self._end_interaction("ignored")
             return
+        intimacy_continue_timer = getattr(self, "_intimacy_continue_timer", None)
+        if intimacy_continue_timer is not None:
+            intimacy_continue_timer.stop()
         if manual_observation is not None and not self.screen_observation_enabled:
             show_themed_information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
             self._clear_manual_screen_observation()
@@ -4178,9 +4239,9 @@ class PetWindow(QWidget):
         if not reply.text.strip() and not reply.translation.strip():
             return
         stage = str(progress.stage or "")
-        # 仅联网搜索空档旁白上气泡/TTS。工具规划中间稿（observe_screen 等）
-        # 不当成回复字幕，避免「字出来了却迟迟不送正式 TTS」的错觉。
-        if not stage.startswith("web_"):
+        # 仅「我查查」上气泡/TTS。搜到标题摘要会打断上一句；读页摘要走最终回答。
+        # 工具规划中间稿（observe_screen 等）也不当成回复字幕。
+        if stage != "web_planning":
             return
         self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
@@ -4221,7 +4282,7 @@ class PetWindow(QWidget):
             subtitle_controller = getattr(self, "subtitle_controller", None)
             if subtitle_controller is not None:
                 subtitle_controller.set_speech(bubble_text, pulse=True)
-        # 「我查查 / 搜到了」等短旁白：搜索等待空档播 TTS；读页长摘要仍 suppress_tts。
+        # 「我查查」：搜索等待空档播 TTS。搜到标题 / 读页摘要不上气泡。
         if (
             segment is not None
             and not segment.suppress_tts
@@ -4254,6 +4315,10 @@ class PetWindow(QWidget):
             self.messages = _without_transient_progress_messages(self.messages)
             return
         self.messages = _without_transient_progress_messages(self.messages)
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        if not intimacy_mode_state.active:
+            self._cancel_intimacy_continue()
         self._log_interaction_stage(
             "agent_result_received",
             {
@@ -4620,7 +4685,7 @@ class PetWindow(QWidget):
             return False
         worker = ScreenObservationSummarizeWorker(
             observation,
-            self.api_client,
+            getattr(self, "agent_runtime", None) or self.api_client,
             context,
         )
         self.resource_manager.spawn_qt_worker(
@@ -5869,6 +5934,10 @@ class PetWindow(QWidget):
             consumed_turns=self.memory_curation_consumed_turns,
             backfill_completed=True if mode == "backfill" else None,
         )
+        try:
+            self._persist_and_maybe_schedule_core_maintainer(result)
+        except Exception as exc:  # noqa: BLE001 — 维护调度失败不得否定已成功的整理。
+            debug_log("Memory", "常驻档案维护调度失败", {"error": str(exc)})
 
     @Slot(str)
     def _handle_memory_curation_failed(self, message: str) -> None:
@@ -5899,6 +5968,130 @@ class PetWindow(QWidget):
             )
         else:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+
+    def _core_candidate_queue(self):
+        from app.agent.core_profile_candidates import CoreCandidateQueue
+
+        settings = self._core_maintainer_settings()
+        return CoreCandidateQueue(
+            StoragePaths(Path(self.base_dir)).memory_core_review_queue(),
+            config=settings.to_candidate_config(),
+        )
+
+    def _core_maintainer_state_store(self):
+        from app.agent.core_profile_maintainer import CoreMaintainerStateStore
+
+        return CoreMaintainerStateStore(
+            StoragePaths(Path(self.base_dir)).memory_core_maintainer_state()
+        )
+
+    def _core_maintainer_settings(self):
+        from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+        loader = getattr(self.settings_service, "load_core_maintainer_settings", None)
+        if callable(loader):
+            try:
+                loaded = loader()
+                if loaded is not None:
+                    return loaded
+            except Exception:  # noqa: BLE001
+                pass
+        return CoreMaintainerSettings()
+
+    def _snapshot_core_profile_maintainer(self):
+        from app.agent.core_profile_maintainer import CoreProfileMaintainer
+
+        settings = self._core_maintainer_settings()
+        scoped_store = self.memory_store.scoped(self.character_profile.id)
+        adapter = CoreMaintainerCompletionAdapter(self.memory_curator.api_client)
+        return CoreProfileMaintainer(
+            api_client=adapter,
+            memory_store=scoped_store,
+            queue=self._core_candidate_queue(),
+            state_store=self._core_maintainer_state_store(),
+            settings=settings,
+        )
+
+    def _persist_and_maybe_schedule_core_maintainer(self, result: MemoryCurationResult) -> None:
+        payloads = tuple(getattr(result, "core_candidates", ()) or ())
+        queue = self._core_candidate_queue()
+        scope_id = str(getattr(self.character_profile, "id", "") or "").strip()
+        trigger = persist_core_candidates(
+            queue,
+            scope_id,
+            payloads,
+            on_error=lambda message: debug_log(
+                "Memory",
+                "常驻档案候选写入失败",
+                {"error": message},
+            ),
+        )
+        busy = getattr(self, "core_profile_maintainer_thread", None) is not None
+        if not maintainer_admission_indicates_work(
+            queue=queue,
+            state_store=self._core_maintainer_state_store(),
+            settings=self._core_maintainer_settings(),
+            scope_id=scope_id,
+            trigger=trigger,
+            busy=busy,
+        ):
+            return
+        self._start_core_profile_maintainer(trigger)
+
+    def _start_core_profile_maintainer(self, trigger) -> None:
+        if getattr(self, "core_profile_maintainer_thread", None) is not None:
+            return
+        worker = CoreProfileMaintainerWorker(
+            self._snapshot_core_profile_maintainer(),
+            str(getattr(self.character_profile, "id", "") or "").strip(),
+            trigger,
+        )
+        self.resource_manager.spawn_qt_worker(
+            worker,
+            parent=self,
+            owner=self,
+            thread_attr="core_profile_maintainer_thread",
+            worker_attr="core_profile_maintainer_worker",
+            signal_bindings=[
+                (worker.finished, self._handle_core_profile_maintainer_finished),
+                (worker.failed, self._handle_core_profile_maintainer_failed),
+                (worker.cancelled, self._handle_core_profile_maintainer_cancelled),
+            ],
+            quit_on=[worker.finished, worker.failed, worker.cancelled],
+            on_finished=self._cleanup_core_profile_maintainer_worker,
+        )
+
+    @Slot(object)
+    def _handle_core_profile_maintainer_finished(self, result: object) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        status = getattr(result, "status", "")
+        metrics = getattr(result, "metrics", None)
+        debug_log(
+            "Memory",
+            "常驻档案维护完成",
+            {
+                "status": status,
+                "metrics_keys": sorted((metrics or {}).keys()) if isinstance(metrics, dict) else [],
+            },
+        )
+
+    @Slot(str)
+    def _handle_core_profile_maintainer_failed(self, message: str) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        debug_log("Memory", "常驻档案维护失败", {"error": message})
+
+    @Slot()
+    def _handle_core_profile_maintainer_cancelled(self) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        debug_log("Memory", "常驻档案维护已取消")
+
+    @Slot()
+    def _cleanup_core_profile_maintainer_worker(self) -> None:
+        self.core_profile_maintainer_thread = None
+        self.core_profile_maintainer_worker = None
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:

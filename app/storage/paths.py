@@ -111,6 +111,12 @@ class StoragePaths:
     def memory_core_profiles(self) -> Path:
         return self.memory_dir / "core_profiles.json"
 
+    def memory_core_review_queue(self) -> Path:
+        return self.memory_dir / "core_review_queue.json"
+
+    def memory_core_maintainer_state(self) -> Path:
+        return self.memory_dir / "core_maintainer_state.json"
+
     def memory_mood_state(self) -> Path:
         return self.memory_dir / "mood_state.json"
 

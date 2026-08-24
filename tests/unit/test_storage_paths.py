@@ -109,6 +109,14 @@ class TestStoragePathsSnapshot:
         assert self.paths.legacy_chat_history() == self.data / "chat_history.jsonl"
         assert self.paths.memory_store() == self.data / "memory.json"
         assert self.paths.memory_core_profiles() == self.data / "memory" / "core_profiles.json"
+        assert (
+            self.paths.memory_core_review_queue()
+            == self.data / "memory" / "core_review_queue.json"
+        )
+        assert (
+            self.paths.memory_core_maintainer_state()
+            == self.data / "memory" / "core_maintainer_state.json"
+        )
         assert self.paths.memory_curation_state() == self.data / "memory_curation_state.json"
         assert self.paths.memory_entity_index_db() == self.data / "memory" / "entity_index.db"
         assert self.paths.memory_access_tracker_db() == self.data / "memory" / "access_tracker.db"

@@ -749,6 +749,12 @@ class AppSettingsService:
     def save_progressive_memory_settings(self, enabled: bool) -> None:
         self.save_system_values("memory", {"progressive_memory": bool(enabled)})
 
+    def load_core_maintainer_settings(self):
+        from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+        memory = self._system_section("memory")
+        return CoreMaintainerSettings.from_mapping(memory.get("core_maintainer"))
+
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
         from app.config.defaults import (

@@ -11,13 +11,16 @@ import sys
 import threading
 import time
 import zipfile
-from contextlib import nullcontext
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from app.agent.persona_state import normalize_emotion
+from app.agent.time_awareness import parse_iso_datetime
 from app.backchannel.emotion import EmotionScorer
 from app.backchannel.models import DEFAULT_EMOTION
 from app.core.debug_log import debug_log
@@ -25,7 +28,7 @@ from app.core.resource_manager import (
     ResourceRegistry,
     ThreadGroupResource,
 )
-from app.storage.atomic import atomic_write_text, rename_with_retry
+from app.storage.atomic import BACKUP_SUFFIX, atomic_write_text, rename_with_retry
 from app.storage.chat_history import ChatHistoryEntry
 from app.storage.paths import StoragePaths
 from app.core.hf_hub_download import default_hf_endpoint, download_hf_snapshot
@@ -76,7 +79,22 @@ MEMORY_LAYER_LABELS = {
 DEFAULT_MEMORY_IMPORTANCE = 0.5
 DEFAULT_MEMORY_CONFIDENCE = 0.75
 DEFAULT_MEMORY_SOURCE = "manual"
+CORE_PROFILE_SCHEMA_VERSION = 2
+CORE_PROFILE_FORMAL_SECTIONS = (
+    "今の関係",
+    "あなたについて知っていること",
+    "今の私",
+    "大切な約束と境界",
+)
+CORE_PROFILE_FORMAL_SECTION_SET = frozenset(CORE_PROFILE_FORMAL_SECTIONS)
+CORE_PROFILE_MAINTAINER_SOURCE = "core_maintainer"
+CORE_PROFILE_MAX_ORDINARY_SECTION_PATCHES = 2
+CORE_PROFILE_LEGACY_SECTION = "legacy"
 CORE_PROFILE_CONTEXT_BUDGET = 1200
+_CORE_PROFILE_QUOTED_TOKEN = re.compile("「[^」]*」|『[^』]*』|\"[^\"]*\"|'[^']*'")
+_CORE_PROFILE_NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
+_CORE_PROFILE_THREAD_LOCKS_GUARD = threading.Lock()
+_CORE_PROFILE_THREAD_LOCKS: dict[str, threading.Lock] = {}
 MOOD_CONTEXT_BUDGET = 500
 SESSION_CONTEXT_BUDGET = 600
 MEMORY_SECTION_CHAR_BUDGET = 1600
@@ -1032,7 +1050,21 @@ class MemoryStore:
         raw = profiles.get(self.scope_id)
         if not isinstance(raw, dict):
             return None
-        record = _normalize_memory_record(raw, default_scope=self.scope_id)
+        view = dict(raw)
+        stored_content = str(raw.get("content") or raw.get("memory") or "").strip()
+        schema_version = _core_profile_schema_version(view)
+        content = stored_content
+        if not content and schema_version == CORE_PROFILE_SCHEMA_VERSION:
+            content = _core_profile_content_for_read(view)
+        if not content:
+            return None
+        if schema_version not in {None, CORE_PROFILE_SCHEMA_VERSION}:
+            logger.debug("常驻档案未知 schema_version=%s，只读兼容", schema_version)
+        elif schema_version == CORE_PROFILE_SCHEMA_VERSION and not stored_content:
+            logger.debug("常驻档案 V2 缺少 content，已按 sections 只读降级")
+        view["content"] = content
+        view["memory"] = content
+        record = _normalize_memory_record(view, default_scope=self.scope_id)
         if record is None:
             return None
         record["id"] = _core_profile_id(self.scope_id)
@@ -1050,40 +1082,161 @@ class MemoryStore:
         text = content.strip()
         if not text:
             raise ValueError("常驻档案内容不能为空。")
-        profiles = self._load_core_profiles()
-        now = _now_iso()
-        previous = profiles.get(self.scope_id) if isinstance(profiles.get(self.scope_id), dict) else {}
-        previous_metadata = previous.get("metadata") if isinstance(previous, dict) else {}
-        merged_metadata = {
-            **(previous_metadata if isinstance(previous_metadata, dict) else {}),
-            **(metadata or {}),
-            "layer": MEMORY_LAYER_CORE_PROFILE,
-            "scope": self.scope_id,
-            "updated_at": now,
-            "created_at": _metadata_text(previous_metadata, "created_at") or now
-            if isinstance(previous_metadata, dict)
-            else now,
-        }
-        record = {
-            "id": _core_profile_id(self.scope_id),
-            "content": text,
-            "memory": text,
-            "metadata": merged_metadata,
-        }
-        profiles[self.scope_id] = record
-        self._save_core_profiles(profiles)
-        normalized = _normalize_memory_record(record, default_scope=self.scope_id)
-        return normalized or record
+        with self._core_profile_guard():
+            profiles = self._load_core_profiles(strict=True)
+            previous = self._require_writable_core_profile(profiles) or {}
+            now = _now_iso()
+            previous_metadata = previous.get("metadata") if isinstance(previous, dict) else {}
+            merged_metadata = {
+                **(previous_metadata if isinstance(previous_metadata, dict) else {}),
+                **(metadata or {}),
+                "layer": MEMORY_LAYER_CORE_PROFILE,
+                "scope": self.scope_id,
+                "updated_at": now,
+                "created_at": _metadata_text(previous_metadata, "created_at") or now
+                if isinstance(previous_metadata, dict)
+                else now,
+            }
+            record = _build_core_profile_v2_record(
+                scope_id=self.scope_id,
+                content=text,
+                metadata=merged_metadata,
+            )
+            profiles[self.scope_id] = record
+            self._save_core_profiles(profiles)
+            normalized = _normalize_memory_record(record, default_scope=self.scope_id)
+            return normalized or record
 
     def delete_core_profile(self) -> dict[str, Any] | None:
         """删除当前角色的常驻档案块。"""
 
-        profiles = self._load_core_profiles()
-        previous = profiles.pop(self.scope_id, None)
-        self._save_core_profiles(profiles)
-        if not isinstance(previous, dict):
+        with self._core_profile_guard():
+            profiles = self._load_core_profiles(strict=True)
+            self._require_writable_core_profile(profiles)
+            previous = profiles.pop(self.scope_id, None)
+            self._save_core_profiles(profiles)
+            if not isinstance(previous, dict):
+                return None
+            return _normalize_memory_record(previous, default_scope=self.scope_id)
+
+    def patch_core_profile_sections(
+        self,
+        base_updated_at: str,
+        sections: Mapping[str, str],
+        *,
+        candidate_ids: Sequence[str] | None = None,
+        migrate_legacy: bool = False,
+    ) -> dict[str, Any]:
+        """按白名单章节更新 V2 常驻档案，失败时不写主文件和备份。"""
+
+        with self._core_profile_guard():
+            return self._patch_core_profile_sections_locked(
+                base_updated_at,
+                sections,
+                candidate_ids=candidate_ids,
+                migrate_legacy=migrate_legacy,
+            )
+
+    def _patch_core_profile_sections_locked(
+        self,
+        base_updated_at: str,
+        sections: Mapping[str, str],
+        *,
+        candidate_ids: Sequence[str] | None,
+        migrate_legacy: bool,
+    ) -> dict[str, Any]:
+        profiles = self._load_core_profiles(strict=True)
+        previous = self._require_writable_core_profile(profiles)
+        if previous is None:
+            raise CoreProfileStorageError("常驻档案不存在，拒绝章节更新")
+        if _core_profile_schema_version(previous) != CORE_PROFILE_SCHEMA_VERSION:
+            raise CoreProfileStorageError("常驻档案不是 V2，拒绝章节更新")
+        if _core_profile_updated_at(previous) != str(base_updated_at or "").strip():
+            raise CoreProfileStorageError("常驻档案乐观锁冲突")
+
+        incoming = _parse_core_profile_section_patch(sections)
+        current_sections = previous.get("sections")
+        _reject_invalid_stored_core_profile_sections(current_sections)
+        if not isinstance(current_sections, dict):
+            current_sections = {}
+        legacy_text = str(current_sections.get(CORE_PROFILE_LEGACY_SECTION) or "").strip()
+
+        if migrate_legacy:
+            if not legacy_text:
+                raise CoreProfileStorageError("常驻档案没有 legacy，拒绝迁移")
+            ordered = {
+                name: incoming.get(name, "").strip()
+                for name in CORE_PROFILE_FORMAL_SECTIONS
+            }
+            _validate_legacy_core_profile_migration(legacy_text, ordered)
+        else:
+            if legacy_text:
+                raise CoreProfileStorageError("常驻档案仍含 legacy，需要 migrate_legacy")
+            if len(incoming) > CORE_PROFILE_MAX_ORDINARY_SECTION_PATCHES:
+                raise CoreProfileStorageError("普通章节更新最多 2 个")
+            ordered = {
+                name: str(current_sections.get(name) or "").strip()
+                for name in CORE_PROFILE_FORMAL_SECTIONS
+            }
+            changed = 0
+            for name, value in incoming.items():
+                current_value = ordered[name]
+                if _normalize_core_profile_text(value) != _normalize_core_profile_text(current_value):
+                    changed += 1
+                    ordered[name] = value.strip()
+            rendered = _render_core_profile_formal_sections(ordered)
+            cache_fresh = (
+                str(previous.get("content") or "") == rendered
+                and str(previous.get("memory") or "") == rendered
+            )
+            if changed == 0 and cache_fresh:
+                viewed = _normalize_memory_record(previous, default_scope=self.scope_id)
+                return viewed or previous
+
+        now = _next_core_profile_updated_at(_core_profile_updated_at(previous))
+        previous_metadata = previous.get("metadata") if isinstance(previous.get("metadata"), dict) else {}
+        if not isinstance(previous_metadata, dict):
+            previous_metadata = {}
+        rendered = _render_core_profile_formal_sections(ordered)
+        record = {
+            "id": _core_profile_id(self.scope_id),
+            "schema_version": CORE_PROFILE_SCHEMA_VERSION,
+            "content": rendered,
+            "memory": rendered,
+            "sections": ordered,
+            "metadata": {
+                **previous_metadata,
+                "layer": MEMORY_LAYER_CORE_PROFILE,
+                "scope": self.scope_id,
+                "updated_at": now,
+                "created_at": _metadata_text(previous_metadata, "created_at") or now,
+                "source": CORE_PROFILE_MAINTAINER_SOURCE,
+                "candidate_ids": _normalize_core_profile_candidate_ids(candidate_ids),
+            },
+        }
+        profiles[self.scope_id] = record
+        self._save_core_profiles_strict(profiles)
+        normalized = _normalize_memory_record(record, default_scope=self.scope_id)
+        return normalized or record
+
+    def _core_profile_guard(self):
+        return _exclusive_core_profile_path_lock(
+            StoragePaths(self.base_dir).memory_core_profiles()
+        )
+
+    def _require_writable_core_profile(self, profiles: dict[str, Any]) -> dict[str, Any] | None:
+        if self.scope_id not in profiles:
             return None
-        return _normalize_memory_record(previous, default_scope=self.scope_id)
+        raw = profiles[self.scope_id]
+        path_name = StoragePaths(self.base_dir).memory_core_profiles().name
+        if not isinstance(raw, dict):
+            raise CoreProfileStorageError(f"常驻档案文件 {path_name} 目标记录不是对象")
+        schema_version = _core_profile_schema_version(raw)
+        if schema_version not in {None, CORE_PROFILE_SCHEMA_VERSION}:
+            raise CoreProfileStorageError(
+                f"常驻档案文件 {path_name} 未知 schema_version={schema_version}，拒绝写入"
+            )
+        return raw
 
     # ---- Mood State (心の記録) ----
 
@@ -2007,16 +2160,24 @@ class MemoryStore:
         raw = mem.add(messages, user_id=self.scope_id, infer=True)
         return _count_mem0_events(raw, total=len(messages))
 
-    def _load_core_profiles(self) -> dict[str, Any]:
+    def _load_core_profiles(self, *, strict: bool = False) -> dict[str, Any]:
         path = StoragePaths(self.base_dir).memory_core_profiles()
         if not path.exists():
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            if strict:
+                raise CoreProfileStorageError(
+                    f"无法读取常驻档案文件 {path.name}：{type(exc).__name__}"
+                ) from exc
             logger.debug("读取常驻档案失败", exc_info=True)
             return {}
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            return data
+        if strict:
+            raise CoreProfileStorageError(f"常驻档案文件 {path.name} 顶层不是对象")
+        return {}
 
     def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
         path = StoragePaths(self.base_dir).memory_core_profiles()
@@ -2024,6 +2185,17 @@ class MemoryStore:
             path,
             json.dumps(profiles, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            backup=True,
+        )
+
+    def _save_core_profiles_strict(self, profiles: dict[str, Any]) -> None:
+        path = StoragePaths(self.base_dir).memory_core_profiles()
+        _backup_core_profile_file(path)
+        atomic_write_text(
+            path,
+            json.dumps(profiles, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            backup=False,
         )
 
     def _reset_scope_curation_cache(
@@ -2362,8 +2534,8 @@ class ScopedMemoryStore(MemoryStore):
     def _get_memory(self, *, wait: bool = True) -> Any | None:
         return self._owner._get_memory(wait=wait)
 
-    def _load_core_profiles(self) -> dict[str, Any]:
-        return self._owner._load_core_profiles()
+    def _load_core_profiles(self, *, strict: bool = False) -> dict[str, Any]:
+        return self._owner._load_core_profiles(strict=strict)
 
     def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
         self._owner._save_core_profiles(profiles)
@@ -2834,6 +3006,267 @@ def _hub_snapshot_has_model_weights(snapshot_dir: Path) -> bool:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _core_profile_timestamp_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _next_core_profile_updated_at(previous: str) -> str:
+    now = _core_profile_timestamp_now()
+    prev = parse_iso_datetime(previous)
+    if prev is not None:
+        if prev.tzinfo is None:
+            prev = prev.astimezone()
+        elif now.tzinfo is not None:
+            now = now.astimezone(prev.tzinfo)
+        if now <= prev:
+            now = prev + timedelta(microseconds=1)
+    return now.isoformat(timespec="microseconds")
+
+
+def _core_profile_lock_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _core_profile_thread_lock_for(path: Path) -> threading.Lock:
+    key = _core_profile_lock_key(path)
+    with _CORE_PROFILE_THREAD_LOCKS_GUARD:
+        lock = _CORE_PROFILE_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CORE_PROFILE_THREAD_LOCKS[key] = lock
+        return lock
+
+
+def _lock_core_profile_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_core_profile_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _exclusive_core_profile_path_lock(path: Path) -> Iterator[None]:
+    thread_lock = _core_profile_thread_lock_for(path)
+    thread_lock.acquire()
+    handle: Any | None = None
+    locked = False
+    try:
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        _lock_core_profile_file(handle)
+        locked = True
+        yield
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    _unlock_core_profile_file(handle)
+                except OSError:
+                    pass
+            handle.close()
+        thread_lock.release()
+
+
+def _backup_core_profile_file(path: Path) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    backup_path = path.with_name(path.name + BACKUP_SUFFIX)
+    try:
+        backup_path.write_bytes(path.read_bytes())
+    except OSError as exc:
+        raise CoreProfileStorageError("常驻档案备份失败，拒绝写入") from exc
+
+
+class CoreProfileStorageError(RuntimeError):
+    """常驻档案严格读写路径上的存储错误；消息不得包含档案正文。"""
+
+
+def _core_profile_schema_version(raw: dict[str, Any]) -> int | None:
+    if "schema_version" not in raw:
+        return None
+    value = raw.get("schema_version")
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
+def _core_profile_content_for_read(raw: dict[str, Any]) -> str:
+    content = str(raw.get("content") or raw.get("memory") or "").strip()
+    if content:
+        return content
+    sections = raw.get("sections")
+    if not isinstance(sections, dict) or not sections:
+        return ""
+    if not all(
+        isinstance(key, str)
+        and key.strip()
+        and isinstance(value, str)
+        and value.strip()
+        for key, value in sections.items()
+    ):
+        return ""
+    return "\n\n".join(
+        str(value).strip()
+        for value in sections.values()
+    )
+
+
+def _build_core_profile_v2_record(
+    *,
+    scope_id: str,
+    content: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": _core_profile_id(scope_id),
+        "schema_version": CORE_PROFILE_SCHEMA_VERSION,
+        "content": content,
+        "memory": content,
+        "sections": {"legacy": content},
+        "metadata": metadata,
+    }
+
+
+def _core_profile_updated_at(raw: dict[str, Any]) -> str:
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict):
+        text = _metadata_text(metadata, "updated_at")
+        if text:
+            return text
+    return str(raw.get("updated_at") or "").strip()
+
+
+def _normalize_core_profile_text(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _normalize_core_profile_candidate_ids(candidate_ids: Sequence[str] | str | None) -> list[str]:
+    if candidate_ids is None:
+        return []
+    if isinstance(candidate_ids, str):
+        value = candidate_ids.strip()
+        return [value] if value else []
+    return [str(item).strip() for item in candidate_ids if str(item).strip()]
+
+
+def _parse_core_profile_section_patch(sections: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(sections, Mapping):
+        raise CoreProfileStorageError("常驻档案 sections 必须是对象")
+    parsed: dict[str, str] = {}
+    for key, value in sections.items():
+        if not isinstance(key, str) or key not in CORE_PROFILE_FORMAL_SECTION_SET:
+            raise CoreProfileStorageError("常驻档案未知 section，拒绝写入")
+        if not isinstance(value, str):
+            raise CoreProfileStorageError("常驻档案 section 必须是文本")
+        parsed[key] = value
+    return parsed
+
+
+def _reject_invalid_stored_core_profile_sections(sections: Any) -> None:
+    if not isinstance(sections, dict):
+        raise CoreProfileStorageError("常驻档案 sections 必须是对象")
+    has_legacy = False
+    has_formal = False
+    for key in sections:
+        if not isinstance(key, str) or not key.strip():
+            raise CoreProfileStorageError("常驻档案存在未知 section，拒绝写入")
+        if key == CORE_PROFILE_LEGACY_SECTION:
+            has_legacy = True
+            continue
+        if key in CORE_PROFILE_FORMAL_SECTION_SET:
+            has_formal = True
+            continue
+        raise CoreProfileStorageError("常驻档案存在未知 section，拒绝写入")
+    if has_legacy and has_formal:
+        raise CoreProfileStorageError("常驻档案 legacy 与正式章节混存，拒绝写入")
+
+
+def _render_core_profile_formal_sections(sections: Mapping[str, str]) -> str:
+    parts: list[str] = []
+    for name in CORE_PROFILE_FORMAL_SECTIONS:
+        body = str(sections.get(name) or "").strip()
+        if not body:
+            continue
+        parts.append(f"＜{name}＞\n{body}")
+    return "\n\n".join(parts)
+
+
+def _split_core_profile_sentences(text: str) -> list[str]:
+    raw = str(text or "")
+    sentences: list[str] = []
+    buf: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\n":
+            sentence = _normalize_core_profile_text("".join(buf))
+            buf = []
+            if sentence:
+                sentences.append(sentence)
+            while index + 1 < len(raw) and raw[index + 1] == "\n":
+                index += 1
+        else:
+            buf.append(char)
+            ascii_stop = char == "." and (index + 1 >= len(raw) or not raw[index + 1].isdigit())
+            if char in "。．？！?!" or ascii_stop:
+                sentence = _normalize_core_profile_text("".join(buf))
+                buf = []
+                if sentence:
+                    sentences.append(sentence)
+        index += 1
+    tail = _normalize_core_profile_text("".join(buf))
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _protected_core_profile_tokens(text: str) -> Counter[str]:
+    normalized = _normalize_core_profile_text(text)
+    tokens = Counter(_CORE_PROFILE_QUOTED_TOKEN.findall(normalized))
+    tokens.update(_CORE_PROFILE_NUMBER_TOKEN.findall(normalized))
+    return tokens
+
+
+def _validate_legacy_core_profile_migration(
+    legacy: str,
+    formal_sections: Mapping[str, str],
+) -> None:
+    formal_text = "\n".join(
+        str(formal_sections.get(name) or "")
+        for name in CORE_PROFILE_FORMAL_SECTIONS
+    )
+    if Counter(_split_core_profile_sentences(legacy)) != Counter(
+        _split_core_profile_sentences(formal_text)
+    ):
+        raise CoreProfileStorageError("常驻档案 legacy 迁移校验失败")
+    if _protected_core_profile_tokens(legacy) != _protected_core_profile_tokens(formal_text):
+        raise CoreProfileStorageError("常驻档案 legacy 迁移校验失败")
 
 
 def _core_profile_id(scope_id: str) -> str:

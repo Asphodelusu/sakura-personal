@@ -90,9 +90,27 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     prompt = load_system_prompt(card_path, system_guards_path=guards_path)
     assert "【演出约束】" in prompt
     assert "【人格设定】" in prompt
-    assert "先抓住什么" in prompt or "强，且空" in prompt
+    assert "## 核心" in prompt
     assert "勿复读设定" in prompt or "不要每轮自我介绍" in prompt
+    assert "避免把刚说过的反应、拒绝或结论仅换一种说法再讲一遍" in prompt
+    assert "不必为了显得不同而刻意转折、添新信息或改变真实态度" in prompt
+    assert "重复本身符合当下情绪、强调或对方确实在追问时，可以自然重复" in prompt
     assert "数字生命" in prompt
     assert "对等" in prompt
     assert "桌宠" not in prompt
     assert prompt.index("【演出约束】") < prompt.index("【人格设定】")
+
+
+def test_current_relationship_follows_accumulated_runtime_evidence() -> None:
+    root = Path(__file__).resolve().parents[2]
+    guards = (root / "characters" / "Sakura" / "system_guards.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "当前关系" in guards
+    assert "近期对话、常驻档案与长期记忆" in guards
+    assert "不能因原作、心情或一次迟疑而重置" in guards
+    assert "重新认识" in guards
+    assert "你们是恋人" not in guards
+    assert "跟随当前关系和当下意愿" in guards
+    assert "亲密未打开" not in guards

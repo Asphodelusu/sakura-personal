@@ -218,6 +218,69 @@ def test_settings_service_loads_and_saves_memory_curation_settings() -> None:
     assert system["memory_curation"]["backfill_limit"] == 150
 
 
+def test_settings_service_loads_core_maintainer_defaults_without_save_method() -> None:
+    from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+    root = _runtime_root("yaml_core_maintainer_defaults")
+    service = AppSettingsService(root)
+
+    loaded = service.load_core_maintainer_settings()
+    assert loaded == CoreMaintainerSettings().normalized()
+    assert loaded.enabled is True
+    assert loaded.observed_min_evidence == 3
+    assert loaded.observed_min_batches == 2
+    assert loaded.observed_min_span_minutes == 30
+    assert loaded.observed_min_confidence == 0.80
+    assert loaded.normal_cooldown_hours == 6
+    assert loaded.stale_eligible_hours == 72
+    assert loaded.max_candidates_per_call == 5
+    assert loaded.max_sections_per_call == 2
+    assert loaded.pause_after_validation_failures == 3
+    assert loaded.pause_hours == 24
+    assert loaded.lease_ttl_minutes == 30
+    assert not hasattr(service, "save_core_maintainer_settings")
+
+
+def test_settings_service_normalizes_core_maintainer_overrides() -> None:
+    root = _runtime_root("yaml_core_maintainer_normalize")
+    service = AppSettingsService(root)
+    service.system_config_path.parent.mkdir(parents=True, exist_ok=True)
+    service.system_config_path.write_text(
+        """
+memory:
+  progressive_memory: false
+  core_maintainer:
+    enabled: false
+    observed_min_evidence: 4
+    observed_min_batches: 3
+    observed_min_span_minutes: 45
+    observed_min_confidence: 1.5
+    normal_cooldown_hours: -2
+    stale_eligible_hours: 0
+    max_candidates_per_call: 99
+    max_sections_per_call: 8
+    pause_after_validation_failures: 0
+    pause_hours: 48
+    lease_ttl_minutes: 0
+""",
+        encoding="utf-8",
+    )
+
+    loaded = service.load_core_maintainer_settings()
+    assert loaded.enabled is False
+    assert loaded.observed_min_evidence == 4
+    assert loaded.observed_min_batches == 3
+    assert loaded.observed_min_span_minutes == 45
+    assert loaded.observed_min_confidence == 1.0
+    assert loaded.normal_cooldown_hours == 0
+    assert loaded.stale_eligible_hours == 0
+    assert loaded.max_candidates_per_call == 5
+    assert loaded.max_sections_per_call == 2
+    assert loaded.pause_after_validation_failures == 1
+    assert loaded.pause_hours == 48
+    assert loaded.lease_ttl_minutes == 1
+
+
 def test_settings_service_loads_and_saves_progressive_memory_settings() -> None:
     root = _runtime_root("yaml_progressive_memory")
     service = AppSettingsService(root)

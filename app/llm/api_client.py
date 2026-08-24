@@ -1063,6 +1063,15 @@ def _public_chat_message(message: ChatMessage) -> ChatMessage:
     return {k: v for k, v in message.items() if k not in _INTERNAL_MESSAGE_KEYS}
 
 
+def _model_omits_custom_temperature(model: str) -> bool:
+    """Moonshot kimi-k2.6 不允许自定义 temperature，首次请求就必须省略。
+
+    只匹配 K2.6，避免误伤 kimi-k2.7 / kimi-k2.7-code。
+    """
+    token = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return token == "kimi-k2.6" or token.startswith("kimi-k2.6-")
+
+
 def _build_chat_completion_payload(
     *,
     model: str,
@@ -1082,8 +1091,12 @@ def _build_chat_completion_payload(
             *[_public_chat_message(m) for m in messages],
         ],
     }
-    payload["temperature"] = temperature
+    omit_temperature = _model_omits_custom_temperature(model)
+    if not omit_temperature:
+        payload["temperature"] = temperature
     payload.update(_filter_supported_chat_params(chat_params or {}))
+    if omit_temperature:
+        payload.pop("temperature", None)
     _ensure_json_keyword_for_json_object_response(payload)
     return payload
 
