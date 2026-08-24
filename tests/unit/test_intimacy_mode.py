@@ -367,8 +367,16 @@ class TestIntimacyGuidePromptGate:
     def test_inactive_mode_is_optional_guidance_not_behavior_gate(self) -> None:
         body = _intimacy_entry_hint_text()
         assert "不会自动开启" in body
+        assert "详细导演层" in body
+        assert "不是身体接触许可" in body
+        assert "未开启不限制拥抱、亲吻、前戏或性行为" in body
+        assert "稳定恋人关系" in body
         assert "自然升温" in body
-        assert "未开启不限制" in body
+        assert "真实迟疑" in body
+        assert "关系不足" in body
+        assert "重新认识" in body
+        assert "默认拒绝" in body
+        assert "也可以拒绝" in body or "自主判断" in body
         assert "不要动手描写" not in body
         assert "开启后才能" not in body
 
