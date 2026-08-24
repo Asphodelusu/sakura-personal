@@ -64,6 +64,12 @@ from app.agent.memory_curator import (
     seconds_since_iso_timestamp,
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
+from app.agent.core_profile_maintainer_worker import (
+    CoreMaintainerCompletionAdapter,
+    CoreProfileMaintainerWorker,
+    maintainer_admission_indicates_work,
+    persist_core_candidates,
+)
 from app.agent.memory_reflector import (
     MemoryReflector,
     ReflectionStateStore,
@@ -794,6 +800,8 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        self.core_profile_maintainer_thread: QThread | None = None
+        self.core_profile_maintainer_worker: CoreProfileMaintainerWorker | None = None
         self.drag_anchor: QPoint | None = None
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
@@ -5926,6 +5934,10 @@ class PetWindow(QWidget):
             consumed_turns=self.memory_curation_consumed_turns,
             backfill_completed=True if mode == "backfill" else None,
         )
+        try:
+            self._persist_and_maybe_schedule_core_maintainer(result)
+        except Exception as exc:  # noqa: BLE001 — 维护调度失败不得否定已成功的整理。
+            debug_log("Memory", "常驻档案维护调度失败", {"error": str(exc)})
 
     @Slot(str)
     def _handle_memory_curation_failed(self, message: str) -> None:
@@ -5956,6 +5968,130 @@ class PetWindow(QWidget):
             )
         else:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+
+    def _core_candidate_queue(self):
+        from app.agent.core_profile_candidates import CoreCandidateQueue
+
+        settings = self._core_maintainer_settings()
+        return CoreCandidateQueue(
+            StoragePaths(Path(self.base_dir)).memory_core_review_queue(),
+            config=settings.to_candidate_config(),
+        )
+
+    def _core_maintainer_state_store(self):
+        from app.agent.core_profile_maintainer import CoreMaintainerStateStore
+
+        return CoreMaintainerStateStore(
+            StoragePaths(Path(self.base_dir)).memory_core_maintainer_state()
+        )
+
+    def _core_maintainer_settings(self):
+        from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+        loader = getattr(self.settings_service, "load_core_maintainer_settings", None)
+        if callable(loader):
+            try:
+                loaded = loader()
+                if loaded is not None:
+                    return loaded
+            except Exception:  # noqa: BLE001
+                pass
+        return CoreMaintainerSettings()
+
+    def _snapshot_core_profile_maintainer(self):
+        from app.agent.core_profile_maintainer import CoreProfileMaintainer
+
+        settings = self._core_maintainer_settings()
+        scoped_store = self.memory_store.scoped(self.character_profile.id)
+        adapter = CoreMaintainerCompletionAdapter(self.memory_curator.api_client)
+        return CoreProfileMaintainer(
+            api_client=adapter,
+            memory_store=scoped_store,
+            queue=self._core_candidate_queue(),
+            state_store=self._core_maintainer_state_store(),
+            settings=settings,
+        )
+
+    def _persist_and_maybe_schedule_core_maintainer(self, result: MemoryCurationResult) -> None:
+        payloads = tuple(getattr(result, "core_candidates", ()) or ())
+        queue = self._core_candidate_queue()
+        scope_id = str(getattr(self.character_profile, "id", "") or "").strip()
+        trigger = persist_core_candidates(
+            queue,
+            scope_id,
+            payloads,
+            on_error=lambda message: debug_log(
+                "Memory",
+                "常驻档案候选写入失败",
+                {"error": message},
+            ),
+        )
+        busy = getattr(self, "core_profile_maintainer_thread", None) is not None
+        if not maintainer_admission_indicates_work(
+            queue=queue,
+            state_store=self._core_maintainer_state_store(),
+            settings=self._core_maintainer_settings(),
+            scope_id=scope_id,
+            trigger=trigger,
+            busy=busy,
+        ):
+            return
+        self._start_core_profile_maintainer(trigger)
+
+    def _start_core_profile_maintainer(self, trigger) -> None:
+        if getattr(self, "core_profile_maintainer_thread", None) is not None:
+            return
+        worker = CoreProfileMaintainerWorker(
+            self._snapshot_core_profile_maintainer(),
+            str(getattr(self.character_profile, "id", "") or "").strip(),
+            trigger,
+        )
+        self.resource_manager.spawn_qt_worker(
+            worker,
+            parent=self,
+            owner=self,
+            thread_attr="core_profile_maintainer_thread",
+            worker_attr="core_profile_maintainer_worker",
+            signal_bindings=[
+                (worker.finished, self._handle_core_profile_maintainer_finished),
+                (worker.failed, self._handle_core_profile_maintainer_failed),
+                (worker.cancelled, self._handle_core_profile_maintainer_cancelled),
+            ],
+            quit_on=[worker.finished, worker.failed, worker.cancelled],
+            on_finished=self._cleanup_core_profile_maintainer_worker,
+        )
+
+    @Slot(object)
+    def _handle_core_profile_maintainer_finished(self, result: object) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        status = getattr(result, "status", "")
+        metrics = getattr(result, "metrics", None)
+        debug_log(
+            "Memory",
+            "常驻档案维护完成",
+            {
+                "status": status,
+                "metrics_keys": sorted((metrics or {}).keys()) if isinstance(metrics, dict) else [],
+            },
+        )
+
+    @Slot(str)
+    def _handle_core_profile_maintainer_failed(self, message: str) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        debug_log("Memory", "常驻档案维护失败", {"error": message})
+
+    @Slot()
+    def _handle_core_profile_maintainer_cancelled(self) -> None:
+        if getattr(self, "_shutdown_in_progress", False):
+            return
+        debug_log("Memory", "常驻档案维护已取消")
+
+    @Slot()
+    def _cleanup_core_profile_maintainer_worker(self) -> None:
+        self.core_profile_maintainer_thread = None
+        self.core_profile_maintainer_worker = None
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:

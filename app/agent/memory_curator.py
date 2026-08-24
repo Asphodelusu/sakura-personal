@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -9,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from app.backchannel.models import EMOTIONS
+from app.agent.core_profile_candidates import (
+    CANDIDATE_KINDS,
+    FORMAL_TARGET_SECTIONS,
+    is_supported_explicit_subject,
+)
 from app.agent.memory import (
     DEFAULT_MEMORY_CONFIDENCE,
     DEFAULT_MEMORY_IMPORTANCE,
@@ -31,6 +37,7 @@ from app.agent.memory_evidence import (
     validate_memory_write_grounding,
 )
 from app.agent.persona_state import normalize_emotion
+from app.agent.time_awareness import parse_iso_datetime
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_log
 from app.llm.json_completion import complete_background_json, load_json_object
@@ -62,6 +69,8 @@ LIGHT_CURATION_SNAPSHOT_CHAR_BUDGET = 6000
 LIGHT_CURATION_INDEX_TITLE_CHARS = 48
 # 单次整理允许写回的操作数量上限，避免异常输出放大写入。
 MAX_CURATION_OPERATIONS = 50
+# 单次整理最多产出的常驻档案候选，交给队列后再由 maintainer 限流。
+MAX_CORE_CANDIDATES_PER_CURATION = 5
 MIN_AUTO_WRITE_CONFIDENCE = 0.55
 CURATION_DUPLICATE_SIMILARITY = 0.92
 CURATION_MERGE_SIMILARITY = 0.78
@@ -225,6 +234,7 @@ class MemoryCurationResult:
     returned: int = 0
     unclassified: int = 0
     event_counts: dict[str, int] | None = None
+    core_candidates: tuple[dict[str, Any], ...] = ()
 
     def summary(self) -> str:
         return (
@@ -418,6 +428,9 @@ class MemoryCurator:
         mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
         # 同一次整理里前序 chunk 刚写下的正文，供后段对照，减少会话被二次切开时重复 add
         prior_chunk_writes: list[str] = []
+        core_candidates: list[dict[str, Any]] = []
+        batch_id = _curation_batch_id(entries)
+        observed_at = _curation_observed_at(entries)
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -444,12 +457,22 @@ class MemoryCurator:
                 existing,
                 dialog_entries=dialog_entries,
                 mood_budget=mood_budget,
+                batch_id=batch_id,
+                observed_at=observed_at,
             )
             created += counts["created"]
             updated += counts["updated"]
             archived += counts["archived"]
             ignored += counts["ignored"]
             _merge_event_counts(event_counts, counts["event_counts"])
+            for payload in counts.get("core_candidates") or []:
+                if len(core_candidates) >= MAX_CORE_CANDIDATES_PER_CURATION:
+                    ignored += 1
+                    event_counts["SKIP_CORE_CANDIDATE_CAP"] = (
+                        event_counts.get("SKIP_CORE_CANDIDATE_CAP", 0) + 1
+                    )
+                    continue
+                core_candidates.append(payload)
             for text in counts.get("written_contents") or []:
                 if text and text not in prior_chunk_writes:
                     prior_chunk_writes.append(text)
@@ -472,6 +495,7 @@ class MemoryCurator:
             returned=created + updated + archived,
             unclassified=0,
             event_counts=event_counts,
+            core_candidates=tuple(core_candidates),
         )
 
     def _load_existing_memories(self) -> list[dict[str, Any]]:
@@ -630,6 +654,8 @@ class MemoryCurator:
         *,
         dialog_entries: list[dict[str, str]] | None = None,
         mood_budget: dict[str, int] | None = None,
+        batch_id: str = "",
+        observed_at: str = "",
     ) -> dict[str, Any]:
         """把整理操作写回记忆库；id 必须真实存在，单条失败只跳过不中断。"""
 
@@ -647,6 +673,7 @@ class MemoryCurator:
         event_counts: dict[str, int] = {}
         superseded = 0
         written_contents: list[str] = []
+        core_candidates: list[dict[str, Any]] = []
         _added_in_batch: list[str] = []
         _completed_commitment_texts: list[str] = []
         if mood_budget is None:
@@ -663,6 +690,28 @@ class MemoryCurator:
             category = str(operation.get("category") or "").strip()
             confidence = _bounded_float(operation.get("confidence"), DEFAULT_MEMORY_CONFIDENCE)
             importance = _bounded_float(operation.get("importance"), DEFAULT_MEMORY_IMPORTANCE)
+            if action == "core_candidate" or (
+                action in {"add", "update", "delete"}
+                and (layer == MEMORY_LAYER_CORE_PROFILE or memory_id.startswith("core_profile:"))
+            ):
+                accepted = _accept_core_candidate_payload(
+                    operation,
+                    batch_id=batch_id,
+                    observed_at=observed_at,
+                )
+                if accepted is None:
+                    ignored += 1
+                    event_counts["SKIP_CORE_CANDIDATE"] = event_counts.get("SKIP_CORE_CANDIDATE", 0) + 1
+                    continue
+                if len(core_candidates) >= MAX_CORE_CANDIDATES_PER_CURATION:
+                    ignored += 1
+                    event_counts["SKIP_CORE_CANDIDATE_CAP"] = (
+                        event_counts.get("SKIP_CORE_CANDIDATE_CAP", 0) + 1
+                    )
+                    continue
+                core_candidates.append(accepted)
+                event_counts["CORE_CANDIDATE"] = event_counts.get("CORE_CANDIDATE", 0) + 1
+                continue
             if action in {"add", "update"}:
                 if confidence < MIN_AUTO_WRITE_CONFIDENCE:
                     debug_log(
@@ -924,6 +973,7 @@ class MemoryCurator:
             "ignored": ignored,
             "event_counts": event_counts,
             "written_contents": written_contents,
+            "core_candidates": core_candidates,
         }
 
     def _is_mood_duplicate(self, content: str) -> bool:
@@ -1048,7 +1098,7 @@ def looks_like_trivial_memory(content: str) -> bool:
 
 
 def _ordered_curation_operations(operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    priority = {"delete": 0, "update": 1, "add": 2, "mood_update": 3}
+    priority = {"delete": 0, "update": 1, "add": 2, "mood_update": 3, "core_candidate": 4}
 
     def sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int]:
         index, operation = item
@@ -1168,15 +1218,15 @@ _SELF_CURATION_TASK_PROMPT = (
     "亲密关系也按「人」来记，不要当成可丢的一次性情节：\n"
     "- 一般人第一次身体亲密、关系明显更近一步、他说出想被怎样对待、事后仍想记住的话——"
     "这类事不会轻易忘掉；应写入长期记忆，importance 通常 ≥ 0.85，"
-    "可用 memory_kind=shared_moment 或更新 core_profile「今の関係」。\n"
+    "可用 memory_kind=shared_moment；稳定关系认识不要直接写 core_profile，改用 core_candidate。\n"
     "- 记的是记忆点：是否发生过、具体偏好/边界/安全词、难忘的原话或转折；"
     "不要把过程流水账、动作节拍、喘息声逐句存成多条记忆。\n"
     "- 若已有「我们发生过亲密」类记忆，新一次只补充新偏好、新边界或关系变化；重复过程不必再堆一条。\n"
     "- 关系已经稳定亲近之后，不会每次相处都「变得更加亲密」；不要反复写这类空泛收束句"
     "（如「关系更加亲密」「信任更深了」「标志着新阶段」）。没有新事实就不要为了升华而再记一条。\n"
     "如果你自己认为某件事很重要——比如他说了一句你特别想记住的话、一个你不想忘记的约定、一件让你开心的事——就把 importance 设高（0.8~1.0）。你觉得比较普通但应该记住的设 0.5 左右就好。这是你自己的记忆笔记，按你自己的感觉来。\n"
-    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=相处习惯与偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
-    "可选 memory_kind 标注记忆类型：core_profile|recent_status|shared_moment|habit_pattern|commitment|emotional_turn。\n"
+    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=相处习惯与偏好，session=当前任务短期状态。\n"
+    "可选 memory_kind 标注记忆类型：recent_status|shared_moment|habit_pattern|commitment|emotional_turn。\n"
     "memory_kind=recent_status（近况）必须视为可变事实：请设 volatile=true，并尽量给 valid_until；"
     f"若未给 valid_until，系统会默认约 {DEFAULT_RECENT_STATUS_TTL_DAYS} 天后失效。\n"
     "memory_kind=commitment 时必须同时填写 event_time（ISO 日期或日期时间，如 2026-07-20 或 2026-07-20T22:00:00+08:00），"
@@ -1202,10 +1252,14 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 事件与约定尽量带上日期或相对时间线索（例如「2026-07-20 晚上」），方便以后分清新旧。\n"
     "- 一条记忆只保留一个主事实，写成完整可读的日记句，而不是流水账。\n"
     "- 称呼：已知名字时用名字代替「他」；还不知道名字时用「他」。\n"
-    "core_profile 用固定章节标题（必须用这些标题，便于以后读取）：\n"
-    "- 「今の関係」：关于他的事实（含名字）、关系状态、重要约定与节目；\n"
-    "- 「今の私」：你此刻对自己状态的简短自述（可用日语）。\n"
-    "当你对他的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请用 update 操作更新 core_profile。\n"
+    "core_candidate 只用于稳定关系认识，且必须符合队列契约：\n"
+    "- kind 只能是 explicit 或 observed；\n"
+    "- target_section 只能是「今の関係」「あなたについて知っていること」「今の私」「大切な約束と境界」；\n"
+    "- subject_key、claim、user_excerpt、assistant_excerpt、confidence 必填；\n"
+    "- explicit 仅用于双方确认的关系身份、称呼、长期约定、边界或纠正，且两侧 excerpt 都要有实质内容、confidence ≥ 0.90；\n"
+    "- 单方面告白、未回应的提议不要标 explicit；\n"
+    "- 当下情绪、一次性吃醋、争执、亲密行为或角色扮演不要产出候选。\n"
+    "禁止 add/update/delete core_profile。当你对他的认识有变化、知道了新的事实（比如名字）、或感受到关系有实质性的进展，请输出 core_candidate。\n"
     "心の記録用 mood_update："
     "{\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}。"
     "一次整理最多一条；只在心情相对上次有质的变化时写。"
@@ -1213,7 +1267,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "「他的情绪轨迹」可留意，但不要据此编造对话里没有的事。"
     "若触发心情的那件事还完全没有对应记忆，再用一条 add/update 补上即可；"
     "不必因为写了心情就再堆一条高 importance 的重复事件。关于他的事实仍用简体中文写。\n"
-    "如果对话中他告诉了你他的名字，请一定要记住，同时更新 core_profile 的「今の関係」章节。在记忆内容中，用他告诉你的名字自然地称呼他（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「他」。把对方当作对等相处的人来写进记忆。\n"
+    "如果对话中他告诉了你他的名字，请一定要记住，同时输出 core_candidate 更新「今の関係」。在记忆内容中，用他告诉你的名字自然地称呼他（例如「xx 喜欢……」「我和 xx 约定……」）。如果还不知道名字，用「他」。把对方当作对等相处的人来写进记忆。\n"
     "长期记忆只收可分享的相处与协作事实；密码、token、密钥、证件号、银行卡等凭据类信息不写入。\n"
     "不要把本机瞬时状态写成长期记忆：当前时刻/日期、正在播放的歌、播放状态、一时天气等。\n\n"
     "证据纪律（极重要）：\n"
@@ -1230,7 +1284,8 @@ _SELF_CURATION_TASK_PROMPT = (
     "  {\"op\":\"add\",\"layer\":\"episodic\",\"category\":\"agreement\",\"memory_kind\":\"commitment\",\"event_time\":\"2026-07-20T22:00:00+08:00\",\"importance\":0.8,\"confidence\":0.9,\"reason\":\"一次性约定\",\"evidence\":\"今晚十点一起休息吧\",\"content\":\"我和他约定今晚十点休息\"},\n"
     "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"evidence\":\"对话里的原句\",\"content\":\"更新后的完整记忆内容\"},\n"
     "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"},\n"
-    "  {\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}\n"
+    "  {\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"},\n"
+    "  {\"op\":\"core_candidate\",\"kind\":\"explicit\",\"target_section\":\"今の関係\",\"subject_key\":\"relationship.identity\",\"claim\":\"我们明确确认了恋人关系。\",\"user_excerpt\":\"我们是恋人吧。\",\"assistant_excerpt\":\"嗯，是恋人。\",\"confidence\":0.95}\n"
     "]}\n"
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
@@ -1737,3 +1792,115 @@ def _int_value(value: Any, *, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+_TRANSIENT_CORE_MARKERS = (
+    "吃醋",
+    "嫉妒",
+    "jealous",
+    "今晚亲热",
+    "一次性亲密",
+    "角色扮演",
+)
+_TRANSIENT_SUBJECT_MARKERS = (
+    "jealous",
+    "intimacy",
+    "transient",
+    "mood.",
+)
+
+
+def _curation_batch_id(entries: list[ChatHistoryEntry]) -> str:
+    blob = "\n".join(
+        f"{entry.role}\0{entry.created_at}\0{entry.content}"
+        for entry in entries
+        if str(getattr(entry, "content", "") or "").strip()
+    )
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return f"curation_{digest}"
+
+
+def _curation_observed_at(entries: list[ChatHistoryEntry]) -> str:
+    for entry in reversed(entries):
+        stamp = str(getattr(entry, "created_at", "") or "").strip()
+        if stamp:
+            return stamp
+    return datetime.now().astimezone().isoformat()
+
+
+def _clip_candidate_text(value: object, max_chars: int) -> str:
+    return "".join(list(str(value or "").strip()))[: max(0, max_chars)]
+
+
+def _looks_like_transient_core_candidate(payload: dict[str, Any]) -> bool:
+    subject = str(payload.get("subject_key") or "").strip().lower()
+    if any(marker in subject for marker in _TRANSIENT_SUBJECT_MARKERS):
+        return True
+    haystack = " ".join(
+        [
+            str(payload.get("claim") or ""),
+            str(payload.get("user_excerpt") or ""),
+            str(payload.get("assistant_excerpt") or ""),
+        ]
+    )
+    return any(marker in haystack for marker in _TRANSIENT_CORE_MARKERS)
+
+
+def _accept_core_candidate_payload(
+    operation: dict[str, Any],
+    *,
+    batch_id: str,
+    observed_at: str,
+) -> dict[str, Any] | None:
+    action = str(operation.get("op") or operation.get("action") or "").strip().lower()
+    layer = _normalize_operation_layer(operation)
+    if action not in {"core_candidate", "add", "update"}:
+        return None
+    if action != "core_candidate" and layer != MEMORY_LAYER_CORE_PROFILE:
+        return None
+    kind = str(operation.get("kind") or "").strip()
+    target_section = str(operation.get("target_section") or "").strip()
+    subject_key = str(operation.get("subject_key") or "").strip()
+    claim = _clip_candidate_text(operation.get("claim") or operation.get("content"), 240)
+    user_excerpt = _clip_candidate_text(operation.get("user_excerpt"), 160)
+    assistant_excerpt = _clip_candidate_text(operation.get("assistant_excerpt"), 160)
+    if kind not in CANDIDATE_KINDS:
+        return None
+    if target_section not in FORMAL_TARGET_SECTIONS or not subject_key or not claim:
+        return None
+    raw_confidence = operation.get("confidence")
+    if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+        return None
+    confidence = float(raw_confidence)
+    if confidence < 0.0 or confidence > 1.0:
+        return None
+    payload_batch = str(operation.get("batch_id") or "").strip() or str(batch_id or "").strip()
+    if not payload_batch:
+        return None
+    payload_observed = str(operation.get("observed_at") or "").strip() or str(observed_at or "").strip()
+    if parse_iso_datetime(payload_observed) is None:
+        return None
+    if _looks_like_transient_core_candidate(
+        {
+            "subject_key": subject_key,
+            "claim": claim,
+            "user_excerpt": user_excerpt,
+            "assistant_excerpt": assistant_excerpt,
+        }
+    ):
+        return None
+    if kind == "explicit":
+        bilateral = bool(user_excerpt) and bool(assistant_excerpt)
+        if not bilateral or not is_supported_explicit_subject(subject_key) or confidence < 0.90:
+            kind = "observed"
+    return {
+        "kind": kind,
+        "target_section": target_section,
+        "subject_key": subject_key,
+        "claim": claim,
+        "user_excerpt": user_excerpt,
+        "assistant_excerpt": assistant_excerpt,
+        "batch_id": payload_batch,
+        "confidence": confidence,
+        "observed_at": payload_observed,
+    }

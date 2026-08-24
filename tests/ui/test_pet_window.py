@@ -312,6 +312,252 @@ def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
     assert worker.curator.memory_store.scope_id == "old-character"  # type: ignore[attr-defined]
 
 
+def _core_candidate_payload(**overrides):  # type: ignore[no-untyped-def]
+    payload = {
+        "kind": "explicit",
+        "target_section": "今の関係",
+        "subject_key": "relationship.identity",
+        "claim": "我们明确确认了恋人关系。",
+        "user_excerpt": "我们是恋人吧。",
+        "assistant_excerpt": "嗯，是恋人。",
+        "batch_id": "curation_fictional_ui",
+        "confidence": 0.95,
+        "observed_at": "2026-08-24T12:00:00+00:00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _maintainer_window(tmp_path, *, busy=False, settings_enabled=True):  # type: ignore[no-untyped-def]
+    from app.agent.core_profile_maintainer import CoreMaintainerSettings
+    from app.agent.memory_curator import MemoryCurationResult
+    from app.ui.pet_window import PetWindow
+
+    captured: dict[str, object] = {}
+
+    class ProfileStub:
+        id = "Sakura"
+        display_name = "Sakura"
+
+    class SettingsServiceStub:
+        def load_core_maintainer_settings(self):  # type: ignore[no-untyped-def]
+            return CoreMaintainerSettings(enabled=settings_enabled)
+
+    class MemoryStateStub:
+        def __init__(self) -> None:
+            self.marked: list[tuple[int, int]] = []
+
+        def mark_processed(self, count, *, consumed_turns=0, backfill_completed=None):  # type: ignore[no-untyped-def]
+            self.marked.append((count, consumed_turns))
+
+    class ScopedStoreStub:
+        def __init__(self, scope_id: str) -> None:
+            self.scope_id = scope_id
+
+    class MemoryStoreStub:
+        def scoped(self, scope_id: str) -> ScopedStoreStub:
+            return ScopedStoreStub(scope_id)
+
+    class CuratorStub:
+        api_client = object()
+
+    class WorkerStub:
+        finished = object()
+        failed = object()
+        cancelled = object()
+
+        def __init__(self, maintainer, scope_id, trigger=None):  # type: ignore[no-untyped-def]
+            self.maintainer = maintainer
+            self.scope_id = scope_id
+            self.trigger = trigger
+            captured["worker"] = self
+
+    class ResourceManagerStub:
+        def spawn_qt_worker(self, worker, **kwargs):  # type: ignore[no-untyped-def]
+            captured["spawned_worker"] = worker
+            captured["spawn_kwargs"] = kwargs
+
+    class MinimalWindow:
+        _handle_memory_curation_finished = PetWindow._handle_memory_curation_finished
+        _persist_and_maybe_schedule_core_maintainer = (
+            PetWindow._persist_and_maybe_schedule_core_maintainer
+        )
+        _start_core_profile_maintainer = PetWindow._start_core_profile_maintainer
+        _core_candidate_queue = PetWindow._core_candidate_queue
+        _core_maintainer_state_store = PetWindow._core_maintainer_state_store
+        _core_maintainer_settings = PetWindow._core_maintainer_settings
+        _snapshot_core_profile_maintainer = PetWindow._snapshot_core_profile_maintainer
+        _handle_core_profile_maintainer_finished = PetWindow._handle_core_profile_maintainer_finished
+        _handle_core_profile_maintainer_failed = PetWindow._handle_core_profile_maintainer_failed
+        _handle_core_profile_maintainer_cancelled = PetWindow._handle_core_profile_maintainer_cancelled
+        _cleanup_core_profile_maintainer_worker = PetWindow._cleanup_core_profile_maintainer_worker
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = False
+    window.base_dir = tmp_path
+    window.character_profile = ProfileStub()
+    window.settings_service = SettingsServiceStub()
+    window.memory_store = MemoryStoreStub()
+    window.memory_curator = CuratorStub()
+    window.memory_curation_state = MemoryStateStub()
+    window.memory_curation_mode = "auto"
+    window.memory_curation_target_history_count = 2
+    window.memory_curation_consumed_turns = 1
+    window.resource_manager = ResourceManagerStub()
+    window.core_profile_maintainer_thread = object() if busy else None
+    window.core_profile_maintainer_worker = None
+    captured["window"] = window
+    captured["result_type"] = MemoryCurationResult
+    captured["worker_stub"] = WorkerStub
+    return captured
+
+
+def test_curation_finished_persists_candidates_then_schedules_maintainer(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](  # type: ignore[misc]
+            created=1,
+            core_candidates=(_core_candidate_payload(),),
+        )
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].kind == "explicit"
+    assert window.memory_curation_state.marked == [(2, 1)]
+    worker = captured["worker"]
+    assert worker.scope_id == "Sakura"
+    assert worker.trigger is not None
+    assert worker.trigger.kind == "explicit"
+    assert captured["spawn_kwargs"]["thread_attr"] == "core_profile_maintainer_thread"
+    assert captured["spawn_kwargs"]["thread_attr"] != "memory_curation_thread"
+    assert "run_once" not in captured
+
+
+def test_curation_finished_does_not_schedule_ineligible_observed(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](  # type: ignore[misc]
+            core_candidates=(
+                _core_candidate_payload(
+                    kind="observed",
+                    target_section="今の私",
+                    subject_key="relationship.trust",
+                    claim="我开始更愿意把不安说出来。",
+                    confidence=0.85,
+                    batch_id="curation_observed_one",
+                ),
+            )
+        )
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].status == "pending"
+    assert "worker" not in captured
+    assert window.memory_curation_state.marked == [(2, 1)]
+
+
+def test_maintainer_busy_defers_and_keeps_candidates(tmp_path) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.agent.core_profile_candidates import CoreCandidateQueue
+    from app.storage.paths import StoragePaths
+
+    captured = _maintainer_window(tmp_path, busy=True)
+    window = captured["window"]
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](core_candidates=(_core_candidate_payload(),))  # type: ignore[misc]
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    queue = CoreCandidateQueue(StoragePaths(tmp_path).memory_core_review_queue())
+    stored = queue.candidates_for("Sakura")
+    assert len(stored) == 1
+    assert stored[0].status == "pending"
+    assert "spawned_worker" not in captured
+    assert window.memory_curation_state.marked == [(2, 1)]
+
+
+def test_maintainer_persist_failure_does_not_fail_curation(tmp_path, monkeypatch) -> None:
+    import app.ui.pet_window as pet_window_module
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+
+    def boom(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(pet_window_module, "persist_core_candidates", boom)
+    original = pet_window_module.CoreProfileMaintainerWorker
+    pet_window_module.CoreProfileMaintainerWorker = captured["worker_stub"]
+    try:
+        result = captured["result_type"](core_candidates=(_core_candidate_payload(),))  # type: ignore[misc]
+        window._handle_memory_curation_finished(result)
+    finally:
+        pet_window_module.CoreProfileMaintainerWorker = original
+
+    assert window.memory_curation_state.marked == [(2, 1)]
+    assert "spawned_worker" not in captured
+
+
+def test_snapshot_core_maintainer_uses_scoped_store_and_current_client(tmp_path) -> None:
+    from app.agent.core_profile_maintainer import CoreMaintainerSettings
+
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    first_client = object()
+    second_client = object()
+    window.memory_curator.api_client = first_client
+
+    first = window._snapshot_core_profile_maintainer()
+    window.memory_curator.api_client = second_client
+    window.settings_service.load_core_maintainer_settings = (  # type: ignore[method-assign]
+        lambda: CoreMaintainerSettings(enabled=False, normal_cooldown_hours=12)
+    )
+    second = window._snapshot_core_profile_maintainer()
+
+    assert first.memory_store.scope_id == "Sakura"
+    assert first.api_client._client is first_client
+    assert first.settings.enabled is True
+    assert second.api_client._client is second_client
+    assert second.settings.enabled is False
+    assert second.settings.normal_cooldown_hours == 12
+    assert first.api_client._client is not second.api_client._client
+
+
+def test_cleanup_core_profile_maintainer_clears_worker_attrs(tmp_path) -> None:
+    captured = _maintainer_window(tmp_path)
+    window = captured["window"]
+    window.core_profile_maintainer_thread = object()
+    window.core_profile_maintainer_worker = object()
+    window._cleanup_core_profile_maintainer_worker()
+    assert window.core_profile_maintainer_thread is None
+    assert window.core_profile_maintainer_worker is None
+
+
 def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
     from app.ui.pet_window import PetWindow
 
