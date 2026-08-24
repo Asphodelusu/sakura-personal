@@ -108,3 +108,53 @@ def test_screen_trigger_wins_same_tick_and_suppresses_relationship_eval() -> Non
         asyncio.run(observer._dispatch_proactive_tick(now))
     observer._do_evaluation.assert_awaited()
     observer._do_relationship_evaluation.assert_not_called()
+
+
+def test_decision_instruction_has_no_ceiling_or_blacklist() -> None:
+    from app.config.relationship_initiative import (
+        expression_bias_guidance,
+        relationship_decision_instruction,
+    )
+
+    text = relationship_decision_instruction("natural")
+    assert "先判断这是不是她此刻真实会做的事" in text
+    assert "不为了证明主动而制造欲望" in text
+    assert "不把屏幕内容硬拗成亲密理由" in text
+    assert "最多只能轻触" not in text
+    assert "不得直接露骨" not in text
+    assert expression_bias_guidance("natural") in text
+
+
+def test_decision_failure_is_silent_without_template() -> None:
+    observer = _obs()
+    spoken: list = []
+    observer.on_speak = lambda payload: spoken.append(payload)
+    observer._post_speech_decision = AsyncMock(return_value=None)
+    asyncio.run(observer._do_relationship_evaluation())
+    assert spoken == []
+    assert observer._last_relationship_silent_at > 0
+    assert observer._last_relationship_spoken_at == 0.0
+    assert observer._last_proactive_at == 0.0
+
+
+def test_speak_uses_relationship_source_and_independent_cooldown() -> None:
+    observer = _obs()
+    spoken: list = []
+    observer.on_speak = lambda payload: spoken.append(payload)
+    observer._relationship_generation = 7
+    observer._post_speech_decision = AsyncMock(
+        return_value={
+            "should_speak": True,
+            "reason": "想靠近",
+            "comment": "こっち。",
+            "translation": "过来。",
+            "tone": "温柔",
+        }
+    )
+    asyncio.run(observer._do_relationship_evaluation())
+    assert len(spoken) == 1
+    assert spoken[0].source == "relationship"
+    assert spoken[0].generation == 7
+    assert spoken[0].text == "こっち。"
+    assert observer._last_relationship_spoken_at > 0
+    assert observer._last_proactive_at == 0.0

@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 import httpx
@@ -1090,16 +1091,120 @@ class ProactiveObserver:
         await self._do_relationship_evaluation()
 
     async def _decide_relationship_speech(self) -> dict | None:
-        return None
+        from app.config.relationship_initiative import (
+            expression_bias_guidance,
+            relationship_decision_instruction,
+        )
+
+        bias = str(getattr(self.relationship, "expression_bias", "") or "natural")
+        instruction = relationship_decision_instruction(bias)
+        system_prompt = (
+            (self._system_prompt.strip() + "\n\n" + instruction)
+            if self._system_prompt.strip()
+            else instruction
+        )
+
+        now_local = datetime.now().astimezone().isoformat(timespec="seconds")
+        since_user = max(0, int(time.monotonic() - self._last_user_at))
+        parts = [
+            f"[当前时间]\n{now_local}",
+            f"[距上次互动]\n{since_user}s",
+        ]
+        guide = (self._relationship_guide or "").strip()
+        if guide:
+            parts.append(f"[关系指南]\n{guide}")
+        parts.append(expression_bias_guidance(bias))
+        try:
+            chat_ctx = self._get_recent_history()
+            if chat_ctx:
+                parts.append(chat_ctx)
+        except Exception:
+            pass
+        try:
+            facts = self._get_relationship_facts()
+            if facts:
+                parts.append(facts)
+        except Exception:
+            pass
+        last_spoken = (self._last_spoken_text or "").strip()
+        if last_spoken:
+            if len(last_spoken) > 160:
+                last_spoken = last_spoken[:160] + "…"
+            parts.append(
+                "[自分の直前の発話]\n"
+                f"{last_spoken}\n"
+                "※これはあなた（夜乃桜）が先ほど口にした内容。相手の発言ではない。"
+            )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        return await self._post_speech_decision(messages)
 
     def _mark_relationship_silent(self) -> None:
         self._last_relationship_silent_at = time.monotonic()
 
     async def _do_relationship_evaluation(self) -> None:
-        decision = await self._decide_relationship_speech()
-        if not decision or not decision.get("should_speak"):
-            self._mark_relationship_silent()
+        generation = self._relationship_generation
+        t0 = time.monotonic()
+        decision = None
+        try:
+            decision = await self._decide_relationship_speech()
+        except Exception as e:
+            logger.warning(
+                "ProactiveObserver: relationship decision failed: {} ({})",
+                e,
+                type(e).__name__,
+            )
+            decision = None
+
+        if generation != self._relationship_generation:
+            debug_log("RelationshipInitiative", "B 取消", {"reason": "stale_generation"})
             return
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        bias = str(getattr(self.relationship, "expression_bias", "") or "natural")
+        comment = str((decision or {}).get("comment", "")).strip() if decision else ""
+        should_speak = bool(decision and decision.get("should_speak") and comment)
+        if decision is None:
+            result = "error"
+        elif should_speak:
+            result = "speak"
+        else:
+            result = "silent"
+        debug_log(
+            "RelationshipInitiative",
+            "B 决策",
+            {"result": result, "bias": bias, "elapsed_ms": elapsed_ms},
+        )
+
+        if not should_speak:
+            if decision is None:
+                reason = "LLM 发言决策失败或未配置"
+            elif not decision.get("should_speak"):
+                reason = str(decision.get("reason", "")).strip() or "LLM 选择不发言"
+            else:
+                reason = "should_speak=true 但 comment 为空"
+            self._mark_relationship_silent()
+            self._safe_on_evaluate(reason, False)
+            return
+
+        reason = str(decision.get("reason", "")).strip() or "关系主动"
+        self._last_relationship_spoken_at = time.monotonic()
+        self._last_relationship_silent_at = 0.0
+        self._last_spoken_text = comment
+        self._safe_on_evaluate(reason, True)
+        payload = ProactiveSpeakPayload(
+            text=comment,
+            translation=str(decision.get("translation", "")).strip(),
+            tone=str(decision.get("tone", "")).strip() or "中性",
+            source="relationship",
+            generation=generation,
+        )
+        try:
+            self.on_speak(payload)
+        except Exception as e:
+            logger.warning("ProactiveObserver: on_speak callback error: {}", e)
 
     async def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
@@ -1328,9 +1433,6 @@ class ProactiveObserver:
         if not self._speech_decision_configured:
             return None
 
-        if self._chat_http is None:
-            self._chat_http = httpx.AsyncClient(timeout=self.config.request_timeout)
-
         system_prompt = (
             (self._system_prompt.strip() + _SPEECH_DECISION_INSTRUCTION)
             if self._system_prompt.strip()
@@ -1387,12 +1489,26 @@ class ProactiveObserver:
         obs_impression = sensory_impression_store.get_for_observer()
         if obs_impression:
             parts.append(f"[观察者上下文]\n{obs_impression}")
+        if self._relationship_motive:
+            parts.append(
+                "[关系动机]\n"
+                "屏幕事件优先。关系与心情可以作为附加动机，但不要把屏幕内容硬拗成亲密理由，"
+                "也不要连续再开一轮关系主动。"
+            )
         user_text = "\n\n".join(parts)
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ]
+        return await self._post_speech_decision(messages)
+
+    async def _post_speech_decision(self, messages: list[dict]) -> dict | None:
+        if not self._speech_decision_configured:
+            return None
+
+        if self._chat_http is None:
+            self._chat_http = httpx.AsyncClient(timeout=self.config.request_timeout)
 
         url = f"{self._chat_api_base_url}/chat/completions"
         payload = {
