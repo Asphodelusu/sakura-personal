@@ -319,6 +319,13 @@ class AgentRuntimeToolLoopMixin:
                         proactive_mode=proactive_mode,
                     )
                 assert turn_state is not None
+                if turn_state.turn_plan.suppress_generation:
+                    debug_log(
+                        "AgentRuntime",
+                        "Turn 已被路由层抑制，不调用模型",
+                        {"decided_by": turn_state.turn_plan.decided_by},
+                    )
+                    return AgentResult(reply=ChatReply(segments=[]), actions=emitted_actions)
                 # step0：Flash 独白 ∥ 记忆改写/召回 fork-join（先 resolve turn_state；join 后再拼 prompt）
                 thought_launch = None
                 recall_launch = None

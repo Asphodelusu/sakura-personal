@@ -470,17 +470,18 @@ def test_intimacy_inactive_is_normal_routing() -> None:
     assert plan.decided_by != "rhythm_focus"
 
 
-def test_intimacy_continue_exhausted_falls_back() -> None:
-    """续投耗尽时 consume_turn 返回 False → 走正常路由。"""
+def test_intimacy_continue_exhausted_is_suppressed() -> None:
+    """续投耗尽时必须成为 no-op，不能落入普通模型路由。"""
     from app.agent.builtin_tools import build_intimacy_continue_message
 
     messages: list[ChatMessage] = [build_intimacy_continue_message()]
     plan = _plan_for(messages, active=True, turns_left=0)
-    assert plan.decided_by != "rhythm_focus"
+    assert plan.suppress_generation is True
+    assert plan.decided_by == "rhythm_exhausted"
 
 
 def test_intimacy_continue_exhausted_keeps_active_without_reentry() -> None:
-    """耗尽续投走普通路由，但 intimacy_mode 保持 active/sleep，不生成 reentry。"""
+    """耗尽续投被抑制，intimacy_mode 保持 active/sleep，不生成 reentry。"""
     from app.agent.builtin_tools import IntimacyModeState, build_intimacy_continue_message
 
     messages: list[ChatMessage] = [build_intimacy_continue_message()]
@@ -505,7 +506,8 @@ def test_intimacy_continue_exhausted_keeps_active_without_reentry() -> None:
             recall_decision=recall,
         )
 
-    assert plan.decided_by != "rhythm_focus"
+    assert plan.suppress_generation is True
+    assert plan.decided_by == "rhythm_exhausted"
     assert state.active is True
     assert state.needs_reentry_hint is False
     assert getattr(state, "continuation_epoch", None) == epoch_before

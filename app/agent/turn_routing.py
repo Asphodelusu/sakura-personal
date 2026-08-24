@@ -130,6 +130,7 @@ class TurnPlan:
     generation_params: dict[str, Any] = field(default_factory=dict)
     recall_decision: RecallDecision = "defer"
     decided_by: str = "default"
+    suppress_generation: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,8 +244,9 @@ def resolve_turn_plan(
     # —— 亲密节奏模式 ——
     # 用户回话：约定词硬开 / 明确退出，再刷新额度；续投扣次。
     # 续投为 system 信号（兼容旧版 user 裸标记），不得当成用户回话去 refresh。
+    intimacy_action = None
     if not latest_is_intimacy_continue(messages):
-        apply_intimacy_user_utterance(
+        intimacy_action = apply_intimacy_user_utterance(
             _latest_user_text(messages) or "",
             intimacy_mode_state,
         )
@@ -253,9 +255,20 @@ def resolve_turn_plan(
         if latest_is_intimacy_continue(messages):
             if intimacy_mode_state.consume_turn():
                 return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
-            # 静默续投耗尽 → 保持 active/sleep，走普通路由，不生成 reentry
+            # 静默续投耗尽或迟到 → 保持 active/sleep，并明确抑制本次生成。
+            return TurnPlan(
+                tier="fast",
+                modality="text",
+                client_key="chat",
+                generation_params=dict(_THINKING_DISABLED),
+                recall_decision=recall,
+                decided_by="rhythm_exhausted",
+                suppress_generation=True,
+            )
         else:
-            intimacy_mode_state.refresh_user_reply()
+            # enter() 已为约定词建立新周期；同一 turn 不再重复增加 epoch。
+            if intimacy_action not in {"entered", "already_on"}:
+                intimacy_mode_state.refresh_user_reply()
             return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
 
     has_image = messages_contain_image(messages)

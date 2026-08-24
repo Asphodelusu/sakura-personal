@@ -3615,10 +3615,21 @@ class PetWindow(QWidget):
             if self._intimacy_continue_timer is not None:
                 self._intimacy_continue_timer.stop()
             return
+        self._intimacy_continue_timer_epoch = epoch
+        generation = int(getattr(self, "_intimacy_continue_timer_generation", 0)) + 1
+        self._intimacy_continue_timer_generation = generation
         if self._intimacy_continue_timer is None:
             self._intimacy_continue_timer = QTimer(self)
             self._intimacy_continue_timer.setSingleShot(True)
-            self._intimacy_continue_timer.timeout.connect(self._on_intimacy_continue_timer)
+        timeout_signal = getattr(self._intimacy_continue_timer, "timeout", None)
+        if timeout_signal is not None:
+            try:
+                timeout_signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            timeout_signal.connect(
+                lambda captured=generation: self._on_intimacy_continue_timer(captured)
+            )
         self._intimacy_continue_timer.start(delay_ms)
 
     def _cancel_intimacy_continue(self) -> None:
@@ -3643,12 +3654,19 @@ class PetWindow(QWidget):
         return False
 
     @Slot()
-    def _on_intimacy_continue_timer(self) -> None:
+    def _on_intimacy_continue_timer(self, scheduled_generation: int | None = None) -> None:
         """计时器到期：检查条件，触发续投。"""
         from app.agent.builtin_tools import build_intimacy_continue_message, intimacy_mode_state
 
         if not intimacy_mode_state.active:
             self._cancel_intimacy_continue()
+            return
+        current_generation = int(getattr(self, "_intimacy_continue_timer_generation", 0))
+        if scheduled_generation is not None and scheduled_generation != current_generation:
+            return
+        scheduled_epoch = int(getattr(self, "_intimacy_continue_timer_epoch", -1))
+        current_epoch = int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0)
+        if scheduled_epoch != current_epoch:
             return
         if self._next_intimacy_continue_delay_ms() is None:
             return
@@ -3665,6 +3683,11 @@ class PetWindow(QWidget):
             return
         if self.speech_timer.isActive():
             self._intimacy_continue_timer.start(2000)
+            return
+
+        # busy 检查期间用户可能已开始新周期；提交续投前再做一次最终校验。
+        current_epoch = int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0)
+        if scheduled_epoch != current_epoch or not intimacy_mode_state.active:
             return
 
         # 续投不调用 enter()：避免重置自动退出计数、拖长误开寿命
@@ -3984,9 +4007,6 @@ class PetWindow(QWidget):
     def send_message(self, source: str = "direct_call") -> None:
         if getattr(self, "startup_initializing", False):
             return
-        intimacy_continue_timer = getattr(self, "_intimacy_continue_timer", None)
-        if intimacy_continue_timer is not None:
-            intimacy_continue_timer.stop()
         text = self.input_edit.text().strip()
         from app.agent.builtin_tools import user_declines_or_exits_intimacy
 
@@ -4024,6 +4044,9 @@ class PetWindow(QWidget):
             if self.active_interaction_id:
                 self._end_interaction("ignored")
             return
+        intimacy_continue_timer = getattr(self, "_intimacy_continue_timer", None)
+        if intimacy_continue_timer is not None:
+            intimacy_continue_timer.stop()
         if manual_observation is not None and not self.screen_observation_enabled:
             show_themed_information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
             self._clear_manual_screen_observation()

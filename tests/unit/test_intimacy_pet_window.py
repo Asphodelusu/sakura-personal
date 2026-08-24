@@ -199,6 +199,10 @@ def _make_intimacy_continue_window():
     window = SimpleNamespace(
         _intimacy_continue_count=0,
         _intimacy_continue_epoch=int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0),
+        _intimacy_continue_timer_epoch=int(
+            getattr(intimacy_mode_state, "continuation_epoch", 0) or 0
+        ),
+        _intimacy_continue_timer_generation=0,
         _intimacy_was_active=True,
         _intimacy_continue_timer=_FakeContinueTimer(),
         messages=[],
@@ -419,3 +423,49 @@ class TestSleepAfterThirdContinuationPlayback:
 
         assert window._intimacy_continue_timer.stopped is True
         assert window._intimacy_continue_count == 0
+
+    def test_stale_timer_from_previous_user_cycle_is_ignored(self) -> None:
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        window, started = _make_intimacy_continue_window()
+        window._schedule_intimacy_continue()
+        scheduled_epoch = window._intimacy_continue_timer_epoch
+        stale_generation = window._intimacy_continue_timer_generation
+
+        intimacy_mode_state.refresh_user_reply()
+        assert intimacy_mode_state.continuation_epoch != scheduled_epoch
+        window._schedule_intimacy_continue()
+        assert window._intimacy_continue_timer_generation != stale_generation
+
+        window._on_intimacy_continue_timer(stale_generation)
+
+        assert started == []
+        assert window.messages == []
+        assert window._intimacy_continue_count == 0
+
+
+class _EmptyInput:
+    def text(self) -> str:
+        return ""
+
+
+def test_empty_send_does_not_cancel_pending_intimacy_timer() -> None:
+    from types import SimpleNamespace
+
+    timer = _FakeContinueTimer()
+    timer.start(35_000)
+    window = SimpleNamespace(
+        startup_initializing=False,
+        _intimacy_continue_timer=timer,
+        input_edit=_EmptyInput(),
+        pending_manual_screen_observation=None,
+        worker_thread=None,
+        active_interaction_id="",
+        _log_interaction_stage=lambda *_args, **_kwargs: None,
+    )
+    _bind_pet_window_method(window, "send_message")
+
+    window.send_message()
+
+    assert timer.stopped is False
+    assert timer.started_ms == 35_000
