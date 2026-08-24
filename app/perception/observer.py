@@ -1079,12 +1079,22 @@ class ProactiveObserver:
         debug_log("RelationshipInitiative", "B 门控", {"reason": rel_reason})
         if screen_triggers:
             self._consume_focus_triggers(screen_triggers)
-            if rel_reason == "eligible":
+            relationship_eligible = rel_reason == "eligible"
+            proactive_before = self._last_proactive_at
+            if relationship_eligible:
                 self._relationship_motive = True
             logger.info("ProactiveObserver: evaluating, triggers={}", screen_triggers)
             _observer_gui_log("正在评估是否发言", {"triggers": screen_triggers})
-            await self._do_evaluation(screen_triggers)
-            self._relationship_motive = False
+            try:
+                await self._do_evaluation(screen_triggers)
+            finally:
+                self._relationship_motive = False
+                if relationship_eligible:
+                    if self._last_proactive_at > proactive_before:
+                        self._last_relationship_spoken_at = self._last_proactive_at
+                        self._last_relationship_silent_at = 0.0
+                    else:
+                        self._mark_relationship_silent()
             return
         if rel_reason != "eligible":
             return

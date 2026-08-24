@@ -108,6 +108,27 @@ def test_screen_trigger_wins_same_tick_and_suppresses_relationship_eval() -> Non
         asyncio.run(observer._dispatch_proactive_tick(now))
     observer._do_evaluation.assert_awaited()
     observer._do_relationship_evaluation.assert_not_called()
+    assert observer._last_relationship_silent_at == now
+    assert observer._relationship_gate_reason(now + 1, "") == "cooldown"
+
+
+def test_screen_evaluation_failure_clears_relationship_motive() -> None:
+    observer = _obs()
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    observer._ready_focus_trigger = "window:A->B"
+    observer._do_evaluation = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with (
+        patch("app.perception.observer.get_active_window_pid", return_value=10_001),
+        patch("app.perception.observer.time.monotonic", return_value=now),
+    ):
+        try:
+            asyncio.run(observer._dispatch_proactive_tick(now))
+        except RuntimeError:
+            pass
+
+    assert observer._relationship_motive is False
 
 
 def test_decision_instruction_has_no_ceiling_or_blacklist() -> None:

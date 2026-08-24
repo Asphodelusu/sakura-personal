@@ -126,6 +126,12 @@ def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
     class MinimalWindow:
         _apply_character = PetWindow._apply_character
 
+        def _load_relationship_initiative_settings_safe(self):  # type: ignore[no-untyped-def]
+            return object()
+
+        def _restart_proactive_observer(self) -> None:
+            events.append(("restart_observer", None))
+
         def setWindowTitle(self, title: str) -> None:
             events.append(("title", title))
 

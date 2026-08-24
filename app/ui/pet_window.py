@@ -8584,7 +8584,9 @@ class PetWindow(QWidget):
             self.history_window.set_history_store(self.history_store, profile.display_name)
 
         self._load_reply_history_from_store()
-        guide_text = load_relationship_guide(profile.relationship_guide_path)
+        guide_text = load_relationship_guide(
+            getattr(profile, "relationship_guide_path", None)
+        )
         rel = self._load_relationship_initiative_settings_safe()
         set_initiative = getattr(self.agent_runtime, "set_relationship_initiative", None)
         if callable(set_initiative):
