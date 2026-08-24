@@ -76,6 +76,7 @@ MEMORY_LAYER_LABELS = {
 DEFAULT_MEMORY_IMPORTANCE = 0.5
 DEFAULT_MEMORY_CONFIDENCE = 0.75
 DEFAULT_MEMORY_SOURCE = "manual"
+CORE_PROFILE_SCHEMA_VERSION = 2
 CORE_PROFILE_CONTEXT_BUDGET = 1200
 MOOD_CONTEXT_BUDGET = 500
 SESSION_CONTEXT_BUDGET = 600
@@ -1032,7 +1033,21 @@ class MemoryStore:
         raw = profiles.get(self.scope_id)
         if not isinstance(raw, dict):
             return None
-        record = _normalize_memory_record(raw, default_scope=self.scope_id)
+        view = dict(raw)
+        stored_content = str(raw.get("content") or raw.get("memory") or "").strip()
+        schema_version = _core_profile_schema_version(view)
+        content = stored_content
+        if not content and schema_version == CORE_PROFILE_SCHEMA_VERSION:
+            content = _core_profile_content_for_read(view)
+        if not content:
+            return None
+        if schema_version not in {None, CORE_PROFILE_SCHEMA_VERSION}:
+            logger.debug("常驻档案未知 schema_version=%s，只读兼容", schema_version)
+        elif schema_version == CORE_PROFILE_SCHEMA_VERSION and not stored_content:
+            logger.debug("常驻档案 V2 缺少 content，已按 sections 只读降级")
+        view["content"] = content
+        view["memory"] = content
+        record = _normalize_memory_record(view, default_scope=self.scope_id)
         if record is None:
             return None
         record["id"] = _core_profile_id(self.scope_id)
@@ -1050,9 +1065,9 @@ class MemoryStore:
         text = content.strip()
         if not text:
             raise ValueError("常驻档案内容不能为空。")
-        profiles = self._load_core_profiles()
+        profiles = self._load_core_profiles(strict=True)
+        previous = self._require_writable_core_profile(profiles) or {}
         now = _now_iso()
-        previous = profiles.get(self.scope_id) if isinstance(profiles.get(self.scope_id), dict) else {}
         previous_metadata = previous.get("metadata") if isinstance(previous, dict) else {}
         merged_metadata = {
             **(previous_metadata if isinstance(previous_metadata, dict) else {}),
@@ -1064,12 +1079,11 @@ class MemoryStore:
             if isinstance(previous_metadata, dict)
             else now,
         }
-        record = {
-            "id": _core_profile_id(self.scope_id),
-            "content": text,
-            "memory": text,
-            "metadata": merged_metadata,
-        }
+        record = _build_core_profile_v2_record(
+            scope_id=self.scope_id,
+            content=text,
+            metadata=merged_metadata,
+        )
         profiles[self.scope_id] = record
         self._save_core_profiles(profiles)
         normalized = _normalize_memory_record(record, default_scope=self.scope_id)
@@ -1078,12 +1092,27 @@ class MemoryStore:
     def delete_core_profile(self) -> dict[str, Any] | None:
         """删除当前角色的常驻档案块。"""
 
-        profiles = self._load_core_profiles()
+        profiles = self._load_core_profiles(strict=True)
+        self._require_writable_core_profile(profiles)
         previous = profiles.pop(self.scope_id, None)
         self._save_core_profiles(profiles)
         if not isinstance(previous, dict):
             return None
         return _normalize_memory_record(previous, default_scope=self.scope_id)
+
+    def _require_writable_core_profile(self, profiles: dict[str, Any]) -> dict[str, Any] | None:
+        if self.scope_id not in profiles:
+            return None
+        raw = profiles[self.scope_id]
+        path_name = StoragePaths(self.base_dir).memory_core_profiles().name
+        if not isinstance(raw, dict):
+            raise CoreProfileStorageError(f"常驻档案文件 {path_name} 目标记录不是对象")
+        schema_version = _core_profile_schema_version(raw)
+        if schema_version not in {None, CORE_PROFILE_SCHEMA_VERSION}:
+            raise CoreProfileStorageError(
+                f"常驻档案文件 {path_name} 未知 schema_version={schema_version}，拒绝写入"
+            )
+        return raw
 
     # ---- Mood State (心の記録) ----
 
@@ -2007,16 +2036,24 @@ class MemoryStore:
         raw = mem.add(messages, user_id=self.scope_id, infer=True)
         return _count_mem0_events(raw, total=len(messages))
 
-    def _load_core_profiles(self) -> dict[str, Any]:
+    def _load_core_profiles(self, *, strict: bool = False) -> dict[str, Any]:
         path = StoragePaths(self.base_dir).memory_core_profiles()
         if not path.exists():
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            if strict:
+                raise CoreProfileStorageError(
+                    f"无法读取常驻档案文件 {path.name}：{type(exc).__name__}"
+                ) from exc
             logger.debug("读取常驻档案失败", exc_info=True)
             return {}
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            return data
+        if strict:
+            raise CoreProfileStorageError(f"常驻档案文件 {path.name} 顶层不是对象")
+        return {}
 
     def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
         path = StoragePaths(self.base_dir).memory_core_profiles()
@@ -2024,6 +2061,7 @@ class MemoryStore:
             path,
             json.dumps(profiles, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            backup=True,
         )
 
     def _reset_scope_curation_cache(
@@ -2362,8 +2400,8 @@ class ScopedMemoryStore(MemoryStore):
     def _get_memory(self, *, wait: bool = True) -> Any | None:
         return self._owner._get_memory(wait=wait)
 
-    def _load_core_profiles(self) -> dict[str, Any]:
-        return self._owner._load_core_profiles()
+    def _load_core_profiles(self, *, strict: bool = False) -> dict[str, Any]:
+        return self._owner._load_core_profiles(strict=strict)
 
     def _save_core_profiles(self, profiles: dict[str, Any]) -> None:
         self._owner._save_core_profiles(profiles)
@@ -2834,6 +2872,54 @@ def _hub_snapshot_has_model_weights(snapshot_dir: Path) -> bool:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class CoreProfileStorageError(RuntimeError):
+    """常驻档案严格读写路径上的存储错误；消息不得包含档案正文。"""
+
+
+def _core_profile_schema_version(raw: dict[str, Any]) -> int | None:
+    if "schema_version" not in raw:
+        return None
+    value = raw.get("schema_version")
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
+def _core_profile_content_for_read(raw: dict[str, Any]) -> str:
+    content = str(raw.get("content") or raw.get("memory") or "").strip()
+    if content:
+        return content
+    sections = raw.get("sections")
+    if not isinstance(sections, dict) or not sections:
+        return ""
+    if not all(
+        isinstance(key, str)
+        and key.strip()
+        and isinstance(value, str)
+        and value.strip()
+        for key, value in sections.items()
+    ):
+        return ""
+    return "\n\n".join(
+        str(value).strip()
+        for value in sections.values()
+    )
+
+
+def _build_core_profile_v2_record(
+    *,
+    scope_id: str,
+    content: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": _core_profile_id(scope_id),
+        "schema_version": CORE_PROFILE_SCHEMA_VERSION,
+        "content": content,
+        "memory": content,
+        "sections": {"legacy": content},
+        "metadata": metadata,
+    }
 
 
 def _core_profile_id(scope_id: str) -> str:
