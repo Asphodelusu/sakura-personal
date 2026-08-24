@@ -53,7 +53,39 @@ class TestIntimacyModeState:
         assert state.active is True
         assert state._turns_left == 3
 
-    def test_third_continuation_stays_active_until_expire_after_silence(self) -> None:
+    def test_exhausted_continuation_sleeps_without_exit(self) -> None:
+        """三轮静默续投耗尽后保持 active，不设 needs_reentry_hint。"""
+        state = IntimacyModeState()
+        state.enter()
+        for _ in range(3):
+            assert state.consume_turn() is True
+            assert state.active is True
+        assert state._turns_left == 0
+        assert state.consume_turn() is False
+        assert state.active is True
+        assert state.pending is False
+        assert state._turns_left == 0
+        assert state.needs_reentry_hint is False
+
+    def test_refresh_user_reply_starts_new_continuation_cycle(self) -> None:
+        """真实用户回话才推进 continuation epoch 并重置额度。"""
+        state = IntimacyModeState()
+        state.enter()
+        epoch_after_enter = getattr(state, "continuation_epoch", None)
+        for _ in range(3):
+            assert state.consume_turn() is True
+        assert getattr(state, "continuation_epoch", None) == epoch_after_enter
+        assert state.consume_turn() is False
+        state.refresh_user_reply()
+        epoch_after_refresh = getattr(state, "continuation_epoch", None)
+        assert epoch_after_refresh is not None
+        assert epoch_after_refresh != epoch_after_enter
+        assert state.active is True
+        assert state._turns_left == 3
+        assert state.needs_reentry_hint is False
+        assert state.consume_turn() is True
+
+    def test_expire_after_silence_still_exits_when_called(self) -> None:
         state = IntimacyModeState()
         state.enter()
         for _ in range(3):
@@ -412,6 +444,20 @@ class TestIntimacyGuidePromptGate:
         assert INTIMACY_ENTER_PHRASE in section.body
         assert "set_intimacy_mode(on=true)" in section.body
         assert "INTIMACY_GUIDE_MARKER" not in section.body
+
+    def test_continuation_sleep_keeps_guide_without_reentry(self) -> None:
+        runtime = self._runtime_with_guide()
+        intimacy_mode_state.enter()
+        for _ in range(3):
+            intimacy_mode_state.consume_turn()
+        assert intimacy_mode_state.consume_turn() is False
+        assert intimacy_mode_state.active is True
+        assert intimacy_mode_state.needs_reentry_hint is False
+        section = runtime._build_intimacy_section()
+        assert section is not None
+        assert section.section_id == "persona.intimacy"
+        assert "INTIMACY_GUIDE_MARKER" in section.body
+        assert "引导与自动续投已关闭" not in section.body
 
     def test_tool_description_mentions_reentry(self) -> None:
         assert "不会自动恢复" in _SET_INTIMACY_MODE_DESCRIPTION

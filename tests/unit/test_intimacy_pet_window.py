@@ -192,11 +192,13 @@ def _bind_pet_window_method(window: object, name: str) -> None:
 def _make_intimacy_continue_window():
     from types import SimpleNamespace
 
+    from app.agent.builtin_tools import intimacy_mode_state
     from app.ui.pet_window import PetWindow
 
     started: list[list] = []
     window = SimpleNamespace(
         _intimacy_continue_count=0,
+        _intimacy_continue_epoch=int(getattr(intimacy_mode_state, "continuation_epoch", 0) or 0),
         _intimacy_was_active=True,
         _intimacy_continue_timer=_FakeContinueTimer(),
         messages=[],
@@ -267,8 +269,8 @@ class TestProgressiveContinueDelays:
         assert window._next_intimacy_continue_delay_ms() is None
 
 
-class TestExpireAfterThirdContinuationPlayback:
-    """expire_after_silence() 只在第三轮续投回复播完后调用，不得早于该轮 prompt/tone 选择。"""
+class TestSleepAfterThirdContinuationPlayback:
+    """第三档耗尽只取消 timer 进入静默休眠；真实用户周期才把续投计数归零。"""
 
     def setup_method(self) -> None:
         from app.agent.builtin_tools import intimacy_mode_state
@@ -281,7 +283,7 @@ class TestExpireAfterThirdContinuationPlayback:
 
         intimacy_mode_state.exit()
 
-    def test_expire_runs_only_after_third_continuation_reply_playback(
+    def test_third_continuation_playback_sleeps_without_expire(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from app.agent.builtin_tools import intimacy_mode_state, message_is_intimacy_continue
@@ -317,17 +319,64 @@ class TestExpireAfterThirdContinuationPlayback:
         assert started
         assert message_is_intimacy_continue(window.messages[-1])
 
-        # 第三轮续投回复播完后才 expire，且不再追加第四条系统信号。
+        # 第三轮续投回复播完后进入静默休眠：取消 timer，保持 active，不追加第四条信号。
         before = len(window.messages)
         window._schedule_intimacy_continue()
-        assert expire_calls == ["expire"]
-        assert intimacy_mode_state.active is False
+        assert expire_calls == []
+        assert intimacy_mode_state.active is True
+        assert intimacy_mode_state.needs_reentry_hint is False
+        assert window._intimacy_continue_count == 3
+        assert window._intimacy_continue_timer.stopped is True
         window._on_intimacy_continue_timer()
         assert len(window.messages) == before
         assert len(started) == 1
 
+    def test_user_cycle_after_sleep_restarts_first_delay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        window, _started = _make_intimacy_continue_window()
+        expire_calls = _track_expire(monkeypatch)
+        window._intimacy_continue_count = 3
+        window._schedule_intimacy_continue()
+        assert expire_calls == []
+        assert window._intimacy_continue_count == 3
+
+        intimacy_mode_state.refresh_user_reply()
+        window._schedule_intimacy_continue()
+
+        assert expire_calls == []
+        assert intimacy_mode_state.active is True
+        assert window._intimacy_continue_count == 0
+        assert window._intimacy_continue_timer.started_ms == 20_000
+        window._intimacy_continue_count = 1
+        window._schedule_intimacy_continue()
+        assert window._intimacy_continue_timer.started_ms == 35_000
+        window._intimacy_continue_count = 2
+        window._schedule_intimacy_continue()
+        assert window._intimacy_continue_timer.started_ms == 60_000
+
+    def test_system_continue_does_not_reset_cycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.agent.builtin_tools import intimacy_mode_state
+
+        window, started = _make_intimacy_continue_window()
+        expire_calls = _track_expire(monkeypatch)
+        window._intimacy_continue_count = 1
+        epoch_before = getattr(intimacy_mode_state, "continuation_epoch", None)
+        intimacy_mode_state.consume_turn()
+        window._schedule_intimacy_continue()
+
+        assert expire_calls == []
+        assert getattr(intimacy_mode_state, "continuation_epoch", None) == epoch_before
+        assert window._intimacy_continue_count == 1
+        assert window._intimacy_continue_timer.started_ms == 35_000
+        assert started == []
+
     @pytest.mark.parametrize("outcome", ["empty_reply", "error", "speaking_timeout"])
-    def test_third_continuation_terminal_outcomes_expire(
+    def test_third_continuation_terminal_outcomes_sleep(
         self, outcome: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from app.agent.builtin_tools import intimacy_mode_state
@@ -338,11 +387,13 @@ class TestExpireAfterThirdContinuationPlayback:
 
         window._end_interaction(outcome)
 
-        assert expire_calls == ["expire"]
-        assert intimacy_mode_state.active is False
+        assert expire_calls == []
+        assert intimacy_mode_state.active is True
+        assert intimacy_mode_state.needs_reentry_hint is False
+        assert window._intimacy_continue_count == 3
 
     @pytest.mark.parametrize("outcome", ["empty_reply", "error", "speaking_timeout"])
-    def test_pre_third_terminal_outcomes_do_not_expire(
+    def test_pre_third_terminal_outcomes_do_not_sleep(
         self, outcome: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from app.agent.builtin_tools import intimacy_mode_state

@@ -253,7 +253,7 @@ def resolve_turn_plan(
         if latest_is_intimacy_continue(messages):
             if intimacy_mode_state.consume_turn():
                 return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")
-            # 静默续投耗尽 → 自动退出（needs_reentry_hint 已置位）
+            # 静默续投耗尽 → 保持 active/sleep，走普通路由，不生成 reentry
         else:
             intimacy_mode_state.refresh_user_reply()
             return _intimacy_plan(recall_decision=recall, decided_by="rhythm_focus")

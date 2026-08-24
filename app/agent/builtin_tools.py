@@ -27,8 +27,9 @@ class IntimacyModeState:
 
     生命周期：
     - 开启：用户整句发送约定词 → 系统硬开启（不经 LLM 工具）
-    - 保持：用户正常回话 → 刷新 3 轮额度；静默续投 → 扣 1 轮
-    - 退出：用户收尾话 / 模型 on=false / 第三轮续投完成后 UI 过期
+    - 保持：用户正常回话 → 刷新续投周期；静默续投 → 扣 1 轮
+    - 静默休眠：三轮续投耗尽后保持 active，停止续投 timer，不设 needs_reentry_hint
+    - 退出：用户收尾话 / 模型 on=false
     """
 
     _AUTO_EXIT_TURNS = 3
@@ -37,6 +38,7 @@ class IntimacyModeState:
         self.active: bool = False
         self.pending: bool = False  # 兼容旧字段；硬入口后不再用于开启
         self._turns_left: int = 0
+        self.continuation_epoch: int = 0
         self.needs_reentry_hint: bool = False
         self.last_user_text: str = ""
         self.opened_by_keyword: bool = False
@@ -59,6 +61,7 @@ class IntimacyModeState:
         self.active = True
         self.pending = False
         self._turns_left = self._AUTO_EXIT_TURNS
+        self.continuation_epoch += 1
         self.needs_reentry_hint = False
         self.opened_by_keyword = bool(by_keyword)
 
@@ -72,16 +75,17 @@ class IntimacyModeState:
         self.opened_by_keyword = False
 
     def refresh_user_reply(self) -> None:
-        """用户回话：刷新存活额度，保持开启。"""
+        """真实用户回话：开启新的续投周期，保持开启。"""
         if not self.active:
             return
         self._turns_left = self._AUTO_EXIT_TURNS
+        self.continuation_epoch += 1
         # 非约定词的普通回话后，去掉「本轮刚硬开」标记
         if not user_requests_intimacy_entry(self.last_user_text):
             self.opened_by_keyword = False
 
     def expire_after_silence(self) -> None:
-        """第三轮续投回复完成后由 UI 调用；生成前不得提前失活。"""
+        """显式过期：清 active 并留下重进提示。续投耗尽的静默休眠不再调用此方法。"""
         if not self.active:
             return
         self.active = False
@@ -91,11 +95,10 @@ class IntimacyModeState:
         self.needs_reentry_hint = True
 
     def consume_turn(self) -> bool:
-        """系统续投消耗一次；返回是否仍活跃。第三轮仍保持 active。"""
+        """系统续投消耗一次；返回是否仍可续投。耗尽后保持 active 进入静默休眠。"""
         if not self.active:
             return False
         if self._turns_left <= 0:
-            self.expire_after_silence()
             return False
         self._turns_left -= 1
         self.opened_by_keyword = False
