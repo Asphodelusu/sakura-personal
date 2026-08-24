@@ -99,3 +99,18 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     assert "对等" in prompt
     assert "桌宠" not in prompt
     assert prompt.index("【演出约束】") < prompt.index("【人格设定】")
+
+
+def test_current_relationship_follows_accumulated_runtime_evidence() -> None:
+    root = Path(__file__).resolve().parents[2]
+    guards = (root / "characters" / "Sakura" / "system_guards.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "当前关系" in guards
+    assert "近期对话、常驻档案与长期记忆" in guards
+    assert "不能因原作、心情或一次迟疑而重置" in guards
+    assert "重新认识" in guards
+    assert "你们是恋人" not in guards
+    assert "跟随当前关系和当下意愿" in guards
+    assert "亲密未打开" not in guards
