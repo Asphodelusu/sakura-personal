@@ -14,6 +14,7 @@ from app.agent.core_profile_candidates import (
     CoreCandidateQueue,
     CoreCandidateQueueError,
     candidate_id,
+    eligible_since,
     evidence_id,
     is_eligible,
 )
@@ -828,3 +829,152 @@ class TestReviewRegressions:
         assert path.read_bytes() == corrupted
         assert original != corrupted
 
+
+class TestEligibleSince:
+    def test_explicit_uses_first_bilateral_qualifying_evidence(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        first_at = (NOW - timedelta(minutes=10)).isoformat()
+        queue.ingest("Sakura", _explicit(user_excerpt="", observed_at=first_at, confidence=0.95))
+        second_at = (NOW - timedelta(minutes=4)).isoformat()
+        queue.ingest(
+            "Sakura",
+            _explicit(
+                user_excerpt="我们是恋人吧。",
+                assistant_excerpt="嗯，是恋人。",
+                observed_at=second_at,
+                batch_id="curation_batch_2",
+                confidence=0.91,
+            ),
+        )
+        later_at = NOW.isoformat()
+        queue.ingest(
+            "Sakura",
+            _explicit(
+                user_excerpt="还是恋人。",
+                assistant_excerpt="当然是。",
+                observed_at=later_at,
+                batch_id="curation_batch_3",
+                confidence=0.99,
+            ),
+        )
+        candidate = queue.candidates_for("Sakura")[0]
+        assert eligible_since(candidate) == second_at
+
+    def test_explicit_ignores_unilateral_and_low_confidence(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        candidate = queue.ingest("Sakura", _explicit(assistant_excerpt="", confidence=0.99))
+        assert eligible_since(candidate) is None
+        low = queue.ingest(
+            "Sakura",
+            _explicit(confidence=0.89, batch_id="curation_batch_2", observed_at=(NOW + timedelta(minutes=1)).isoformat()),
+        )
+        assert eligible_since(low) is None
+
+    def test_observed_uses_first_prefix_meeting_all_thresholds(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        origin = NOW - timedelta(minutes=40)
+        stamps = [
+            origin.isoformat(),
+            (origin + timedelta(minutes=10)).isoformat(),
+            (origin + timedelta(minutes=30)).isoformat(),
+            (origin + timedelta(minutes=40)).isoformat(),
+        ]
+        last = None
+        for index, observed_at in enumerate(stamps):
+            last = queue.ingest(
+                "Sakura",
+                _observed(
+                    user_excerpt=f"用户证据{index}",
+                    assistant_excerpt=f"我的回应{index}",
+                    batch_id=f"curation_{index}",
+                    confidence=0.85,
+                    observed_at=observed_at,
+                ),
+            )
+        assert eligible_since(last) == stamps[2]
+
+    def test_observed_prefix_waits_until_confidence_and_batches_pass(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        origin = NOW - timedelta(minutes=60)
+        confidences = [0.70, 0.80, 0.80, 0.90]
+        last = None
+        last_at = ""
+        for index, confidence in enumerate(confidences):
+            last_at = (origin + timedelta(minutes=20 * index)).isoformat()
+            last = queue.ingest(
+                "Sakura",
+                _observed(
+                    user_excerpt=f"用户证据{index}",
+                    assistant_excerpt=f"我的回应{index}",
+                    batch_id=f"curation_{index % 2}",
+                    confidence=confidence,
+                    observed_at=last_at,
+                ),
+            )
+        assert last is not None
+        assert eligible_since(last) == last_at
+
+
+class TestMarkProcessedTransaction:
+    def test_applied_and_reviewed_commit_together(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        applied = queue.ingest("Sakura", _explicit())
+        reviewed = queue.ingest(
+            "Sakura",
+            _explicit(subject_key="relationship.address", claim="我叫他你。"),
+        )
+        queue.mark_processed("Sakura", applied_ids=[applied.id], reviewed_ids=[reviewed.id])
+        stored = {item.id: item.status for item in queue.candidates_for("Sakura")}
+        assert stored[applied.id] == "applied"
+        assert stored[reviewed.id] == "reviewed"
+
+    def test_mark_processed_updates_last_seen_at_to_processing_time(self, tmp_path: Path) -> None:
+        class Clock:
+            def __init__(self, now: datetime) -> None:
+                self.now = now
+
+            def __call__(self) -> datetime:
+                return self.now
+
+        clock = Clock(NOW)
+        queue = CoreCandidateQueue(_queue_path(tmp_path), clock=clock)
+        item = queue.ingest("Sakura", _explicit())
+        assert item.last_seen_at == NOW.isoformat()
+        clock.now = NOW + timedelta(hours=2)
+        queue.mark_processed("Sakura", applied_ids=[item.id], reviewed_ids=[])
+        stored = queue.candidates_for("Sakura")[0]
+        assert stored.status == "applied"
+        assert stored.last_seen_at == clock.now.isoformat()
+        assert stored.first_seen_at == NOW.isoformat()
+
+    def test_unknown_id_rolls_back_entire_transaction(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        kept = queue.ingest("Sakura", _explicit())
+        before = _queue_path(tmp_path).read_bytes()
+        with pytest.raises(CoreCandidateQueueError):
+            queue.mark_processed("Sakura", applied_ids=[kept.id], reviewed_ids=["cc_missing"])
+        assert _queue_path(tmp_path).read_bytes() == before
+        assert queue.candidates_for("Sakura")[0].status == "pending"
+
+    def test_non_pending_id_rolls_back_without_partial_write(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        first = queue.ingest("Sakura", _explicit())
+        second = queue.ingest(
+            "Sakura",
+            _explicit(subject_key="relationship.boundary", claim="晚上十一点后不打电话。"),
+        )
+        queue.mark_processed("Sakura", applied_ids=[first.id], reviewed_ids=[])
+        before = _queue_path(tmp_path).read_bytes()
+        with pytest.raises(CoreCandidateQueueError):
+            queue.mark_processed("Sakura", applied_ids=[first.id], reviewed_ids=[second.id])
+        assert _queue_path(tmp_path).read_bytes() == before
+        stored = {item.id: item.status for item in queue.candidates_for("Sakura")}
+        assert stored[first.id] == "applied"
+        assert stored[second.id] == "pending"
+
+    def test_overlapping_ids_are_rejected(self, tmp_path: Path) -> None:
+        queue = _queue(tmp_path)
+        item = queue.ingest("Sakura", _explicit())
+        with pytest.raises(CoreCandidateQueueError):
+            queue.mark_processed("Sakura", applied_ids=[item.id], reviewed_ids=[item.id])
+        assert queue.candidates_for("Sakura")[0].status == "pending"

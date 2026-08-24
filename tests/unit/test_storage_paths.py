@@ -113,6 +113,10 @@ class TestStoragePathsSnapshot:
             self.paths.memory_core_review_queue()
             == self.data / "memory" / "core_review_queue.json"
         )
+        assert (
+            self.paths.memory_core_maintainer_state()
+            == self.data / "memory" / "core_maintainer_state.json"
+        )
         assert self.paths.memory_curation_state() == self.data / "memory_curation_state.json"
         assert self.paths.memory_entity_index_db() == self.data / "memory" / "entity_index.db"
         assert self.paths.memory_access_tracker_db() == self.data / "memory" / "access_tracker.db"

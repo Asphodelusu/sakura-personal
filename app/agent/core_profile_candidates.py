@@ -8,7 +8,7 @@ import math
 import os
 import threading
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
@@ -169,6 +169,11 @@ def candidate_id(target_section: str, subject_key: str) -> str:
     return _stable_id("cc_", target_section, subject_key)
 
 
+def candidate_generation_fingerprint(candidate: CoreCandidate) -> str:
+    parts = [candidate.id, *sorted(item.id for item in candidate.evidence)]
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def evidence_id(
     *,
     user_excerpt: str,
@@ -205,8 +210,8 @@ def _has_bilateral_evidence(evidence: tuple[CoreEvidence, ...]) -> bool:
     )
 
 
-def _evidence_span(candidate: CoreCandidate) -> timedelta:
-    stamps = [_parse_dt(item.observed_at) for item in candidate.evidence]
+def _evidence_span(evidence: tuple[CoreEvidence, ...]) -> timedelta:
+    stamps = [_parse_dt(item.observed_at) for item in evidence]
     present = [item for item in stamps if item is not None]
     if len(present) < 2:
         return timedelta(0)
@@ -244,14 +249,55 @@ def is_eligible(
             and _has_bilateral_evidence(explicit_evidence)
         )
     if candidate.kind == "observed":
-        batches = {item.batch_id for item in candidate.evidence}
-        return (
-            len(candidate.evidence) >= rules.observed_min_evidence
-            and len(batches) >= rules.observed_min_batches
-            and _evidence_span(candidate) >= timedelta(minutes=rules.observed_min_span_minutes)
-            and _meets_threshold(candidate.confidence, rules.observed_min_confidence)
-        )
+        return _observed_prefix_meets(candidate.evidence, rules)
     return False
+
+
+def _observed_prefix_meets(evidence: tuple[CoreEvidence, ...], rules: CoreCandidateConfig) -> bool:
+    if not evidence:
+        return False
+    batches = {item.batch_id for item in evidence}
+    return (
+        len(evidence) >= rules.observed_min_evidence
+        and len(batches) >= rules.observed_min_batches
+        and _evidence_span(evidence) >= timedelta(minutes=rules.observed_min_span_minutes)
+        and _meets_threshold(_mean_confidence(evidence), rules.observed_min_confidence)
+    )
+
+
+def _evidence_sort_key(item: CoreEvidence) -> tuple[datetime, str]:
+    stamp = _parse_dt(item.observed_at) or datetime.min.replace(tzinfo=timezone.utc)
+    return (stamp, item.id)
+
+
+def eligible_since(
+    candidate: CoreCandidate,
+    *,
+    config: CoreCandidateConfig | None = None,
+) -> str | None:
+    """候选首次真正 eligible 的证据时间；从未达标则 None。"""
+
+    rules = config or CoreCandidateConfig()
+    ordered = tuple(sorted(candidate.evidence, key=_evidence_sort_key))
+    if candidate.kind == "explicit":
+        if not is_supported_explicit_subject(candidate.subject_key):
+            return None
+        for item in ordered:
+            if item.kind != "explicit":
+                continue
+            if not (_clean_text(item.user_excerpt) and _clean_text(item.assistant_excerpt)):
+                continue
+            if not _meets_threshold(item.confidence, rules.explicit_min_confidence):
+                continue
+            return item.observed_at
+        return None
+    if candidate.kind == "observed":
+        for end in range(1, len(ordered) + 1):
+            prefix = ordered[:end]
+            if _observed_prefix_meets(prefix, rules):
+                return prefix[-1].observed_at
+        return None
+    return None
 
 
 def _default_clock() -> datetime:
@@ -331,6 +377,9 @@ def _exclusive_path_lock(path: Path) -> Iterator[None]:
         thread_lock.release()
 
 
+exclusive_json_path_lock = _exclusive_path_lock
+
+
 def _copy_scopes(scopes: dict[str, list[CoreCandidate]]) -> dict[str, list[CoreCandidate]]:
     return {scope_id: list(items) for scope_id, items in scopes.items()}
 
@@ -379,6 +428,52 @@ class CoreCandidateQueue:
                 for item in self._candidates_for_locked(scope_id)
                 if is_eligible(item, now=now, config=self.config)
             )
+
+    def mark_processed(
+        self,
+        scope_id: str,
+        *,
+        applied_ids: Sequence[str] = (),
+        reviewed_ids: Sequence[str] = (),
+    ) -> None:
+        applied = tuple(str(item).strip() for item in applied_ids if str(item).strip())
+        reviewed = tuple(str(item).strip() for item in reviewed_ids if str(item).strip())
+        with _exclusive_path_lock(self._path):
+            loaded = self._load_from_disk()
+            working = self._housekeep_scopes(_copy_scopes(loaded))
+            scope = str(scope_id or "").strip()
+            self._apply_processed_locked(working, scope, applied=applied, reviewed=reviewed)
+            self._commit(working)
+
+    def _apply_processed_locked(
+        self,
+        scopes: dict[str, list[CoreCandidate]],
+        scope_id: str,
+        *,
+        applied: Sequence[str],
+        reviewed: Sequence[str],
+    ) -> None:
+        if not scope_id:
+            raise CoreCandidateQueueError("scope_id is required")
+        applied_set = list(applied)
+        reviewed_set = list(reviewed)
+        combined = applied_set + reviewed_set
+        if len(combined) != len(set(combined)):
+            raise CoreCandidateQueueError("processed ids overlap or repeat")
+        items = list(scopes.get(scope_id, []))
+        by_id = {item.id: index for index, item in enumerate(items)}
+        for candidate_id_value, status in (
+            *((item, "applied") for item in applied_set),
+            *((item, "reviewed") for item in reviewed_set),
+        ):
+            index = by_id.get(candidate_id_value)
+            if index is None:
+                raise CoreCandidateQueueError("processed id is missing")
+            current = items[index]
+            if current.status != "pending":
+                raise CoreCandidateQueueError("processed id is not pending")
+            items[index] = replace(current, status=status, last_seen_at=self._clock().isoformat())
+        scopes[scope_id] = items
 
     def _candidates_for_locked(self, scope_id: str) -> tuple[CoreCandidate, ...]:
         loaded = self._load_from_disk()
