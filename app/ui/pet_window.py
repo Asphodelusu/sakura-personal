@@ -88,6 +88,7 @@ from app.config.character_loader import (
     CharacterProfile,
     CharacterRegistry,
     load_character_system_prompt,
+    load_relationship_guide,
     resolve_reply_segment,
     save_character_theme,
 )
@@ -870,6 +871,9 @@ class PetWindow(QWidget):
         self.screen_awareness_context_dropped_count = 0
         # ---- proactive observer ----
         self._proactive_observer: ProactiveObserver | None = None
+        self._relationship_generation = 0
+        self.relationship_initiative_settings = None
+        self._relationship_guide_missing_logged = False
         self.proactive_comment_arrived.connect(self._show_proactive_comment)
         self.proactive_evaluate_arrived.connect(self._record_proactive_evaluate)
         self._init_proactive_observer()
@@ -1610,6 +1614,10 @@ class PetWindow(QWidget):
             shutdown_backchannel = getattr(backchannel_controller, "shutdown", None)
             if callable(shutdown_backchannel):
                 shutdown_backchannel(timeout=0.25)
+        self._relationship_generation = int(getattr(self, "_relationship_generation", 0) or 0) + 1
+        observer = getattr(self, "_proactive_observer", None)
+        if observer is not None:
+            observer.bump_relationship_generation()
         self._stop_proactive_observer()
         self.resource_manager.stop_all(SHUTDOWN_TOTAL_BUDGET_MS)
         self.user_idle_timer.stop()
@@ -3375,11 +3383,45 @@ class PetWindow(QWidget):
             return fast_client.settings
         return self.api_client.settings
 
+    def _load_relationship_initiative_settings_safe(self):
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        try:
+            rel = self.settings_service.load_relationship_initiative_settings()
+        except Exception as exc:
+            debug_log("PetWindow", "关系主动设置加载失败", {"error": str(exc)})
+            rel = getattr(
+                self,
+                "relationship_initiative_settings",
+                None,
+            ) or RelationshipInitiativeSettings().normalized()
+        self.relationship_initiative_settings = rel
+        return rel
+
     def _init_proactive_observer(self) -> None:
         """Initialize the desktop-kanojo style proactive screen observer."""
         proactive_cfg = self.settings_service.load_proactive_config()
         config = ProactiveConfig.from_dict(proactive_cfg)
-        if not config.enabled:
+        rel = self._load_relationship_initiative_settings_safe()
+        guide_text = load_relationship_guide(
+            getattr(self.character_profile, "relationship_guide_path", None)
+        )
+        set_initiative = getattr(self.agent_runtime, "set_relationship_initiative", None)
+        if callable(set_initiative):
+            set_initiative(rel, guide_text)
+        expected_guide = getattr(self.character_profile, "relationship_guide_path", None)
+        if (
+            expected_guide is not None
+            and not guide_text
+            and not getattr(self, "_relationship_guide_missing_logged", False)
+        ):
+            debug_log(
+                "RelationshipInitiative",
+                "guide 缺失",
+                {"character_id": getattr(self.character_profile, "id", "")},
+            )
+            self._relationship_guide_missing_logged = True
+        if not config.enabled and not rel.proactive_enabled:
             return
         try:
             api = self._resolve_proactive_vision_api()
@@ -3399,8 +3441,16 @@ class PetWindow(QWidget):
                 on_speak=self._on_proactive_speak,
                 on_evaluate=self._on_proactive_evaluate,
                 is_busy=self._is_proactive_observer_busy,
+                relationship=rel,
             )
             observer.set_recent_history_provider(self._format_recent_history)
+            observer.set_relationship_guide(guide_text)
+            observer.set_relationship_facts_provider(
+                lambda: self.memory_store.build_continuity_context()
+            )
+            observer._relationship_generation = int(
+                getattr(self, "_relationship_generation", 0) or 0
+            )
             self._proactive_observer = observer
             debug_log(
                 "PetWindow",
@@ -3536,7 +3586,9 @@ class PetWindow(QWidget):
             source = str(m.get("source") or "").strip()
             if role == "assistant":
                 name = "她自己的"
-                if source == "proactive":
+                if source == "relationship":
+                    name = "她自己的·关系主动"
+                elif source == "proactive":
                     name = "她自己的·主动"
             else:
                 # 用户对 Sakura 说的话（打字/语音转写进对话的都算）
@@ -3552,7 +3604,7 @@ class PetWindow(QWidget):
         lines.reverse()
         legend = (
             "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
-            "她自己的·主动=你主动开口。称呼用「他」。"
+            "她自己的·主动=你主动开口；她自己的·关系主动=你因关系主动开口。称呼用「他」。"
         )
         return "[最近の会話]\n" + legend + "\n" + "\n".join(lines)
 
@@ -3572,14 +3624,26 @@ class PetWindow(QWidget):
         """将 ProactiveObserver 的 should_speak 评论接入 TTS/字幕/历史/立绘。"""
         if not isinstance(payload, ProactiveSpeakPayload) or not payload.text.strip():
             return
-        if self._is_proactive_observer_busy():
+        source = getattr(payload, "source", "screen") or "screen"
+        generation = int(getattr(payload, "generation", 0) or 0)
+        if source == "relationship":
+            if generation != int(getattr(self, "_relationship_generation", 0) or 0):
+                debug_log("RelationshipInitiative", "B 取消", {"reason": "stale_generation"})
+                return
+            if self._is_proactive_observer_busy():
+                debug_log("RelationshipInitiative", "B 取消", {"reason": "busy_before_display"})
+                return
+        elif self._is_proactive_observer_busy():
             debug_log("PetWindow", "主动发言被跳过（UI 忙碌）", {"comment": payload.text[:40]})
             return
 
         # 长文按日文句末标点拆分为多段，避免一口气说一大段（与 prompt 约束互补）。
         segments = _split_proactive_comment(payload.text, payload.translation, payload.tone)
         result = AgentResult(reply=ChatReply(segments=segments))
-        self._consume_agent_result(result, message_source="proactive")
+        message_source = "relationship" if source == "relationship" else "proactive"
+        self._consume_agent_result(result, message_source=message_source)
+        if source == "relationship":
+            debug_log("RelationshipInitiative", "B 发言完成", {"chars": len(payload.text)})
 
     def _restart_proactive_observer(self) -> None:
         self._stop_proactive_observer()
@@ -3742,6 +3806,7 @@ class PetWindow(QWidget):
         self.last_user_activity_at = now
         if proactive:
             self.last_proactive_interaction_at = now
+            self._relationship_generation = int(getattr(self, "_relationship_generation", 0) or 0) + 1
             observer = getattr(self, "_proactive_observer", None)
             if observer is not None:
                 observer.notify_user_spoke()
@@ -8519,10 +8584,17 @@ class PetWindow(QWidget):
             self.history_window.set_history_store(self.history_store, profile.display_name)
 
         self._load_reply_history_from_store()
+        guide_text = load_relationship_guide(profile.relationship_guide_path)
+        rel = self._load_relationship_initiative_settings_safe()
+        set_initiative = getattr(self.agent_runtime, "set_relationship_initiative", None)
+        if callable(set_initiative):
+            set_initiative(rel, guide_text)
         if profile.id != previous_character_id:
+            self._relationship_generation = int(getattr(self, "_relationship_generation", 0) or 0) + 1
             self.messages = []
             self._collapse_auto_fit_bubble_height()
             self.subtitle_controller.cancel_reply_flow(profile.initial_message)
+            self._restart_proactive_observer()
             self._emit_plugin_event(
                 PLUGIN_EVENT_CHARACTER_LOADED,
                 {
@@ -8532,6 +8604,10 @@ class PetWindow(QWidget):
                 },
                 source="character",
             )
+        else:
+            observer = getattr(self, "_proactive_observer", None)
+            if observer is not None:
+                observer.set_relationship_guide(guide_text)
 
     def _create_history_store(self, profile: CharacterProfile) -> ChatHistoryStore:
         # 路径与旧历史迁移统一走 bootstrap 的公开 helper，避免两处实现漂移

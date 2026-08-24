@@ -85,6 +85,11 @@ _PROGRAM_MESSAGE_LABELS = {
     ("Event", "主动事件生成失败"): "主动事件生成失败",
     ("Portrait", "分段立绘切换"): "立绘切换",
     ("Portrait", "渲染器表情同步"): "渲染器表情同步",
+    ("RelationshipInitiative", "A 注入"): "关系主动 A 注入",
+    ("RelationshipInitiative", "B 门控"): "关系主动门控",
+    ("RelationshipInitiative", "B 决策"): "关系主动决策",
+    ("RelationshipInitiative", "B 取消"): "关系主动取消",
+    ("RelationshipInitiative", "B 发言完成"): "关系主动发言完成",
 }
 # 这些分类下的 info 级日志默认进入 GUI（错误/警告始终收录）。
 _PROGRAM_GUI_CATEGORIES = frozenset({
@@ -92,6 +97,7 @@ _PROGRAM_GUI_CATEGORIES = frozenset({
     "Plugin",
     "LocalLLM",
     "ProactiveObserver",
+    "RelationshipInitiative",
 })
 _CATEGORY_MESSAGE_ALLOWLIST: dict[str, frozenset[str]] = {
     # 旧 ScreenAwareness 批次日志；主动已改走 ProactiveObserver，下列条目多半只在残留/清理路径出现。
