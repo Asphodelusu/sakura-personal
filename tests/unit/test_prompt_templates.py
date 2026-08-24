@@ -126,7 +126,8 @@ def test_intimacy_entry_prompt_distinguishes_overall_entry_from_ongoing_consent(
     try:
         section = runtime._build_intimacy_section()
         assert section is not None
-        assert "不必机械地再问一次相同的总体许可" in section.body
+        assert "请求启用详细 guide 与连续节奏" in section.body
+        assert "总体许可" not in section.body
         assert "沉默不代表同意升级" in section.body
         assert "安全词「苹果」" in section.body
         assert "不要再口头确认意愿" not in section.body
@@ -140,6 +141,9 @@ def test_intimacy_tool_copy_uses_safe_word_not_ambiguous_exit_example() -> None:
 
     assert "苹果" in _SET_INTIMACY_MODE_DESCRIPTION
     assert "好了" not in _SET_INTIMACY_MODE_DESCRIPTION
+    assert "引导" in _SET_INTIMACY_MODE_DESCRIPTION
+    assert "节奏" in _SET_INTIMACY_MODE_DESCRIPTION
+    assert "关闭身体亲密" not in _SET_INTIMACY_MODE_DESCRIPTION
 
 
 def test_prompt_lengths_stay_compact() -> None:

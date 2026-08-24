@@ -29,13 +29,11 @@ def _intimacy_entry_hint_text() -> str:
     from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE
 
     return (
-        "# 节奏入口\n"
-        f"身体亲密节奏由对方硬开启：对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」时，"
-        "系统会自动开启并注入引导。\n"
-        "你不要猜测要不要开，不要调用 set_intimacy_mode(on=true)。\n"
-        "未开启时不要动手描写，不要用 tone「亲密」/「H」。\n"
-        "摸头、抱抱、撒娇、口头调情、关心安慰时保持日常即可。\n"
-        "开启后才能使用 tone「亲密」与「H」。结束或降温时调用 set_intimacy_mode(on=false)。"
+        "# 可选亲密导演层\n"
+        f"只有对方整句发送「{INTIMACY_ENTER_PHRASE}」时，系统才开启详细 guide、扩展节奏与自动续投；"
+        "不会自动开启，也不会因对话自然升温而开启。\n"
+        "未开启不限制拥抱、亲吻、前戏或性行为。仍依据当前关系、记忆、双方当下意愿与具体语境自然回应。\n"
+        "不要猜测或调用 set_intimacy_mode(on=true)。需要结束已开启的导演层时才调用 on=false。"
     )
 
 
@@ -83,28 +81,26 @@ class AgentRuntimePromptMixin:
 
 
     def _effective_reply_tones(self) -> list[str]:
-        """回复可用 tone：亲密节奏开启时追加扩展 tone；日常不开放。"""
+        """回复可用 tone：保留角色已配置词表；导演层 active 时补齐缺失的扩展 tone。"""
         tones = [str(t).strip() for t in self.reply_tones if str(t).strip()]
-        # 角色包若误把扩展 tone 写进日常词表，日常仍剔除，避免不开节奏也能用。
-        if not self._intimacy_focus_active():
-            return [tone for tone in tones if tone not in _INTIMACY_EXTRA_TONES]
-        for extra in _INTIMACY_EXTRA_TONES:
-            if extra not in tones:
-                tones.append(extra)
+        if self._intimacy_focus_active():
+            for extra in _INTIMACY_EXTRA_TONES:
+                if extra not in tones:
+                    tones.append(extra)
         return tones
 
 
     def _seal_reply_tones(self, reply: ChatReply) -> ChatReply:
-        """按当前可用词表清洗 tone（未 active 会剥掉亲密/H）。开启不由模型 tone 触发。"""
+        """按当前可用词表清洗 tone。开启不由模型 tone 触发。"""
         return sanitize_reply_tones(reply, self._effective_reply_tones())
 
 
     def _build_intimacy_section(self, snapshot: ContextSnapshot | None = None) -> PromptSection | None:
-        """亲密节奏相关提示段。
+        """可选亲密导演层提示段。
 
         - active：注入本地 guide + 退出提醒；若本轮约定词硬开则追加入口说明
-        - 轮次耗尽自动关闭：短重进提示（等对方再发约定词）
-        - 未开启但有 guide：短入口说明（告知硬入口，禁止猜开）
+        - 轮次耗尽自动关闭：短重进提示（引导/续投已关，不限制自然回应）
+        - 未开启但有 guide：短入口说明（告知硬入口，禁止猜开；不限制亲密行为）
         """
         guide = getattr(self, "_intimacy_guide", "")
         from app.agent.builtin_tools import (
@@ -121,27 +117,27 @@ class AgentRuntimePromptMixin:
                 keyword_note = (
                     f"\n\n# 约定入口（本轮已硬开启）\n"
                     f"对方本轮发送了约定词「{INTIMACY_ENTER_PHRASE}」。"
-                    "亲密节奏已由系统自动开启；对方明确想要进入身体亲密。"
-                    "约定词已表达进入这一整体节奏的意愿，不必机械地再问一次相同的总体许可。"
+                    "这表示对方请求启用详细 guide 与连续节奏，不表示刚刚取得亲密许可，"
+                    "也不创建或升级关系。系统不再机械询问一次相同的模式确认。"
                     "但沉默不代表同意升级；对方迟疑、退开、改变主意或不适时，立即放缓、暂停或确认。"
                     f"安全词「{INTIMACY_EXIT_PHRASE}」或明确拒绝会由系统立即退出。"
                     "不要调用 set_intimacy_mode(on=true)。\n"
                 )
             rhythm_hint = (
                 f"{keyword_note}\n\n# 节奏 — 已开启\n"
-                "你正在亲密节奏模式下，回复更快、可以主动续说。\n\n"
+                "你正在可选导演层：回复更快、可以主动续说，并注入详细 guide。\n\n"
                 "## 系统续投信号（重要）\n"
                 "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
                 "那是系统提示，绝不是对方说过的话；不要回答、复述或当成用户发言。\n"
                 "收到后续投信号时，根据当前状态自然回应；可以放缓、确认或收束，"
                 "不要把沉默当成同意升级，也不要仅换说法重复上一句；"
-                "若已不是身体亲密场景，调用 set_intimacy_mode(on=false)。\n\n"
+                "若已不再需要详细引导与连续节奏，调用 set_intimacy_mode(on=false)。\n\n"
                 "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
-                "出现以下任一信号时立刻退出，不要犹豫：\n"
+                "出现以下任一信号时立刻退出导演层，不要犹豫：\n"
                 "- 对方语气从亲昵转为日常闲聊（聊吃饭、工作、天气、新闻等）\n"
                 "- 对方说了结束/收尾/降温的话（「好了」「不闹了」「先这样」"
                 "「冷静一下」「睡吧」「休息吧」「差不多了」「聊点别的」等）\n"
-                "- 对方连续两轮未回应身体亲密，话题已明显漂移\n"
+                "- 对方连续两轮未回应亲密互动，话题已明显漂移\n"
                 "- 对方表示累了、困了、要出门、要忙，主动切断互动\n\n"
                 "宁可误退。误退后对方再次发送约定词即可重开。拖着不退才是问题。\n\n"
                 "## 其他\n"
@@ -158,10 +154,11 @@ class AgentRuntimePromptMixin:
             return PromptSection(
                 section_id="persona.intimacy_reentry",
                 body=(
-                    "# 节奏 — 已自动关闭\n"
-                    "亲密节奏模式因长时间无回话或你主动关闭而结束了。\n"
+                    "# 可选导演层 — 引导与自动续投已关闭\n"
+                    "详细 guide、扩展节奏与自动续投因长时间无回话或你主动关闭而结束了。\n"
                     f"重开只能等对方再次整句发送约定词「{INTIMACY_ENTER_PHRASE}」；"
-                    "不要调用 set_intimacy_mode(on=true)，不要自行动手。\n"
+                    "不要猜测或调用 set_intimacy_mode(on=true)。\n"
+                    "仍按当前关系和意愿自然回应。"
                     "若对方当前话题明显是日常/结束/其他内容，保持日常即可。"
                 ),
                 source="character",

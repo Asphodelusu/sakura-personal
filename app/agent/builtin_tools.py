@@ -23,7 +23,7 @@ from app.storage.paths import StoragePaths
 
 
 class IntimacyModeState:
-    """身体亲密进行中的对话节奏状态。只影响回复节奏（非思考模式 + 可选续投）。
+    """可选亲密导演层状态。只影响详细引导注入、回复节奏与自动续投，不构成许可或行为开关。
 
     生命周期：
     - 开启：用户整句发送约定词 → 系统硬开启（不经 LLM 工具）
@@ -114,7 +114,7 @@ INTIMACY_CONTINUE_SYSTEM_TEXT = (
     "【系统续投信号／不是对方发言】对方当前沉默。"
     "根据当前姿势、呼吸和对方最后的反应自然回应；不要把沉默当成同意升级。"
     "可以放缓、短暂确认或自然收束，不要仅换说法重复上一句。"
-    "若当前已不是身体亲密场景，调用 set_intimacy_mode(on=false)。"
+    "若已不再需要详细引导、连续节奏或自动续投，调用 set_intimacy_mode(on=false)。"
     "本条是系统信号，绝不要当成用户说过的话，不要回答或复述本信号。\n"
     f"{INTIMACY_CONTINUE_MARKER}"
 )
@@ -225,13 +225,13 @@ def latest_is_intimacy_continue(messages: list[Any] | None) -> bool:
 
 
 _SET_INTIMACY_MODE_DESCRIPTION = (
-    "关闭身体亲密相关的对话节奏（更快回复、沉默续投、亲密/H tone）。"
+    "关闭可选亲密导演层的详细引导、回复节奏与自动续投（更快回复、沉默续投、亲密/H tone）。"
     f"开启不由本工具控制：只有对方整句发送约定词「{INTIMACY_ENTER_PHRASE}」时，"
     "系统才会自动开启；不要猜测、不要调用 on=true 试图开启。"
-    "当身体亲密自然结束或对方降温/收尾时，调用 on=false："
+    "当详细引导、节奏或自动续投不再需要，或对方降温/收尾时，调用 on=false："
     f"安全词「{INTIMACY_EXIT_PHRASE}」或明确的停下、不要继续、不适等表达会立即退出。"
     f"关闭后不会自动恢复；对方需再次发送「{INTIMACY_ENTER_PHRASE}」。"
-    "本工具只影响回复节奏与引导注入。"
+    "本工具只影响引导注入、回复节奏与自动续投，不限制身体亲密行为本身。"
 )
 
 
@@ -288,8 +288,8 @@ def create_builtin_tool_registry(
                         "on": {
                             "type": "boolean",
                             "description": (
-                                "true=准备或正在身体亲密，需要更快节奏；"
-                                "false=回到日常或对方已停下。"
+                                "true=无效，开启只能靠约定词；"
+                                "false=关闭详细引导、节奏与自动续投，不表示结束身体亲密。"
                             ),
                         },
                     },
