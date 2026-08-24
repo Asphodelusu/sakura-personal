@@ -65,6 +65,9 @@ class AgentRuntimePromptMixin:
                 sensitivity="private",
             )
         ]
+        relationship_section = self._build_relationship_guide_section()
+        if relationship_section is not None:
+            sections.append(relationship_section)
         # 亲密专注当下：跳过插件往人格前缀塞的长补充，避免再把注意力拉回日常设定
         if not intimacy_focus:
             sections.extend(
@@ -77,6 +80,51 @@ class AgentRuntimePromptMixin:
                 if patch.system_prompt_append.strip()
             )
         return sections
+
+
+    def _build_relationship_guide_section(self) -> PromptSection | None:
+        from app.config.relationship_initiative import (
+            RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+            expression_bias_guidance,
+        )
+        from app.core.debug_log import debug_log
+        from app.llm.prompts.runtime import estimate_prompt_tokens, truncate_to_token_budget
+
+        settings = getattr(self, "_relationship_settings", None)
+        guide = str(getattr(self, "_relationship_guide", "") or "").strip()
+        enabled = bool(getattr(settings, "in_turn_enabled", False))
+        if not enabled or not guide:
+            debug_log(
+                "RelationshipInitiative",
+                "A 注入",
+                {"injected": False, "enabled": enabled, "chars": 0, "tokens": 0},
+            )
+            return None
+        bias = expression_bias_guidance(getattr(settings, "expression_bias", "natural"))
+        body, truncated = truncate_to_token_budget(
+            f"{guide}\n\n{bias}",
+            RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+        )
+        tokens = estimate_prompt_tokens(body)
+        debug_log(
+            "RelationshipInitiative",
+            "A 注入",
+            {
+                "injected": True,
+                "chars": len(body),
+                "tokens": tokens,
+                "truncated": truncated,
+                "bias": getattr(settings, "expression_bias", "natural"),
+            },
+        )
+        return PromptSection(
+            section_id="persona.relationship_guide",
+            body=body,
+            source="character",
+            sensitivity="private",
+            cache_scope="static",
+            token_budget=RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+        )
 
 
     def _intimacy_focus_active(self) -> bool:
