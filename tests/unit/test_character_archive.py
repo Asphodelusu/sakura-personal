@@ -487,3 +487,37 @@ def _build_character_package(root: Path):
         encoding="utf-8",
     )
     return CharacterRegistry(root).get("demo")
+
+
+def test_character_archive_preserves_optional_relationship_guide() -> None:
+    root = _runtime_root("relationship_guide")
+    source_root = root / "source"
+    profile = _build_character_package(source_root)
+    guide = profile.package_dir / "relationship_guide.md"
+    guide.write_text("主动靠近，不复读台词库。", encoding="utf-8")
+    manifest_path = profile.package_dir / "character.json"
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["relationship_guide"] = "relationship_guide.md"
+    manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    profile = CharacterRegistry(source_root).get("demo")
+    archive_path = root / "demo.char"
+    export_character_archive(profile, archive_path)
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        names = set(zf.namelist())
+    assert manifest["character"]["relationship_guide"] == "character/relationship_guide.md"
+    assert "character/relationship_guide.md" in names
+    imported = import_character_archive(archive_path, source_root)
+    loaded = CharacterRegistry(source_root).get(imported.character_id)
+    assert loaded.relationship_guide_path is not None
+    assert loaded.relationship_guide_path.read_text(encoding="utf-8") == "主动靠近，不复读台词库。"
+
+
+def test_character_archive_without_relationship_guide_still_roundtrips() -> None:
+    root = _runtime_root("no_relationship_guide")
+    profile = _build_character_package(root / "source")
+    archive_path = root / "demo.char"
+    export_character_archive(profile, archive_path)
+    result = import_character_archive(archive_path, root / "source")
+    loaded = CharacterRegistry(root / "source").get(result.character_id)
+    assert loaded.relationship_guide_path is None
