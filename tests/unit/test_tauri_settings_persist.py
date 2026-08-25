@@ -10,6 +10,7 @@ from app.ui.tauri_settings import (
     TAURI_SETTINGS_PROTOCOL_VERSION,
     TauriSettingsProcess,
     parse_tauri_settings_payload,
+    _api_probe_settings,
 )
 
 
@@ -189,3 +190,18 @@ def test_tauri_settings_process_persist_handler_failure_surfaces_on_apply() -> N
     line = process._process.write.call_args[0][0].decode("utf-8")
     payload = json.loads(line.split("@@SAKURA_SETTINGS_RPC_RESULT@@", 1)[1].strip())
     assert payload["ok"] is False
+
+
+def test_api_probe_settings_allows_slow_provider_timeout() -> None:
+    """Gemini 思考模型探测常超过 25s；必须低于设置页 host RPC 上限，但不能被卡死在 25s。"""
+    settings = _api_probe_settings(
+        "api.test_connection",
+        {
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "api_key": "key",
+            "model": "gemini-3.7-flash",
+            "timeout_seconds": 120,
+        },
+    )
+    assert settings.timeout_seconds == 60
+    assert settings.model == "gemini-3.7-flash"

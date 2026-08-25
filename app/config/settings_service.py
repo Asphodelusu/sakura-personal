@@ -651,6 +651,29 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_relationship_initiative_settings(self):
+        from app.config.relationship_initiative import settings_from_mapping
+
+        return settings_from_mapping(self._system_section("relationship_initiative"))
+
+    def save_relationship_initiative_settings(self, settings) -> None:
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, RelationshipInitiativeSettings)
+            else RelationshipInitiativeSettings().normalized()
+        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["relationship_initiative"] = {
+            "in_turn_enabled": bool(normalized.in_turn_enabled),
+            "proactive_enabled": bool(normalized.proactive_enabled),
+            "expression_bias": normalized.expression_bias,
+            "proactive_cooldown_seconds": int(normalized.proactive_cooldown_seconds),
+            "proactive_min_silence_seconds": int(normalized.proactive_min_silence_seconds),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_backchannel_settings(self) -> BackchannelSettings:
         section = self._system_section("backchannel")
         return BackchannelSettings(

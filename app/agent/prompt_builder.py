@@ -32,7 +32,12 @@ def _intimacy_entry_hint_text() -> str:
         "# 可选亲密导演层\n"
         f"只有对方整句发送「{INTIMACY_ENTER_PHRASE}」时，系统才开启详细 guide、扩展节奏与自动续投；"
         "不会自动开启，也不会因对话自然升温而开启。\n"
-        "未开启不限制拥抱、亲吻、前戏或性行为。仍依据当前关系、记忆、双方当下意愿与具体语境自然回应。\n"
+        "这只是详细导演层，不是身体接触许可开关。"
+        "未开启不限制拥抱、亲吻、前戏或性行为。"
+        "稳定恋人关系中，这些互动可以依据既有关系、记忆和双方当下反应自然升温；"
+        "出现真实迟疑、退开或拒绝时才停下确认。\n"
+        f"未发送「{INTIMACY_ENTER_PHRASE}」不表示关系不足、需要重新认识或默认拒绝；"
+        "你仍按自己的判断回应，也可以拒绝。\n"
         "不要猜测或调用 set_intimacy_mode(on=true)。需要结束已开启的导演层时才调用 on=false。"
     )
 
@@ -60,6 +65,9 @@ class AgentRuntimePromptMixin:
                 sensitivity="private",
             )
         ]
+        relationship_section = self._build_relationship_guide_section()
+        if relationship_section is not None:
+            sections.append(relationship_section)
         # 亲密专注当下：跳过插件往人格前缀塞的长补充，避免再把注意力拉回日常设定
         if not intimacy_focus:
             sections.extend(
@@ -72,6 +80,51 @@ class AgentRuntimePromptMixin:
                 if patch.system_prompt_append.strip()
             )
         return sections
+
+
+    def _build_relationship_guide_section(self) -> PromptSection | None:
+        from app.config.relationship_initiative import (
+            RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+            expression_bias_guidance,
+        )
+        from app.core.debug_log import debug_log
+        from app.llm.prompts.runtime import estimate_prompt_tokens, truncate_to_token_budget
+
+        settings = getattr(self, "_relationship_settings", None)
+        guide = str(getattr(self, "_relationship_guide", "") or "").strip()
+        enabled = bool(getattr(settings, "in_turn_enabled", False))
+        if not enabled or not guide:
+            debug_log(
+                "RelationshipInitiative",
+                "A 注入",
+                {"injected": False, "enabled": enabled, "chars": 0, "tokens": 0},
+            )
+            return None
+        bias = expression_bias_guidance(getattr(settings, "expression_bias", "natural"))
+        body, truncated = truncate_to_token_budget(
+            f"{guide}\n\n{bias}",
+            RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+        )
+        tokens = estimate_prompt_tokens(body)
+        debug_log(
+            "RelationshipInitiative",
+            "A 注入",
+            {
+                "injected": True,
+                "chars": len(body),
+                "tokens": tokens,
+                "truncated": truncated,
+                "bias": getattr(settings, "expression_bias", "natural"),
+            },
+        )
+        return PromptSection(
+            section_id="persona.relationship_guide",
+            body=body,
+            source="character",
+            sensitivity="private",
+            cache_scope="static",
+            token_budget=RELATIONSHIP_GUIDE_TOKEN_BUDGET,
+        )
 
 
     def _intimacy_focus_active(self) -> bool:
@@ -129,8 +182,8 @@ class AgentRuntimePromptMixin:
                 "## 系统续投信号（重要）\n"
                 "对方沉默时，系统可能注入一条 role=system 的续投信号（含「（続けて）」）。\n"
                 "那是系统提示，绝不是对方说过的话；不要回答、复述或当成用户发言。\n"
-                "收到后续投信号时，根据当前状态自然回应；可以放缓、确认或收束，"
-                "不要把沉默当成同意升级，也不要仅换说法重复上一句；"
+                "收到后续投信号时，从你自己上一句接着说，像你主动又补了一句；"
+                "不要重新回答对方上一句，不要把沉默当成同意升级，也不要仅换说法重复上一句；"
                 "若已不再需要详细引导与连续节奏，调用 set_intimacy_mode(on=false)。\n\n"
                 "## 何时退出（必须主动调用 set_intimacy_mode(on=false)）\n"
                 "出现以下任一信号时立刻退出导演层，不要犹豫：\n"

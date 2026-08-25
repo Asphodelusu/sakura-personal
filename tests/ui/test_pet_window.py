@@ -126,6 +126,12 @@ def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
     class MinimalWindow:
         _apply_character = PetWindow._apply_character
 
+        def _load_relationship_initiative_settings_safe(self):  # type: ignore[no-untyped-def]
+            return object()
+
+        def _restart_proactive_observer(self) -> None:
+            events.append(("restart_observer", None))
+
         def setWindowTitle(self, title: str) -> None:
             events.append(("title", title))
 
@@ -4624,6 +4630,130 @@ class _DummyInputBarAnimator:
 
     def play_send_feedback(self) -> None:
         self.feedback_count += 1
+
+
+def _build_minimal_manual_screenshot_encode_window():
+    from app.ui.pet_window import PetWindow
+
+    class MinimalManualEncodeWindow:
+        _handle_screen_observation_encoded = PetWindow._handle_screen_observation_encoded
+        _handle_screen_observation_summarized = PetWindow._handle_screen_observation_summarized
+        _finish_manual_screen_observation = PetWindow._finish_manual_screen_observation
+        _manual_screenshot_is_attached = PetWindow._manual_screenshot_is_attached
+        _clear_manual_screen_observation = PetWindow._clear_manual_screen_observation
+
+        def _update_manual_screenshot_button(self) -> None:
+            self.attached_visual = self._manual_screenshot_is_attached()
+
+    window = MinimalManualEncodeWindow()
+    window._shutdown_in_progress = False
+    window.pending_manual_screen_observation = None
+    window.pending_manual_screen_summary = ""
+    window.pending_manual_screenshot_capturing = False
+    window.attached_visual = False
+    window.summarize_started = False
+    window._start_screen_observation_summarize = lambda _context, _observation: (
+        setattr(window, "summarize_started", True) or True
+    )
+    return window
+
+
+def test_manual_screenshot_button_marks_attached_while_encoding() -> None:
+    window = _build_minimal_manual_screenshot_encode_window()
+    window.pending_manual_screenshot_capturing = True
+
+    assert window._manual_screenshot_is_attached() is True
+    window._update_manual_screenshot_button()
+    assert window.attached_visual is True
+
+
+def test_manual_screenshot_attaches_after_encode_without_waiting_for_vlm() -> None:
+    window = _build_minimal_manual_screenshot_encode_window()
+    window.pending_manual_screenshot_capturing = True
+    observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,manual",
+        width=320,
+        height=180,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="manual-selection",
+    )
+
+    window._handle_screen_observation_encoded({"kind": "manual"}, observation)
+
+    assert window.pending_manual_screen_observation is observation
+    assert window.pending_manual_screen_summary == ""
+    assert window.pending_manual_screenshot_capturing is False
+    assert window.summarize_started is True
+    assert window.attached_visual is True
+
+
+def test_manual_screenshot_summary_updates_without_resetting_attachment() -> None:
+    window = _build_minimal_manual_screenshot_encode_window()
+    observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,manual",
+        width=320,
+        height=180,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="manual-selection",
+    )
+    window.pending_manual_screen_observation = observation
+
+    window._handle_screen_observation_summarized(
+        {"kind": "manual", "_observation": observation},
+        "图上是聊天气泡。",
+    )
+
+    assert window.pending_manual_screen_observation is observation
+    assert window.pending_manual_screen_summary == "图上是聊天气泡。"
+    assert window.attached_visual is True
+
+
+def test_manual_screenshot_late_summary_does_not_reattach_after_send() -> None:
+    window = _build_minimal_manual_screenshot_encode_window()
+    observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,manual",
+        width=320,
+        height=180,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="manual-selection",
+    )
+
+    window._handle_screen_observation_summarized(
+        {"kind": "manual", "_observation": observation},
+        "迟到的摘要",
+    )
+
+    assert window.pending_manual_screen_observation is None
+    assert window.pending_manual_screen_summary == ""
+    assert window.attached_visual is False
+
+
+def test_manual_screenshot_late_summary_does_not_overwrite_new_attachment() -> None:
+    window = _build_minimal_manual_screenshot_encode_window()
+    old_observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,old",
+        width=320,
+        height=180,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="manual-selection",
+    )
+    new_observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,new",
+        width=640,
+        height=360,
+        captured_at="2026-05-31T12:00:01+08:00",
+        screen_name="manual-selection",
+    )
+    window.pending_manual_screen_observation = new_observation
+
+    window._handle_screen_observation_summarized(
+        {"kind": "manual", "_observation": old_observation},
+        "旧截图迟到的摘要",
+    )
+
+    assert window.pending_manual_screen_observation is new_observation
+    assert window.pending_manual_screen_summary == ""
+    assert window.attached_visual is False
 
 
 def test_manual_screenshot_empty_input_sends_default_text() -> None:

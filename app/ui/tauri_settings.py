@@ -199,6 +199,8 @@ TAURI_SETTINGS_RESULT_MARKER = "@@SAKURA_SETTINGS_RESULT@@"
 TAURI_SETTINGS_RPC_MARKER = "@@SAKURA_SETTINGS_RPC@@"
 TAURI_SETTINGS_RPC_RESULT_MARKER = "@@SAKURA_SETTINGS_RPC_RESULT@@"
 TAURI_SETTINGS_CONTROL_MARKER = "@@SAKURA_SETTINGS_CONTROL@@"
+# 必须低于设置页 host RPC（api.test_connection / api.list_models 为 90s）。
+API_PROBE_MAX_TIMEOUT_SECONDS = 60
 
 PLUGIN_PERMISSION_LABELS: dict[str, dict[str, str]] = {
     PERMISSION_TOOL: {"group": "工具", "label": "Agent 工具"},
@@ -242,8 +244,8 @@ def _api_probe_settings(method: str, params: dict[str, Any]) -> ApiSettings:
             timeout_seconds = int(raw_timeout)
         except (TypeError, ValueError):
             timeout_seconds = 60
-    # 控制单次探测时长，留在 Rust 30s RPC 超时之内。
-    timeout_seconds = max(5, min(timeout_seconds, 25))
+    # 控制单次探测时长，留在设置页 host RPC（90s）之内。
+    timeout_seconds = max(5, min(timeout_seconds, API_PROBE_MAX_TIMEOUT_SECONDS))
     return ApiSettings(
         base_url=base_url,
         api_key=api_key,
@@ -465,6 +467,7 @@ def resolve_tauri_settings_binary(
     root = Path(base_dir)
     binary_name = "sakura-settings.exe" if sys.platform == "win32" else "sakura-settings"
     candidates = (
+        root / "tools" / "settings-tauri" / "bin" / binary_name,
         root / "tools" / "settings-tauri" / "src-tauri" / "target" / "release" / binary_name,
         root / "tools" / "settings-tauri" / "src-tauri" / "target" / "debug" / binary_name,
     )

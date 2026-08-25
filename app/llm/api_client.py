@@ -18,6 +18,9 @@ from app.llm.prompt_templates import build_segmented_reply_instruction
 MAX_API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1.0
 API_RETRY_JITTER = 0.25
+# 探测预算过小会被 Gemini 等思考模型全部用于 reasoning，OpenAI 兼容层会返回空 content。
+CONNECTION_PROBE_MAX_TOKENS = 64
+CONNECTION_PROBE_MAX_ATTEMPTS = 1
 STRUCTURED_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 ChatMessage = dict[str, Any]
 SUPPORTED_CHAT_COMPLETION_PARAMS = {
@@ -278,18 +281,14 @@ class OpenAICompatibleClient:
                     "content": "Reply with only OK.",
                 },
             ],
-            "max_tokens": 8,
+            "max_tokens": CONNECTION_PROBE_MAX_TOKENS,
         }
-        data = self._post_chat_completions_with_compatibility_fallbacks(payload)
-
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ApiRequestError(
-                f"API 返回格式无法解析：{_truncate_diagnostic(json.dumps(data, ensure_ascii=False))}"
-            ) from exc
-
-        return str(content).strip() or "OK"
+        data = self._post_chat_completions_with_compatibility_fallbacks(
+            payload,
+            request_timeout=float(self.settings.timeout_seconds),
+            max_attempts=CONNECTION_PROBE_MAX_ATTEMPTS,
+        )
+        return _parse_connection_probe_reply(data)
 
     def list_models(self) -> list[str]:
         """读取 OpenAI 兼容 /models 接口，返回可选择的模型 id 列表。"""
@@ -426,6 +425,7 @@ class OpenAICompatibleClient:
             ),
             temperature=temperature,
             chat_params=chat_params,
+            base_url=self.settings.base_url,
         )
         effective_timeout = (
             float(request_timeout)
@@ -469,6 +469,7 @@ class OpenAICompatibleClient:
                     messages=_messages_with_runtime_context(messages, runtime_context, "user"),
                     temperature=temperature,
                     chat_params=chat_params,
+                    base_url=self.settings.base_url,
                 )
                 debug_log(
                     "API",
@@ -520,6 +521,7 @@ class OpenAICompatibleClient:
             ),
             temperature=temperature,
             chat_params={**chat_params, "stream": True},
+            base_url=self.settings.base_url,
         )
         debug_log(
             "API",
@@ -627,6 +629,7 @@ class OpenAICompatibleClient:
             messages=request_messages,
             temperature=temperature,
             chat_params=chat_params,
+            base_url=self.settings.base_url,
         )
         debug_log(
             "API",
@@ -664,6 +667,7 @@ class OpenAICompatibleClient:
                     messages=_messages_with_runtime_context(messages, runtime_context, "user"),
                     temperature=temperature,
                     chat_params=chat_params,
+                    base_url=self.settings.base_url,
                 )
                 debug_log(
                     "API",
@@ -755,6 +759,15 @@ class OpenAICompatibleClient:
                     debug_log(
                         "API",
                         "模型不支持自定义 temperature，已回退默认温度",
+                        {"error": str(exc)},
+                    )
+                    continue
+                if "thinking" in fallback_payload and _is_thinking_unsupported_error(exc):
+                    self._unsupported_chat_params.add("thinking")
+                    fallback_payload.pop("thinking", None)
+                    debug_log(
+                        "API",
+                        "端点不支持 thinking 参数，已省略后重试",
                         {"error": str(exc)},
                     )
                     continue
@@ -954,6 +967,28 @@ class OpenAICompatibleClient:
         raise ApiRequestError("API 请求失败。")
 
 
+def _parse_connection_probe_reply(data: dict[str, Any]) -> str:
+    """连通性探测：服务端接受 Key/模型并返回合法 choices 即视为成功。
+
+    Gemini 等思考模型可能把短输出预算全部用于 reasoning，OpenAI 兼容层会返回
+    只有 role、没有 content 的 assistant 消息。这对探测来说仍证明链路可用。
+    """
+    try:
+        choice = data["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ApiRequestError(
+            f"API 返回格式无法解析：{_truncate_diagnostic(json.dumps(data, ensure_ascii=False))}"
+        ) from exc
+    if not isinstance(message, dict):
+        raise ApiRequestError(
+            f"API 返回格式无法解析：{_truncate_diagnostic(json.dumps(data, ensure_ascii=False))}"
+        )
+    content = message.get("content")
+    text = str(content).strip() if content else ""
+    return text or "OK"
+
+
 def _extract_choice_diagnostics(data: dict[str, Any]) -> dict[str, Any]:
     """从 chat/completions 响应提取 finish_reason 与 token usage，供空回复排查。"""
     diagnostics: dict[str, Any] = {}
@@ -1072,6 +1107,16 @@ def _model_omits_custom_temperature(model: str) -> bool:
     return token == "kimi-k2.6" or token.startswith("kimi-k2.6-")
 
 
+def _endpoint_omits_thinking_param(base_url: str) -> bool:
+    """Google OpenAI 兼容层不认 DeepSeek 风格的 thinking 字段。"""
+    try:
+        return urlparse((base_url or "").strip()).netloc.lower() == (
+            "generativelanguage.googleapis.com"
+        )
+    except Exception:
+        return False
+
+
 def _build_chat_completion_payload(
     *,
     model: str,
@@ -1079,6 +1124,7 @@ def _build_chat_completion_payload(
     messages: list[ChatMessage],
     temperature: float,
     chat_params: dict[str, Any] | None = None,
+    base_url: str = "",
 ) -> dict[str, Any]:
     """构建 OpenAI 兼容请求体，并丢弃已知非标准参数。"""
     payload = {
@@ -1097,6 +1143,8 @@ def _build_chat_completion_payload(
     payload.update(_filter_supported_chat_params(chat_params or {}))
     if omit_temperature:
         payload.pop("temperature", None)
+    if _endpoint_omits_thinking_param(base_url):
+        payload.pop("thinking", None)
     _ensure_json_keyword_for_json_object_response(payload)
     return payload
 
@@ -1218,6 +1266,25 @@ def _is_temperature_unsupported_error(exc: ApiRequestError) -> bool:
         "not configurable",
         "cannot be configured",
         "invalid",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _is_thinking_unsupported_error(exc: ApiRequestError) -> bool:
+    """Google 等兼容层会拒绝 DeepSeek 风格 thinking 字段。"""
+    text = str(exc).lower()
+    if "thinking" not in text:
+        return False
+    markers = (
+        "unknown name",
+        "unknown field",
+        "cannot find field",
+        "unrecognized",
+        "not support",
+        "unsupported",
+        "unexpected",
+        "does not exist",
+        "invalid json payload",
     )
     return any(marker in text for marker in markers)
 

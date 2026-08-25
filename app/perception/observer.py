@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 import httpx
@@ -251,6 +252,8 @@ class ProactiveSpeakPayload:
     text: str
     translation: str = ""
     tone: str = "中性"
+    source: str = "screen"
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -580,6 +583,7 @@ class ProactiveObserver:
         on_speak: OnSpeakFn | None = None,
         on_evaluate: OnEvaluateFn | None = None,
         is_busy: IsBusyFn | None = None,
+        relationship=None,
     ) -> None:
         self._api_base_url = api_base_url.rstrip("/")
         self._api_key = api_key
@@ -650,6 +654,16 @@ class ProactiveObserver:
         self._was_busy = False
         self._last_busy_reason = ""
 
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        self.relationship = relationship or RelationshipInitiativeSettings(proactive_enabled=False)
+        self._relationship_guide = ""
+        self._get_relationship_facts: Callable[[], str] = lambda: ""
+        self._last_relationship_spoken_at = 0.0
+        self._last_relationship_silent_at = 0.0
+        self._relationship_generation = 0
+        self._relationship_motive = False
+
     @property
     def enabled(self) -> bool:
         return self.config.enabled
@@ -664,9 +678,64 @@ class ProactiveObserver:
         """Set a callback that returns recent conversation history as a string."""
         self._get_recent_history = provider
 
+    def set_relationship_settings(self, settings) -> None:
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        self.relationship = (
+            settings.normalized()
+            if isinstance(settings, RelationshipInitiativeSettings)
+            else RelationshipInitiativeSettings(proactive_enabled=False)
+        )
+
+    def set_relationship_guide(self, guide: str) -> None:
+        self._relationship_guide = str(guide or "").strip()
+
+    def set_relationship_facts_provider(self, provider: Callable[[], str]) -> None:
+        self._get_relationship_facts = provider
+
+    def bump_relationship_generation(self) -> None:
+        self._relationship_generation += 1
+
+    def reset_relationship_state(self) -> None:
+        self._last_relationship_spoken_at = 0.0
+        self._last_relationship_silent_at = 0.0
+        self._relationship_generation += 1
+        self._relationship_motive = False
+
+    def _relationship_enabled(self) -> bool:
+        return bool(getattr(self.relationship, "proactive_enabled", False))
+
+    def _relationship_gate_reason(self, now: float, busy_reason: str) -> str:
+        from app.config.relationship_initiative import RELATIONSHIP_SILENT_COOLDOWN_SECONDS
+
+        if not self._relationship_enabled():
+            return "disabled"
+        if self._away_mode:
+            return "busy"
+        if busy_reason == "rhythm_focus":
+            return "continuation"
+        if busy_reason:
+            return "busy"
+        silence = float(getattr(self.relationship, "proactive_min_silence_seconds", 300) or 300)
+        if now - self._last_user_at < silence:
+            return "silence"
+        cooldown = float(getattr(self.relationship, "proactive_cooldown_seconds", 3600) or 3600)
+        if self._last_relationship_spoken_at and now - self._last_relationship_spoken_at < cooldown:
+            return "cooldown"
+        if (
+            self._last_relationship_silent_at
+            and now - self._last_relationship_silent_at < RELATIONSHIP_SILENT_COOLDOWN_SECONDS
+        ):
+            return "cooldown"
+        return "eligible"
+
+    def _relationship_ready(self, now: float) -> bool:
+        return self._relationship_gate_reason(now, "") == "eligible"
+
     def notify_user_spoke(self) -> None:
         self._last_user_at = time.monotonic()
         self._idle_armed = True
+        self._relationship_generation += 1
         if self._away_mode:
             self.set_away_mode(False)
             logger.info("ProactiveObserver: away_mode cleared by user message")
@@ -793,44 +862,14 @@ class ProactiveObserver:
                 except asyncio.CancelledError:
                     break
 
-                if not self.config.enabled:
+                if not self.config.enabled and not self._relationship_enabled():
                     continue
 
                 try:
                     now = time.monotonic()
                     # busy / 冷却期间也持续跟踪焦点，避免丢切换、错计时。
                     self._sync_focus_tracking(now)
-
-                    busy = self._is_busy()
-                    if busy:
-                        reason = busy if isinstance(busy, str) else "busy"
-                        self._was_busy = True
-                        self._last_busy_reason = reason
-                        now_busy = time.monotonic()
-                        if now_busy - self._last_busy_log_at >= 60.0:
-                            self._last_busy_log_at = now_busy
-                            logger.info(
-                                "ProactiveObserver: UI busy, holding triggers ({})",
-                                reason,
-                            )
-                            _observer_gui_log(
-                                "UI 忙碌，暂缓评估（不消耗触发）",
-                                {"reason": reason},
-                            )
-                        continue
-                    if self._was_busy:
-                        self._was_busy = False
-                        logger.info(
-                            "ProactiveObserver: UI idle, resuming (was: {})",
-                            self._last_busy_reason,
-                        )
-                    triggers = await self._collect_triggers()
-                    if not triggers:
-                        continue
-                    self._consume_focus_triggers(triggers)
-                    logger.info("ProactiveObserver: evaluating, triggers={}", triggers)
-                    _observer_gui_log("正在评估是否发言", {"triggers": triggers})
-                    await self._do_evaluation(triggers)
+                    await self._dispatch_proactive_tick(now)
                 except Exception as e:
                     logger.warning("ProactiveObserver loop error: {}", e)
                     _observer_gui_log("主动观察循环异常", {"error": str(e)})
@@ -1005,6 +1044,177 @@ class ProactiveObserver:
     def _consume_focus_triggers(self, triggers: list[str]) -> None:
         if any(t.startswith("window:") for t in triggers):
             self._ready_focus_trigger = ""
+
+    async def _dispatch_proactive_tick(self, now: float) -> None:
+        busy = self._is_busy()
+        busy_reason = busy if isinstance(busy, str) else ("busy" if busy else "")
+        if busy_reason:
+            self._was_busy = True
+            self._last_busy_reason = busy_reason
+            now_busy = time.monotonic()
+            if now_busy - self._last_busy_log_at >= 60.0:
+                self._last_busy_log_at = now_busy
+                logger.info(
+                    "ProactiveObserver: UI busy, holding triggers ({})",
+                    busy_reason,
+                )
+                _observer_gui_log(
+                    "UI 忙碌，暂缓评估（不消耗触发）",
+                    {"reason": busy_reason},
+                )
+            rel_reason = self._relationship_gate_reason(now, busy_reason)
+            debug_log("RelationshipInitiative", "B 门控", {"reason": rel_reason})
+            return
+        if self._was_busy:
+            self._was_busy = False
+            logger.info(
+                "ProactiveObserver: UI idle, resuming (was: {})",
+                self._last_busy_reason,
+            )
+
+        screen_triggers: list[str] = []
+        if self.config.enabled:
+            screen_triggers = await self._collect_triggers()
+        rel_reason = self._relationship_gate_reason(now, "")
+        debug_log("RelationshipInitiative", "B 门控", {"reason": rel_reason})
+        if screen_triggers:
+            self._consume_focus_triggers(screen_triggers)
+            relationship_eligible = rel_reason == "eligible"
+            proactive_before = self._last_proactive_at
+            if relationship_eligible:
+                self._relationship_motive = True
+            logger.info("ProactiveObserver: evaluating, triggers={}", screen_triggers)
+            _observer_gui_log("正在评估是否发言", {"triggers": screen_triggers})
+            try:
+                await self._do_evaluation(screen_triggers)
+            finally:
+                self._relationship_motive = False
+                if relationship_eligible:
+                    if self._last_proactive_at > proactive_before:
+                        self._last_relationship_spoken_at = self._last_proactive_at
+                        self._last_relationship_silent_at = 0.0
+                    else:
+                        self._mark_relationship_silent()
+            return
+        if rel_reason != "eligible":
+            return
+        await self._do_relationship_evaluation()
+
+    async def _decide_relationship_speech(self) -> dict | None:
+        from app.config.relationship_initiative import (
+            expression_bias_guidance,
+            relationship_decision_instruction,
+        )
+
+        bias = str(getattr(self.relationship, "expression_bias", "") or "natural")
+        instruction = relationship_decision_instruction(bias)
+        system_prompt = (
+            (self._system_prompt.strip() + "\n\n" + instruction)
+            if self._system_prompt.strip()
+            else instruction
+        )
+
+        now_local = datetime.now().astimezone().isoformat(timespec="seconds")
+        since_user = max(0, int(time.monotonic() - self._last_user_at))
+        parts = [
+            f"[当前时间]\n{now_local}",
+            f"[距上次互动]\n{since_user}s",
+        ]
+        guide = (self._relationship_guide or "").strip()
+        if guide:
+            parts.append(f"[关系指南]\n{guide}")
+        parts.append(expression_bias_guidance(bias))
+        try:
+            chat_ctx = self._get_recent_history()
+            if chat_ctx:
+                parts.append(chat_ctx)
+        except Exception:
+            pass
+        try:
+            facts = self._get_relationship_facts()
+            if facts:
+                parts.append(facts)
+        except Exception:
+            pass
+        last_spoken = (self._last_spoken_text or "").strip()
+        if last_spoken:
+            if len(last_spoken) > 160:
+                last_spoken = last_spoken[:160] + "…"
+            parts.append(
+                "[自分の直前の発話]\n"
+                f"{last_spoken}\n"
+                "※これはあなた（夜乃桜）が先ほど口にした内容。相手の発言ではない。"
+            )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        return await self._post_speech_decision(messages)
+
+    def _mark_relationship_silent(self) -> None:
+        self._last_relationship_silent_at = time.monotonic()
+
+    async def _do_relationship_evaluation(self) -> None:
+        generation = self._relationship_generation
+        t0 = time.monotonic()
+        decision = None
+        try:
+            decision = await self._decide_relationship_speech()
+        except Exception as e:
+            logger.warning(
+                "ProactiveObserver: relationship decision failed: {} ({})",
+                e,
+                type(e).__name__,
+            )
+            decision = None
+
+        if generation != self._relationship_generation:
+            debug_log("RelationshipInitiative", "B 取消", {"reason": "stale_generation"})
+            return
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        bias = str(getattr(self.relationship, "expression_bias", "") or "natural")
+        comment = str((decision or {}).get("comment", "")).strip() if decision else ""
+        should_speak = bool(decision and decision.get("should_speak") and comment)
+        if decision is None:
+            result = "error"
+        elif should_speak:
+            result = "speak"
+        else:
+            result = "silent"
+        debug_log(
+            "RelationshipInitiative",
+            "B 决策",
+            {"result": result, "bias": bias, "elapsed_ms": elapsed_ms},
+        )
+
+        if not should_speak:
+            if decision is None:
+                reason = "LLM 发言决策失败或未配置"
+            elif not decision.get("should_speak"):
+                reason = str(decision.get("reason", "")).strip() or "LLM 选择不发言"
+            else:
+                reason = "should_speak=true 但 comment 为空"
+            self._mark_relationship_silent()
+            self._safe_on_evaluate(reason, False)
+            return
+
+        reason = str(decision.get("reason", "")).strip() or "关系主动"
+        self._last_relationship_spoken_at = time.monotonic()
+        self._last_relationship_silent_at = 0.0
+        self._last_spoken_text = comment
+        self._safe_on_evaluate(reason, True)
+        payload = ProactiveSpeakPayload(
+            text=comment,
+            translation=str(decision.get("translation", "")).strip(),
+            tone=str(decision.get("tone", "")).strip() or "中性",
+            source="relationship",
+            generation=generation,
+        )
+        try:
+            self.on_speak(payload)
+        except Exception as e:
+            logger.warning("ProactiveObserver: on_speak callback error: {}", e)
 
     async def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
@@ -1233,9 +1443,6 @@ class ProactiveObserver:
         if not self._speech_decision_configured:
             return None
 
-        if self._chat_http is None:
-            self._chat_http = httpx.AsyncClient(timeout=self.config.request_timeout)
-
         system_prompt = (
             (self._system_prompt.strip() + _SPEECH_DECISION_INSTRUCTION)
             if self._system_prompt.strip()
@@ -1292,12 +1499,26 @@ class ProactiveObserver:
         obs_impression = sensory_impression_store.get_for_observer()
         if obs_impression:
             parts.append(f"[观察者上下文]\n{obs_impression}")
+        if self._relationship_motive:
+            parts.append(
+                "[关系动机]\n"
+                "屏幕事件优先。关系与心情可以作为附加动机，但不要把屏幕内容硬拗成亲密理由，"
+                "也不要连续再开一轮关系主动。"
+            )
         user_text = "\n\n".join(parts)
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ]
+        return await self._post_speech_decision(messages)
+
+    async def _post_speech_decision(self, messages: list[dict]) -> dict | None:
+        if not self._speech_decision_configured:
+            return None
+
+        if self._chat_http is None:
+            self._chat_http = httpx.AsyncClient(timeout=self.config.request_timeout)
 
         url = f"{self._chat_api_base_url}/chat/completions"
         payload = {

@@ -15,6 +15,7 @@ from app.llm.api_client import (
     _extract_choice_diagnostics,
     _filter_supported_chat_params,
     _is_temperature_unsupported_error,
+    _is_thinking_unsupported_error,
     resolve_chat_model,
     api_settings_uses_dual_endpoint,
     normalize_provider_base_url,
@@ -194,6 +195,90 @@ def test_complete_with_tools_kimi_k26_omits_temperature_keeps_thinking(monkeypat
     assert captured.get("thinking") == {"type": "disabled"}
     assert "stream" not in captured
     assert captured.get("stream") is not True
+
+
+def test_build_chat_payload_omits_thinking_for_google_ai_studio() -> None:
+    """Google OpenAI 兼容层不认 DeepSeek 的 thinking 字段，首次就必须省略。"""
+    payload = _build_chat_completion_payload(
+        model="gemini-3.7-flash",
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.8,
+        chat_params={"thinking": {"type": "disabled"}},
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+
+    assert "thinking" not in payload
+    assert payload["temperature"] == 0.8
+
+
+def test_complete_with_tools_omits_thinking_on_google_ai_studio(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key="key",
+            model="gemini-3.7-flash",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        captured.update(payload)
+        return {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    client.complete_with_tools(
+        "system",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.8,
+        thinking={"type": "disabled"},
+    )
+
+    assert "thinking" not in captured
+    assert captured.get("temperature") == 0.8
+
+
+def test_is_thinking_unsupported_error_matches_google_unknown_field() -> None:
+    message = (
+        'API HTTP 400: {"error":{"message":"Invalid JSON payload received. '
+        'Unknown name \\"thinking\\": Cannot find field."}}'
+    )
+    assert _is_thinking_unsupported_error(ApiRequestError(message))
+    assert not _is_thinking_unsupported_error(ApiRequestError("temperature not supported"))
+
+
+def test_complete_raw_retries_without_thinking_on_unknown_field(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[dict[str, Any]] = []
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="compatible-model",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(payload))
+        if "thinking" in payload:
+            raise ApiRequestError(
+                'API HTTP 400: Unknown name "thinking": Cannot find field.'
+            )
+        return {"choices": [{"message": {"content": "OK"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    assert (
+        client.complete_raw(
+            "system",
+            [{"role": "user", "content": "hello"}],
+            temperature=0.8,
+            thinking={"type": "disabled"},
+        )
+        == "OK"
+    )
+    assert "thinking" in calls[0]
+    assert "thinking" not in calls[1]
 
 
 def test_build_chat_payload_strips_internal_message_keys() -> None:
@@ -796,6 +881,75 @@ def test_connection_omits_temperature(monkeypatch) -> None:  # type: ignore[no-u
     # 只接受默认温度的模型在检测阶段不应被显式 temperature 拒绝。
     assert client.test_connection() == "OK"
     assert "temperature" not in captured["payload"]
+
+
+def test_connection_uses_single_attempt(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """设置页 host RPC 只有几十秒；探测失败后重试会把整次测试拖成 timed out。"""
+    captured: dict[str, Any] = {}
+
+    def fake_post(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        captured["max_attempts"] = kwargs.get("max_attempts")
+        captured["request_timeout"] = kwargs.get("request_timeout")
+        return {"choices": [{"message": {"content": "OK"}}]}
+
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="gemini-3.7-flash", timeout_seconds=60)
+    )
+    monkeypatch.setattr(client, "_post_chat_completions_with_compatibility_fallbacks", fake_post)
+
+    assert client.test_connection() == "OK"
+    assert captured["max_attempts"] == 1
+    assert captured["request_timeout"] == 60
+
+
+def test_connection_accepts_empty_assistant_message(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Gemini thinking 会把探测预算吃光，OpenAI 兼容层返回无 content 的 assistant 消息。"""
+    import json
+
+    captured: dict[str, Any] = {}
+    gemini_probe_body = json.dumps(
+        {
+            "id": "probe",
+            "object": "chat.completion",
+            "model": "gemini-3.7-flash",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {"role": "assistant"},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 6,
+                "completion_tokens": 0,
+                "total_tokens": 11,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    class FakeClient:
+        def __init__(self, *, base_url: str, timeout: Any, headers: dict[str, str], limits: Any) -> None:
+            return None
+
+        def request(self, method: str, path: str, **kwargs: Any) -> Any:
+            captured["payload"] = json.loads(kwargs.get("content") or b"{}")
+            return _fake_http_response(gemini_probe_body)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("app.llm.api_client.httpx.Client", FakeClient)
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key="key",
+            model="gemini-3.7-flash",
+        )
+    )
+
+    assert client.test_connection() == "OK"
+    assert captured["payload"]["max_tokens"] > 8
 
 
 def test_local_chat_completion_base_url_stays_loopback(monkeypatch) -> None:  # type: ignore[no-untyped-def]

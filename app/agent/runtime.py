@@ -240,6 +240,11 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         # 默认 False；bootstrap / 设置保存后经 set_progressive_memory_enabled 覆盖。
         self._progressive_memory = False
         self._intimacy_guide = _load_intimacy_guide()
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        self._relationship_guide = ""
+        self._relationship_settings = RelationshipInitiativeSettings().normalized()
+        self._relationship_guide_warned = False
 
     @property
     def vision_api_client(self) -> OpenAICompatibleClient | None:
@@ -305,6 +310,21 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         if character_profile is not None:
             self.character_id = character_profile.id.strip()
             self.character_name = character_profile.display_name.strip()
+            from app.config.character_loader import load_relationship_guide
+
+            self._relationship_guide = load_relationship_guide(
+                character_profile.relationship_guide_path
+            )
+
+    def set_relationship_initiative(self, settings, guide_text: str = "") -> None:
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        self._relationship_settings = (
+            settings.normalized()
+            if isinstance(settings, RelationshipInitiativeSettings)
+            else RelationshipInitiativeSettings().normalized()
+        )
+        self._relationship_guide = str(guide_text or "").strip()
 
     def _reload_lore_index(self) -> None:
         profile = self.character_profile

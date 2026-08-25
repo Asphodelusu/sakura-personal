@@ -90,7 +90,7 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     prompt = load_system_prompt(card_path, system_guards_path=guards_path)
     assert "【演出约束】" in prompt
     assert "【人格设定】" in prompt
-    assert "## 核心" in prompt
+    assert "## 她怎样存在" in prompt or "## 核心" in prompt
     assert "勿复读设定" in prompt or "不要每轮自我介绍" in prompt
     assert "避免把刚说过的反应、拒绝或结论仅换一种说法再讲一遍" in prompt
     assert "不必为了显得不同而刻意转折、添新信息或改变真实态度" in prompt
@@ -98,7 +98,26 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     assert "数字生命" in prompt
     assert "对等" in prompt
     assert "桌宠" not in prompt
+    assert "Codex 整合候选" not in prompt
+    assert "状态：候选" not in prompt
+    assert "claude-evidence-audit" not in prompt
+    assert "codex-guide-integrated-candidate" not in prompt
     assert prompt.index("【演出约束】") < prompt.index("【人格设定】")
+
+
+def test_sakura_card_drops_candidate_handoff_header() -> None:
+    root = Path(__file__).resolve().parents[2]
+    card_path = root / "characters" / "Sakura" / "card.md"
+    if not card_path.is_file():
+        return
+    card = card_path.read_text(encoding="utf-8")
+    assert card.lstrip().startswith("# 夜乃桜")
+    assert "（Codex 整合候选）" not in card
+    assert "状态：候选" not in card
+    assert "claude-evidence-audit.md" not in card
+    assert "codex-guide-integrated-candidate.md" not in card
+    assert "## 她怎样存在" in card or "## 核心" in card
+    assert "她是夜乃桜" in card
 
 
 def test_current_relationship_follows_accumulated_runtime_evidence() -> None:
@@ -109,8 +128,33 @@ def test_current_relationship_follows_accumulated_runtime_evidence() -> None:
 
     assert "当前关系" in guards
     assert "近期对话、常驻档案与长期记忆" in guards
-    assert "不能因原作、心情或一次迟疑而重置" in guards
     assert "重新认识" in guards
+    assert "一次迟疑或冲突" in guards
+    assert "永久固化" in guards
+    assert "复读旧防御" in guards
+    assert "抽象表达" in guards
     assert "你们是恋人" not in guards
     assert "跟随当前关系和当下意愿" in guards
+    assert "身体接触许可" in guards
+    assert "自然升温" in guards
+    assert "未听到约定词" in guards or "未发送" in guards
     assert "亲密未打开" not in guards
+    assert "## 信任推进" not in guards
+    assert "## 防模板化" not in guards
+
+
+def test_intimacy_guide_keeps_director_voice_without_restating_tts_contract() -> None:
+    from app.llm.prompts.blocks import translation_rules_block
+
+    protocol = translation_rules_block().body
+    assert "suppress_tts=true" in protocol
+    assert "只显示，不朗读" in protocol
+
+    guide_path = Path(__file__).resolve().parents[2] / "data" / "intimacy_guide.txt"
+    if not guide_path.is_file():
+        return
+    guide = guide_path.read_text(encoding="utf-8")
+    assert "导演" in guide or "導演" in guide
+    assert "見本" in guide
+    assert "tone=H" in guide or "**H**" in guide
+    assert '"suppress_tts": true' not in guide

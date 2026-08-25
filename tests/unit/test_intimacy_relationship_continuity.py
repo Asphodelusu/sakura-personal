@@ -59,10 +59,15 @@ def test_established_relationship_evidence_survives_mood_and_one_declined_action
     combined = f"{built.system_prompt}\n{built.runtime_context}"
 
     assert "当前关系以真实积累" in built.system_prompt
+    assert "一次迟疑或冲突" in built.system_prompt
+    assert "复读旧防御" in built.system_prompt
     assert "我们是对等的恋人" in built.runtime_context
     assert "他在试探我的变化" in built.runtime_context
     assert "上一次具体触碰，我说先等一下" in built.runtime_context
+    assert "不是身体接触许可" in combined
     assert "未开启不限制拥抱、亲吻、前戏或性行为" in combined
+    assert "自然升温" in combined
+    assert "关系不足" in combined
     assert "不要动手描写" not in combined
     assert "开启后才能" not in combined
     assert "你们是恋人" not in built.system_prompt

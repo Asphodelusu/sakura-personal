@@ -79,6 +79,8 @@ class CharacterProfile:
     backchannel_manifest_path: Path | None = None
     # 系统侧演出约束（可选）。与 card 分离：短规则靠前注入，不进叙事人格卡。
     system_guards_path: Path | None = None
+    # 可选关系演出参考。缺失不让角色包加载失败。
+    relationship_guide_path: Path | None = None
     reply_tones: list[str] = field(default_factory=lambda: [*DEFAULT_TONES])
     theme_settings: ThemeSettings | None = None
     theme_source: CharacterThemeSource = THEME_SOURCE_COMPAT_DEFAULT
@@ -314,6 +316,9 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
     initial_message = _optional_text(raw_data, "initial_message", "……起動した。用事があるなら、呼んで。")
     card_path = _resolve_required_file(package_dir, _required_text(raw_data, "card", manifest_path), "角色卡")
     system_guards_path = _resolve_optional_system_guards(package_dir, raw_data.get("system_guards"))
+    relationship_guide_path = _resolve_optional_relationship_guide(
+        package_dir, raw_data.get("relationship_guide")
+    )
 
     portrait_data = _required_dict(raw_data, "portrait", manifest_path)
     default_portrait = _resolve_required_file(
@@ -355,6 +360,7 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         voice=voice,
         backchannel_manifest_path=backchannel_manifest_path,
         system_guards_path=system_guards_path,
+        relationship_guide_path=relationship_guide_path,
         reply_tones=reply_tones,
         theme_settings=theme_settings,
         theme_source=theme_source,
@@ -686,6 +692,29 @@ def _resolve_optional_system_guards(package_dir: Path, raw: Any) -> Path | None:
             raise CharacterConfigError(f"角色演出约束不存在：{path}")
         return path
     default_path = package_dir / "system_guards.md"
+    return default_path if default_path.exists() else None
+
+
+def load_relationship_guide(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _resolve_optional_relationship_guide(package_dir: Path, raw: Any) -> Path | None:
+    """解析可选关系演出参考；缺失不让角色包加载失败。"""
+    from loguru import logger
+
+    if isinstance(raw, str) and raw.strip():
+        path = _resolve_package_path(package_dir, raw)
+        if not path.exists():
+            logger.warning("角色 relationship_guide 不存在，降级为无 L1：{}", path)
+            return None
+        return path
+    default_path = package_dir / "relationship_guide.md"
     return default_path if default_path.exists() else None
 
 
