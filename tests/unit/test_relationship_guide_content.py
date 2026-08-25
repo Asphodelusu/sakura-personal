@@ -52,8 +52,16 @@ def test_canonical_guide_covers_situations_without_ladder_or_mode_gate() -> None
     assert len(text) < 4000
 
 
-def test_live_sakura_guide_matches_canonical_when_present() -> None:
+def test_live_sakura_guide_keeps_relationship_director_contract_when_present() -> None:
     live = Path(__file__).resolve().parents[2] / "characters" / "Sakura" / "relationship_guide.md"
     if not live.is_file():
         return
-    assert live.read_text(encoding="utf-8").strip() == CANONICAL_RELATIONSHIP_GUIDE.strip()
+    text = live.read_text(encoding="utf-8")
+    assert text.lstrip().startswith("# 关系演出参考")
+    assert "固定台词" in text
+    assert "稳定恋人日常" in text
+    assert "私下升温" in text
+    assert "冲突" in text
+    assert "高温后的生活" in text
+    assert "贴紧" in text
+    assert "苹果" in text

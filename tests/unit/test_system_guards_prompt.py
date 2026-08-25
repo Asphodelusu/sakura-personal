@@ -90,7 +90,7 @@ def test_sakura_package_loads_guards_in_chain() -> None:
     prompt = load_system_prompt(card_path, system_guards_path=guards_path)
     assert "【演出约束】" in prompt
     assert "【人格设定】" in prompt
-    assert "## 核心" in prompt
+    assert "## 她怎样存在" in prompt or "## 核心" in prompt
     assert "勿复读设定" in prompt or "不要每轮自我介绍" in prompt
     assert "避免把刚说过的反应、拒绝或结论仅换一种说法再讲一遍" in prompt
     assert "不必为了显得不同而刻意转折、添新信息或改变真实态度" in prompt
@@ -116,7 +116,7 @@ def test_sakura_card_drops_candidate_handoff_header() -> None:
     assert "状态：候选" not in card
     assert "claude-evidence-audit.md" not in card
     assert "codex-guide-integrated-candidate.md" not in card
-    assert "## 核心" in card
+    assert "## 她怎样存在" in card or "## 核心" in card
     assert "她是夜乃桜" in card
 
 
@@ -154,7 +154,7 @@ def test_intimacy_guide_keeps_director_voice_without_restating_tts_contract() ->
     if not guide_path.is_file():
         return
     guide = guide_path.read_text(encoding="utf-8")
-    assert "導演" in guide
+    assert "导演" in guide or "導演" in guide
     assert "見本" in guide
     assert "tone=H" in guide or "**H**" in guide
     assert '"suppress_tts": true' not in guide

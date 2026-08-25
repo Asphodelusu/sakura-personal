@@ -329,7 +329,9 @@ class TestModuleLevelSingleton:
         assert system_msg["role"] == "system"
         assert INTIMACY_CONTINUE_MARKER in system_msg["content"]
         assert system_msg["_sakura_transient_progress"] is True
-        assert "根据当前姿势、呼吸和对方最后的反应自然回应" in system_msg["content"]
+        assert "从你自己刚刚说出口的那一句接着往下说" in system_msg["content"]
+        assert "不要重新回答对方上一句" in system_msg["content"]
+        assert "根据当前姿势、呼吸和对方最后的反应自然回应" not in system_msg["content"]
         assert "若当前已不是身体亲密场景" not in system_msg["content"]
         assert "不再需要详细引导、连续节奏或自动续投" in system_msg["content"]
         assert "若当前已不是身体亲密场景" not in INTIMACY_CONTINUE_SYSTEM_TEXT
@@ -480,6 +482,9 @@ class TestIntimacyGuidePromptGate:
         assert section.section_id == "persona.intimacy"
         assert "退出" in section.body
         assert "set_intimacy_mode(on=false)" in section.body
+        assert "从你自己上一句接着说" in section.body
+        assert "不要重新回答对方上一句" in section.body
+        assert "根据当前状态自然回应" not in section.body
 
     def test_empty_guide_stays_hidden_even_when_active(self) -> None:
         runtime = self._runtime_with_guide("")

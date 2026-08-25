@@ -830,6 +830,7 @@ class PetWindow(QWidget):
         self.pending_tool_action: PendingToolAction | None = None
         self.pending_manual_screen_observation: ScreenObservation | None = None
         self.pending_manual_screen_summary: str = ""
+        self.pending_manual_screenshot_capturing: bool = False
         self.manual_screenshot_overlay: ManualScreenshotOverlay | None = None
         self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
         self.pending_screen_observation_event: AgentEvent | None = None
@@ -3889,6 +3890,8 @@ class PetWindow(QWidget):
                 ),
             )
             return
+        self.pending_manual_screenshot_capturing = True
+        self._update_manual_screenshot_button()
         if not self._start_screen_observation_encode(
             CapturedScreenImage(
                 image=pixmap.toImage().copy(),
@@ -3897,6 +3900,8 @@ class PetWindow(QWidget):
             ),
             {"kind": "manual"},
         ):
+            self.pending_manual_screenshot_capturing = False
+            self._update_manual_screenshot_button()
             show_themed_warning(self, "截图处理中", "上一张截图还在处理，请稍后再试。")
             return
 
@@ -3910,6 +3915,7 @@ class PetWindow(QWidget):
         _ = context
         if observation is None and not summary:
             return
+        self.pending_manual_screenshot_capturing = False
         self.pending_manual_screen_observation = observation
         self.pending_manual_screen_summary = summary
         self._update_manual_screenshot_button()
@@ -3935,15 +3941,26 @@ class PetWindow(QWidget):
         self.manual_screenshot_overlay = None
 
     def _clear_manual_screen_observation(self) -> None:
-        if self.pending_manual_screen_observation is None and not self.pending_manual_screen_summary:
+        if (
+            self.pending_manual_screen_observation is None
+            and not self.pending_manual_screen_summary
+            and not getattr(self, "pending_manual_screenshot_capturing", False)
+        ):
             return
         self.pending_manual_screen_observation = None
         self.pending_manual_screen_summary = ""
+        self.pending_manual_screenshot_capturing = False
         self._update_manual_screenshot_button()
         debug_log("PetWindow", "待发送手动截图已清除")
 
+    def _manual_screenshot_is_attached(self) -> bool:
+        return (
+            self.pending_manual_screen_observation is not None
+            or bool(getattr(self, "pending_manual_screenshot_capturing", False))
+        )
+
     def _update_manual_screenshot_button(self) -> None:
-        attached = self.pending_manual_screen_observation is not None
+        attached = self._manual_screenshot_is_attached()
         self.screenshot_button.setText("")
         icon_path = _SCREENSHOT_ATTACHED_ICON_PATH if attached else _SCREENSHOT_ICON_PATH
         self.screenshot_button.setIcon(QIcon(str(icon_path)))
@@ -4236,6 +4253,7 @@ class PetWindow(QWidget):
         if manual_observation is not None:
             self.pending_manual_screen_observation = None
             self.pending_manual_screen_summary = ""
+            self.pending_manual_screenshot_capturing = False
             self._update_manual_screenshot_button()
         if visual_observation_jobs:
             self.pending_visual_observation_jobs = [
@@ -4712,10 +4730,20 @@ class PetWindow(QWidget):
             self.screen_observation_followup_in_progress = False
             return
         kind = context.get("kind")
-        if kind in {"chat_followup", "manual"}:
+        if kind == "manual":
+            # 框选后先附加截图，让按钮立刻变深色；VLM 摘要在后台补，不挡“已框上”反馈。
+            context["_observation"] = observation
+            self._finish_manual_screen_observation(observation=observation, summary="")
+            if not self._start_screen_observation_summarize(context, observation):
+                debug_log(
+                    "PetWindow",
+                    "VLM 摘要启动失败，手动截图已按原图附加",
+                    {"kind": kind},
+                )
+        elif kind == "chat_followup":
             # 编码完成 → 启动 VLM 摘要 → 摘要完成后再构建消息。
             # 启动失败（摘要线程已占用 / 关闭中）时降级：不带摘要直接走原路径，
-            # 避免 followup_in_progress 卡死或手动截图静默丢失。
+            # 避免 followup_in_progress 卡死。
             context["_observation"] = observation
             if not self._start_screen_observation_summarize(context, observation):
                 debug_log(
@@ -4723,14 +4751,9 @@ class PetWindow(QWidget):
                     "VLM 摘要启动失败，降级为原始截图消息",
                     {"kind": kind},
                 )
-                if kind == "chat_followup":
-                    self._finish_chat_screen_observation_followup(
-                        context, observation=observation, summary=""
-                    )
-                else:
-                    self._finish_manual_screen_observation(
-                        observation=observation, summary=""
-                    )
+                self._finish_chat_screen_observation_followup(
+                    context, observation=observation, summary=""
+                )
         elif kind == "event_followup":
             self._finish_event_screen_observation_followup(context, observation)
         elif kind in {"screen_awareness_context", "proactive_context"}:
@@ -4784,11 +4807,15 @@ class PetWindow(QWidget):
                 observation=observation,
                 summary=summary,
             )
-        elif kind == "manual" and observation is not None:
-            self._finish_manual_screen_observation(
-                observation=observation,
-                context=context,
-                summary=summary,
+        elif kind == "manual":
+            if self.pending_manual_screen_observation is not observation:
+                return
+            self.pending_manual_screen_summary = summary
+            self._update_manual_screenshot_button()
+            debug_log(
+                "PetWindow",
+                "手动框选截图摘要已更新",
+                {"summary_chars": len(summary)},
             )
 
     @Slot(object, str)
@@ -4821,6 +4848,9 @@ class PetWindow(QWidget):
         elif kind in {"screen_awareness_context", "proactive_context"}:
             debug_log("ScreenAwareness", "主动屏幕上下文编码失败", {"error": message})
         elif kind == "manual":
+            self.pending_manual_screenshot_capturing = False
+            if self.pending_manual_screen_observation is None:
+                self._update_manual_screenshot_button()
             show_themed_warning(
                 self,
                 "截图失败",

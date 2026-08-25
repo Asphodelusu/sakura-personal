@@ -17,6 +17,7 @@ const CONTROL_MARKER: &str = "@@SAKURA_SETTINGS_CONTROL@@";
 const CLOSE_REQUESTED_EVENT: &str = "sakura://settings-close-requested";
 const PROTOCOL_VERSION: u8 = 3;
 const DEFAULT_HOST_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const API_PROBE_HOST_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const LONG_HOST_RPC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 static RPC_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -181,6 +182,7 @@ fn settings_result_payload(
 fn host_rpc_timeout(method: &str) -> Option<Duration> {
     match method {
         "studio.launch" => None,
+        "api.test_connection" | "api.list_models" => Some(API_PROBE_HOST_RPC_TIMEOUT),
         "character.import_archive"
         | "character.import_voice_archive"
         | "character.export_archive" => Some(LONG_HOST_RPC_TIMEOUT),
@@ -440,7 +442,11 @@ mod tests {
         assert_eq!(host_rpc_timeout("studio.launch"), None);
         assert_eq!(
             host_rpc_timeout("api.test_connection"),
-            Some(Duration::from_secs(30))
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            host_rpc_timeout("api.list_models"),
+            Some(Duration::from_secs(90))
         );
     }
 

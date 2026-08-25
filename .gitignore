@@ -71,6 +71,8 @@ plugins/sakura_mobile/**/*.py[cod]
 # Tauri 本地构建产物
 tools/**/src-tauri/target/
 tools/**/src-tauri/gen/
+tools/**/src-tauri/target-probe/
+tools/settings-tauri/bin/
 # 用户态运行配置：发布包不携带，覆盖升级不冲掉（必须位于上方 ! 白名单之后）
 plugins/playwright_browser/config.json
 
@@ -87,3 +89,6 @@ data/hf-cache/
 
 # 本地私密角色扩展材料（可选，不入库；缺失不影响正常使用）
 data/intimacy_guide.txt
+
+# 私有角色蒸馏交接稿已归档到 Shelf，不进入公开仓库
+docs/agent-handoffs/sakura-route-continuity-2026-08-25/
