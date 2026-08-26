@@ -1561,22 +1561,22 @@ class ProactiveObserver:
             content = choice.get("message", {}).get("content", "")
             finish = choice.get("finish_reason", "")
             if not content:
-                logger.warning(
-                    "ProactiveObserver: LLM returned empty content (finish={}, model={}) raw={}",
-                    finish,
-                    self._chat_api_model,
-                    json.dumps(data, ensure_ascii=False)[:300],
-                )
+                _log_speech_decision_outcome("rejected_invalid_output", finish, 0)
                 return None
             parsed = _extract_json(content)
-            if not parsed:
-                logger.warning(
-                    "ProactiveObserver: LLM speech decision JSON parse failed (finish={}): {!r}",
-                    finish,
-                    content[:200],
+            if parsed:
+                _log_speech_decision_outcome("valid_json", finish, len(content))
+                return parsed
+            adopted = _adopt_plain_dialogue_decision(content)
+            if adopted:
+                _log_speech_decision_outcome(
+                    "adopted_plain_dialogue", finish, len(content)
                 )
-                return None
-            return parsed
+                return adopted
+            _log_speech_decision_outcome(
+                "rejected_invalid_output", finish, len(content)
+            )
+            return None
         except Exception as e:
             logger.warning(
                 "ProactiveObserver: LLM speech decision call failed: {} ({})",
@@ -2051,6 +2051,48 @@ class ProactiveObserver:
         return content or ""
 
 
+_PLAIN_DIALOGUE_MAX_CHARS = 80
+_PLAIN_DIALOGUE_MAX_SENTENCES = 2
+_PLAIN_DIALOGUE_KANA_RE = re.compile(r"[\u3040-\u30ff\uff66-\uff9f]")
+_PLAIN_DIALOGUE_SENTENCE_RE = re.compile(r"[。！？!?]+")
+_PLAIN_DIALOGUE_JSONISH_RE = re.compile(
+    r"[{}\[\]]|\"[A-Za-z_][A-Za-z0-9_]*\"\s*:"
+)
+_PLAIN_DIALOGUE_LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_PLAIN_DIALOGUE_MARKDOWN_RE = re.compile(
+    r"```|\*\*|__|^\s{0,3}(?:[-*+] |\d+\. |#{1,6} |> )",
+    re.MULTILINE,
+)
+_PLAIN_DIALOGUE_REPORT_MARKERS = (
+    "观察者",
+    "评估",
+    "系统",
+    "报告",
+    "建议保持",
+    "システム",
+    "報告",
+    "評価",
+    "should_speak",
+    "ことにします",
+    "ことにしました",
+    "発言します",
+    "発言すること",
+    "発言すべき",
+    "すべきです",
+    "判断しました",
+    "判断します",
+)
+
+
+def _log_speech_decision_outcome(outcome: str, finish: object, chars: int) -> None:
+    logger.info(
+        "ProactiveObserver: speech decision outcome={} finish={} chars={}",
+        outcome,
+        finish,
+        chars,
+    )
+
+
 def _extract_json(text: str) -> dict | None:
     text = text.strip()
     try:
@@ -2070,3 +2112,38 @@ def _extract_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def _is_plain_japanese_dialogue(text: str) -> bool:
+    if not text or len(text) > _PLAIN_DIALOGUE_MAX_CHARS:
+        return False
+    if _PLAIN_DIALOGUE_MARKDOWN_RE.search(text):
+        return False
+    if _PLAIN_DIALOGUE_JSONISH_RE.search(text):
+        return False
+    if _PLAIN_DIALOGUE_LATIN_WORD_RE.search(text):
+        return False
+    if not _PLAIN_DIALOGUE_KANA_RE.search(text):
+        return False
+    if any(marker in text for marker in _PLAIN_DIALOGUE_REPORT_MARKERS):
+        return False
+    sentences = [
+        part.strip()
+        for part in _PLAIN_DIALOGUE_SENTENCE_RE.split(text)
+        if part.strip()
+    ]
+    return 1 <= len(sentences) <= _PLAIN_DIALOGUE_MAX_SENTENCES
+
+
+def _adopt_plain_dialogue_decision(content: str) -> dict | None:
+    comment = (content or "").strip()
+    if not _is_plain_japanese_dialogue(comment):
+        return None
+    return {
+        "should_speak": True,
+        "comment": comment,
+        "translation": "",
+        "tone": "中性",
+        "reason": "决策输出回退为短日语对白",
+        "situational_summary": "",
+    }
