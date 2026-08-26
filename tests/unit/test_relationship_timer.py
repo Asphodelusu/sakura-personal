@@ -10,6 +10,7 @@ def _obs(*, busy: str = "", **rel: object) -> ProactiveObserver:
         proactive_enabled=bool(rel.get("proactive_enabled", True)),
         proactive_cooldown_seconds=int(rel.get("cooldown", 3600)),
         proactive_min_silence_seconds=int(rel.get("silence", 300)),
+        desktop_idle_seconds=int(rel.get("desktop_idle", 86_400)),
     ).normalized()
     observer = ProactiveObserver(
         api_base_url="https://example.com",
@@ -33,6 +34,7 @@ def _obs(*, busy: str = "", **rel: object) -> ProactiveObserver:
     observer._last_silent_eval_at = 0.0
     observer._last_relationship_spoken_at = 0.0
     observer._last_relationship_silent_at = 0.0
+    observer._relationship_silence_streak = 0
     return observer
 
 
@@ -94,7 +96,8 @@ def test_relationship_eval_does_not_capture_or_call_vlm() -> None:
     observer._chat_completion.assert_not_called()
 
 
-def test_screen_trigger_wins_same_tick_and_suppresses_relationship_eval() -> None:
+def test_screen_trigger_wins_same_tick_and_does_not_consume_relationship(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
     observer = _obs()
     now = 10_000.0
     observer._last_user_at = now - 400
@@ -108,11 +111,13 @@ def test_screen_trigger_wins_same_tick_and_suppresses_relationship_eval() -> Non
         asyncio.run(observer._dispatch_proactive_tick(now))
     observer._do_evaluation.assert_awaited()
     observer._do_relationship_evaluation.assert_not_called()
-    assert observer._last_relationship_silent_at == now
-    assert observer._relationship_gate_reason(now + 1, "") == "cooldown"
+    assert observer._last_relationship_silent_at == 0.0
+    assert observer._relationship_silence_streak == 0
+    assert observer._relationship_gate_reason(now + 1, "") == "eligible"
 
 
-def test_screen_evaluation_failure_clears_relationship_motive() -> None:
+def test_screen_evaluation_failure_clears_relationship_motive(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
     observer = _obs()
     now = 10_000.0
     observer._last_user_at = now - 400
@@ -129,6 +134,36 @@ def test_screen_evaluation_failure_clears_relationship_motive() -> None:
             pass
 
     assert observer._relationship_motive is False
+    assert observer._last_relationship_silent_at == 0.0
+    assert observer._relationship_silence_streak == 0
+    assert observer._relationship_gate_reason(now + 1, "") == "eligible"
+
+
+def test_screen_speak_consumes_relationship_opportunity(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
+    observer = _obs()
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    observer._ready_focus_trigger = "window:A->B"
+    observer._mark_relationship_silent()
+    observer._mark_relationship_silent()
+    observer._last_relationship_silent_at = now - 10_000
+
+    async def _speak(_triggers: list[str]) -> None:
+        observer._last_proactive_at = now
+
+    observer._do_evaluation = _speak
+    observer._do_relationship_evaluation = AsyncMock()
+    with (
+        patch("app.perception.observer.get_active_window_pid", return_value=10_001),
+        patch("app.perception.observer.time.monotonic", return_value=now),
+    ):
+        asyncio.run(observer._dispatch_proactive_tick(now))
+    observer._do_relationship_evaluation.assert_not_called()
+    assert observer._last_relationship_spoken_at == now
+    assert observer._relationship_silence_streak == 0
+    assert observer._last_relationship_silent_at == 0.0
+    assert observer._relationship_gate_reason(now + 1, "") == "cooldown"
 
 
 def test_decision_instruction_has_no_ceiling_or_blacklist() -> None:
@@ -179,3 +214,109 @@ def test_speak_uses_relationship_source_and_independent_cooldown() -> None:
     assert spoken[0].text == "こっち。"
     assert observer._last_relationship_spoken_at > 0
     assert observer._last_proactive_at == 0.0
+
+
+def test_desktop_idle_seconds_default_and_clamp() -> None:
+    settings = RelationshipInitiativeSettings().normalized()
+    assert settings.desktop_idle_seconds == 900
+    assert RelationshipInitiativeSettings(desktop_idle_seconds=10).normalized().desktop_idle_seconds == 60
+    assert (
+        RelationshipInitiativeSettings(desktop_idle_seconds=99_999).normalized().desktop_idle_seconds
+        == 86400
+    )
+
+
+def test_idle_below_threshold_stays_eligible(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 899.0)
+    observer = _obs(desktop_idle=900)
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    assert observer._relationship_gate_reason(now, "") == "eligible"
+
+
+def test_idle_at_threshold_returns_desktop_idle(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 900.0)
+    observer = _obs(desktop_idle=900)
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    assert observer._relationship_gate_reason(now, "") == "desktop_idle"
+
+
+def test_desktop_idle_skips_relationship_llm(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 1_200.0)
+    observer = _obs(desktop_idle=900)
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    observer._do_relationship_evaluation = AsyncMock()
+    observer._do_evaluation = AsyncMock()
+    with (
+        patch("app.perception.observer.get_active_window_pid", return_value=10_001),
+        patch("app.perception.observer.time.monotonic", return_value=now),
+    ):
+        asyncio.run(observer._dispatch_proactive_tick(now))
+    observer._do_relationship_evaluation.assert_not_called()
+    observer._do_evaluation.assert_not_called()
+
+
+def test_relationship_silent_backoff_boundaries(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
+    observer = _obs()
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    durations = (300.0, 600.0, 1200.0, 1800.0)
+    for duration in durations:
+        observer._mark_relationship_silent()
+        observer._last_relationship_silent_at = now
+        assert observer._relationship_gate_reason(now + duration - 1, "") == "cooldown"
+        assert observer._relationship_gate_reason(now + duration, "") == "eligible"
+
+
+def test_user_spoke_resets_silent_backoff(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
+    observer = _obs()
+    now = 10_000.0
+    observer._last_user_at = now - 400
+    observer._mark_relationship_silent()
+    observer._mark_relationship_silent()
+    observer._last_relationship_silent_at = now
+    with patch("app.perception.observer.time.monotonic", return_value=now):
+        observer.notify_user_spoke()
+    observer._last_user_at = now - 400
+    assert observer._relationship_silence_streak == 0
+    assert observer._last_relationship_silent_at == 0.0
+    assert observer._relationship_gate_reason(now, "") == "eligible"
+
+
+def test_relationship_speak_resets_silent_backoff(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
+    observer = _obs()
+    observer._last_user_at = 0.0
+    observer._mark_relationship_silent()
+    observer._mark_relationship_silent()
+    observer._post_speech_decision = AsyncMock(
+        return_value={
+            "should_speak": True,
+            "reason": "想靠近",
+            "comment": "こっち。",
+            "translation": "过来。",
+            "tone": "温柔",
+        }
+    )
+    asyncio.run(observer._do_relationship_evaluation())
+    assert observer._relationship_silence_streak == 0
+    assert observer._last_relationship_silent_at == 0.0
+
+
+def test_stale_generation_does_not_increase_silent_backoff() -> None:
+    observer = _obs()
+    observer._last_user_at = 0.0
+    observer._relationship_generation = 1
+
+    async def _decide() -> dict[str, object]:
+        observer.bump_relationship_generation()
+        return {"should_speak": False, "reason": "取消"}
+
+    observer._decide_relationship_speech = _decide
+    asyncio.run(observer._do_relationship_evaluation())
+    assert observer._last_relationship_silent_at == 0.0
+    assert observer._relationship_silence_streak == 0

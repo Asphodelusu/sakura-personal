@@ -7,18 +7,23 @@ EXPRESSION_BIASES = ("restrained", "natural", "expressive")
 DEFAULT_EXPRESSION_BIAS = "natural"
 DEFAULT_PROACTIVE_COOLDOWN_SECONDS = 3600
 DEFAULT_PROACTIVE_MIN_SILENCE_SECONDS = 300
+DEFAULT_DESKTOP_IDLE_SECONDS = 900
 RELATIONSHIP_SILENT_COOLDOWN_SECONDS = 300.0
+RELATIONSHIP_SILENT_BACKOFF_SECONDS = (300.0, 600.0, 1200.0, 1800.0)
 RELATIONSHIP_GUIDE_TOKEN_BUDGET = 1600
 COOLDOWN_MIN_SECONDS = 60
 COOLDOWN_MAX_SECONDS = 86400
 SILENCE_MIN_SECONDS = 30
 SILENCE_MAX_SECONDS = 3600
+DESKTOP_IDLE_MIN_SECONDS = 60
+DESKTOP_IDLE_MAX_SECONDS = 86400
 RELATIONSHIP_GATE_REASONS = (
     "disabled",
     "busy",
     "silence",
     "cooldown",
     "continuation",
+    "desktop_idle",
     "eligible",
 )
 
@@ -70,6 +75,7 @@ class RelationshipInitiativeSettings:
     expression_bias: str = DEFAULT_EXPRESSION_BIAS
     proactive_cooldown_seconds: int = DEFAULT_PROACTIVE_COOLDOWN_SECONDS
     proactive_min_silence_seconds: int = DEFAULT_PROACTIVE_MIN_SILENCE_SECONDS
+    desktop_idle_seconds: int = DEFAULT_DESKTOP_IDLE_SECONDS
 
     def normalized(self) -> "RelationshipInitiativeSettings":
         bias = str(self.expression_bias or "").strip().lower()
@@ -91,6 +97,12 @@ class RelationshipInitiativeSettings:
                 SILENCE_MIN_SECONDS,
                 SILENCE_MAX_SECONDS,
             ),
+            desktop_idle_seconds=_clamp_int(
+                self.desktop_idle_seconds,
+                DEFAULT_DESKTOP_IDLE_SECONDS,
+                DESKTOP_IDLE_MIN_SECONDS,
+                DESKTOP_IDLE_MAX_SECONDS,
+            ),
         )
 
 
@@ -107,6 +119,10 @@ def settings_from_mapping(raw: Mapping[str, Any] | None) -> RelationshipInitiati
         proactive_min_silence_seconds=_as_int(
             source.get("proactive_min_silence_seconds"),
             DEFAULT_PROACTIVE_MIN_SILENCE_SECONDS,
+        ),
+        desktop_idle_seconds=_as_int(
+            source.get("desktop_idle_seconds"),
+            DEFAULT_DESKTOP_IDLE_SECONDS,
         ),
     ).normalized()
 

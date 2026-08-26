@@ -671,6 +671,7 @@ class AppSettingsService:
             "expression_bias": normalized.expression_bias,
             "proactive_cooldown_seconds": int(normalized.proactive_cooldown_seconds),
             "proactive_min_silence_seconds": int(normalized.proactive_min_silence_seconds),
+            "desktop_idle_seconds": int(normalized.desktop_idle_seconds),
         }
         save_yaml_mapping(self.system_config_path, data)
 

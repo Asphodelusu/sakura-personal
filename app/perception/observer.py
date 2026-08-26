@@ -661,6 +661,7 @@ class ProactiveObserver:
         self._get_relationship_facts: Callable[[], str] = lambda: ""
         self._last_relationship_spoken_at = 0.0
         self._last_relationship_silent_at = 0.0
+        self._relationship_silence_streak = 0
         self._relationship_generation = 0
         self._relationship_motive = False
 
@@ -698,7 +699,7 @@ class ProactiveObserver:
 
     def reset_relationship_state(self) -> None:
         self._last_relationship_spoken_at = 0.0
-        self._last_relationship_silent_at = 0.0
+        self._reset_relationship_silence_backoff()
         self._relationship_generation += 1
         self._relationship_motive = False
 
@@ -706,8 +707,6 @@ class ProactiveObserver:
         return bool(getattr(self.relationship, "proactive_enabled", False))
 
     def _relationship_gate_reason(self, now: float, busy_reason: str) -> str:
-        from app.config.relationship_initiative import RELATIONSHIP_SILENT_COOLDOWN_SECONDS
-
         if not self._relationship_enabled():
             return "disabled"
         if self._away_mode:
@@ -724,9 +723,16 @@ class ProactiveObserver:
             return "cooldown"
         if (
             self._last_relationship_silent_at
-            and now - self._last_relationship_silent_at < RELATIONSHIP_SILENT_COOLDOWN_SECONDS
+            and now - self._last_relationship_silent_at < self._relationship_silent_cooldown_seconds()
         ):
             return "cooldown"
+        idle_threshold = float(getattr(self.relationship, "desktop_idle_seconds", 900) or 900)
+        try:
+            idle = float(get_idle_seconds())
+        except Exception:
+            idle = 0.0
+        if idle >= idle_threshold:
+            return "desktop_idle"
         return "eligible"
 
     def _relationship_ready(self, now: float) -> bool:
@@ -736,6 +742,7 @@ class ProactiveObserver:
         self._last_user_at = time.monotonic()
         self._idle_armed = True
         self._relationship_generation += 1
+        self._reset_relationship_silence_backoff()
         if self._away_mode:
             self.set_away_mode(False)
             logger.info("ProactiveObserver: away_mode cleared by user message")
@@ -1089,12 +1096,9 @@ class ProactiveObserver:
                 await self._do_evaluation(screen_triggers)
             finally:
                 self._relationship_motive = False
-                if relationship_eligible:
-                    if self._last_proactive_at > proactive_before:
-                        self._last_relationship_spoken_at = self._last_proactive_at
-                        self._last_relationship_silent_at = 0.0
-                    else:
-                        self._mark_relationship_silent()
+                if relationship_eligible and self._last_proactive_at > proactive_before:
+                    self._last_relationship_spoken_at = self._last_proactive_at
+                    self._reset_relationship_silence_backoff()
             return
         if rel_reason != "eligible":
             return
@@ -1151,8 +1155,24 @@ class ProactiveObserver:
         ]
         return await self._post_speech_decision(messages)
 
+    def _relationship_silent_cooldown_seconds(self) -> float:
+        from app.config.relationship_initiative import RELATIONSHIP_SILENT_BACKOFF_SECONDS
+
+        if self._relationship_silence_streak <= 0:
+            return RELATIONSHIP_SILENT_BACKOFF_SECONDS[0]
+        index = min(
+            self._relationship_silence_streak - 1,
+            len(RELATIONSHIP_SILENT_BACKOFF_SECONDS) - 1,
+        )
+        return RELATIONSHIP_SILENT_BACKOFF_SECONDS[index]
+
+    def _reset_relationship_silence_backoff(self) -> None:
+        self._relationship_silence_streak = 0
+        self._last_relationship_silent_at = 0.0
+
     def _mark_relationship_silent(self) -> None:
         self._last_relationship_silent_at = time.monotonic()
+        self._relationship_silence_streak = min(self._relationship_silence_streak + 1, 4)
 
     async def _do_relationship_evaluation(self) -> None:
         generation = self._relationship_generation
@@ -1200,8 +1220,8 @@ class ProactiveObserver:
             return
 
         reason = str(decision.get("reason", "")).strip() or "关系主动"
+        self._reset_relationship_silence_backoff()
         self._last_relationship_spoken_at = time.monotonic()
-        self._last_relationship_silent_at = 0.0
         self._last_spoken_text = comment
         self._safe_on_evaluate(reason, True)
         payload = ProactiveSpeakPayload(
