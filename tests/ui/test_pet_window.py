@@ -1292,116 +1292,121 @@ def test_emit_app_closed_event_logs_once_with_interrupted_flag() -> None:
     assert len(window.runtime_event_queue) == 0
 
 
-def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
-    pytest.skip("personal fork — thread lifecycle differs")
-    from app.core.resource_manager import QtWorkerResource, ResourceManager
-    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+def test_close_external_tools_honors_window_shutdown_contract_once() -> None:
+    from app.ui.pet_window import (
+        PetWindow,
+        SHUTDOWN_TOTAL_BUDGET_MS,
+        TRANSIENT_PROGRESS_MESSAGE_KEY,
+    )
 
-    class SignalStub:
+    class TimerStub:
         def __init__(self) -> None:
-            self.callbacks = []
+            self.stop_calls = 0
 
-        def connect(self, callback):  # type: ignore[no-untyped-def]
-            self.callbacks.append(callback)
+        def stop(self) -> None:
+            self.stop_calls += 1
 
-    class ThreadStub:
+    class ResourceManagerStub:
         def __init__(self) -> None:
-            self.finished = SignalStub()
-            self.interrupted = False
-            self.quit_called = False
-            self.waits: list[int] = []
+            self.stop_calls: list[int] = []
 
-        def requestInterruption(self) -> None:
-            self.interrupted = True
+        def stop_all(self, timeout_ms: int = 1000) -> None:
+            self.stop_calls.append(timeout_ms)
 
-        def isRunning(self) -> bool:
+    class BackchannelStub:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+            self.shutdown_calls: list[float | None] = []
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+        def shutdown(self, timeout: float | None = None) -> bool:
+            self.shutdown_calls.append(timeout)
             return True
-
-        def quit(self) -> None:
-            self.quit_called = True
-
-        def wait(self, timeout: int) -> bool:
-            self.waits.append(timeout)
-            return False
 
     class WorkerStub:
         def __init__(self) -> None:
-            self.cancelled = False
+            self.cancel_calls = 0
 
         def cancel(self) -> None:
-            self.cancelled = True
+            self.cancel_calls += 1
 
     class SubtitleStub:
         def __init__(self) -> None:
-            self.cancelled = False
+            self.cancel_calls = 0
 
         def cancel_reply_flow(self) -> None:
-            self.cancelled = True
+            self.cancel_calls += 1
 
-    order: list[str] = []
+    class ProactiveObserverStub:
+        def __init__(self) -> None:
+            self.bump_calls = 0
+            self.stop_calls = 0
 
-    class BackchannelStub:
-        def cancel(self) -> None:
-            order.append("backchannel_cancel")
+        def bump_relationship_generation(self) -> None:
+            self.bump_calls += 1
 
-        def shutdown(self, timeout: float | None = None) -> bool:
-            order.append("backchannel_shutdown")
-            return True
-
-    class RecordingResourceManager(ResourceManager):
-        def stop_all(self, timeout_ms: int = 1000) -> None:
-            order.append("stop_all")
-            super().stop_all(timeout_ms)
+        def stop(self) -> None:
+            self.stop_calls += 1
 
     class MinimalWindow:
         close_external_tools = PetWindow.close_external_tools
 
+    event_order: list[str] = []
     window = MinimalWindow()
-    manager = RecordingResourceManager()
-    thread = ThreadStub()
-    worker = WorkerStub()
-    subtitle = SubtitleStub()
     window._shutdown_in_progress = False
-    window.resource_manager = manager
+    window.resource_manager = ResourceManagerStub()
+    window._relationship_generation = 3
     window.messages = [
-        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+        {"role": "assistant", "content": "途中経過。", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
     ]
-    window.subtitle_controller = subtitle
+    window.subtitle_controller = SubtitleStub()
     window.backchannel_controller = BackchannelStub()
-    window.worker_thread = thread
-    window.worker = worker
-    # close_external_tools 通过 resource_manager.stop_all 关闭已注册的 worker。
-    manager._register(
-        QtWorkerResource(
-            manager,
-            thread,
-            worker,
-            owner=window,
-            thread_attr="worker_thread",
-            worker_attr="worker",
-            label="worker_thread",
-        )
-    )
-    window._emit_app_closed_event = lambda: None
-    window._stop_speaking_state_watchdog = lambda: None
-    window.close_tts_tools = lambda: order.append("tts_close")
-    window.close_mcp_tools = lambda: order.append("mcp_close")
-    window.close_plugins = lambda: order.append("plugins_close")
-    window._close_renderer_manager = lambda: order.append("renderer_close")
+    window.worker = WorkerStub()
+    window._proactive_observer = ProactiveObserverStub()
+    window.user_idle_timer = TimerStub()
+    window.reminder_timer = TimerStub()
+    window.screen_awareness_timer = TimerStub()
+    window._save_window_position = lambda: event_order.append("save_window_position")
+    window._emit_app_closed_event = lambda: event_order.append("emit_app_closed_event")
+    window._stop_speaking_state_watchdog = lambda: event_order.append("stop_speaking_state_watchdog")
+    def _stop_proactive_observer() -> None:
+        event_order.append("stop_proactive_observer")
+        window._proactive_observer.stop()
+
+    window._stop_proactive_observer = _stop_proactive_observer
 
     window.close_external_tools()
 
     assert window._shutdown_in_progress is True
-    assert worker.cancelled is True
-    assert thread.interrupted is True
-    assert thread.quit_called is True
-    from app.ui.pet_window import SHUTDOWN_TOTAL_BUDGET_MS
-
-    assert thread.waits == [SHUTDOWN_TOTAL_BUDGET_MS]
-    assert manager._lingering == [(thread, worker)]
     assert window.messages == []
-    assert subtitle.cancelled is True
-    assert order == ["backchannel_cancel", "backchannel_shutdown", "stop_all"]
+    assert window.subtitle_controller.cancel_calls == 1
+    assert window.worker.cancel_calls == 1
+    assert window.backchannel_controller.cancel_calls == 1
+    assert window.backchannel_controller.shutdown_calls == [0.25]
+    assert window._proactive_observer.bump_calls == 1
+    assert window._proactive_observer.stop_calls == 1
+    assert window.resource_manager.stop_calls == [SHUTDOWN_TOTAL_BUDGET_MS]
+    assert window.user_idle_timer.stop_calls == 1
+    assert window.reminder_timer.stop_calls == 1
+    assert window.screen_awareness_timer.stop_calls == 1
+
+    first_call_events = event_order.copy()
+    window.close_external_tools()
+
+    assert event_order == first_call_events
+    assert window._relationship_generation == 4
+    assert window.backchannel_controller.cancel_calls == 1
+    assert window.backchannel_controller.shutdown_calls == [0.25]
+    assert window.subtitle_controller.cancel_calls == 1
+    assert window.worker.cancel_calls == 1
+    assert window.resource_manager.stop_calls == [SHUTDOWN_TOTAL_BUDGET_MS]
+    assert window._proactive_observer.bump_calls == 1
+    assert window._proactive_observer.stop_calls == 1
+    assert window.user_idle_timer.stop_calls == 1
+    assert window.reminder_timer.stop_calls == 1
+    assert window.screen_awareness_timer.stop_calls == 1
 
 
 def test_pet_window_registers_runtime_services_in_registry_order() -> None:
@@ -5350,6 +5355,7 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     shown_segments = []
     applied_results = []
     history = []
+    message_sources: list[str] = []
     window.messages = [
         {
             "role": "assistant",
@@ -5358,7 +5364,15 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
         }
     ]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
-    window._record_assistant_reply_history = lambda reply, _debug=None: history.append((reply, _debug))
+    def _record_assistant_reply_history(
+        reply,
+        _debug=None,
+        message_source: str = "",
+    ) -> None:
+        history.append((reply, _debug))
+        message_sources.append(message_source)
+
+    window._record_assistant_reply_history = _record_assistant_reply_history
     window._show_reply_segments = lambda segments: shown_segments.append(segments)
     window._apply_pending_action_from_result = lambda result: applied_results.append(result)
 
@@ -5368,6 +5382,7 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
 
     assert window.messages == [{"role": "assistant", "content": segment.text}]
     assert history == [(result.reply, {"source": "reminder_due"})]
+    assert message_sources == [""]
     assert shown_segments == [[segment]]
     assert applied_results == [result]
 

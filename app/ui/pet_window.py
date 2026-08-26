@@ -4931,7 +4931,11 @@ class PetWindow(QWidget):
             if message_source:
                 assistant_msg["source"] = message_source
             self.messages.append(assistant_msg)
-            history_ids = self._record_assistant_reply_history(reply, _debug=result._debug)
+            history_ids = self._record_assistant_reply_history(
+                reply,
+                _debug=result._debug,
+                message_source=message_source,
+            )
         self._show_reply_segments(reply.segments)
         self._schedule_subtitle_translations(reply.segments, history_ids=history_ids)
         self._apply_pending_action_from_result(result)
@@ -7465,10 +7469,18 @@ class PetWindow(QWidget):
         tone: str = "",
         portrait: str = "",
         _debug: dict | None = None,
+        *,
+        channel: str = "",
     ) -> int:
         try:
             entry_id = self.history_store.append(
-                role, content, translation, tone, portrait, _debug=_debug
+                role,
+                content,
+                translation,
+                tone,
+                portrait,
+                channel=channel,
+                _debug=_debug,
             )
             return int(entry_id or 0)
         except OSError as exc:
@@ -7488,8 +7500,18 @@ class PetWindow(QWidget):
             return 0
 
     def _record_assistant_reply_history(
-        self, reply: ChatReply, _debug: dict | None = None
+        self,
+        reply: ChatReply,
+        _debug: dict | None = None,
+        *,
+        message_source: str = "",
     ) -> list[int]:
+        history_source = str(message_source or "").strip()
+        channel = (
+            history_source
+            if history_source in {"proactive", "relationship"}
+            else ""
+        )
         clean_segments = [segment for segment in reply.segments if segment.text.strip()]
         if not clean_segments:
             return []
@@ -7502,6 +7524,7 @@ class PetWindow(QWidget):
                     segment.translation,
                     segment.tone,
                     segment.portrait,
+                    channel=channel,
                     _debug=_debug if i == 0 else None,
                 )
             )
