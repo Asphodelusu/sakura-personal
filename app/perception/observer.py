@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
@@ -664,6 +664,7 @@ class ProactiveObserver:
         self._relationship_silence_streak = 0
         self._relationship_generation = 0
         self._relationship_motive = False
+        self._ledger_attempt: _ObserverLedgerAttempt | None = None
 
     @property
     def enabled(self) -> bool:
@@ -1175,6 +1176,23 @@ class ProactiveObserver:
         self._relationship_silence_streak = min(self._relationship_silence_streak + 1, 4)
 
     async def _do_relationship_evaluation(self) -> None:
+        attempt = _ObserverLedgerAttempt(
+            path="relationship",
+            source="relationship",
+            decision_model=self._chat_api_model if self._speech_decision_configured else "",
+        )
+        previous_ledger = self._ledger_attempt
+        self._ledger_attempt = attempt
+        try:
+            await self._relationship_evaluation_attempt(attempt)
+        finally:
+            attempt.settle("silent")
+            self._ledger_attempt = previous_ledger
+
+    async def _relationship_evaluation_attempt(
+        self,
+        attempt: _ObserverLedgerAttempt,
+    ) -> None:
         generation = self._relationship_generation
         t0 = time.monotonic()
         decision = None
@@ -1190,6 +1208,7 @@ class ProactiveObserver:
 
         if generation != self._relationship_generation:
             debug_log("RelationshipInitiative", "B 取消", {"reason": "stale_generation"})
+            attempt.settle("stale_cancel")
             return
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -1211,6 +1230,7 @@ class ProactiveObserver:
         if not should_speak:
             if decision is None:
                 reason = "LLM 发言决策失败或未配置"
+                attempt.settle("decision_error")
             elif not decision.get("should_speak"):
                 reason = str(decision.get("reason", "")).strip() or "LLM 选择不发言"
             else:
@@ -1235,6 +1255,7 @@ class ProactiveObserver:
             self.on_speak(payload)
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
+        attempt.settle("speak")
 
     async def _collect_triggers(self) -> list[str]:
         now = time.monotonic()
@@ -1553,6 +1574,8 @@ class ProactiveObserver:
             "Content-Type": "application/json",
         }
 
+        t0 = time.monotonic()
+        data: Any = None
         try:
             resp = await self._chat_http.post(url, headers=headers, json=payload)
             resp.raise_for_status()
@@ -1560,22 +1583,31 @@ class ProactiveObserver:
             choice = data.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
             finish = choice.get("finish_reason", "")
+            ledger = self._ledger_attempt
             if not content:
                 _log_speech_decision_outcome("rejected_invalid_output", finish, 0)
+                if ledger is not None:
+                    ledger.decision_format = "rejected_invalid_output"
                 return None
             parsed = _extract_json(content)
             if parsed:
                 _log_speech_decision_outcome("valid_json", finish, len(content))
+                if ledger is not None:
+                    ledger.decision_format = "valid_json"
                 return parsed
             adopted = _adopt_plain_dialogue_decision(content)
             if adopted:
                 _log_speech_decision_outcome(
                     "adopted_plain_dialogue", finish, len(content)
                 )
+                if ledger is not None:
+                    ledger.decision_format = "adopted_plain_dialogue"
                 return adopted
             _log_speech_decision_outcome(
                 "rejected_invalid_output", finish, len(content)
             )
+            if ledger is not None:
+                ledger.decision_format = "rejected_invalid_output"
             return None
         except Exception as e:
             logger.warning(
@@ -1584,23 +1616,52 @@ class ProactiveObserver:
                 type(e).__name__,
             )
             return None
+        finally:
+            ledger = self._ledger_attempt
+            if ledger is not None:
+                ledger.decision_elapsed_ms = int((time.monotonic() - t0) * 1000)
+                usage = _extract_openai_usage(data)
+                if usage:
+                    ledger.decision_usage = usage
 
     async def _do_evaluation(self, triggers: list[str]) -> None:
         now = time.monotonic()
         self._last_eval_at = now
+        attempt = _ObserverLedgerAttempt(
+            path="screen",
+            source="screen",
+            vlm_model=self._api_model,
+            decision_model=self._chat_api_model if self._speech_decision_configured else "",
+            triggers=tuple(triggers),
+        )
+        previous_ledger = self._ledger_attempt
+        self._ledger_attempt = attempt
+        try:
+            await self._screen_evaluation_attempt(triggers, now, attempt)
+        finally:
+            attempt.settle("silent")
+            self._ledger_attempt = previous_ledger
 
+    async def _screen_evaluation_attempt(
+        self,
+        triggers: list[str],
+        now: float,
+        attempt: _ObserverLedgerAttempt,
+    ) -> None:
         # 双重护栏：评估瞬间前台若已切回本进程，直接放弃（截图/UIA 都会读到自家 UI）。
         focus = self._focus_current
         if focus is not None and focus.is_own_process:
             logger.info("ProactiveObserver: skip eval, focus is own process")
             _observer_gui_log("跳过评估：前台为本进程", {"triggers": triggers})
             self._safe_on_evaluate("前台为本进程，跳过", False)
+            attempt.settle("preflight_skip")
             return
         try:
             if int(get_active_window_pid() or 0) == int(os.getpid()):
                 logger.info("ProactiveObserver: skip eval, foreground pid is self")
                 _observer_gui_log("跳过评估：前台为本进程", {"triggers": triggers})
                 self._safe_on_evaluate("前台为本进程，跳过", False)
+                attempt.settle("preflight_skip")
                 return
         except Exception:
             pass
@@ -1610,6 +1671,7 @@ class ProactiveObserver:
             logger.info("ProactiveObserver: privacy block ({})", matched)
             _observer_gui_log("隐私拦截", {"matched": matched})
             self._safe_on_evaluate(f"隐私拦截：{matched}", False)
+            attempt.settle("preflight_skip")
             return
 
         try:
@@ -1618,6 +1680,7 @@ class ProactiveObserver:
             logger.warning("ProactiveObserver: screen capture failed: {}", e)
             _observer_gui_log("截图失败", {"error": str(e)})
             self._safe_on_evaluate(f"截图失败：{e}", False)
+            attempt.settle("capture_error")
             return
 
         if obs.dhash and self._last_frame_dhash is not None:
@@ -1631,6 +1694,7 @@ class ProactiveObserver:
                 self._last_frame_dhash = obs.dhash
                 self._last_dedup_skip_at = now
                 self._safe_on_evaluate("画面未变化（dHash去重）", False)
+                attempt.settle("dedup_skip")
                 return
         if obs.dhash:
             self._last_frame_dhash = obs.dhash
@@ -1767,6 +1831,7 @@ class ProactiveObserver:
                     await old_chat.aclose()
             except Exception:
                 pass
+            attempt.settle("vlm_error")
             return
 
         parsed = _extract_json(response)
@@ -1782,6 +1847,7 @@ class ProactiveObserver:
                 "VLM 返回无法解析为 JSON（请确认 vision 槽位用支持识图的模型）",
                 False,
             )
+            attempt.settle("vlm_error")
             return
 
         visual_summary = str(parsed.get("visual_summary", "")).strip()
@@ -1857,6 +1923,7 @@ class ProactiveObserver:
         if not packet.has_perception:
             logger.info("ProactiveObserver: VLM returned empty perception packet")
             self._safe_on_evaluate("VLM 观测包为空", False)
+            attempt.settle("empty_perception")
             return
 
         logger.info(
@@ -1890,6 +1957,7 @@ class ProactiveObserver:
             self._mark_silent_eval()
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
+            attempt.settle("dedup_skip")
             return
         if self._speech_decision_configured:
             _observer_gui_log(
@@ -1924,6 +1992,7 @@ class ProactiveObserver:
             self._mark_silent_eval()
             self._safe_on_evaluate(reason, False)
             self._record_observation(window_title, False, reason)
+            attempt.settle("decision_error")
             return
 
         if not speech_decision.get("should_speak"):
@@ -1967,6 +2036,7 @@ class ProactiveObserver:
         except Exception as e:
             logger.warning("ProactiveObserver: on_speak callback error: {}", e)
             _observer_gui_log("主动发言回调失败", {"error": str(e)})
+        attempt.settle("speak")
 
     def _record_observation(
         self,
@@ -2032,23 +2102,99 @@ class ProactiveObserver:
             "thinking": {"type": "disabled"},
         }
 
-        resp = await self._http.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content")
-        finish = choice.get("finish_reason", "")
-        if not content:
-            logger.warning(
-                "ProactiveObserver: VLM returned empty content (finish={}, model={})",
-                finish,
-                self._api_model,
-            )
-            logger.debug(
-                "ProactiveObserver: raw response: {}",
-                json.dumps(data, ensure_ascii=False)[:500],
-            )
-        return content or ""
+        t0 = time.monotonic()
+        data: Any = None
+        try:
+            resp = await self._http.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content")
+            finish = choice.get("finish_reason", "")
+            if not content:
+                logger.warning(
+                    "ProactiveObserver: VLM returned empty content (finish={}, model={})",
+                    finish,
+                    self._api_model,
+                )
+                logger.debug(
+                    "ProactiveObserver: raw response: {}",
+                    json.dumps(data, ensure_ascii=False)[:500],
+                )
+            return content or ""
+        finally:
+            ledger = self._ledger_attempt
+            if ledger is not None:
+                ledger.vlm_elapsed_ms = int((time.monotonic() - t0) * 1000)
+                usage = _extract_openai_usage(data)
+                if usage:
+                    ledger.vlm_usage = usage
+
+
+@dataclass
+class _ObserverLedgerAttempt:
+    """Exactly-once settlement record for one screen or relationship evaluation."""
+
+    path: str
+    source: str
+    vlm_model: str = ""
+    decision_model: str = ""
+    triggers: tuple[str, ...] | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    decision_format: str = ""
+    vlm_elapsed_ms: int | None = None
+    decision_elapsed_ms: int | None = None
+    vlm_usage: dict[str, int] | None = None
+    decision_usage: dict[str, int] | None = None
+    _settled: bool = False
+
+    def settle(self, outcome: str) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        data: dict[str, Any] = {
+            "path": self.path,
+            "source": self.source,
+            "outcome": outcome,
+            "total_elapsed_ms": int((time.monotonic() - self.started_at) * 1000),
+        }
+        if self.path == "screen":
+            if self.vlm_model:
+                data["vlm_model"] = self.vlm_model
+            if self.triggers is not None:
+                data["triggers"] = list(self.triggers)
+        if self.decision_model:
+            data["decision_model"] = self.decision_model
+        if self.decision_format:
+            data["decision_format"] = self.decision_format
+        if self.vlm_elapsed_ms is not None:
+            data["vlm_elapsed_ms"] = self.vlm_elapsed_ms
+        if self.decision_elapsed_ms is not None:
+            data["decision_elapsed_ms"] = self.decision_elapsed_ms
+        if self.vlm_usage:
+            data["vlm_usage"] = dict(self.vlm_usage)
+        if self.decision_usage:
+            data["decision_usage"] = dict(self.decision_usage)
+        debug_log("ObserverLedger", "评估结算", data)
+
+
+def _extract_openai_usage(data: Any) -> dict[str, int] | None:
+    """Copy provider usage fields only; never estimate missing counts."""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    copied: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            copied[key] = value
+        elif isinstance(value, float) and value.is_integer():
+            copied[key] = int(value)
+    return copied or None
 
 
 _PLAIN_DIALOGUE_MAX_CHARS = 80

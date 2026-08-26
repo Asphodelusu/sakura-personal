@@ -36,4 +36,3 @@
 - [ ] **Step 4: Emit structured outcome values `valid_json`, `adopted_plain_dialogue`, or `rejected_invalid_output` through existing logging, without leaking full private dialogue.**
 - [ ] **Step 5: Run focused Observer/relationship tests and then `tests/unit tests/ui`; run `git diff --check`.**
 - [ ] **Step 6: Fill the Cursor section of `integration-notes.md`; do not commit or push.**
-

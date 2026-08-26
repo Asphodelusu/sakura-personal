@@ -20,4 +20,3 @@ Cursor may modify only:
 - `docs/agent-handoffs/observer-decision-fallback-p2/integration-notes.md`
 
 Do not commit or push. Preserve all unrelated files.
-
