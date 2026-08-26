@@ -100,6 +100,11 @@ class SubtitleController(QObject):
         self.waiting_indicator_timer = QTimer(self)
         self.waiting_indicator_timer.setInterval(WAITING_INDICATOR_INTERVAL_MS)
         self.waiting_indicator_timer.timeout.connect(self._show_next_waiting_indicator_frame)
+        self._translation_gate_active = False
+        self._translation_gate_interaction_id = ""
+        self._translation_gate_timer = QTimer(self)
+        self._translation_gate_timer.setSingleShot(True)
+        self._translation_gate_timer.timeout.connect(self._on_translation_gate_timeout)
 
     def set_display_speed(self, typing_interval_ms: int, segment_pause_ms: int) -> None:
         """更新字幕逐字间隔和分段停顿，后续显示流程立即使用新配置。"""
@@ -165,6 +170,7 @@ class SubtitleController(QObject):
         *,
         transition: bool = False,
     ) -> None:
+        self._clear_translation_gate()
         self.stop_waiting_indicator()
         self.reply_sequence_id += 1
         self.pending_reply_segments = []
@@ -425,6 +431,9 @@ class SubtitleController(QObject):
                 "portrait": self.current_segment.portrait,
             },
         )
+        if self._should_hold_chinese_display():
+            self._hold_translation_waiting_indicator()
+            return
         self.set_speech(
             self.current_segment.display_text(self.subtitle_language),
             pulse=self._should_pulse_bubble(),
@@ -508,6 +517,74 @@ class SubtitleController(QObject):
             },
         )
         self._start_reply_segments_now(next_segments)
+
+    def begin_translation_gate(
+        self,
+        timeout_seconds: float = 6.0,
+        *,
+        interaction_id: str = "",
+    ) -> None:
+        """在中文字幕后补完成前挡住日语展示；超时后回退日语以免卡死。"""
+        self._translation_gate_active = True
+        self._translation_gate_interaction_id = str(interaction_id or "")
+        timeout_ms = max(0, int(round(float(timeout_seconds) * 1000)))
+        self._translation_gate_timer.stop()
+        self._translation_gate_timer.start(timeout_ms)
+        self._log_stage(
+            "translation_gate_started",
+            {
+                "timeout_ms": timeout_ms,
+                "interaction_id": self._translation_gate_interaction_id,
+            },
+        )
+
+    def release_translation_gate(self, *, fallback: bool = False) -> None:
+        """结束门闩。fallback=True 时展示日语回退并放行分段推进。"""
+        was_active = self._translation_gate_active
+        self._clear_translation_gate()
+        if not was_active and not fallback:
+            return
+        if not fallback:
+            self._log_stage("translation_gate_released", {"fallback": False})
+            return
+        if self.current_segment is None:
+            return
+        self._log_stage("translation_gate_released", {"fallback": True})
+        self.set_speech(
+            self.current_segment.display_text(self.subtitle_language),
+            pulse=False,
+            instant=True,
+        )
+
+    def _clear_translation_gate(self) -> None:
+        self._translation_gate_active = False
+        self._translation_gate_interaction_id = ""
+        if self._translation_gate_timer.isActive():
+            self._translation_gate_timer.stop()
+
+    def _on_translation_gate_timeout(self) -> None:
+        if not self._translation_gate_active:
+            return
+        self.release_translation_gate(fallback=True)
+
+    def _should_hold_chinese_display(self) -> bool:
+        if not self._translation_gate_active:
+            return False
+        if self.subtitle_language != "zh":
+            return False
+        segment = self.current_segment
+        if segment is None:
+            return False
+        return not str(segment.translation or "").strip()
+
+    def _hold_translation_waiting_indicator(self) -> None:
+        if self.waiting_indicator_active:
+            return
+        self.waiting_indicator_active = True
+        self.waiting_indicator_index = 0
+        self._show_waiting_indicator_frame()
+        self.waiting_indicator_timer.start()
+        self._log_stage("translation_waiting_indicator_held", None)
 
     @Slot()
     def _show_next_speech_char(self) -> None:

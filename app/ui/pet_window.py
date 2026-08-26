@@ -751,7 +751,8 @@ class PetWindow(QWidget):
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
-        # Phase 1：默认不绑定供应商；测试可注入 FakeTranslationProvider。
+        # Phase 2：由 AppContext 显式注入；未装配时保持 None。
+        self.translation_settings = getattr(context, "translation_settings", None)
         self.translation_provider = getattr(context, "translation_provider", None)
         self._subtitle_translation_thread: QThread | None = None
         self._subtitle_translation_worker: QObject | None = None
@@ -4376,8 +4377,8 @@ class PetWindow(QWidget):
                     "character_id": self.character_profile.id,
                 },
             )
-        self._show_reply_segments(reply.segments)
         self._schedule_subtitle_translations(reply.segments, history_ids=history_ids)
+        self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
     def _queue_screen_observation_followup(self, result: AgentResult) -> bool:
@@ -4936,8 +4937,8 @@ class PetWindow(QWidget):
                 _debug=result._debug,
                 message_source=message_source,
             )
-        self._show_reply_segments(reply.segments)
         self._schedule_subtitle_translations(reply.segments, history_ids=history_ids)
+        self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
     def _apply_pending_action_from_result(self, result: AgentResult) -> None:
@@ -6812,6 +6813,17 @@ class PetWindow(QWidget):
         self.agent_runtime.inner_thought_settings = (
             self.settings_service.load_inner_thought_settings()
         )
+        from app.llm.openai_translation_provider import build_translation_provider
+
+        translation_settings = getattr(self, "translation_settings", None)
+        load_translation = getattr(self.settings_service, "load_translation_settings", None)
+        if callable(load_translation):
+            translation_settings = load_translation()
+            self.translation_settings = translation_settings
+        self.translation_provider = build_translation_provider(
+            translation_settings,
+            clients.chat_fast,
+        )
         self.memory_curator.api_client = clients.memory_curation
         reflector = getattr(self, "memory_reflector", None)
         if reflector is not None:
@@ -7605,9 +7617,14 @@ class PetWindow(QWidget):
         *,
         history_ids: list[int] | None = None,
     ) -> None:
-        """缺 zh 的 segment 异步翻译；不阻塞 TTS。无 provider 时跳过。"""
+        """缺 zh 的 segment 异步翻译；不阻塞 TTS。无 provider 或日语字幕模式时跳过。"""
         from app.ui.subtitle_translation import segments_needing_translation
 
+        if str(getattr(self, "subtitle_language", SUBTITLE_LANGUAGE_ZH) or SUBTITLE_LANGUAGE_ZH) == SUBTITLE_LANGUAGE_JA:
+            return
+        settings = getattr(self, "translation_settings", None)
+        if settings is not None and not bool(getattr(settings, "enabled", True)):
+            return
         provider = getattr(self, "translation_provider", None)
         if provider is None:
             return
@@ -7626,6 +7643,13 @@ class PetWindow(QWidget):
 
         interaction_id = str(getattr(self, "active_interaction_id", "") or "")
         self._pending_subtitle_translation_interaction_id = interaction_id
+        timeout_seconds = 6.0
+        if settings is not None:
+            timeout_seconds = float(getattr(settings, "gate_timeout_seconds", 6) or 6)
+        controller = getattr(self, "subtitle_controller", None)
+        begin_gate = getattr(controller, "begin_translation_gate", None)
+        if callable(begin_gate):
+            begin_gate(timeout_seconds=timeout_seconds, interaction_id=interaction_id)
         self._start_subtitle_translation_worker(
             interaction_id=interaction_id,
             texts=texts,
@@ -7727,11 +7751,23 @@ class PetWindow(QWidget):
 
     @Slot(object)
     def _on_subtitle_translation_failed(self, payload: object) -> None:
-        # 失败：保留日语原文，不展示任何系统降级文案。
+        # 失败：立即释放当前门闩，保留日语原文，不展示任何系统降级文案。
         error = ""
+        interaction_id = ""
         if isinstance(payload, dict):
             error = str(payload.get("error") or "")
+            interaction_id = str(payload.get("interaction_id") or "")
         debug_log("PetWindow", "异步字幕翻译失败，保留日语原文", {"error": error})
+        active_id = str(getattr(self, "active_interaction_id", "") or "")
+        pending_id = str(getattr(self, "_pending_subtitle_translation_interaction_id", "") or "")
+        if interaction_id and active_id and interaction_id != active_id:
+            return
+        if pending_id and interaction_id and interaction_id != pending_id:
+            return
+        controller = getattr(self, "subtitle_controller", None)
+        release_gate = getattr(controller, "release_translation_gate", None)
+        if callable(release_gate):
+            release_gate(fallback=True)
 
     def _apply_subtitle_translations(
         self,
@@ -7780,6 +7816,9 @@ class PetWindow(QWidget):
             if current is not None and str(current.text or "").strip() == ja:
                 updated = with_segment_translation(current, zh)
                 controller.current_segment = updated
+                release_gate = getattr(controller, "release_translation_gate", None)
+                if callable(release_gate):
+                    release_gate(fallback=False)
                 # 仅中文字幕模式才刷新显示；日语模式保持不变。
                 if getattr(self, "subtitle_language", "zh") == "zh":
                     display = updated.display_text("zh")

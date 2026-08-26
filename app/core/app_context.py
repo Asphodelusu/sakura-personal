@@ -7,6 +7,7 @@ from app.agent import AgentRuntime, MemoryStore, ReminderStore, ToolRegistry
 from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider
 from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
 from app.config.settings_service import AppSettingsService, DebugLogSettings, StartupSettings
+from app.config.translation_settings import TranslationSettings
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.llm.local_client import LocalLlmSettings, RoutingLlmClient
 from app.config.character_loader import CharacterProfile, CharacterRegistry
@@ -55,6 +56,8 @@ class FeatureServices:
     memory_curation_state: MemoryCurationState
     memory_curator: MemoryCurator
     screen_awareness_settings: ScreenAwarenessSettings
+    translation_settings: TranslationSettings
+    translation_provider: object | None
 
 
 @dataclass(frozen=True)
@@ -151,3 +154,11 @@ class AppContext:
     def proactive_care_settings(self) -> ScreenAwarenessSettings:
         """兼容旧调用点；新代码请使用 screen_awareness_settings。"""
         return self.features.screen_awareness_settings
+
+    @property
+    def translation_settings(self) -> TranslationSettings:
+        return self.features.translation_settings
+
+    @property
+    def translation_provider(self) -> object | None:
+        return self.features.translation_provider

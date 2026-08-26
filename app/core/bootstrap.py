@@ -12,6 +12,7 @@ from app.config.settings_service import AppSettingsService
 from app.llm.api_client import ApiSettings
 from app.llm.local_client import LocalLlmSettings
 from app.llm.slot_clients import build_app_llm_clients, resolve_chat_api_settings
+from app.llm.openai_translation_provider import build_translation_provider
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.extensions import ExtensionRegistry
@@ -194,6 +195,15 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         character_name=character_profile.display_name,
     )
     screen_awareness_settings = settings_service.load_screen_awareness_settings()
+    translation_settings = settings_service.load_translation_settings()
+    translation_provider = build_translation_provider(
+        translation_settings,
+        llm_clients.chat_fast,
+    )
+    provider_model = ""
+    provider_settings = getattr(getattr(translation_provider, "client", None), "settings", None)
+    if provider_settings is not None:
+        provider_model = str(getattr(provider_settings, "model", "") or "")
 
     debug_log(
         "Startup",
@@ -204,6 +214,11 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
             "plugins_deferred": True,
             "tts_deferred": True,
             "auto_memory": memory_curation_settings.enabled,
+            "translation_enabled": translation_settings.enabled,
+            "translation_ready": translation_provider is not None,
+            "translation_model": provider_model,
+            "translation_gate_timeout_seconds": translation_settings.gate_timeout_seconds,
+            "translation_max_attempts": translation_settings.max_attempts,
             "tool_loop": {
                 "max_agent_steps_per_turn": runtime_loop_settings.max_agent_steps_per_turn,
                 "max_tool_calls_per_step": runtime_loop_settings.max_tool_calls_per_step,
@@ -245,6 +260,8 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
             memory_curation_state=memory_curation_state,
             memory_curator=memory_curator,
             screen_awareness_settings=screen_awareness_settings,
+            translation_settings=translation_settings,
+            translation_provider=translation_provider,
         ),
         startup_initializing=True,
     )
