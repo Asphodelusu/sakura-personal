@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
 
@@ -65,6 +66,22 @@ def cleanup_tts_providers_before_qt(
         except RuntimeError:
             # 测试主动删除过底层 QObject 时，Python wrapper 可能已失效。
             continue
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_file_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterable[None]:
+    from app.core.debug_log import _close_file_logger_for_tests
+
+    _close_file_logger_for_tests()
+    monkeypatch.setattr(
+        "app.core.debug_log._FILE_LOG_PATH",
+        tmp_path / "sakura-runtime.log",
+    )
+    yield
+    _close_file_logger_for_tests()
 
 
 @pytest.fixture(autouse=True)
