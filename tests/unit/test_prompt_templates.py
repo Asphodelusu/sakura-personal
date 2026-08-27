@@ -115,6 +115,16 @@ def test_agent_reply_protocol_guides_ja_translation_self_check() -> None:
     assert "只显示，不朗读" in instruction
 
 
+def test_segmented_reply_instruction_models_optional_visible_action() -> None:
+    instruction = build_segmented_reply_instruction(["中性", "请求"], ["站立待机"])
+
+    assert "（そっと隣に座り、肩を寄せる）" in instruction
+    assert '"suppress_tts":true' in instruction
+    assert "可观察" in instruction
+    assert "纯对白" in instruction
+    assert "内心" in instruction
+
+
 def test_intimacy_entry_prompt_distinguishes_overall_entry_from_ongoing_consent() -> None:
     from app.agent.builtin_tools import INTIMACY_ENTER_PHRASE, intimacy_mode_state
 
@@ -187,8 +197,9 @@ def test_agent_tool_prompt_length_stays_compact() -> None:
         allow_screen_observation=True,
     )
 
-    # 静态前缀不再内联记忆/时间/步数（改由运行时上下文消息注入），应更精简。
-    assert len(prompt) < 3000
+    # 静态前缀不再内联记忆/时间/步数（改由运行时上下文消息注入）。
+    # 可见动作合同有意保留一个完整 silent-segment 示例；仍给总前缀设置紧凑上限。
+    assert len(prompt) < 3350
     assert prompt.count("主动屏幕感知核心规则") == 0
     assert "长期记忆摘要" not in prompt
     assert "这是第 1 步" not in prompt

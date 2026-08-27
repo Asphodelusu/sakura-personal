@@ -120,6 +120,18 @@ def test_sakura_card_drops_candidate_handoff_header() -> None:
     assert "她是夜乃桜" in card
 
 
+def test_sakura_card_distinguishes_inner_feeling_from_spoken_expression() -> None:
+    root = Path(__file__).resolve().parents[2]
+    card_path = root / "characters" / "Sakura" / "card.md"
+    if not card_path.is_file():
+        return
+    card = card_path.read_text(encoding="utf-8")
+
+    assert "内心" in card
+    assert "说出口" in card
+    assert "事实、问题和具体请求" in card
+
+
 def test_current_relationship_follows_accumulated_runtime_evidence() -> None:
     root = Path(__file__).resolve().parents[2]
     guards = (root / "characters" / "Sakura" / "system_guards.md").read_text(
