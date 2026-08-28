@@ -3696,6 +3696,7 @@ async function loadMemories(options = {}) {
   if (!request) {
     return;
   }
+  const requestGeneration = memorySearchController.beginRequest();
   const silent = Boolean(options.silent);
   const preserveScroll = options.preserveScroll !== false;
   const preferredSelectedId = String(
@@ -3723,6 +3724,9 @@ async function loadMemories(options = {}) {
       params.layer = fields.memoryLayerFilter.value;
     }
     const result = await hostCall("memory.search", params);
+    if (!memorySearchController.isCurrentRequest(requestGeneration)) {
+      return;
+    }
     memoryState.status = result.status || "ready";
     memoryState.message = result.message || result.error || "";
     shouldRetry = memoryState.status === "loading";
@@ -3747,12 +3751,18 @@ async function loadMemories(options = {}) {
       memoryState.selectedId = memoryState.entries[0]?.id || "";
     }
   } catch (error) {
+    if (!memorySearchController.isCurrentRequest(requestGeneration)) {
+      return;
+    }
     memoryState.status = "failed";
     memoryState.message = String(error);
     if (!silent) {
       memoryState.entries = [];
     }
   } finally {
+    if (!memorySearchController.isCurrentRequest(requestGeneration)) {
+      return;
+    }
     memoryState.loading = false;
     renderMemoryPage();
     if (preserveScroll && anchor) {
@@ -4978,20 +4988,36 @@ fields.resetThemeButton.addEventListener("click", () => {
 });
 fields.debugLogEnabled.addEventListener("change", syncDebugLogState);
 fields.bubbleAutoHide.addEventListener("change", syncBubbleState);
-let memorySearchTimer = null;
-fields.memorySearch.addEventListener("input", () => {
-  clearMemoryRetry();
-  window.clearTimeout(memorySearchTimer);
-  memorySearchTimer = window.setTimeout(loadMemories, 180);
+const memorySearchController = SakuraMemorySearch.createMemorySearchController({
+  delayMs: 450,
+  onSearch: () => loadMemories({ silent: true }),
 });
-fields.memoryLayerFilter.addEventListener("change", loadMemories);
+fields.memorySearch.addEventListener("compositionstart", () => {
+  clearMemoryRetry();
+  memorySearchController.onCompositionStart();
+});
+fields.memorySearch.addEventListener("compositionend", () => {
+  clearMemoryRetry();
+  memorySearchController.onCompositionEnd();
+});
+fields.memorySearch.addEventListener("input", (event) => {
+  clearMemoryRetry();
+  memorySearchController.onInput(event);
+});
+fields.memoryLayerFilter.addEventListener("change", () => {
+  memorySearchController.cancelPending();
+  loadMemories();
+});
 fields.memorySort.addEventListener("change", () => {
   const anchor = captureMemoryListAnchor();
   renderMemoryPage();
   restoreMemoryListAnchor(anchor);
 });
 fields.memoryAddButton.addEventListener("click", newMemoryDraft);
-fields.memoryRefreshButton.addEventListener("click", loadMemories);
+fields.memoryRefreshButton.addEventListener("click", () => {
+  memorySearchController.cancelPending();
+  loadMemories();
+});
 fields.memorySaveButton.addEventListener("click", saveMemoryEditor);
 fields.memoryRevertButton.addEventListener("click", () => fillMemoryEditor(selectedMemory()));
 fields.memoryDeleteButton.addEventListener("click", deleteSelectedMemory);

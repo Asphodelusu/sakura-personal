@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QThread, QTimer, Signal, Slot
 
 from app.config.character_studio import CharacterStudioService
 from app.ui.screen_color_picker import pick_screen_color
@@ -165,6 +165,7 @@ def _workspace_reference(params: dict[str, Any]) -> str | Path:
 class TauriStudioProcess(QObject):
     closed = Signal()
     failed = Signal(str)
+    _rpc_response_ready = Signal(str, bool, object, str)
 
     def __init__(self, base_dir: Path, *, initial_character_id: str = "", parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -176,6 +177,7 @@ class TauriStudioProcess(QObject):
         self._done = False
         self._startup_focus_complete = False
         self._rpcs: dict[str, tuple[QThread, QObject]] = {}
+        self._rpc_response_ready.connect(self._deliver_queued_rpc_response)
 
     def start(self) -> bool:
         binary = resolve_tauri_studio_binary(self.base_dir)
@@ -341,14 +343,14 @@ class TauriStudioProcess(QObject):
         self._rpcs[request_id] = (thread, worker)
         thread.started.connect(worker.run)
         worker.succeeded.connect(
-            lambda result, rid=request_id: self._send_rpc_response(
+            lambda result, rid=request_id: self._queue_rpc_response(
                 rid,
                 ok=True,
                 result=result if isinstance(result, dict) else {"value": result},
             )
         )
         worker.failed.connect(
-            lambda message, rid=request_id: self._send_rpc_response(
+            lambda message, rid=request_id: self._queue_rpc_response(
                 rid,
                 ok=False,
                 error=str(message),
@@ -359,6 +361,27 @@ class TauriStudioProcess(QObject):
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda rid=request_id: self._rpcs.pop(rid, None))
         thread.start()
+
+    def _queue_rpc_response(
+        self,
+        request_id: str,
+        *,
+        ok: bool,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        self._rpc_response_ready.emit(request_id, bool(ok), result, error or "")
+
+    @Slot(str, bool, object, str)
+    def _deliver_queued_rpc_response(
+        self,
+        request_id: str,
+        ok: bool,
+        result: object,
+        error: str,
+    ) -> None:
+        payload = result if isinstance(result, dict) else None
+        self._send_rpc_response(request_id, ok=ok, result=payload, error=error)
 
     def _send_rpc_response(
         self,
