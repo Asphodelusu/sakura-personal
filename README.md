@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.9.9--personal.3-informational)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.9.9--personal.5-informational)](VERSION)
 [![Upstream](https://img.shields.io/badge/upstream-Rvosy%2FSakura-lightgrey)](https://github.com/Rvosy/Sakura)
 
 </div>
@@ -15,7 +15,7 @@
 
 Sakura 会持续对话、记住长期信息，并在合适的时候主动开口。角色包决定她的风格、立绘与音色，内置 Agent 负责工具调用与感知。
 
-本仓库是 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护的 **Personal Edition**（当前版本 `0.9.9-personal.3`）。它从上游 Sakura 分出，保留同一套桌宠与 Agent 骨架，并在记忆连贯、时间感、互动节奏和屏幕感知等方向做了更偏个人使用的强化。
+本仓库是 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护的 **Personal Edition**（当前版本 `0.9.9-personal.5`）。它从上游 Sakura 分出，保留同一套桌宠与 Agent 骨架，并在记忆连贯、时间感、互动节奏和屏幕感知等方向做了更偏个人使用的强化。
 
 面向愿意自己搭源码环境的用户：**不提供独立官方安装包**，也不保证与上游发版节奏同步。若你需要开箱即用的完整包（含 `runtime/`、`install.bat` 等），请直接使用上游 [Releases](https://github.com/Rvosy/Sakura/releases)。
 
@@ -27,22 +27,40 @@ Sakura 会持续对话、记住长期信息，并在合适的时候主动开口�
 
 本仓库额外侧重、或实现方式已经不同的部分主要有：
 
-**主动屏幕感知**  
-上游常见做法是定时截图、攒一批画面再交给主模型找话题。本仓库改成独立的观察循环：结合前台窗口截图与控件文字，先由视觉模型写下「看到了什么、想到了什么」，再由对话模型决定要不要开口。支持隐私黑名单（敏感进程 / 窗口标题）、按专注程度调整观察间隔，以及「出门了 / 晚安」一类离开时自动暂停。
+**主动感知与关系互动**
 
-**记忆更连贯**  
-在上游分层记忆与自动整理之上，增加了空闲时的记忆反思（以及对反思再归纳的二阶总结）、人物/事物相关的轻量实体索引，以及按「最近是否被想起」跟踪记忆访问。情绪侧用连续的愉悦度–唤醒度空间去影响「此刻更贴哪类记忆」，而不是只靠离散标签。
+上游常见做法是定时截图、攒一批画面再交给主模型找话题。本仓库改成独立的观察循环：结合前台窗口截图与控件文字，先由视觉模型写下「看到了什么、想到了什么」，再由对话模型决定要不要开口。屏幕观察之外，也会根据关系与近期互动主动开口；两条路径结合用户是否在场、当前专注状态、最近互动与历史效果作出选择，尽量减少无效打扰和重复问候。支持隐私黑名单（敏感进程 / 窗口标题）、自适应观察间隔，以及「出门了 / 晚安」一类离开时自动暂停。
 
-**聊天历史存储**  
-上游使用 JSONL；本仓库改为 SQLite（读写更快，首次启动可从旧 JSONL 自动迁移），对外调用方式保持兼容。
+**记忆与关系连续性**
 
-**语音输入**  
+在上游分层记忆与自动整理之上，增加了渐进召回、空闲反思、人物与事物索引，以及记忆访问跟踪。常驻档案会随证据充足的互动逐步更新，让关系和长期认识自然发展，不轻易被单次对话重置。
+
+**情绪与内在连续性**
+
+角色会保留当前心情与近期变化，让情绪自然影响语气、节奏、记忆召回和主动反应，而不是每轮清零或只套用离散标签。
+
+**内心独白**
+
+回复前可以形成一段不会直接说出口的内心活动，并在最近几轮之间延续。它结合角色人格、当前对话与相关记忆，让隐藏的感受和回应篇幅显得更自然。
+
+**回复、翻译与演出**
+
+主回复可专注于角色语言与当下反应，中文字幕由独立翻译侧路异步补齐，避免为了翻译再次调用主对话模型。分段字幕会协调动作、晚到翻译与语音播放的先后和停留时间；工具轮已有完整正文时也会尽量直接采用，减少重复合成带来的延迟和复读。
+
+**聊天历史与通道**
+
+上游使用 JSONL；本仓库改为 SQLite（读写更快，首次启动可从旧 JSONL 自动迁移），对外调用方式保持兼容。历史记录同时保留普通聊天、主动发言和手机端等来源，使后续上下文知道一句话是从哪里发生的。
+
+**语音输入**
+
 集成本地 STT（SenseVoice），可用快捷键或按钮把说话转成输入，不必只靠打字。
 
-**互动节奏**  
-在部分亲密或高互动场景下，可切换更快的回复节奏，并在对方沉默时有限度地续说（由内置工具与本地指引控制，默认仍克制）。
+**互动节奏**
 
-**发行方式**  
+回应速度、主动程度和沉默后的续接会随既有关系、现场氛围与对方反应自然变化；角色仍保留自己的判断，不把关系演成固定流程。
+
+**发行方式**
+
 上游提供 Windows 完整包与更新脚本等；本仓库只维护源码流程（`.venv` + `run.bat`），方便个人改代码与试验，不维护单独的安装包发行线。
 
 更细的目录与配置说明见 [docs/TECHNICAL_README.md](docs/TECHNICAL_README.md)，版本变更见 [CHANGELOG.md](CHANGELOG.md)。
@@ -171,4 +189,4 @@ Copyright © 2026 Rvosy
 
 ## 关于本仓库
 
-Personal Edition（当前 `0.9.9-personal.3`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。本分支未经过完整部署测试，遇到问题欢迎提交 [Issue](https://github.com/Asphodelusu/sakura-personal/issues)，会尽量跟进。
+Personal Edition（当前 `0.9.9-personal.5`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。本分支未经过完整部署测试，遇到问题欢迎提交 [Issue](https://github.com/Asphodelusu/sakura-personal/issues)，会尽量跟进。
