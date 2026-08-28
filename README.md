@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.9.9--personal.3-informational)](VERSION)
+[![Version](https://img.shields.io/badge/version-0.9.9--personal.5-informational)](VERSION)
 [![Upstream](https://img.shields.io/badge/upstream-Rvosy%2FSakura-lightgrey)](https://github.com/Rvosy/Sakura)
 
 </div>
@@ -15,7 +15,7 @@
 
 Sakura 会持续对话、记住长期信息，并在合适的时候主动开口。角色包决定她的风格、立绘与音色，内置 Agent 负责工具调用与感知。
 
-本仓库是 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护的 **Personal Edition**（当前版本 `0.9.9-personal.3`）。它从上游 Sakura 分出，保留同一套桌宠与 Agent 骨架，并在记忆连贯、时间感、互动节奏和屏幕感知等方向做了更偏个人使用的强化。
+本仓库是 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护的 **Personal Edition**（当前版本 `0.9.9-personal.5`）。它从上游 Sakura 分出，保留同一套桌宠与 Agent 骨架，并在记忆连贯、时间感、互动节奏和屏幕感知等方向做了更偏个人使用的强化。
 
 面向愿意自己搭源码环境的用户：**不提供独立官方安装包**，也不保证与上游发版节奏同步。若你需要开箱即用的完整包（含 `runtime/`、`install.bat` 等），请直接使用上游 [Releases](https://github.com/Rvosy/Sakura/releases)。
 
@@ -171,4 +171,4 @@ Copyright © 2026 Rvosy
 
 ## 关于本仓库
 
-Personal Edition（当前 `0.9.9-personal.3`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。本分支未经过完整部署测试，遇到问题欢迎提交 [Issue](https://github.com/Asphodelusu/sakura-personal/issues)，会尽量跟进。
+Personal Edition（当前 `0.9.9-personal.5`）由 [Asphodelusu/sakura-personal](https://github.com/Asphodelusu/sakura-personal) 维护，供个人使用与实验，与上游正式发行相互独立。本分支未经过完整部署测试，遇到问题欢迎提交 [Issue](https://github.com/Asphodelusu/sakura-personal/issues)，会尽量跟进。
