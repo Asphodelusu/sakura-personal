@@ -25,6 +25,11 @@ def build_segmented_reply_instruction(
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     portraits = labels_or_default(reply_portraits, DEFAULT_REPLY_PORTRAITS)
+    action_example = (
+        '{"ja":"（そっと隣に座り、肩を寄せる）",'
+        '"zh":"（轻轻在对方身边坐下，把肩靠了过去）",'
+        f'"tone":"{tones[0]}","suppress_tts":true}}'
+    )
     rules = [
         "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
         "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
@@ -37,6 +42,11 @@ def build_segmented_reply_instruction(
         "tone 跟她当下真实心情走：不满就用不满，认真就用认真，不必为了稳妥默认成中性。",
         "- 无论你本轮是否调用工具，一旦决定直接回复对方，assistant 的 content 必须是合法 JSON segments，"
         "禁止纯文本、Markdown 或代码块。",
+        "- 当身体距离、触碰或实际行动确实承载这一拍情绪时，可以把一个短动作写成独立 segment；"
+        "ja/zh 都用全角括号，suppress_tts=true。只写外部可观察的行为、位置或接触，不解释内心。"
+        "没有值得表现的动作时，纯对白完全正常。",
+        f"- 可选动作段示例：{action_example}。动作与对白不要复述同一件事；"
+        "表情主要交给 portrait，不把微笑、脸红、点头写成每轮固定前缀。",
     ]
     if len(portraits) > 1:
         if portrait_hints:

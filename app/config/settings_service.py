@@ -671,6 +671,33 @@ class AppSettingsService:
             "expression_bias": normalized.expression_bias,
             "proactive_cooldown_seconds": int(normalized.proactive_cooldown_seconds),
             "proactive_min_silence_seconds": int(normalized.proactive_min_silence_seconds),
+            "desktop_idle_seconds": int(normalized.desktop_idle_seconds),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
+    def load_translation_settings(self):
+        from app.config.translation_settings import TranslationSettings
+
+        section = self._system_section("translation")
+        return TranslationSettings(
+            enabled=_bool_value(section.get("enabled"), False),
+            gate_timeout_seconds=_int_value(section.get("gate_timeout_seconds"), 6),
+            max_attempts=_int_value(section.get("max_attempts"), 2),
+        ).normalized()
+
+    def save_translation_settings(self, settings) -> None:
+        from app.config.translation_settings import TranslationSettings
+
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, TranslationSettings)
+            else TranslationSettings().normalized()
+        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["translation"] = {
+            "enabled": bool(normalized.enabled),
+            "gate_timeout_seconds": int(normalized.gate_timeout_seconds),
+            "max_attempts": int(normalized.max_attempts),
         }
         save_yaml_mapping(self.system_config_path, data)
 

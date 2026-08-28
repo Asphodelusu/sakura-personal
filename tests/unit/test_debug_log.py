@@ -74,6 +74,21 @@ def test_file_log_writes_when_terminal_log_disabled(monkeypatch, capsys) -> None
     _close_file_logger_for_tests()
 
 
+def test_file_log_path_is_isolated_for_pytest(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.core.debug_log import _FILE_LOG_PATH
+
+    monkeypatch.setattr(
+        "app.core.debug_log._load_debug_values",
+        lambda: {"enabled": False, "file_enabled": True},
+    )
+
+    debug_log("Runtime", "测试日志路径隔离")
+    path = Path(_FILE_LOG_PATH)
+    assert str(path).startswith(str(tmp_path))
+    assert path.exists()
+    _close_file_logger_for_tests()
+
+
 def test_file_log_ignores_body_enabled_full_text(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
     log_path = _runtime_log_path("file_body_guard")
     monkeypatch.setattr("app.core.debug_log._FILE_LOG_PATH", log_path)

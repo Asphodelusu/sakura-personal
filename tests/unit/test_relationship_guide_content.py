@@ -65,3 +65,6 @@ def test_live_sakura_guide_keeps_relationship_director_contract_when_present() -
     assert "高温后的生活" in text
     assert "贴紧" in text
     assert "苹果" in text
+    assert "## 感情如何出口" in text
+    assert "继续沉默会真正失去机会" in text
+    assert "具体请求" in text

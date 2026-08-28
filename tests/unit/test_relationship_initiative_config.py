@@ -93,3 +93,15 @@ def test_save_roundtrip_preserves_unknown_sibling_keys(tmp_path: Path) -> None:
     assert loaded.expression_bias == "restrained"
     assert loaded.proactive_cooldown_seconds == 1800
     assert loaded.proactive_min_silence_seconds == 120
+
+
+def test_save_roundtrip_preserves_desktop_idle_seconds(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.system_config_path.write_text("ui: {}\n", encoding="utf-8")
+    service.save_relationship_initiative_settings(
+        RelationshipInitiativeSettings(
+            desktop_idle_seconds=1800,
+        )
+    )
+    loaded = service.load_relationship_initiative_settings()
+    assert loaded.desktop_idle_seconds == 1800
