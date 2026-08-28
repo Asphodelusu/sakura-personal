@@ -43,6 +43,20 @@ class _DelayedTTS:
         return None
 
 
+# Displayed "早安。": 3 chars → 500 + 80 * 3 = 740 → clamp 1000.
+# Displayed "おはよう。": 5 chars → 500 + 80 * 5 = 900 → clamp 1000.
+LATE_FIRST_LINE_DWELL_MS = 1000
+
+
+def _fire_dialogue_dwell(controller, expected_ms: int) -> None:
+    timer = getattr(controller, "_dialogue_reading_dwell_timer", None)
+    assert timer is not None
+    assert timer.isActive()
+    assert int(timer.interval()) == expected_ms
+    timer.stop()
+    timer.timeout.emit()
+
+
 def _build_controller(label: _DummyLabel, tts: _DelayedTTS, applied: list[ChatSegment]):
     from app.ui.subtitle_controller import SubtitleController
     from app.voice import VoicePlaybackController
@@ -262,6 +276,8 @@ def test_multi_segment_missing_zh_holds_until_success_then_patches_and_completes
 
     tts.on_finished()
     QCoreApplication.processEvents()
+    assert label.text == "早安。"
+    _fire_dialogue_dwell(controller, LATE_FIRST_LINE_DWELL_MS)
     assert tts.on_started is not None
     tts.on_started()
     assert label.text == "喂。"
@@ -309,6 +325,9 @@ def test_multi_segment_exposes_japanese_only_after_one_turn_level_timeout() -> N
 
     tts.on_finished()
     QCoreApplication.processEvents()
+    assert "おはよう" in label.text
+    assert "ねえ" not in label.text
+    _fire_dialogue_dwell(controller, LATE_FIRST_LINE_DWELL_MS)
     tts.on_started()
     assert "ねえ" in label.text
     tts.on_finished()

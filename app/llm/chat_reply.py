@@ -106,13 +106,16 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
                 needs_retry=True,
                 reason="invalid_json",
             )
-        return ChatReplyParseResult(ChatReply([ChatSegment(content, DEFAULT_TONE)]), ok=True)
+        return ChatReplyParseResult(
+            ChatReply(_normalize_malformed_segments([ChatSegment(content, DEFAULT_TONE)])),
+            ok=True,
+        )
 
     if isinstance(data, dict):
         segments, has_language_issue = _parse_segments(data)
         if segments:
             return ChatReplyParseResult(
-                ChatReply(segments),
+                ChatReply(_normalize_malformed_segments(segments)),
                 ok=not has_language_issue,
                 needs_retry=has_language_issue,
                 repaired=repaired,
@@ -125,6 +128,130 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
         needs_retry=True,
         repaired=repaired,
         reason="missing_segments",
+    )
+
+
+def _normalize_malformed_segments(segments: list[ChatSegment]) -> list[ChatSegment]:
+    """按畸形段形状拆开动作/台词，已正确的动作段只做幂等保留。"""
+    normalized: list[ChatSegment] = []
+    for segment in segments:
+        normalized.extend(_normalize_malformed_segment(segment))
+    return normalized
+
+
+def _normalize_malformed_segment(segment: ChatSegment) -> list[ChatSegment]:
+    ja_pieces = _repair_segment_text(segment.text)
+    if not ja_pieces:
+        return [segment]
+
+    zh_pieces = _repair_segment_text(segment.translation) if segment.translation.strip() else []
+    pair_translations = _same_repair_shape(ja_pieces, zh_pieces)
+    already_correct = (
+        len(ja_pieces) == 1
+        and ja_pieces[0][0] == segment.text
+        and (not ja_pieces[0][1] or segment.suppress_tts)
+    )
+    if already_correct:
+        return [segment]
+
+    repaired: list[ChatSegment] = []
+    split_occurred = len(ja_pieces) > 1
+    for index, (text, is_action) in enumerate(ja_pieces):
+        if pair_translations:
+            translation = zh_pieces[index][0]
+        elif split_occurred:
+            translation = ""
+        else:
+            translation = segment.translation
+        repaired.append(
+            ChatSegment(
+                text,
+                segment.tone,
+                translation,
+                segment.portrait,
+                suppress_tts=True if is_action else segment.suppress_tts,
+            )
+        )
+    return repaired
+
+
+def _repair_segment_text(text: str) -> list[tuple[str, bool]]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    units = lines if len(lines) > 1 else [stripped]
+    pieces: list[tuple[str, bool]] = []
+    for unit in units:
+        split = _split_fullwidth_actions(unit)
+        if split is None:
+            pieces.append((unit, False))
+        else:
+            pieces.extend(split)
+    return pieces
+
+
+def _split_fullwidth_actions(text: str) -> list[tuple[str, bool]] | None:
+    spans = _scan_fullwidth_action_spans(text)
+    if not spans:
+        return None
+    pieces: list[tuple[str, bool]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            dialogue = text[cursor:start].strip()
+            if dialogue:
+                pieces.append((dialogue, False))
+        action = text[start:end].strip()
+        if action:
+            pieces.append((action, True))
+        cursor = end
+    if cursor < len(text):
+        dialogue = text[cursor:].strip()
+        if dialogue:
+            pieces.append((dialogue, False))
+    return pieces or None
+
+
+def _scan_fullwidth_action_spans(text: str) -> list[tuple[int, int]] | None:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "）":
+            return None
+        if char != "（":
+            index += 1
+            continue
+        close_at = _find_non_nested_fullwidth_close(text, index + 1)
+        if close_at is None:
+            return None
+        if text[index + 1 : close_at].strip():
+            spans.append((index, close_at + 1))
+        index = close_at + 1
+    return spans
+
+
+def _find_non_nested_fullwidth_close(text: str, start: int) -> int | None:
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "（":
+            return None
+        if char == "）":
+            return index
+    return None
+
+
+def _same_repair_shape(
+    ja_pieces: list[tuple[str, bool]],
+    zh_pieces: list[tuple[str, bool]],
+) -> bool:
+    if len(ja_pieces) != len(zh_pieces):
+        return False
+    return all(
+        ja_is_action == zh_is_action
+        for (_ja, ja_is_action), (_zh, zh_is_action) in zip(ja_pieces, zh_pieces)
     )
 
 

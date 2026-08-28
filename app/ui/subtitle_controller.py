@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 from PySide6.QtCore import (
@@ -27,6 +28,15 @@ SUBTITLE_TYPING_INTERVAL_MIN_MS = 5
 SUBTITLE_TYPING_INTERVAL_MAX_MS = 200
 REPLY_SEGMENT_PAUSE_MIN_MS = 0
 REPLY_SEGMENT_PAUSE_MAX_MS = 3000
+ACTION_READING_HOLD_BASE_MS = 400
+ACTION_READING_HOLD_PER_CHAR_MS = 40
+ACTION_READING_HOLD_MIN_MS = 600
+ACTION_READING_HOLD_MAX_MS = 1200
+ACTION_TRANSLATION_DEADLINE_MS = 12_000
+DIALOGUE_DWELL_BASE_MS = 500
+DIALOGUE_DWELL_PER_CHAR_MS = 80
+DIALOGUE_DWELL_MIN_MS = 1000
+DIALOGUE_DWELL_MAX_MS = 2500
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]
 SegmentCallback = Callable[[ChatSegment], None]
@@ -102,9 +112,26 @@ class SubtitleController(QObject):
         self.waiting_indicator_timer.timeout.connect(self._show_next_waiting_indicator_frame)
         self._translation_gate_active = False
         self._translation_gate_interaction_id = ""
+        self._translation_in_flight = False
+        self._translation_deadline_generation = 0
+        self._action_translation_deadline_token = 0
         self._translation_gate_timer = QTimer(self)
         self._translation_gate_timer.setSingleShot(True)
         self._translation_gate_timer.timeout.connect(self._on_translation_gate_timeout)
+        self._action_translation_deadline_timer = QTimer(self)
+        self._action_translation_deadline_timer.setSingleShot(True)
+        self._action_translation_deadline_timer.timeout.connect(self._on_action_translation_deadline)
+        self._action_reading_hold_timer = QTimer(self)
+        self._action_reading_hold_timer.setSingleShot(True)
+        self._action_reading_hold_timer.timeout.connect(self._on_action_reading_hold_timeout)
+        self._action_reading_hold_token = 0
+        self._action_reading_hold_sequence_id = 0
+        self._dialogue_reading_dwell_timer = QTimer(self)
+        self._dialogue_reading_dwell_timer.setSingleShot(True)
+        self._dialogue_reading_dwell_timer.timeout.connect(self._on_dialogue_reading_dwell_timeout)
+        self._dialogue_reading_dwell_token = 0
+        self._dialogue_reading_dwell_sequence_id = 0
+        self._segment_visible_monotonic: float | None = None
 
     def set_display_speed(self, typing_interval_ms: int, segment_pause_ms: int) -> None:
         """更新字幕逐字间隔和分段停顿，后续显示流程立即使用新配置。"""
@@ -142,6 +169,8 @@ class SubtitleController(QObject):
 
     def start_waiting_indicator(self) -> None:
         """显示模型回复等待动效；收到真实回复或错误时由后续流程停止。"""
+        self._clear_translation_lifecycle()
+        self._stop_hold_and_dwell_timers()
         self.reply_sequence_id += 1
         self.pending_reply_segments = []
         self.queued_reply_segment_batches = []
@@ -170,7 +199,8 @@ class SubtitleController(QObject):
         *,
         transition: bool = False,
     ) -> None:
-        self._clear_translation_gate()
+        self._clear_translation_lifecycle()
+        self._stop_hold_and_dwell_timers()
         self.stop_waiting_indicator()
         self.reply_sequence_id += 1
         self.pending_reply_segments = []
@@ -239,6 +269,8 @@ class SubtitleController(QObject):
             if pulse and cleaned and self._should_pulse_bubble():
                 self._pulse_bubble()
             if self.current_segment_sequence_id is not None:
+                if cleaned:
+                    self._record_segment_visible()
                 self._mark_segment_speech_done(self.current_segment_sequence_id)
             self._log_stage(
                 "speech_text_shown_instant" if instant else "speech_text_started",
@@ -254,6 +286,7 @@ class SubtitleController(QObject):
         if len(self.speech_text) > 1:
             self.speech_timer.start()
         elif self.current_segment_sequence_id is not None:
+            self._record_segment_visible()
             self._mark_segment_speech_done(self.current_segment_sequence_id)
         if pulse and self._should_pulse_bubble():
             self._pulse_bubble()
@@ -359,6 +392,8 @@ class SubtitleController(QObject):
         self.current_segment_speech_done = False
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
+        self._stop_hold_and_dwell_timers()
+        self._segment_visible_monotonic = None
 
     def _start_reply_segments_now(self, segments: list[ChatSegment]) -> None:
         self.reply_sequence_id += 1
@@ -446,8 +481,8 @@ class SubtitleController(QObject):
         self.current_segment_speech_done = True
         self._restore_typing_interval()
         self._log_stage("segment_text_render_done", {"sequence_id": sequence_id})
-        self._end_interaction_if_reply_done()
         self._schedule_next_reply_segment_if_ready(sequence_id)
+        self._end_interaction_if_reply_done()
 
     def _mark_segment_tts_done(self, sequence_id: int) -> None:
         if sequence_id != self.reply_sequence_id or sequence_id != self.current_segment_sequence_id:
@@ -457,8 +492,8 @@ class SubtitleController(QObject):
         # 先露后半，再进入段间停顿 / 下一段，听完还能扫一眼溢出部分。
         if self._on_segment_audio_finished is not None:
             self._on_segment_audio_finished()
-        self._end_interaction_if_reply_done()
         self._schedule_next_reply_segment_if_ready(sequence_id)
+        self._end_interaction_if_reply_done()
 
     def _schedule_next_reply_segment_if_ready(self, sequence_id: int) -> None:
         if (
@@ -467,9 +502,20 @@ class SubtitleController(QObject):
             or self.reply_advance_scheduled
             or not self.current_segment_speech_done
             or not self.current_segment_tts_done
-            or not self.pending_reply_segments
         ):
             return
+
+        if _is_silent_visible_action(self.current_segment):
+            self._arm_action_reading_hold(sequence_id)
+            return
+        if not self.pending_reply_segments:
+            return
+
+        delay_ms = self.segment_pause_ms
+        remaining_dwell_ms = 0
+        if _is_ordinary_spoken_dialogue(self.current_segment):
+            remaining_dwell_ms = self._remaining_dialogue_dwell_ms()
+            delay_ms = max(self.segment_pause_ms, remaining_dwell_ms)
 
         self.reply_advance_scheduled = True
         self.reply_advance_token += 1
@@ -478,12 +524,17 @@ class SubtitleController(QObject):
             "next_segment_scheduled",
             {
                 "sequence_id": sequence_id,
-                "delay_ms": self.segment_pause_ms,
+                "delay_ms": delay_ms,
                 "remaining_segments": len(self.pending_reply_segments),
             },
         )
+        if remaining_dwell_ms > 0:
+            self._dialogue_reading_dwell_token = reply_advance_token
+            self._dialogue_reading_dwell_sequence_id = sequence_id
+            self._dialogue_reading_dwell_timer.start(delay_ms)
+            return
         QTimer.singleShot(
-            self.segment_pause_ms,
+            delay_ms,
             lambda: self._show_scheduled_next_reply_segment(sequence_id, reply_advance_token),
         )
 
@@ -494,6 +545,8 @@ class SubtitleController(QObject):
         self._show_next_reply_segment(sequence_id)
 
     def _end_interaction_if_reply_done(self) -> None:
+        if self.reply_advance_scheduled or self._action_reading_hold_timer.isActive():
+            return
         if (
             self._should_complete_reply()
             and self.current_segment_speech_done
@@ -526,10 +579,14 @@ class SubtitleController(QObject):
     ) -> None:
         """在中文字幕后补完成前挡住日语展示；超时后回退日语以免卡死。"""
         self._translation_gate_active = True
+        self._translation_in_flight = True
         self._translation_gate_interaction_id = str(interaction_id or "")
         timeout_ms = max(0, int(round(float(timeout_seconds) * 1000)))
         self._translation_gate_timer.stop()
         self._translation_gate_timer.start(timeout_ms)
+        self._translation_deadline_generation += 1
+        self._action_translation_deadline_token = self._translation_deadline_generation
+        self._action_translation_deadline_timer.start(ACTION_TRANSLATION_DEADLINE_MS)
         self._log_stage(
             "translation_gate_started",
             {
@@ -541,11 +598,11 @@ class SubtitleController(QObject):
     def release_translation_gate(self, *, fallback: bool = False) -> None:
         """结束门闩。fallback=True 时展示日语回退并放行分段推进。"""
         was_active = self._translation_gate_active
-        self._clear_translation_gate()
-        if not was_active and not fallback:
-            return
+        was_in_flight = self._translation_in_flight
+        self._clear_translation_lifecycle()
         if not fallback:
-            self._log_stage("translation_gate_released", {"fallback": False})
+            if was_active or was_in_flight:
+                self._log_stage("translation_gate_released", {"fallback": False})
             return
         if self.current_segment is None:
             return
@@ -562,20 +619,56 @@ class SubtitleController(QObject):
         if self._translation_gate_timer.isActive():
             self._translation_gate_timer.stop()
 
+    def _clear_translation_in_flight(self) -> None:
+        self._translation_in_flight = False
+        self._translation_deadline_generation += 1
+        if self._action_translation_deadline_timer.isActive():
+            self._action_translation_deadline_timer.stop()
+
+    def _clear_translation_lifecycle(self) -> None:
+        self._clear_translation_gate()
+        self._clear_translation_in_flight()
+
+    def _stop_hold_and_dwell_timers(self) -> None:
+        if self._action_reading_hold_timer.isActive():
+            self._action_reading_hold_timer.stop()
+        if self._dialogue_reading_dwell_timer.isActive():
+            self._dialogue_reading_dwell_timer.stop()
+
     def _on_translation_gate_timeout(self) -> None:
         if not self._translation_gate_active:
             return
+        if _is_silent_visible_action(self.current_segment) and self._translation_in_flight:
+            self._translation_gate_active = False
+            if self._translation_gate_timer.isActive():
+                self._translation_gate_timer.stop()
+            return
         self.release_translation_gate(fallback=True)
 
+    def _on_action_translation_deadline(self) -> None:
+        if self._action_translation_deadline_token != self._translation_deadline_generation:
+            return
+        if not self._translation_in_flight:
+            return
+        if (
+            _is_silent_visible_action(self.current_segment)
+            and not self.current_segment_speech_done
+        ):
+            self.release_translation_gate(fallback=True)
+            return
+        self._clear_translation_in_flight()
+
     def _should_hold_chinese_display(self) -> bool:
-        if not self._translation_gate_active:
-            return False
         if self.subtitle_language != "zh":
             return False
         segment = self.current_segment
         if segment is None:
             return False
-        return not str(segment.translation or "").strip()
+        if str(segment.translation or "").strip():
+            return False
+        if _is_silent_visible_action(segment):
+            return self._translation_in_flight
+        return self._translation_gate_active
 
     def _hold_translation_waiting_indicator(self) -> None:
         if self.waiting_indicator_active:
@@ -585,6 +678,51 @@ class SubtitleController(QObject):
         self._show_waiting_indicator_frame()
         self.waiting_indicator_timer.start()
         self._log_stage("translation_waiting_indicator_held", None)
+
+    def _record_segment_visible(self) -> None:
+        self._segment_visible_monotonic = time.monotonic()
+
+    def _remaining_dialogue_dwell_ms(self) -> int:
+        dwell_ms = _dialogue_dwell_ms(self.speech_text)
+        if self._segment_visible_monotonic is None:
+            return dwell_ms
+        elapsed_ms = int((time.monotonic() - self._segment_visible_monotonic) * 1000)
+        return max(0, dwell_ms - elapsed_ms)
+
+    def _arm_action_reading_hold(self, sequence_id: int) -> None:
+        hold_ms = _action_reading_hold_ms(self.speech_text)
+        self.reply_advance_scheduled = True
+        self.reply_advance_token += 1
+        self._action_reading_hold_token = self.reply_advance_token
+        self._action_reading_hold_sequence_id = sequence_id
+        self._log_stage(
+            "action_reading_hold_started",
+            {
+                "sequence_id": sequence_id,
+                "delay_ms": hold_ms,
+                "remaining_segments": len(self.pending_reply_segments),
+            },
+        )
+        self._action_reading_hold_timer.start(hold_ms)
+
+    def _on_action_reading_hold_timeout(self) -> None:
+        if self._action_reading_hold_token != self.reply_advance_token:
+            return
+        if self._action_reading_hold_sequence_id != self.reply_sequence_id:
+            return
+        sequence_id = self._action_reading_hold_sequence_id
+        self._log_stage("action_reading_hold_fired", {"sequence_id": sequence_id})
+        if self.pending_reply_segments:
+            self._show_scheduled_next_reply_segment(sequence_id, self._action_reading_hold_token)
+            return
+        self.reply_advance_scheduled = False
+        self._end_interaction_if_reply_done()
+
+    def _on_dialogue_reading_dwell_timeout(self) -> None:
+        self._show_scheduled_next_reply_segment(
+            self._dialogue_reading_dwell_sequence_id,
+            self._dialogue_reading_dwell_token,
+        )
 
     @Slot()
     def _show_next_speech_char(self) -> None:
@@ -599,6 +737,7 @@ class SubtitleController(QObject):
         if self.speech_index >= len(self.speech_text):
             self.speech_timer.stop()
             if self.current_segment_sequence_id is not None:
+                self._record_segment_visible()
                 self._mark_segment_speech_done(self.current_segment_sequence_id)
 
     def _emit_typing_geometry(self) -> None:
@@ -655,6 +794,57 @@ def _segment_debug_payload(segment: ChatSegment) -> dict[str, str]:
         "portrait": segment.portrait,
         "translation": segment.translation,
     }
+
+
+def _visible_non_whitespace_count(text: str) -> int:
+    return sum(1 for char in text if not char.isspace())
+
+
+def _action_reading_hold_ms(displayed_text: str) -> int:
+    count = _visible_non_whitespace_count(displayed_text)
+    return max(
+        ACTION_READING_HOLD_MIN_MS,
+        min(
+            ACTION_READING_HOLD_MAX_MS,
+            ACTION_READING_HOLD_BASE_MS + ACTION_READING_HOLD_PER_CHAR_MS * count,
+        ),
+    )
+
+
+def _dialogue_dwell_ms(displayed_text: str) -> int:
+    count = _visible_non_whitespace_count(displayed_text)
+    return max(
+        DIALOGUE_DWELL_MIN_MS,
+        min(
+            DIALOGUE_DWELL_MAX_MS,
+            DIALOGUE_DWELL_BASE_MS + DIALOGUE_DWELL_PER_CHAR_MS * count,
+        ),
+    )
+
+
+def _is_silent_visible_action(segment: ChatSegment | None) -> bool:
+    if segment is None or not bool(getattr(segment, "suppress_tts", False)):
+        return False
+    text = str(segment.text or "").strip()
+    if len(text) < 2 or not text.startswith("（") or not text.endswith("）"):
+        return False
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "（":
+            depth += 1
+        elif char == "）":
+            depth -= 1
+            if depth < 0:
+                return False
+            if depth == 0 and index != len(text) - 1:
+                return False
+    return depth == 0
+
+
+def _is_ordinary_spoken_dialogue(segment: ChatSegment | None) -> bool:
+    if segment is None or _is_silent_visible_action(segment):
+        return False
+    return not bool(getattr(segment, "suppress_tts", False))
 
 
 def normalize_subtitle_display_speed(
