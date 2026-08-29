@@ -42,6 +42,7 @@ data/reminders.json
 data/tasks.json
 data/visual_observations/
 data/runtime_events/
+data/runtime_state/
 data/notes/
 data/tts_bundles/
 data/logs/

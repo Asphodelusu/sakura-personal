@@ -10,6 +10,7 @@ from app.backchannel.models import EMOTIONS
 from app.llm.prompt_templates import with_desktop_pet_context
 
 if TYPE_CHECKING:
+    from app.core.relational_drive import RelationalDriveProfile
     from app.ui.theme import ThemeSettings
 
 
@@ -88,6 +89,8 @@ class CharacterProfile:
     renderer_config: dict[str, Any] | None = None
     # 可选原作/设定 lore 索引（lore/index.json 或 manifest.lore）
     lore_index_path: Path | None = None
+    relationship_drive_profile: RelationalDriveProfile | None = None
+    relationship_drive_mapping: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.theme_settings is None:
@@ -366,7 +369,21 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         theme_source=theme_source,
         renderer_config=_load_renderer_config(raw_data),
         lore_index_path=lore_index_path,
+        relationship_drive_profile=_relationship_drive_profile(raw_data.get("relationship_drive")),
+        relationship_drive_mapping=_relationship_drive_mapping(raw_data.get("relationship_drive")),
     )
+
+
+def _relationship_drive_mapping(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return dict(raw)
+
+
+def _relationship_drive_profile(raw: Any):
+    from app.config.relationship_drive import profile_from_mapping
+
+    return profile_from_mapping(raw)
 
 
 def _resolve_lore_index_path(package_dir: Path, raw_data: dict[str, Any]) -> Path | None:

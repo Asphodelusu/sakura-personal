@@ -651,6 +651,25 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_relationship_drive_settings(self):
+        from app.config.relationship_drive import settings_from_mapping
+
+        return settings_from_mapping(self._system_section("relationship_drive"))
+
+    def save_relationship_drive_settings(self, settings) -> None:
+        from app.config.relationship_drive import RelationshipDriveSettings
+
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, RelationshipDriveSettings)
+            else RelationshipDriveSettings().normalized()
+        )
+        data = load_yaml_mapping(self.system_config_path)
+        section = _mapping(data.get("relationship_drive"))
+        section["enabled"] = bool(normalized.enabled)
+        data["relationship_drive"] = section
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_relationship_initiative_settings(self):
         from app.config.relationship_initiative import settings_from_mapping
 

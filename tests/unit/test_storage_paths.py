@@ -172,6 +172,12 @@ class TestStoragePathsSnapshot:
         )
         assert self.paths.tts_service_log("  ") == self.data / "logs" / "tts-service.log"
 
+    def test_relational_drive_path_is_per_character(self) -> None:
+        assert self.paths.runtime_state_dir == self.data / "runtime_state"
+        assert self.paths.relational_drive_for("Sakura") == (
+            self.data / "runtime_state" / "Sakura-relational-drive.json"
+        )
+
     def test_plugin_data_for_sanitizes(self) -> None:
         assert (
             self.paths.plugin_data_for("my/évil:plugin")
@@ -193,6 +199,7 @@ class TestEnsureDirs:
             paths.notes_dir,
             paths.tts_cache_dir,
             paths.logs_dir,
+            paths.runtime_state_dir,
         ]:
             assert d.is_dir()
 
