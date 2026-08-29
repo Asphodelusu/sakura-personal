@@ -8,15 +8,15 @@ from app.llm.chat_reply import ChatSegment
 
 
 # Displayed text "（轻轻坐到你身边）": 9 visible non-whitespace chars.
-# 400 + 40 * 9 = 760, already inside 600–1200.
+# 500 + 40 * 9 = 860, already inside 720–1200.
 ACTION_JA = "（そっと隣に座る）"
 ACTION_ZH = "（轻轻坐到你身边）"
-ACTION_HOLD_MS = 760
+ACTION_HOLD_MS = 860
 
-# Displayed text "（坐）": 3 chars → 400 + 40 * 3 = 520 → clamp 600.
+# Displayed text "（坐）": 3 chars → 500 + 40 * 3 = 620 → clamp 720.
 SHORT_ACTION_JA = "（座る）"
 SHORT_ACTION_ZH = "（坐）"
-SHORT_ACTION_HOLD_MS = 600
+SHORT_ACTION_HOLD_MS = 720
 
 ACTION_DEADLINE_MS = 12_000
 
@@ -61,12 +61,15 @@ class _DummyLabel:
 
 
 class _DelayedTTS:
-    def __init__(self) -> None:
+    def __init__(self, label: _DummyLabel | None = None) -> None:
         self.spoken: list[tuple[str, str]] = []
+        self.label = label
+        self.visible_text_at_speak: list[str] = []
         self.on_started = None
         self.on_finished = None
 
     def speak(self, text: str, tone: str, on_finished=None, on_started=None):  # type: ignore[no-untyped-def]
+        self.visible_text_at_speak.append(self.label.text if self.label is not None else "")
         self.spoken.append((text, tone))
         self.on_started = on_started
         self.on_finished = on_finished
@@ -190,7 +193,7 @@ def test_already_translated_action_waits_hand_calculated_reading_hold() -> None:
     controller.cancel_reply_flow()
 
 
-def test_short_action_reading_hold_clamps_to_600() -> None:
+def test_short_action_reading_hold_clamps_to_min() -> None:
     from PySide6.QtCore import QCoreApplication
 
     _qt_app_or_skip()
@@ -330,6 +333,77 @@ def test_action_translation_hard_deadline_shows_japanese_then_holds() -> None:
     assert DIALOGUE_JA not in label.text
     hold = _require_timer(controller, ACTION_HOLD_MS, HOLD_TIMER_ATTR)
     assert hold.isActive()
+    controller.cancel_reply_flow()
+
+
+def test_chinese_text_is_visible_before_tts_speak_is_requested() -> None:
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS(label)
+    stages: list[tuple[str, object]] = []
+    controller = _build_controller(label, tts, [], stages=stages)
+    first = ChatSegment(HI_JA, "开心", HI_ZH, "站立待机")
+
+    controller.show_segments([first])
+
+    assert label.text == HI_ZH
+    assert tts.spoken == [(HI_JA, "开心")]
+    assert tts.visible_text_at_speak == [HI_ZH]
+    text_stages = [name for name, _payload in stages if "speech_text" in name or name == "segment_text_render_done"]
+    assert text_stages
+    assert tts.on_started is not None
+    tts.on_started()
+    assert label.text == HI_ZH
+    assert text_stages.count("segment_text_render_done") <= 1
+    controller.cancel_reply_flow()
+
+
+def test_japanese_text_is_visible_before_tts_speak_is_requested() -> None:
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS(label)
+    controller = _build_controller(label, tts, [], subtitle_language="ja")
+
+    controller.show_segments([ChatSegment(HI_JA, "开心", HI_ZH, "站立待机")])
+
+    assert label.text == HI_JA
+    assert tts.spoken == [(HI_JA, "开心")]
+    assert tts.visible_text_at_speak == [HI_JA]
+    controller.cancel_reply_flow()
+
+
+def test_late_zh_after_ja_fallback_restarts_reading_dwell() -> None:
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtTest import QTest
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment(DIALOGUE_JA, "请求", "", "站立待机")
+    second = ChatSegment(HEY_JA, "温柔", HEY_ZH, "站立待机")
+
+    controller.begin_translation_gate(timeout_seconds=6)
+    controller.show_segments([first, second])
+    assert tts.on_started is not None
+    tts.on_started()
+    tts.on_finished()
+    controller.release_translation_gate(fallback=True)
+    assert label.text == DIALOGUE_JA
+    ja_dwell = _require_timer(controller, DIALOGUE_JA_DWELL_MS, DWELL_TIMER_ATTR)
+    assert ja_dwell.isActive()
+
+    QTest.qWait(400)
+    updated = ChatSegment(DIALOGUE_JA, "请求", DIALOGUE_ZH, "站立待机")
+    controller.current_segment = updated
+    controller.set_speech(updated.display_text("zh"), pulse=False, instant=True)
+    QCoreApplication.processEvents()
+
+    assert label.text == DIALOGUE_ZH
+    assert HEY_ZH not in label.text
+    zh_dwell = _require_timer(controller, DIALOGUE_ZH_DWELL_MS, DWELL_TIMER_ATTR)
+    assert zh_dwell.isActive()
+    assert int(zh_dwell.interval()) == DIALOGUE_ZH_DWELL_MS
     controller.cancel_reply_flow()
 
 

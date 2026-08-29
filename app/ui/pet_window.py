@@ -3388,6 +3388,8 @@ class PetWindow(QWidget):
                 relationship=rel,
             )
             observer.set_recent_history_provider(self._format_recent_history)
+            observer.set_recent_chat_facts_unix_provider(self._recent_ordinary_chat_unix)
+            observer.set_history_entries_after_provider(self._observer_history_after_id)
             observer.set_relationship_guide(guide_text)
             observer.set_relationship_facts_provider(
                 lambda: self.memory_store.build_continuity_context()
@@ -3508,49 +3510,85 @@ class PetWindow(QWidget):
         except Exception as exc:
             debug_log("ProactiveObserver", "评估结果写入历史失败", {"error": str(exc)})
 
+    def _observer_history_lines(self):
+        """Observer 用的近期对话行：优先只读历史库，回退内存窗口。"""
+        from app.agent.builtin_tools import message_is_intimacy_continue
+        from app.perception.observer import ObserverHistoryLine
+
+        store = getattr(self, "history_store", None)
+        if store is not None:
+            try:
+                tail, _has_more = store.load_tail(40)
+                lines = [
+                    ObserverHistoryLine(
+                        role=str(entry.role or ""),
+                        content=str(entry.content or ""),
+                        created_at=str(entry.created_at or ""),
+                        channel=str(entry.channel or ""),
+                        id=int(getattr(entry, "id", 0) or 0),
+                    )
+                    for entry in tail
+                    if str(entry.role or "") in {"user", "assistant"}
+                ]
+                if lines:
+                    return lines
+            except Exception:
+                pass
+
+        lines: list[ObserverHistoryLine] = []
+        for message in self.messages:
+            if not isinstance(message, dict) or message_is_intimacy_continue(message):
+                continue
+            role = str(message.get("role") or "")
+            content = str(message.get("content") or "").strip()
+            if not content or role not in {"user", "assistant"}:
+                continue
+            source = str(message.get("source") or message.get("channel") or "").strip()
+            created_at = str(message.get("created_at") or "")
+            lines.append(
+                ObserverHistoryLine(
+                    role=role,
+                    content=content,
+                    created_at=created_at,
+                    channel=source,
+                    id=int(message.get("id") or 0),
+                )
+            )
+        return lines
+
+    def _recent_ordinary_chat_unix(self) -> float | None:
+        from app.perception.observer import latest_ordinary_chat_unix
+
+        return latest_ordinary_chat_unix(self._observer_history_lines())
+
+    def _observer_history_after_id(self, after_id: int, limit: int):
+        from app.perception.observer import ObserverHistoryLine
+
+        store = getattr(self, "history_store", None)
+        if store is None:
+            return []
+        try:
+            entries = store.load_after_id(after_id, limit=limit)
+        except OSError as exc:
+            debug_log("ProactiveObserver", "读取主动交流后续历史失败", {"error": str(exc)})
+            raise
+        return [
+            ObserverHistoryLine(
+                role=str(entry.role or ""),
+                content=str(entry.content or ""),
+                created_at=str(entry.created_at or ""),
+                channel=str(entry.channel or ""),
+                id=int(getattr(entry, "id", 0) or 0),
+            )
+            for entry in entries
+            if str(entry.role or "") in {"user", "assistant"}
+        ]
+
     def _format_recent_history(self) -> str:
         """Format last few conversation turns for the observer decision LLM."""
-        from app.agent.builtin_tools import message_is_intimacy_continue
+        from app.perception.observer import format_observer_recent_history
 
-        msgs = self.messages[-10:]
-        if not msgs:
-            return ""
-        lines: list[str] = []
-        count = 0
-        for m in reversed(msgs):
-            if not isinstance(m, dict):
-                continue
-            # 系统续投信号绝不能标成「我说的」
-            if message_is_intimacy_continue(m):
-                continue
-            role = m.get("role", "")
-            content = str(m.get("content", "")).strip()
-            if not content or role not in ("user", "assistant"):
-                continue
-            source = str(m.get("source") or "").strip()
-            if role == "assistant":
-                name = "她自己的"
-                if source == "relationship":
-                    name = "她自己的·关系主动"
-                elif source == "proactive":
-                    name = "她自己的·主动"
-            else:
-                # 用户对 Sakura 说的话（打字/语音转写进对话的都算）
-                name = "我说的"
-            if len(content) > 120:
-                content = content[:120] + "…"
-            lines.append(f"[{name}] {content}")
-            count += 1
-            if count >= 6:
-                break
-        if not lines:
-            return ""
-        lines.reverse()
-        legend = (
-            "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
-            "她自己的·主动=你主动开口；她自己的·关系主动=你因关系主动开口。称呼用「他」。"
-        )
-        return "[最近の会話]\n" + legend + "\n" + "\n".join(lines)
+        return format_observer_recent_history(self._observer_history_lines())
 
     def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
         """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
@@ -7529,17 +7567,35 @@ class PetWindow(QWidget):
             return []
         history_ids: list[int] = []
         for i, segment in enumerate(clean_segments):
-            history_ids.append(
-                self._record_history(
-                    "assistant",
-                    segment.text,
-                    segment.translation,
-                    segment.tone,
-                    segment.portrait,
-                    channel=channel,
-                    _debug=_debug if i == 0 else None,
-                )
+            raw_id = self._record_history(
+                "assistant",
+                segment.text,
+                segment.translation,
+                segment.tone,
+                segment.portrait,
+                channel=channel,
+                _debug=_debug if i == 0 else None,
             )
+            try:
+                history_ids.append(int(raw_id or 0))
+            except (TypeError, ValueError):
+                history_ids.append(0)
+        if (
+            channel in {"proactive", "relationship"}
+            and history_ids
+            and all(entry_id > 0 for entry_id in history_ids)
+        ):
+            observer = getattr(self, "_proactive_observer", None)
+            record = getattr(observer, "record_proactive_exchange", None)
+            if callable(record):
+                source = "relationship" if channel == "relationship" else "screen"
+                text = "".join(
+                    str(getattr(segment, "text", "") or "") for segment in clean_segments
+                )
+                try:
+                    record(source=source, history_ids=list(history_ids), text=text)
+                except Exception:
+                    debug_log("PetWindow", "主动交流账本登记失败", {"source": source})
         return history_ids
 
     @Slot()

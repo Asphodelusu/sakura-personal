@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -84,6 +86,90 @@ class ChatReplyParseResult:
     needs_retry: bool = False
     repaired: bool = False
     reason: str = ""
+
+
+def classify_chat_reply_failure(content: str) -> str:
+    """精确失败类别：ok / syntax / envelope / schema / language / semantic。"""
+    text = str(content or "").strip()
+    if not text:
+        return "semantic"
+    parsed = parse_chat_reply_result(text)
+    data, _repaired = _try_load_json(text)
+    has_json_object = isinstance(data, dict)
+    if (
+        not parsed.needs_retry
+        and has_json_object
+        and any(segment.text.strip() for segment in parsed.reply.segments)
+    ):
+        return "ok"
+    if parsed.reason == "language_issue":
+        return "language"
+    if parsed.reason == "missing_segments":
+        return "schema"
+    if parsed.reason == "empty":
+        return "semantic"
+    if parsed.reason == "invalid_json":
+        return "envelope" if _has_code_fence(text) else "syntax"
+    if not has_json_object and _looks_japanese(text) and extract_adoptable_japanese_units(text):
+        return "envelope"
+    return "semantic"
+
+
+def extract_adoptable_japanese_units(content: str) -> list[str]:
+    text = str(content or "").strip()
+    if not text:
+        return []
+    parsed = parse_chat_reply_result(text)
+    safe_hit = any(
+        segment.text.strip() == SAFE_PARSE_FAILURE_TEXT
+        for segment in parsed.reply.segments
+    )
+    if parsed.needs_retry or safe_hit:
+        stripped = _strip_code_fence(text).strip()
+        extracted = _extract_japanese_from_broken_payload(stripped)
+        if extracted:
+            return extracted
+        if _looks_japanese(stripped) and not _looks_chinese(stripped):
+            return [stripped]
+        return []
+    return [segment.text.strip() for segment in parsed.reply.segments if segment.text.strip()]
+
+
+def normalize_japanese_text(text: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", str(text or "")).strip()
+    return re.sub(r"\s+", "", cleaned)
+
+
+def structural_repair_is_faithful(
+    original: str,
+    repaired: str,
+    *,
+    allowed_tones: list[str] | tuple[str, ...] | None = None,
+    allowed_portraits: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    original_units = extract_adoptable_japanese_units(original)
+    if not original_units:
+        return False
+    parsed = parse_chat_reply_result(repaired)
+    if parsed.needs_retry:
+        return False
+    new_units = [segment.text.strip() for segment in parsed.reply.segments if segment.text.strip()]
+    if not new_units:
+        return False
+    if normalize_japanese_text("".join(original_units)) != normalize_japanese_text("".join(new_units)):
+        return False
+    tones = {str(item).strip() for item in (allowed_tones or []) if str(item).strip()}
+    portraits = {str(item).strip() for item in (allowed_portraits or []) if str(item).strip()}
+    for segment in parsed.reply.segments:
+        if segment.translation.strip():
+            return False
+        tone = segment.tone.strip()
+        portrait = segment.portrait.strip()
+        if tones and tone and tone not in tones:
+            return False
+        if portraits and portrait and portrait not in portraits:
+            return False
+    return True
 
 
 def parse_chat_reply(content: str) -> ChatReply:
@@ -474,6 +560,23 @@ def _next_non_space(content: str, start: int) -> str:
         if not char.isspace():
             return char
     return ""
+
+
+def _has_code_fence(content: str) -> bool:
+    return str(content or "").lstrip().startswith("```")
+
+
+def _extract_japanese_from_broken_payload(text: str) -> list[str]:
+    units: list[str] = []
+    for match in re.findall(r'"(?:ja|text)"\s*:\s*"((?:\\.|[^"\\])*)"', text):
+        try:
+            value = json.loads(f'"{match}"')
+        except json.JSONDecodeError:
+            value = match
+        cleaned = str(value or "").strip()
+        if cleaned:
+            units.append(cleaned)
+    return units
 
 
 def _looks_structured_reply(content: str) -> bool:

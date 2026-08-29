@@ -35,11 +35,12 @@ def _dummy_api_client() -> MagicMock:
 
 
 def test_missing_translation_currently_triggers_second_pro_compose() -> None:
-    """现状：纯日语正文（无 zh）→ reason=missing_translation → 第二次 Pro 合成。"""
+    """纯日语无 JSON 仍记 missing_translation；P1-A 走最小结构修复且不改写日文。"""
+    original = "……開いたよ。北京の天気は曇りみたい。"
     client = _dummy_api_client()
     client.complete_with_tools.side_effect = [
         MagicMock(
-            content="……開いたよ。北京の天気は曇りみたい。",
+            content=original,
             tool_calls=[],
         ),
         MagicMock(
@@ -47,8 +48,8 @@ def test_missing_translation_currently_triggers_second_pro_compose() -> None:
                 {
                     "segments": [
                         {
-                            "ja": "北京の天気を確認したよ。",
-                            "zh": "我确认了北京天气。",
+                            "ja": original,
+                            "zh": "",
                             "tone": "中性",
                             "portrait": "站立待机",
                         }
@@ -61,9 +62,7 @@ def test_missing_translation_currently_triggers_second_pro_compose() -> None:
     ]
     runtime = AgentRuntime(client, _dummy_system_prompt())
 
-    reason = runtime._structured_compose_reason(
-        "……開いたよ。北京の天気は曇りみたい。"
-    )
+    reason = runtime._structured_compose_reason(original)
     assert reason == "missing_translation"
 
     result = runtime.handle_user_message(
@@ -71,8 +70,10 @@ def test_missing_translation_currently_triggers_second_pro_compose() -> None:
     )
 
     assert client.complete_with_tools.call_count == 2
-    assert result.reply.segments[0].text == "北京の天気を確認したよ。"
-    assert result.reply.segments[0].translation == "我确认了北京天气。"
+    assert result.reply.segments[0].text == original
+    assert client.complete_with_tools.call_args_list[1].kwargs.get("request_purpose") == (
+        "structural_repair"
+    )
 
 
 def test_ja_only_segments_do_not_call_compose_structured_final_reply() -> None:

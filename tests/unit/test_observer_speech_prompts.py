@@ -45,3 +45,36 @@ def test_speech_decision_teaches_source_labels() -> None:
     text = _SPEECH_DECISION_INSTRUCTION
     assert "即时通讯" in text or "别人" in text
     assert "游戏" in text
+
+
+def test_vlm_user_content_omits_prior_observer_speech_history() -> None:
+    import time
+
+    from app.perception.observer import ObservationRecord, ProactiveConfig, ProactiveObserver
+
+    observer = ProactiveObserver(
+        api_base_url="https://example.com",
+        api_key="x",
+        api_model="m",
+        config=ProactiveConfig(enabled=False),
+    )
+    observer._obs_history.append(
+        ObservationRecord(
+            timestamp=time.monotonic() - 30,
+            window_title="Code",
+            should_speak=True,
+            reason="他完全没有回应午饭的问题",
+            comment="昼ごはん、どうする？",
+        )
+    )
+    text = observer._build_vlm_user_content(
+        window_title="Code",
+        idle_s=12,
+        triggers=("timer",),
+        now=time.monotonic(),
+    )
+    assert "活动窗口：Code" in text
+    assert "[最近の観測履歴]" not in text
+    assert "他完全没有回应" not in text
+    assert "昼ごはん、どうする？" not in text
+    assert "user did not answer" not in text.lower()

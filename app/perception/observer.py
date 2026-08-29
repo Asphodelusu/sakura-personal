@@ -18,7 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import httpx
 from loguru import logger
@@ -44,15 +44,336 @@ from app.perception.win32 import (
 __all__ = [
     "FocusSnapshot",
     "ObservationPacket",
+    "ObserverHistoryLine",
     "ProactiveConfig",
+    "ProactiveExchange",
+    "ProactiveExchangeView",
     "ProactiveObserver",
     "ProactiveSpeakPayload",
     "VisibleTextResolution",
+    "derive_proactive_exchange_view",
+    "format_observer_recent_history",
+    "format_proactive_exchange_context",
     "format_visible_text_block",
     "infer_content_scene",
+    "latest_ordinary_chat_unix",
     "resolve_visible_text",
     "resolve_visible_text_excerpt",
 ]
+
+
+@dataclass(frozen=True)
+class ObserverHistoryLine:
+    role: str
+    content: str
+    created_at: str = ""
+    channel: str = ""
+    id: int = 0
+
+
+@dataclass(frozen=True)
+class ProactiveExchange:
+    source: Literal["screen", "relationship"]
+    history_start_id: int
+    history_end_id: int
+    spoken_at_unix: float
+    text: str
+
+
+@dataclass(frozen=True)
+class ProactiveExchangeView:
+    exchange: ProactiveExchange
+    state: Literal["awaiting_reply", "engaged", "expired"]
+    first_user_reply: ObserverHistoryLine | None
+    first_ordinary_assistant_followup: ObserverHistoryLine | None
+
+
+def derive_proactive_exchange_view(
+    exchange: ProactiveExchange,
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+    *,
+    now_unix: float,
+    ttl_seconds: float = 1200.0,
+) -> ProactiveExchangeView:
+    """由权威历史行推导交流状态；不解读接受/拒绝。"""
+    if float(now_unix) - float(exchange.spoken_at_unix) > float(ttl_seconds):
+        return ProactiveExchangeView(exchange, "expired", None, None)
+    later = [
+        item
+        for item in entries
+        if int(getattr(item, "id", 0) or 0) > int(exchange.history_end_id)
+    ]
+    later.sort(key=lambda item: int(getattr(item, "id", 0) or 0))
+    first_user: ObserverHistoryLine | None = None
+    first_user_index: int | None = None
+    followup: ObserverHistoryLine | None = None
+    for index, item in enumerate(later):
+        role = str(item.role or "").strip()
+        if role == "user":
+            first_user = item
+            first_user_index = index
+            break
+    if first_user is None:
+        return ProactiveExchangeView(exchange, "awaiting_reply", None, None)
+    for item in _group_observer_history_turns(later[(first_user_index or 0) + 1 :]):
+        if str(item.role or "").strip() != "assistant":
+            continue
+        channel = str(item.channel or "").strip()
+        if channel not in {"proactive", "relationship"}:
+            followup = item
+            break
+    return ProactiveExchangeView(exchange, "engaged", first_user, followup)
+
+
+_EXCHANGE_FIELD_MAX = 120
+
+
+def _clip_exchange_field(text: str, *, limit: int = _EXCHANGE_FIELD_MAX) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+
+def _exchange_clock(*, unix: float | None = None, created_at: str = "") -> str:
+    parsed = _parse_history_datetime(created_at)
+    if parsed is not None:
+        return parsed.strftime("%H:%M")
+    if unix:
+        try:
+            return datetime.fromtimestamp(float(unix)).astimezone().strftime("%H:%M")
+        except (OSError, OverflowError, ValueError):
+            return ""
+    return ""
+
+
+def format_proactive_exchange_context(
+    views: list[ProactiveExchangeView] | tuple[ProactiveExchangeView, ...],
+    *,
+    max_views: int = 3,
+) -> str:
+    """渲染最多三条未过期主动交流视图；engaged 只表示有后续 user 行。"""
+    live = [view for view in views if getattr(view, "state", "") != "expired"]
+    live.sort(key=lambda view: view.exchange.spoken_at_unix, reverse=True)
+    if max_views > 0:
+        live = live[: int(max_views)]
+    blocks: list[str] = []
+    for view in live:
+        spoken_clock = _exchange_clock(unix=view.exchange.spoken_at_unix)
+        verb = "她关系主动说" if view.exchange.source == "relationship" else "她主动说"
+        spoken = _clip_exchange_field(view.exchange.text)
+        spoken_line = f"{spoken_clock} {verb}：{spoken}" if spoken_clock else f"{verb}：{spoken}"
+        if view.state == "engaged":
+            lines = ["[近期主动交流 · 已得到回应]", spoken_line]
+            reply = view.first_user_reply
+            if reply is not None:
+                reply_clock = _exchange_clock(created_at=reply.created_at) or spoken_clock
+                reply_text = _clip_exchange_field(reply.content)
+                lines.append(
+                    f"{reply_clock} 他说：{reply_text}" if reply_clock else f"他说：{reply_text}"
+                )
+            follow = view.first_ordinary_assistant_followup
+            if follow is not None:
+                follow_clock = _exchange_clock(created_at=follow.created_at) or spoken_clock
+                follow_text = _clip_exchange_field(follow.content)
+                lines.append(
+                    f"{follow_clock} 她随后说：{follow_text}"
+                    if follow_clock
+                    else f"她随后说：{follow_text}"
+                )
+            lines.append("状态说明：他已经回应；原话是否表示确定、拒绝或暂缓，应按原文理解。")
+            blocks.append("\n".join(lines))
+            continue
+        if view.state == "awaiting_reply":
+            blocks.append(
+                "\n".join(
+                    [
+                        "[近期主动交流 · 尚无后续用户记录]",
+                        spoken_line,
+                        "状态说明：其后还没有持久化的用户发言。不要据此推断他的意图。",
+                    ]
+                )
+            )
+    return "\n\n".join(blocks)
+
+
+def exchange_context_diagnostics(
+    views: list[ProactiveExchangeView] | tuple[ProactiveExchangeView, ...],
+    *,
+    elapsed_ms: int,
+    now_unix: float | None = None,
+) -> dict[str, Any]:
+    """交流上下文诊断：只记 counts/IDs/ages/timing，不记正文。"""
+    now = time.time() if now_unix is None else float(now_unix)
+    state_counts = {"awaiting_reply": 0, "engaged": 0}
+    exchanges: list[dict[str, Any]] = []
+    for view in views:
+        state = str(view.state)
+        if state in state_counts:
+            state_counts[state] += 1
+        age_s = max(0, int(now - float(view.exchange.spoken_at_unix)))
+        exchanges.append(
+            {
+                "source": view.exchange.source,
+                "history_start_id": int(view.exchange.history_start_id),
+                "history_end_id": int(view.exchange.history_end_id),
+                "state": state,
+                "age_s": age_s,
+            }
+        )
+    return {
+        "view_count": len(views),
+        "state_counts": state_counts,
+        "exchanges": exchanges,
+        "elapsed_ms": int(elapsed_ms),
+    }
+
+
+def _observer_speaker_label(role: str, channel: str) -> str:
+    source = (channel or "").strip()
+    if role == "assistant":
+        if source == "relationship":
+            return "她自己的·关系主动"
+        if source == "proactive":
+            return "她自己的·主动"
+        return "她自己的"
+    return "我说的"
+
+
+def _parse_history_datetime(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed
+
+
+def _group_observer_history_turns(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+) -> list[ObserverHistoryLine]:
+    turns: list[ObserverHistoryLine] = []
+    for item in entries:
+        content = str(item.content or "").strip()
+        role = str(item.role or "").strip()
+        if not content or role not in {"user", "assistant"}:
+            continue
+        channel = str(item.channel or "").strip()
+        created_at = str(item.created_at or "").strip()
+        previous_created_at = (
+            str(turns[-1].created_at or "").strip() if turns else ""
+        )
+        if (
+            turns
+            and role == "assistant"
+            and turns[-1].role == "assistant"
+            and channel == str(turns[-1].channel or "").strip()
+            and (
+                not created_at
+                or not previous_created_at
+                or created_at == previous_created_at
+            )
+        ):
+            previous = turns[-1]
+            turns[-1] = ObserverHistoryLine(
+                role="assistant",
+                content=f"{previous.content}{content}",
+                created_at=item.created_at or previous.created_at,
+                channel=channel,
+                id=int(item.id or previous.id or 0),
+            )
+            continue
+        turns.append(
+            ObserverHistoryLine(
+                role=role,
+                content=content,
+                created_at=item.created_at,
+                channel=channel,
+                id=int(item.id or 0),
+            )
+        )
+    return turns
+
+
+def _format_observer_line_age(created_at: str, now: datetime) -> str:
+    parsed = _parse_history_datetime(created_at)
+    if parsed is None:
+        return ""
+    if parsed.tzinfo is None and now.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=now.tzinfo)
+    elif parsed.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=parsed.tzinfo)
+    seconds = int((now - parsed).total_seconds())
+    if seconds < 90:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}分钟前"
+    if seconds < 86400:
+        return f"{max(1, seconds // 3600)}小时前"
+    return f"{max(1, seconds // 86400)}天前"
+
+
+def format_observer_recent_history(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+    *,
+    now: datetime | None = None,
+    max_turns: int = 6,
+) -> str:
+    """按真实 turn 折叠多段回复，并带上可比较的时间与渠道。"""
+    stamp = now or datetime.now().astimezone()
+    turns = _group_observer_history_turns(entries)
+    if max_turns > 0:
+        turns = turns[-max_turns:]
+    rendered: list[str] = []
+    for item in turns:
+        name = _observer_speaker_label(item.role, item.channel)
+        extras: list[str] = []
+        parsed = _parse_history_datetime(item.created_at)
+        if parsed is not None:
+            extras.append(parsed.strftime("%H:%M"))
+        age = _format_observer_line_age(item.created_at, stamp)
+        if age:
+            extras.append(age)
+        channel = str(item.channel or "").strip()
+        if item.role == "user" and channel == "mobile":
+            extras.append("手机")
+        content = item.content
+        if len(content) > 160:
+            content = content[:160] + "…"
+        prefix = f"[{name}]"
+        if extras:
+            prefix = f"{prefix} {' · '.join(extras)}"
+        rendered.append(f"{prefix} {content}")
+    if not rendered:
+        return ""
+    legend = (
+        "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
+        "她自己的·主动=你主动开口；她自己的·关系主动=你因关系主动开口。称呼用「他」。"
+        "同一轮多段回复已合并。时间越新越可靠；后续纠正或完成应压过更早的计划。"
+    )
+    return "[最近の会話]\n" + legend + "\n" + "\n".join(rendered)
+
+
+def latest_ordinary_chat_unix(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+) -> float | None:
+    latest: float | None = None
+    for item in entries:
+        role = str(item.role or "").strip()
+        channel = str(item.channel or "").strip()
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and channel in {"proactive", "relationship"}:
+            continue
+        parsed = _parse_history_datetime(item.created_at)
+        if parsed is None:
+            continue
+        unix = parsed.timestamp()
+        if latest is None or unix > latest:
+            latest = unix
+    return latest
 
 
 def _observer_gui_log(message: str, data: Any | None = None) -> None:
@@ -493,8 +814,8 @@ comment / reason / situational_summary もその関係のまま。相手は「�
 根拠（スクショは見ていない）：
 - [画面摘要][可见文字摘录]＝我看见的（ヘッダの 采集/场景 を読む）
 - [反应提示]＝内感ヒント
-- [最近の会話][自分の直前の発話]＝対話（最優先）
-- [最近の観測履歴][观察者上下文]
+- [最近の会話][近期主动交流]＝対話（最優先）
+- [观察者上下文]
 
 来源の読み方：
 - [我说的]＝彼→あなた／[她自己的・主动]＝あなた／我看见的＝画面の字
@@ -600,6 +921,7 @@ class ProactiveObserver:
         self.on_evaluate = on_evaluate or (lambda _reason, _should_speak: None)
         self._is_busy = is_busy or (lambda: False)
         self._get_recent_history: Callable[[], str] = lambda: ""
+        self._get_recent_chat_facts_unix: Callable[[], float | None] = lambda: None
         self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
         # 短时印象改由 sensory_impression_store 承载（Observer VLM + 主对话共享）
 
@@ -665,6 +987,11 @@ class ProactiveObserver:
         self._relationship_generation = 0
         self._relationship_motive = False
         self._ledger_attempt: _ObserverLedgerAttempt | None = None
+        self._exchange_lock = threading.Lock()
+        self._exchanges: deque[ProactiveExchange] = deque(maxlen=5)
+        self._get_history_after: Callable[[int, int], list[ObserverHistoryLine]] = (
+            lambda _after, _limit: []
+        )
 
     @property
     def enabled(self) -> bool:
@@ -679,6 +1006,151 @@ class ProactiveObserver:
     def set_recent_history_provider(self, provider: Callable[[], str]) -> None:
         """Set a callback that returns recent conversation history as a string."""
         self._get_recent_history = provider
+
+    def set_history_entries_after_provider(
+        self, provider: Callable[[int, int], list[ObserverHistoryLine]]
+    ) -> None:
+        """只读：返回 id 大于给定值的权威对话行。"""
+        self._get_history_after = provider
+
+    def record_proactive_exchange(
+        self,
+        *,
+        source: str,
+        history_ids: list[int],
+        text: str,
+        spoken_at_unix: float | None = None,
+    ) -> bool:
+        """成功落库后登记一条主动交流锚点；无效 ID 不建账。"""
+        ids: list[int] = []
+        for raw in history_ids or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return False
+            if value <= 0:
+                return False
+            ids.append(value)
+        cleaned = str(text or "").strip()
+        src = str(source or "").strip()
+        if not ids or not cleaned or src not in {"screen", "relationship"}:
+            return False
+        exchange = ProactiveExchange(
+            source=src,  # type: ignore[arg-type]
+            history_start_id=min(ids),
+            history_end_id=max(ids),
+            spoken_at_unix=time.time() if spoken_at_unix is None else float(spoken_at_unix),
+            text=cleaned,
+        )
+        with self._exchange_lock:
+            self._exchanges.append(exchange)
+        return True
+
+    def _current_exchange_views(
+        self, now_unix: float | None = None
+    ) -> list[ProactiveExchangeView]:
+        now = time.time() if now_unix is None else float(now_unix)
+        with self._exchange_lock:
+            anchors = list(self._exchanges)
+        if not anchors:
+            return []
+        views: list[ProactiveExchangeView] = []
+        for item in anchors:
+            try:
+                entries = list(self._get_history_after(item.history_end_id, 100) or [])
+            except Exception:
+                with self._exchange_lock:
+                    self._exchanges.clear()
+                return []
+            view = derive_proactive_exchange_view(item, entries, now_unix=now)
+            if view.state == "awaiting_reply" and len(entries) >= 100:
+                view = ProactiveExchangeView(item, "expired", None, None)
+            views.append(view)
+        kept = [view for view in views if view.state != "expired"]
+        evaluated_keys = {
+            (
+                item.source,
+                item.history_start_id,
+                item.history_end_id,
+                item.spoken_at_unix,
+            )
+            for item in anchors
+        }
+        live_keys = {
+            (
+                view.exchange.source,
+                view.exchange.history_start_id,
+                view.exchange.history_end_id,
+                view.exchange.spoken_at_unix,
+            )
+            for view in kept
+        }
+        with self._exchange_lock:
+            self._exchanges = deque(
+                (
+                    item
+                    for item in self._exchanges
+                    if (
+                        item.source,
+                        item.history_start_id,
+                        item.history_end_id,
+                        item.spoken_at_unix,
+                    )
+                    not in evaluated_keys
+                    or (
+                        item.source,
+                        item.history_start_id,
+                        item.history_end_id,
+                        item.spoken_at_unix,
+                    )
+                    in live_keys
+                ),
+                maxlen=5,
+            )
+        kept.sort(key=lambda view: view.exchange.spoken_at_unix, reverse=True)
+        return kept
+
+    def _append_exchange_context(
+        self,
+        parts: list[str],
+        *,
+        now_unix: float | None = None,
+    ) -> None:
+        started = time.monotonic()
+        views = self._current_exchange_views(now_unix=now_unix)
+        exchange_ctx = format_proactive_exchange_context(views)
+        if exchange_ctx:
+            parts.append(exchange_ctx)
+        try:
+            debug_log(
+                "ObserverLedger",
+                "交流上下文",
+                exchange_context_diagnostics(
+                    views,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    now_unix=now_unix,
+                ),
+            )
+        except Exception:
+            pass
+
+    def set_recent_chat_facts_unix_provider(
+        self, provider: Callable[[], float | None]
+    ) -> None:
+        """最近一条用户/普通主聊天事实的 unix 时间，供印象 freshness 比较。"""
+        self._get_recent_chat_facts_unix = provider
+
+    def _recent_chat_facts_unix(self) -> float | None:
+        try:
+            value = self._get_recent_chat_facts_unix()
+        except Exception:
+            return None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def set_relationship_settings(self, settings) -> None:
         from app.config.relationship_initiative import RelationshipInitiativeSettings
@@ -1141,15 +1613,7 @@ class ProactiveObserver:
                 parts.append(facts)
         except Exception:
             pass
-        last_spoken = (self._last_spoken_text or "").strip()
-        if last_spoken:
-            if len(last_spoken) > 160:
-                last_spoken = last_spoken[:160] + "…"
-            parts.append(
-                "[自分の直前の発話]\n"
-                f"{last_spoken}\n"
-                "※これはあなた（夜乃桜）が先ほど口にした内容。相手の発言ではない。"
-            )
+        self._append_exchange_context(parts)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "\n\n".join(parts)},
@@ -1490,6 +1954,19 @@ class ProactiveObserver:
             else _SPEECH_DECISION_INSTRUCTION.lstrip()
         )
 
+        user_text = self._build_speech_decision_user_content(packet)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        return await self._post_speech_decision(messages)
+
+    def _build_speech_decision_user_content(
+        self,
+        packet: ObservationPacket,
+        now_unix: float | None = None,
+    ) -> str:
+        """决策用户文：近六轮对话 + 最多三条交流视图 + 当前视觉，不含旧发言账。"""
         parts = [
             f"[画面摘要]\n{packet.visual_summary.strip() or '（无）'}",
             format_visible_text_block(
@@ -1523,21 +2000,10 @@ class ProactiveObserver:
                 parts.append(chat_ctx)
         except Exception:
             pass
-        last_spoken = (self._last_spoken_text or "").strip()
-        if last_spoken:
-            if len(last_spoken) > 160:
-                last_spoken = last_spoken[:160] + "…"
-            parts.append(
-                "[自分の直前の発話]\n"
-                f"{last_spoken}\n"
-                "※これはあなた（夜乃桜）が先ほど口にした内容。相手の発言ではない。"
-            )
-        obs_ctx = self._format_obs_history()
-        if obs_ctx:
-            parts.append(obs_ctx)
-        # 决策 LLM 看自己上一轮的短时印象（含「対話の既知事実」），
-        # 避免对同一画面/话题重复问。
-        obs_impression = sensory_impression_store.get_for_observer()
+        self._append_exchange_context(parts, now_unix=now_unix)
+        obs_impression = sensory_impression_store.get_for_observer(
+            chat_facts_unix=self._recent_chat_facts_unix()
+        )
         if obs_impression:
             parts.append(f"[观察者上下文]\n{obs_impression}")
         if self._relationship_motive:
@@ -1546,13 +2012,7 @@ class ProactiveObserver:
                 "屏幕事件优先。关系与心情可以作为附加动机，但不要把屏幕内容硬拗成亲密理由，"
                 "也不要连续再开一轮关系主动。"
             )
-        user_text = "\n\n".join(parts)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ]
-        return await self._post_speech_decision(messages)
+        return "\n\n".join(parts)
 
     async def _post_speech_decision(self, messages: list[dict]) -> dict | None:
         if not self._speech_decision_configured:
@@ -1721,26 +2181,14 @@ class ProactiveObserver:
         idle_s = int(get_idle_seconds())
 
         ctx_parts = []
-        if window_title:
-            ctx_parts.append(f"活动窗口：{window_title}")
-        if idle_s >= 60:
-            ctx_parts.append(f"距离最后输入：{idle_s // 60} 分 {idle_s % 60} 秒")
-        elif idle_s > 0:
-            ctx_parts.append(f"距离最后输入：{idle_s} 秒")
-        if triggers:
-            ctx_parts.append(f"触发原因：{', '.join(triggers)}")
-
-        # 短时印象（LLM→VLM / 主对话共享）：过期由 store TTL 处理
-        observer_ctx = sensory_impression_store.get_for_observer(now=now)
-        if observer_ctx:
-            ctx_parts.append(f"[观察者上下文]\n{observer_ctx}")
-
-        # 最近观测历史（VLM 用于避免对相似场景写重复摘要）
-        # 完整对话历史留给 LLM 决策；VLM 只通过 situational_summary 里的
-        # 「対話の既知事実」拿极薄锚点，避免再塞全文。
-        obs_ctx = self._format_obs_history()
-        if obs_ctx:
-            ctx_parts.append(obs_ctx)
+        vlm_meta = self._build_vlm_user_content(
+            window_title=window_title,
+            idle_s=idle_s,
+            triggers=triggers,
+            now=now,
+        )
+        if vlm_meta:
+            ctx_parts.append(vlm_meta)
 
         uia_raw = (
             window_text.text_content.strip()
@@ -2054,6 +2502,32 @@ class ProactiveObserver:
                 comment=comment,
             )
         )
+
+    def _build_vlm_user_content(
+        self,
+        *,
+        window_title: str = "",
+        idle_s: int = 0,
+        triggers: tuple[str, ...] | list[str] = (),
+        now: float | None = None,
+    ) -> str:
+        """VLM 用户文：当前窗口/空闲/触发 + 新鲜印象，不含旧 reason/comment。"""
+        ctx_parts: list[str] = []
+        if window_title:
+            ctx_parts.append(f"活动窗口：{window_title}")
+        if idle_s >= 60:
+            ctx_parts.append(f"距离最后输入：{idle_s // 60} 分 {idle_s % 60} 秒")
+        elif idle_s > 0:
+            ctx_parts.append(f"距离最后输入：{idle_s} 秒")
+        if triggers:
+            ctx_parts.append(f"触发原因：{', '.join(triggers)}")
+        observer_ctx = sensory_impression_store.get_for_observer(
+            now=now,
+            chat_facts_unix=self._recent_chat_facts_unix(),
+        )
+        if observer_ctx:
+            ctx_parts.append(f"[观察者上下文]\n{observer_ctx}")
+        return "\n".join(ctx_parts)
 
     def _format_obs_history(self) -> str:
         if not self._obs_history:

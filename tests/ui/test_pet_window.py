@@ -5100,6 +5100,76 @@ def test_assistant_reply_history_records_tone_and_portrait() -> None:
     assert history == [("assistant", "どうしたの？", "怎么了？", "困惑", "张嘴疑问")]
 
 
+def test_observer_history_lines_include_persisted_ids() -> None:
+    from app.perception.observer import ObserverHistoryLine
+    from app.storage.chat_history import ChatHistoryEntry
+    from app.ui.pet_window import PetWindow
+
+    class Store:
+        def load_tail(self, limit: int):
+            assert limit == 40
+            return (
+                [
+                    ChatHistoryEntry(
+                        created_at="2026-08-29T20:16:00+08:00",
+                        role="assistant",
+                        content="明日の昼、どうする？",
+                        channel="proactive",
+                        id=12,
+                    ),
+                    ChatHistoryEntry(
+                        created_at="2026-08-29T20:16:10+08:00",
+                        role="user",
+                        content="听到了",
+                        id=13,
+                    ),
+                ],
+                False,
+            )
+
+        def load_after_id(self, entry_id: int, *, limit: int = 100):
+            assert entry_id == 12
+            return [
+                ChatHistoryEntry(
+                    created_at="2026-08-29T20:16:10+08:00",
+                    role="user",
+                    content="听到了",
+                    id=13,
+                )
+            ]
+
+    class Window:
+        history_store = Store()
+        messages: list = []
+        _observer_history_lines = PetWindow._observer_history_lines
+        _observer_history_after_id = PetWindow._observer_history_after_id
+
+    window = Window()
+    lines = window._observer_history_lines()
+    assert [line.id for line in lines] == [12, 13]
+    assert isinstance(lines[0], ObserverHistoryLine)
+    later = window._observer_history_after_id(12, 100)
+    assert [line.id for line in later] == [13]
+    assert later[0].role == "user"
+
+
+def test_observer_history_after_id_preserves_read_failure_signal() -> None:
+    import pytest
+
+    from app.ui.pet_window import PetWindow
+
+    class Store:
+        def load_after_id(self, entry_id: int, *, limit: int = 100):
+            raise OSError("history unavailable")
+
+    class Window:
+        history_store = Store()
+        _observer_history_after_id = PetWindow._observer_history_after_id
+
+    with pytest.raises(OSError, match="history unavailable"):
+        Window()._observer_history_after_id(12, 100)
+
+
 def test_chat_history_store_round_trips_tone_and_portrait() -> None:
     from app.storage.chat_history import ChatHistoryStore
 
@@ -6272,7 +6342,7 @@ def test_subtitle_waiting_indicator_animates_and_stops_on_text() -> None:
     assert label.text == "回复到了"
 
 
-def test_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
+def test_untranslated_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
     from app.ui.subtitle_controller import SubtitleController
     from app.voice import VoicePlaybackController
 
@@ -6313,7 +6383,9 @@ def test_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
 
     controller.start_waiting_indicator()
     controller._show_next_waiting_indicator_frame()
-    controller.show_segments([ChatSegment("第一段回复", "中性", "第一段回复")])
+    # 已有中文字幕的段落现在必须先显示文字再请求 TTS；本测试保留给
+    # 尚无译文、也没有 sidecar gate 的日文回退路径。
+    controller.show_segments([ChatSegment("第一段回复", "中性", "")])
 
     assert controller.waiting_indicator_active
     assert label.text == ".."

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
@@ -11,7 +12,15 @@ import httpx
 
 from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
 from app.core.debug_log import debug_log, summarize_messages
+from app.core.interaction import get_interaction_id
 from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
+from app.llm.payload_inspection import (
+    attach_usage,
+    extract_usage_metrics,
+    inspect_chat_payload,
+    inspection_log_dict,
+    normalize_request_purpose,
+)
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
 
@@ -149,6 +158,10 @@ class OpenAICompatibleClient:
         # 可选事件发射器（由宿主注入），用于派发 llm.request.* 插件事件。
         self._event_emit: Callable[[str, dict[str, Any] | None], None] | None = None
         self._http: httpx.Client | None = None
+        self.payload_inspections: deque[Any] = deque(maxlen=128)
+        self._request_index_by_interaction: OrderedDict[str, int] = OrderedDict()
+        self._previous_payload_inspection: Any | None = None
+        self._previous_inspection_payload: dict[str, Any] | None = None
 
     def _http_client(self) -> httpx.Client:
         """获取或创建可复用的 httpx.Client，连接池复用 TCP 连接。"""
@@ -182,6 +195,59 @@ class OpenAICompatibleClient:
             emitter(event_name, payload)
         except Exception:  # noqa: BLE001 — 事件派发不得影响 LLM 请求
             pass
+
+    def _record_payload_inspection(
+        self,
+        payload: dict[str, Any],
+        *,
+        runtime_context: str,
+        request_purpose: str | None,
+        request_index: int | None,
+        interaction_id: str | None,
+        model: str,
+    ) -> Any:
+        iid = str(interaction_id or get_interaction_id() or "")
+        purpose = normalize_request_purpose(request_purpose)
+        if request_index is None:
+            if iid in self._request_index_by_interaction:
+                self._request_index_by_interaction.move_to_end(iid)
+            self._request_index_by_interaction[iid] = (
+                self._request_index_by_interaction.get(iid, 0) + 1
+            )
+            while len(self._request_index_by_interaction) > 128:
+                self._request_index_by_interaction.popitem(last=False)
+            resolved_index = self._request_index_by_interaction[iid]
+        else:
+            resolved_index = int(request_index)
+        inspection = inspect_chat_payload(
+            payload,
+            runtime_context=runtime_context,
+            interaction_id=iid,
+            request_index=resolved_index,
+            request_purpose=purpose,
+            endpoint=_normalize_openai_base_url(self.settings.base_url),
+            model=model,
+            previous=self._previous_payload_inspection,
+            previous_payload=self._previous_inspection_payload,
+        )
+        self._previous_payload_inspection = inspection
+        # 仅保留上一个请求用于相邻前缀比较；正文不进入 inspection 历史。
+        self._previous_inspection_payload = dict(payload)
+        self.payload_inspections.append(inspection)
+        debug_log("API", "payload_inspection", inspection_log_dict(inspection))
+        return inspection
+
+    def _finish_payload_inspection(
+        self,
+        inspection: Any,
+        usage: dict[str, Any] | None,
+    ) -> None:
+        completed = attach_usage(inspection, usage)
+        for index in range(len(self.payload_inspections) - 1, -1, -1):
+            if self.payload_inspections[index] is inspection:
+                self.payload_inspections[index] = completed
+                break
+        debug_log("API", "payload_inspection_usage", inspection_log_dict(completed))
 
     def update_settings(self, settings: ApiSettings) -> None:
         """运行时更新 API 配置，供设置界面保存后立即生效。"""
@@ -404,6 +470,9 @@ class OpenAICompatibleClient:
         task: str | None = None,
         request_timeout: float | None = None,
         max_attempts: int | None = None,
+        request_purpose: str | None = None,
+        request_index: int | None = None,
+        interaction_id: str | None = None,
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。
@@ -426,6 +495,14 @@ class OpenAICompatibleClient:
             temperature=temperature,
             chat_params=chat_params,
             base_url=self.settings.base_url,
+        )
+        inspection = self._record_payload_inspection(
+            payload,
+            runtime_context=runtime_context,
+            request_purpose=request_purpose,
+            request_index=request_index,
+            interaction_id=interaction_id,
+            model=request_model,
         )
         effective_timeout = (
             float(request_timeout)
@@ -471,6 +548,14 @@ class OpenAICompatibleClient:
                     chat_params=chat_params,
                     base_url=self.settings.base_url,
                 )
+                inspection = self._record_payload_inspection(
+                    payload,
+                    runtime_context=runtime_context,
+                    request_purpose=request_purpose,
+                    request_index=None,
+                    interaction_id=interaction_id,
+                    model=request_model,
+                )
                 debug_log(
                     "API",
                     "端点不支持尾部 system 上下文，已回退为 user 上下文",
@@ -492,6 +577,11 @@ class OpenAICompatibleClient:
             raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
 
         result = str(content).strip() if content else ""
+        usage = data.get("usage") if isinstance(data, dict) else None
+        self._finish_payload_inspection(
+            inspection,
+            usage if isinstance(usage, dict) else None,
+        )
         debug_log("API", "模型原始文本返回", {"content": result})
         return result
 
@@ -606,6 +696,9 @@ class OpenAICompatibleClient:
         structured_response: bool = False,
         runtime_context: str = "",
         cancel_checker: CancelChecker | None = None,
+        request_purpose: str | None = None,
+        request_index: int | None = None,
+        interaction_id: str | None = None,
         **chat_params: Any,
     ) -> ChatCompletionTurn:
         """调用 OpenAI 原生 tools/tool_calls 协议并返回 assistant 消息。"""
@@ -630,6 +723,14 @@ class OpenAICompatibleClient:
             temperature=temperature,
             chat_params=chat_params,
             base_url=self.settings.base_url,
+        )
+        inspection = self._record_payload_inspection(
+            payload,
+            runtime_context=runtime_context,
+            request_purpose=request_purpose,
+            request_index=request_index,
+            interaction_id=interaction_id,
+            model=request_model,
         )
         debug_log(
             "API",
@@ -669,6 +770,14 @@ class OpenAICompatibleClient:
                     chat_params=chat_params,
                     base_url=self.settings.base_url,
                 )
+                inspection = self._record_payload_inspection(
+                    payload,
+                    runtime_context=runtime_context,
+                    request_purpose=request_purpose,
+                    request_index=None,
+                    interaction_id=interaction_id,
+                    model=request_model,
+                )
                 debug_log(
                     "API",
                     "端点不支持尾部 system 上下文，已回退为 user 上下文",
@@ -706,6 +815,11 @@ class OpenAICompatibleClient:
             **choice_diagnostics,
         }
         debug_log("API", "原生工具模型返回", response_log)
+        usage = data.get("usage") if isinstance(data, dict) else None
+        self._finish_payload_inspection(
+            inspection,
+            usage if isinstance(usage, dict) else None,
+        )
         if not str(content or "").strip() and not tool_calls:
             debug_log(
                 "API",
@@ -1013,6 +1127,11 @@ def _extract_choice_diagnostics(data: dict[str, Any]) -> dict[str, Any]:
             for key in ("prompt_tokens", "completion_tokens", "total_tokens")
             if key in usage
         }
+        metrics = extract_usage_metrics(usage)
+        if metrics["cached_input_tokens"] is not None:
+            usage_summary["cached_input_tokens"] = metrics["cached_input_tokens"]
+        if metrics["reasoning_tokens"] is not None:
+            usage_summary["reasoning_tokens"] = metrics["reasoning_tokens"]
         if usage_summary:
             diagnostics["usage"] = usage_summary
     return diagnostics

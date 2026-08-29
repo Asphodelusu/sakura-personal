@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -636,3 +637,37 @@ def test_ledger_denylist_rejects_body_fields_and_private_samples() -> None:
     records = _run_screen(observer)
     assert len(records) == 1
     _assert_private_free(records[0])
+
+
+def test_exchange_context_record_stays_private_during_screen_eval() -> None:
+    observer = _screen_observer()
+    observer.set_history_entries_after_provider(lambda _after, _limit: [])
+    observer.record_proactive_exchange(
+        source="screen",
+        history_ids=[10],
+        text=_SECRET_COMMENT,
+        spoken_at_unix=time.time(),
+    )
+    _wire_http(observer, decision_content=_SILENT_JSON)
+    with (
+        patch("app.perception.observer.debug_log") as mock_log,
+        patch("app.perception.observer.get_active_window_pid", return_value=_PID_OTHER),
+        patch("app.perception.observer.get_active_window_title", return_value="Chrome"),
+        patch("app.perception.observer.get_idle_seconds", return_value=0.0),
+        patch(
+            "app.perception.observer.get_active_window_process_name",
+            return_value="chrome.exe",
+        ),
+    ):
+        asyncio.run(observer._do_evaluation(["timer"]))
+        records = [
+            call.args[2]
+            for call in mock_log.call_args_list
+            if len(call.args) >= 3
+            and call.args[0] == "ObserverLedger"
+            and call.args[1] == "交流上下文"
+        ]
+    assert len(records) == 1
+    _assert_private_free(records[0])
+    assert records[0]["view_count"] == 1
+    assert records[0]["exchanges"][0]["history_end_id"] == 10
