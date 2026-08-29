@@ -31,7 +31,10 @@ from app.llm.chat_reply import (
     ChatReply,
     ChatReplyParseResult,
     _try_load_json,
+    classify_chat_reply_failure,
+    extract_adoptable_japanese_units,
     parse_chat_reply_result,
+    structural_repair_is_faithful,
 )
 from app.llm.context_trimming import trim_messages_for_model
 
@@ -147,6 +150,7 @@ class AgentRuntimeReplyMixin:
             runtime_context=runtime_context,
             structured_response=True,
             cancel_checker=cancel_checker,
+            request_purpose="semantic_compose",
             **dialogue_extra_params,
         )
         debug_log(
@@ -155,6 +159,112 @@ class AgentRuntimeReplyMixin:
             {"content_chars": len(turn.content or "")},
         )
         return turn.content
+
+
+    def _can_attempt_structural_repair(self, raw_content: str) -> bool:
+        klass = classify_chat_reply_failure(raw_content)
+        # 通用 syntax 往往意味着响应被截断，无法证明语义已经完整；
+        # 仅对完整纯日语/围栏包裹等 envelope，以及可证明有正文的 schema 尝试快修。
+        if klass not in {"envelope", "schema"}:
+            return False
+        return bool(extract_adoptable_japanese_units(raw_content))
+
+
+    def _structural_repair_enums(self) -> tuple[list[str], list[str]]:
+        tones = list(self._effective_reply_tones())
+        portraits = list(self._prompt_reply_portraits())
+        return tones, portraits
+
+
+    def _build_structural_repair_system(self, tones: list[str], portraits: list[str]) -> str:
+        tone_rule = f"tone 只能从以下选择：{'、'.join(tones)}。" if tones else "tone 使用简短中文情绪词。"
+        portrait_rule = (
+            f"portrait 只能从以下选择：{'、'.join(portraits)}。"
+            if portraits
+            else "portrait 可为空或使用已有立绘名。"
+        )
+        return (
+            "你是 JSON 结构修复器，不是角色。"
+            "只输出合法 JSON："
+            '{"segments":[{"ja":"自然日语","zh":"","tone":"中性","portrait":""}]}。'
+            f"{tone_rule}{portrait_rule}"
+            "不得改写日文语义，不得调换分段顺序，不得新增事实。"
+            "不要解释，不要使用 Markdown，不要调用工具。"
+        )
+
+
+    def _compose_structural_repair(
+        self,
+        raw_content: str,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
+    ) -> str:
+        check_cancelled(cancel_checker)
+        tones, portraits = self._structural_repair_enums()
+        system_prompt = self._build_structural_repair_system(tones, portraits)
+        user_content = (
+            "把下面原文封装为合法 JSON segments。"
+            "不得改写日文语义或顺序。\n\n【原文】\n"
+            f"{raw_content}"
+        )
+        if turn_state is not None:
+            repair_client = self._client_for_turn([], turn_state.turn_plan)
+            _, repair_extra = self._resolve_dialogue_params_for_turn(
+                turn_state.turn_plan,
+                repair_client,
+            )
+        else:
+            repair_client = self.api_client
+            repair_extra = {}
+        turn = repair_client.complete_with_tools(
+            system_prompt,
+            [{"role": "user", "content": user_content}],
+            tools=[],
+            tool_choice="none",
+            temperature=0.2,
+            runtime_context="",
+            structured_response=True,
+            cancel_checker=cancel_checker,
+            request_purpose="structural_repair",
+            **repair_extra,
+        )
+        debug_log(
+            "AgentRuntime",
+            "结构修复快车道完成",
+            {"content_chars": len(turn.content or "")},
+        )
+        return turn.content
+
+
+    def _try_structural_repair(
+        self,
+        raw_content: str,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        turn_state: TurnState | None = None,
+    ) -> str | None:
+        if not self._can_attempt_structural_repair(raw_content):
+            return None
+        try:
+            repaired = self._compose_structural_repair(
+                raw_content,
+                cancel_checker=cancel_checker,
+                turn_state=turn_state,
+            )
+        except ApiRequestError as exc:
+            debug_log("AgentRuntime", "结构修复快车道失败，回退语义合成", {"error": str(exc)})
+            return None
+        tones, portraits = self._structural_repair_enums()
+        if structural_repair_is_faithful(
+            raw_content,
+            repaired,
+            allowed_tones=tones,
+            allowed_portraits=portraits,
+        ):
+            return repaired
+        debug_log("AgentRuntime", "结构修复结果未通过等价校验，回退语义合成")
+        return None
 
 
     def _resolve_final_reply_content(
@@ -171,6 +281,13 @@ class AgentRuntimeReplyMixin:
         reason = self._structured_compose_reason(raw_content)
         if not reason:
             return raw_content
+        repaired = self._try_structural_repair(
+            raw_content,
+            cancel_checker=cancel_checker,
+            turn_state=turn_state,
+        )
+        if repaired is not None:
+            return repaired
         debug_log(
             "AgentRuntime",
             "首轮最终回复不合格，启动结构化合成",
@@ -322,6 +439,16 @@ class AgentRuntimeReplyMixin:
         if not retry_reason:
             retry_reason = "missing_segments"
 
+        repaired_raw = self._try_structural_repair(
+            raw_content,
+            cancel_checker=cancel_checker,
+            turn_state=turn_state,
+        )
+        if repaired_raw is not None:
+            repaired = self._normalize_parsed_reply(parse_chat_reply_result(repaired_raw))
+            if not repaired.needs_retry and _reply_has_adoptable_segments(repaired.reply):
+                return repaired
+
         if retry_reason in _STRUCTURED_COMPOSE_RETRY_REASONS:
             debug_log(
                 "AgentRuntime",
@@ -379,6 +506,7 @@ class AgentRuntimeReplyMixin:
                 temperature=0.2,
                 structured_response=True,
                 cancel_checker=cancel_checker,
+                request_purpose="semantic_compose",
                 **repair_extra,
             )
         except ApiRequestError as exc:

@@ -484,6 +484,7 @@ class AgentRuntimeToolLoopMixin:
                         and not messages_contain_image(working_messages)
                     ),
                     cancel_checker=cancel_checker,
+                    request_purpose="initial" if step_index == 0 else "tool_step",
                     **dialogue_extra_params,
                 )
                 last_turn = turn
