@@ -4,7 +4,10 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.core.relational_drive import DriveEffect
 
 
 DEFAULT_TONE = "中性"
@@ -53,6 +56,7 @@ class ChatSegment:
 @dataclass(frozen=True)
 class ChatReply:
     segments: list[ChatSegment]
+    drive_effect: DriveEffect | None = None
 
     @property
     def text(self) -> str:
@@ -172,6 +176,14 @@ def structural_repair_is_faithful(
     return True
 
 
+def _optional_drive_effect(data: dict[str, Any]):
+    from app.core.relational_drive import parse_drive_effect
+
+    if "drive_effect" not in data:
+        return None
+    return parse_drive_effect(data.get("drive_effect"))
+
+
 def parse_chat_reply(content: str) -> ChatReply:
     """解析模型返回；坏结构化回复会降级成安全提示，避免原文泄到 UI。"""
     return parse_chat_reply_result(content).reply
@@ -201,7 +213,10 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
         segments, has_language_issue = _parse_segments(data)
         if segments:
             return ChatReplyParseResult(
-                ChatReply(_normalize_malformed_segments(segments)),
+                ChatReply(
+                    _normalize_malformed_segments(segments),
+                    drive_effect=_optional_drive_effect(data),
+                ),
                 ok=not has_language_issue,
                 needs_retry=has_language_issue,
                 repaired=repaired,
@@ -379,7 +394,11 @@ def sanitize_reply_tones(reply: ChatReply, allowed_tones: list[str] | None) -> C
             changed = True
         else:
             new_segments.append(segment)
-    return ChatReply(new_segments) if changed else reply
+    return (
+        ChatReply(segments=new_segments, drive_effect=reply.drive_effect)
+        if changed
+        else reply
+    )
 
 
 def _parse_segments(data: dict[str, Any]) -> tuple[list[ChatSegment], bool]:

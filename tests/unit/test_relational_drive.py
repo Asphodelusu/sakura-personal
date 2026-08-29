@@ -203,6 +203,37 @@ def test_effect_vectors_match_approved_semantics() -> None:
     assert stopped.attachment_longing >= state.attachment_longing
 
 
+def test_effect_strength_scales_positive_and_negative_dimensions() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 8, 30, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        attachment_longing=0.40
+    )
+    subtle = apply_drive_effect(
+        state, profile, DriveEffect(event="mutual_affection", strength="subtle"), start
+    )
+    mild = apply_drive_effect(
+        state, profile, DriveEffect(event="mutual_affection", strength="mild"), start
+    )
+    strong = apply_drive_effect(
+        state, profile, DriveEffect(event="mutual_affection", strength="strong"), start
+    )
+    assert mild.physical_arousal == pytest.approx(
+        _apply_delta(state.physical_arousal, 0.03), abs=1e-6
+    )
+    assert mild.attachment_longing == pytest.approx(
+        _apply_delta(state.attachment_longing, -0.04), abs=1e-6
+    )
+    assert state.physical_arousal < subtle.physical_arousal < mild.physical_arousal < strong.physical_arousal
+    assert state.attachment_longing > subtle.attachment_longing > mild.attachment_longing > strong.attachment_longing
+    assert subtle.physical_arousal == pytest.approx(
+        _apply_delta(state.physical_arousal, 0.03 * 0.5), abs=1e-6
+    )
+    assert strong.physical_arousal == pytest.approx(
+        _apply_delta(state.physical_arousal, 0.03 * 1.5), abs=1e-6
+    )
+
+
 def test_high_values_saturate_instead_of_jumping() -> None:
     profile = RelationalDriveProfile.natural_default()
     start = datetime(2026, 8, 30, tzinfo=UTC)

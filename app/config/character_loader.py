@@ -496,7 +496,7 @@ def normalize_reply_portraits(reply: "ChatReply", profile: CharacterProfile | No
         if resolved_segment is not segment:
             changed = True
         segments.append(resolved_segment)
-    return ChatReply(segments) if changed else reply
+    return ChatReply(segments=segments, drive_effect=reply.drive_effect) if changed else reply
 
 
 def _match_portrait_alias(portrait_key: str, expression_portraits: dict[str, Path]) -> str | None:

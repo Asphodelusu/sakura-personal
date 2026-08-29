@@ -20,6 +20,7 @@ def build_segmented_reply_instruction(
     *,
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
+    include_drive_effect: bool = True,
     portrait_hints: str | None = None,
     verbosity_guidance: str | None = None,
 ) -> str:
@@ -79,13 +80,24 @@ def build_segmented_reply_instruction(
     guidance = str(verbosity_guidance or "").strip()
     if guidance:
         rules.append(guidance)
-    return build_segment_protocol(
+    protocol = build_segment_protocol(
         tones,
         portraits,
         format_text=segment_format_for_portraits(portraits),
         segment_rules="\n".join(rules),
         include_translation_rules=include_translation_rules,
         portrait_hints=portrait_hints,
+    )
+    if not include_drive_effect:
+        return protocol
+    return (
+        protocol
+        + "\n\n共同互动确实改变短期身体或亲近状态时，才可在 segments 同一顶层附加 drive_effect；"
+        "不确定则省略，不为填写而改变正文。"
+        "event 只可用 mutual_affection、mutual_escalation、fulfilled、aftercare、hesitation、stopped；"
+        "strength 只可用 subtle、mild、strong。"
+        '顶层示例：{"segments":[{"ja":"……好き。","zh":"……喜欢。","tone":"亲密"}],'
+        '"drive_effect":{"event":"mutual_affection","strength":"mild"}}。'
     )
 
 
@@ -95,6 +107,7 @@ def build_agent_reply_protocol(
     *,
     portrait_hints: str | None = None,
     verbosity_guidance: str | None = None,
+    include_drive_effect: bool = True,
 ) -> str:
     """与分段回复协议共用同一套分段规则，避免 agent 路径重复维护两套文案。"""
     return build_segmented_reply_instruction(
@@ -102,6 +115,7 @@ def build_agent_reply_protocol(
         reply_portraits,
         include_translation_rules=True,
         include_no_single_segment_rule=True,
+        include_drive_effect=include_drive_effect,
         portrait_hints=portrait_hints,
         verbosity_guidance=verbosity_guidance,
     )

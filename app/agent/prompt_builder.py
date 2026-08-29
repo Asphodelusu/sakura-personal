@@ -372,6 +372,10 @@ class AgentRuntimePromptMixin:
                 prompt_portraits,
                 portrait_hints=self._portrait_hints(current_input=current_input) or None,
                 verbosity_guidance=verbosity or None,
+                include_drive_effect=(
+                    getattr(self.character_profile, "relationship_drive_profile", None)
+                    is not None
+                ),
             ),
             _plugin_patch_text,
         )

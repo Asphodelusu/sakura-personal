@@ -338,6 +338,11 @@ def apply_drive_effect(
         "afterglow": evolved.afterglow,
         "inhibition": evolved.inhibition,
     }
+    scale = {
+        DriveStrength.SUBTLE: 0.5,
+        DriveStrength.MILD: 1.0,
+        DriveStrength.STRONG: 1.5,
+    }.get(str(effect.strength), 1.0)
     protect_longing = str(effect.event) in {
         DriveEffectEvent.HESITATION,
         DriveEffectEvent.STOPPED,
@@ -345,7 +350,7 @@ def apply_drive_effect(
     for field, delta in vector.items():
         if protect_longing and field == "attachment_longing":
             continue
-        values[field] = _apply_delta(values[field], delta)
+        values[field] = _apply_delta(values[field], delta * scale)
     return evolved.with_values(**values, updated_at=_aware(now))
 
 
