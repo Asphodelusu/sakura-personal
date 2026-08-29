@@ -14,7 +14,14 @@ from app.llm.prompts.runtime import estimate_prompt_tokens
 ESTIMATED_IMAGE_PART_TOKENS = 28_000
 
 KNOWN_REQUEST_PURPOSES = frozenset(
-    {"initial", "tool_step", "semantic_compose", "structural_repair"}
+    {
+        "initial",
+        "tool_step",
+        "semantic_compose",
+        "structural_repair",
+        "subtitle_translation",
+        "subtitle_translation_retry",
+    }
 )
 _RUNTIME_USER_PREFIX = "[Sakura runtime context; system-provided facts, not a user request]\n"
 
