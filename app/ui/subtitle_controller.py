@@ -28,9 +28,9 @@ SUBTITLE_TYPING_INTERVAL_MIN_MS = 5
 SUBTITLE_TYPING_INTERVAL_MAX_MS = 200
 REPLY_SEGMENT_PAUSE_MIN_MS = 0
 REPLY_SEGMENT_PAUSE_MAX_MS = 3000
-ACTION_READING_HOLD_BASE_MS = 400
+ACTION_READING_HOLD_BASE_MS = 500
 ACTION_READING_HOLD_PER_CHAR_MS = 40
-ACTION_READING_HOLD_MIN_MS = 600
+ACTION_READING_HOLD_MIN_MS = 720
 ACTION_READING_HOLD_MAX_MS = 1200
 ACTION_TRANSLATION_DEADLINE_MS = 12_000
 DIALOGUE_DWELL_BASE_MS = 500
@@ -256,6 +256,7 @@ class SubtitleController(QObject):
         duration_ms: int | None = None,
         instant: bool = False,
     ) -> None:
+        previous_text = self.speech_text
         self.stop_waiting_indicator()
         cleaned = " ".join(text.split())
         self.speech_timer.stop()
@@ -271,7 +272,10 @@ class SubtitleController(QObject):
             if self.current_segment_sequence_id is not None:
                 if cleaned:
                     self._record_segment_visible()
+                already_shown = self.current_segment_speech_done
                 self._mark_segment_speech_done(self.current_segment_sequence_id)
+                if already_shown and cleaned and cleaned != previous_text:
+                    self._restart_dialogue_dwell_for_new_visible_text()
             self._log_stage(
                 "speech_text_shown_instant" if instant else "speech_text_started",
                 {"text": cleaned},
@@ -441,6 +445,8 @@ class SubtitleController(QObject):
             self._preload_segment(segment)
         # 立绘应在分段开始时立刻切换，不等待 TTS 合成/开播回调。
         self._apply_segment(segment)
+        if self._can_reveal_text_before_audio():
+            self._reveal_current_segment_text()
         self.voice_playback.speak_segment(
             segment,
             sequence_id,
@@ -466,6 +472,8 @@ class SubtitleController(QObject):
                 "portrait": self.current_segment.portrait,
             },
         )
+        if self.current_segment_speech_done:
+            return
         if self._should_hold_chinese_display():
             self._hold_translation_waiting_indicator()
             return
@@ -678,6 +686,38 @@ class SubtitleController(QObject):
         self._show_waiting_indicator_frame()
         self.waiting_indicator_timer.start()
         self._log_stage("translation_waiting_indicator_held", None)
+
+    def _can_reveal_text_before_audio(self) -> bool:
+        if self._should_hold_chinese_display():
+            return False
+        segment = self.current_segment
+        if segment is None:
+            return False
+        if self.subtitle_language == "zh":
+            if str(segment.translation or "").strip():
+                return True
+            return _is_silent_visible_action(segment)
+        return bool(str(segment.text or "").strip())
+
+    def _reveal_current_segment_text(self) -> None:
+        if self.current_segment is None:
+            return
+        self.set_speech(
+            self.current_segment.display_text(self.subtitle_language),
+            pulse=self._should_pulse_bubble(),
+            instant=True,
+        )
+
+    def _restart_dialogue_dwell_for_new_visible_text(self) -> None:
+        sequence_id = self.current_segment_sequence_id
+        if sequence_id is None or not _is_ordinary_spoken_dialogue(self.current_segment):
+            return
+        if not self.current_segment_tts_done:
+            return
+        if self._dialogue_reading_dwell_timer.isActive():
+            self._dialogue_reading_dwell_timer.stop()
+        self.reply_advance_scheduled = False
+        self._schedule_next_reply_segment_if_ready(sequence_id)
 
     def _record_segment_visible(self) -> None:
         self._segment_visible_monotonic = time.monotonic()

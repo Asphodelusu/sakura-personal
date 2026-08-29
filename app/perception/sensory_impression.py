@@ -33,6 +33,7 @@ class SensoryImpression:
     updated_at: float  # time.monotonic()
     spoken: bool = False
     window_hint: str = ""
+    updated_at_unix: float = 0.0
 
 
 class SensoryImpressionStore:
@@ -50,6 +51,7 @@ class SensoryImpressionStore:
         spoken: bool = False,
         window_hint: str = "",
         now: float | None = None,
+        wall_unix: float | None = None,
     ) -> None:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -57,12 +59,14 @@ class SensoryImpressionStore:
         if len(cleaned) > STORE_MAX_CHARS:
             cleaned = cleaned[: STORE_MAX_CHARS - 1] + "…"
         stamp = time.monotonic() if now is None else float(now)
+        wall = time.time() if wall_unix is None else float(wall_unix)
         with self._lock:
             self._current = SensoryImpression(
                 text=cleaned,
                 updated_at=stamp,
                 spoken=bool(spoken),
                 window_hint=(window_hint or "").strip(),
+                updated_at_unix=wall,
             )
 
     def clear(self) -> None:
@@ -84,10 +88,23 @@ class SensoryImpressionStore:
                 return None
             return cur
 
-    def get_for_observer(self, *, now: float | None = None) -> str:
-        """给 VLM 的观察者上下文（完整存档文）。"""
+    def get_for_observer(
+        self,
+        *,
+        now: float | None = None,
+        chat_facts_unix: float | None = None,
+    ) -> str:
+        """给观察者的情境文。晚于印象的用户/主聊天事实会让旧印象不再当当前情境。"""
         cur = self.get(now=now)
-        return cur.text if cur else ""
+        if cur is None:
+            return ""
+        if (
+            chat_facts_unix is not None
+            and cur.updated_at_unix > 0
+            and float(chat_facts_unix) > cur.updated_at_unix
+        ):
+            return ""
+        return cur.text
 
     def get_for_chat(self, *, now: float | None = None) -> str:
         """给主对话的薄注入正文（不含 intro）。"""

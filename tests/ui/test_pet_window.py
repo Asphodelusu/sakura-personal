@@ -6272,7 +6272,7 @@ def test_subtitle_waiting_indicator_animates_and_stops_on_text() -> None:
     assert label.text == "回复到了"
 
 
-def test_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
+def test_untranslated_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
     from app.ui.subtitle_controller import SubtitleController
     from app.voice import VoicePlaybackController
 
@@ -6313,7 +6313,9 @@ def test_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
 
     controller.start_waiting_indicator()
     controller._show_next_waiting_indicator_frame()
-    controller.show_segments([ChatSegment("第一段回复", "中性", "第一段回复")])
+    # 已有中文字幕的段落现在必须先显示文字再请求 TTS；本测试保留给
+    # 尚无译文、也没有 sidecar gate 的日文回退路径。
+    controller.show_segments([ChatSegment("第一段回复", "中性", "")])
 
     assert controller.waiting_indicator_active
     assert label.text == ".."

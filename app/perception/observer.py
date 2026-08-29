@@ -44,15 +44,171 @@ from app.perception.win32 import (
 __all__ = [
     "FocusSnapshot",
     "ObservationPacket",
+    "ObserverHistoryLine",
     "ProactiveConfig",
     "ProactiveObserver",
     "ProactiveSpeakPayload",
     "VisibleTextResolution",
+    "format_observer_recent_history",
     "format_visible_text_block",
     "infer_content_scene",
+    "latest_ordinary_chat_unix",
     "resolve_visible_text",
     "resolve_visible_text_excerpt",
 ]
+
+
+@dataclass(frozen=True)
+class ObserverHistoryLine:
+    role: str
+    content: str
+    created_at: str = ""
+    channel: str = ""
+
+
+def _observer_speaker_label(role: str, channel: str) -> str:
+    source = (channel or "").strip()
+    if role == "assistant":
+        if source == "relationship":
+            return "她自己的·关系主动"
+        if source == "proactive":
+            return "她自己的·主动"
+        return "她自己的"
+    return "我说的"
+
+
+def _parse_history_datetime(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed
+
+
+def _group_observer_history_turns(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+) -> list[ObserverHistoryLine]:
+    turns: list[ObserverHistoryLine] = []
+    for item in entries:
+        content = str(item.content or "").strip()
+        role = str(item.role or "").strip()
+        if not content or role not in {"user", "assistant"}:
+            continue
+        channel = str(item.channel or "").strip()
+        created_at = str(item.created_at or "").strip()
+        previous_created_at = (
+            str(turns[-1].created_at or "").strip() if turns else ""
+        )
+        if (
+            turns
+            and role == "assistant"
+            and turns[-1].role == "assistant"
+            and channel == str(turns[-1].channel or "").strip()
+            and (
+                not created_at
+                or not previous_created_at
+                or created_at == previous_created_at
+            )
+        ):
+            previous = turns[-1]
+            turns[-1] = ObserverHistoryLine(
+                role="assistant",
+                content=f"{previous.content}{content}",
+                created_at=item.created_at or previous.created_at,
+                channel=channel,
+            )
+            continue
+        turns.append(
+            ObserverHistoryLine(
+                role=role,
+                content=content,
+                created_at=item.created_at,
+                channel=channel,
+            )
+        )
+    return turns
+
+
+def _format_observer_line_age(created_at: str, now: datetime) -> str:
+    parsed = _parse_history_datetime(created_at)
+    if parsed is None:
+        return ""
+    if parsed.tzinfo is None and now.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=now.tzinfo)
+    elif parsed.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=parsed.tzinfo)
+    seconds = int((now - parsed).total_seconds())
+    if seconds < 90:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}分钟前"
+    if seconds < 86400:
+        return f"{max(1, seconds // 3600)}小时前"
+    return f"{max(1, seconds // 86400)}天前"
+
+
+def format_observer_recent_history(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+    *,
+    now: datetime | None = None,
+    max_turns: int = 6,
+) -> str:
+    """按真实 turn 折叠多段回复，并带上可比较的时间与渠道。"""
+    stamp = now or datetime.now().astimezone()
+    turns = _group_observer_history_turns(entries)
+    if max_turns > 0:
+        turns = turns[-max_turns:]
+    rendered: list[str] = []
+    for item in turns:
+        name = _observer_speaker_label(item.role, item.channel)
+        extras: list[str] = []
+        parsed = _parse_history_datetime(item.created_at)
+        if parsed is not None:
+            extras.append(parsed.strftime("%H:%M"))
+        age = _format_observer_line_age(item.created_at, stamp)
+        if age:
+            extras.append(age)
+        channel = str(item.channel or "").strip()
+        if item.role == "user" and channel == "mobile":
+            extras.append("手机")
+        content = item.content
+        if len(content) > 160:
+            content = content[:160] + "…"
+        prefix = f"[{name}]"
+        if extras:
+            prefix = f"{prefix} {' · '.join(extras)}"
+        rendered.append(f"{prefix} {content}")
+    if not rendered:
+        return ""
+    legend = (
+        "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
+        "她自己的·主动=你主动开口；她自己的·关系主动=你因关系主动开口。称呼用「他」。"
+        "同一轮多段回复已合并。时间越新越可靠；后续纠正或完成应压过更早的计划。"
+    )
+    return "[最近の会話]\n" + legend + "\n" + "\n".join(rendered)
+
+
+def latest_ordinary_chat_unix(
+    entries: list[ObserverHistoryLine] | tuple[ObserverHistoryLine, ...],
+) -> float | None:
+    latest: float | None = None
+    for item in entries:
+        role = str(item.role or "").strip()
+        channel = str(item.channel or "").strip()
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and channel in {"proactive", "relationship"}:
+            continue
+        parsed = _parse_history_datetime(item.created_at)
+        if parsed is None:
+            continue
+        unix = parsed.timestamp()
+        if latest is None or unix > latest:
+            latest = unix
+    return latest
 
 
 def _observer_gui_log(message: str, data: Any | None = None) -> None:
@@ -600,6 +756,7 @@ class ProactiveObserver:
         self.on_evaluate = on_evaluate or (lambda _reason, _should_speak: None)
         self._is_busy = is_busy or (lambda: False)
         self._get_recent_history: Callable[[], str] = lambda: ""
+        self._get_recent_chat_facts_unix: Callable[[], float | None] = lambda: None
         self._obs_history: deque[ObservationRecord] = deque(maxlen=5)
         # 短时印象改由 sensory_impression_store 承载（Observer VLM + 主对话共享）
 
@@ -679,6 +836,24 @@ class ProactiveObserver:
     def set_recent_history_provider(self, provider: Callable[[], str]) -> None:
         """Set a callback that returns recent conversation history as a string."""
         self._get_recent_history = provider
+
+    def set_recent_chat_facts_unix_provider(
+        self, provider: Callable[[], float | None]
+    ) -> None:
+        """最近一条用户/普通主聊天事实的 unix 时间，供印象 freshness 比较。"""
+        self._get_recent_chat_facts_unix = provider
+
+    def _recent_chat_facts_unix(self) -> float | None:
+        try:
+            value = self._get_recent_chat_facts_unix()
+        except Exception:
+            return None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def set_relationship_settings(self, settings) -> None:
         from app.config.relationship_initiative import RelationshipInitiativeSettings
@@ -1537,7 +1712,9 @@ class ProactiveObserver:
             parts.append(obs_ctx)
         # 决策 LLM 看自己上一轮的短时印象（含「対話の既知事実」），
         # 避免对同一画面/话题重复问。
-        obs_impression = sensory_impression_store.get_for_observer()
+        obs_impression = sensory_impression_store.get_for_observer(
+            chat_facts_unix=self._recent_chat_facts_unix()
+        )
         if obs_impression:
             parts.append(f"[观察者上下文]\n{obs_impression}")
         if self._relationship_motive:
@@ -1731,7 +1908,10 @@ class ProactiveObserver:
             ctx_parts.append(f"触发原因：{', '.join(triggers)}")
 
         # 短时印象（LLM→VLM / 主对话共享）：过期由 store TTL 处理
-        observer_ctx = sensory_impression_store.get_for_observer(now=now)
+        observer_ctx = sensory_impression_store.get_for_observer(
+            now=now,
+            chat_facts_unix=self._recent_chat_facts_unix(),
+        )
         if observer_ctx:
             ctx_parts.append(f"[观察者上下文]\n{observer_ctx}")
 

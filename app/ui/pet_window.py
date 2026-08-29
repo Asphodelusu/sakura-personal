@@ -3388,6 +3388,7 @@ class PetWindow(QWidget):
                 relationship=rel,
             )
             observer.set_recent_history_provider(self._format_recent_history)
+            observer.set_recent_chat_facts_unix_provider(self._recent_ordinary_chat_unix)
             observer.set_relationship_guide(guide_text)
             observer.set_relationship_facts_provider(
                 lambda: self.memory_store.build_continuity_context()
@@ -3508,49 +3509,60 @@ class PetWindow(QWidget):
         except Exception as exc:
             debug_log("ProactiveObserver", "评估结果写入历史失败", {"error": str(exc)})
 
+    def _observer_history_lines(self):
+        """Observer 用的近期对话行：优先只读历史库，回退内存窗口。"""
+        from app.agent.builtin_tools import message_is_intimacy_continue
+        from app.perception.observer import ObserverHistoryLine
+
+        store = getattr(self, "history_store", None)
+        if store is not None:
+            try:
+                tail, _has_more = store.load_tail(40)
+                lines = [
+                    ObserverHistoryLine(
+                        role=str(entry.role or ""),
+                        content=str(entry.content or ""),
+                        created_at=str(entry.created_at or ""),
+                        channel=str(entry.channel or ""),
+                    )
+                    for entry in tail
+                    if str(entry.role or "") in {"user", "assistant"}
+                ]
+                if lines:
+                    return lines
+            except Exception:
+                pass
+
+        lines: list[ObserverHistoryLine] = []
+        for message in self.messages:
+            if not isinstance(message, dict) or message_is_intimacy_continue(message):
+                continue
+            role = str(message.get("role") or "")
+            content = str(message.get("content") or "").strip()
+            if not content or role not in {"user", "assistant"}:
+                continue
+            source = str(message.get("source") or message.get("channel") or "").strip()
+            created_at = str(message.get("created_at") or "")
+            lines.append(
+                ObserverHistoryLine(
+                    role=role,
+                    content=content,
+                    created_at=created_at,
+                    channel=source,
+                )
+            )
+        return lines
+
+    def _recent_ordinary_chat_unix(self) -> float | None:
+        from app.perception.observer import latest_ordinary_chat_unix
+
+        return latest_ordinary_chat_unix(self._observer_history_lines())
+
     def _format_recent_history(self) -> str:
         """Format last few conversation turns for the observer decision LLM."""
-        from app.agent.builtin_tools import message_is_intimacy_continue
+        from app.perception.observer import format_observer_recent_history
 
-        msgs = self.messages[-10:]
-        if not msgs:
-            return ""
-        lines: list[str] = []
-        count = 0
-        for m in reversed(msgs):
-            if not isinstance(m, dict):
-                continue
-            # 系统续投信号绝不能标成「我说的」
-            if message_is_intimacy_continue(m):
-                continue
-            role = m.get("role", "")
-            content = str(m.get("content", "")).strip()
-            if not content or role not in ("user", "assistant"):
-                continue
-            source = str(m.get("source") or "").strip()
-            if role == "assistant":
-                name = "她自己的"
-                if source == "relationship":
-                    name = "她自己的·关系主动"
-                elif source == "proactive":
-                    name = "她自己的·主动"
-            else:
-                # 用户对 Sakura 说的话（打字/语音转写进对话的都算）
-                name = "我说的"
-            if len(content) > 120:
-                content = content[:120] + "…"
-            lines.append(f"[{name}] {content}")
-            count += 1
-            if count >= 6:
-                break
-        if not lines:
-            return ""
-        lines.reverse()
-        legend = (
-            "※ 标签：我说的=他对你说的话；她自己的=你说过的话；"
-            "她自己的·主动=你主动开口；她自己的·关系主动=你因关系主动开口。称呼用「他」。"
-        )
-        return "[最近の会話]\n" + legend + "\n" + "\n".join(lines)
+        return format_observer_recent_history(self._observer_history_lines())
 
     def _on_proactive_speak(self, payload: ProactiveSpeakPayload) -> None:
         """Callback: 主动发言走正式回复管线（thread-safe via Qt signal）。"""
