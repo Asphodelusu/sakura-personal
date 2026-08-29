@@ -271,3 +271,23 @@ def test_context_around_invalid_id(store: ChatHistoryStore) -> None:
     result3 = store.context_around(99999)
     assert result3["target"] is None
     assert "hint" in result3
+
+
+def test_load_after_id_keeps_ascending_ids_and_channels(store: ChatHistoryStore) -> None:
+    first_id = store.append("assistant", "明日の昼、どうする？", channel="proactive")
+    second_id = store.append("user", "听到了，还看情况")
+    third_id = store.append("assistant", "作るなら教えて", channel="")
+    fourth_id = store.append("user", "稍后")
+
+    rows = store.load_after_id(first_id, limit=2)
+    assert [row.id for row in rows] == [second_id, third_id]
+    assert rows[0].role == "user"
+    assert rows[0].channel == ""
+    assert rows[1].role == "assistant"
+    assert rows[1].channel == ""
+
+    all_later = store.load_after_id(first_id, limit=50)
+    assert [row.id for row in all_later] == [second_id, third_id, fourth_id]
+    assert store.load_after_id(fourth_id) == []
+    assert store.load_after_id(0) == []
+    assert store.load_after_id(-1) == []

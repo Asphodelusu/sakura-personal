@@ -163,3 +163,48 @@ def test_stale_sensory_impression_is_not_injected_after_newer_chat_facts() -> No
         wall_unix=later_impression,
     )
     assert "コード" in store.get_for_observer(now=400.0, chat_facts_unix=chat_unix)
+
+
+def test_engaged_exchange_is_not_reopened_by_older_situational_summary() -> None:
+    from app.perception.observer import ProactiveConfig, ProactiveObserver
+
+    store = SensoryImpressionStore(ttl_seconds=3600.0)
+    impression_unix = datetime(2026, 8, 29, 20, 10, 0, tzinfo=TZ).timestamp()
+    store.update(
+        "相手はまだ答えていない。対話の既知：他完全没有回应。",
+        now=100.0,
+        wall_unix=impression_unix,
+    )
+    observer = ProactiveObserver(
+        api_base_url="https://example.com",
+        api_key="x",
+        api_model="m",
+        config=ProactiveConfig(enabled=False),
+    )
+    observer.set_recent_chat_facts_unix_provider(
+        lambda: datetime(2026, 8, 29, 20, 17, 0, tzinfo=TZ).timestamp()
+    )
+    observer.record_proactive_exchange(
+        source="screen",
+        history_ids=[10],
+        text="明日の昼、どうする？",
+        spoken_at_unix=datetime(2026, 8, 29, 20, 16, 0, tzinfo=TZ).timestamp(),
+    )
+    observer.set_history_entries_after_provider(
+        lambda _after, _limit: [
+            ObserverHistoryLine(
+                role="user",
+                content="听到了，会不会一起吃还是看情况吧……",
+                created_at=_at(20, 16),
+                id=14,
+            )
+        ]
+    )
+    views = observer._current_exchange_views(
+        now_unix=datetime(2026, 8, 29, 20, 18, 0, tzinfo=TZ).timestamp()
+    )
+    assert views and views[0].state == "engaged"
+    assert store.get_for_observer(
+        now=200.0,
+        chat_facts_unix=observer._recent_chat_facts_unix(),
+    ) == ""

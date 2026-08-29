@@ -320,6 +320,28 @@ class ChatHistoryStore:
         rows.reverse()
         return [self._row_to_entry(row) for row in rows], has_more
 
+    def load_after_id(self, entry_id: int, *, limit: int = 100) -> list[ChatHistoryEntry]:
+        """只读：返回 id 严格大于 entry_id 的 user/assistant 行，升序。"""
+        try:
+            after_id = int(entry_id)
+        except (TypeError, ValueError):
+            return []
+        if after_id <= 0:
+            return []
+        try:
+            capped = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            capped = 100
+        role_placeholders = ", ".join("?" for _ in _DIALOGUE_ROLES)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_HISTORY_COLUMNS} FROM chat_history "
+                f"WHERE id > ? AND role IN ({role_placeholders}) "
+                "ORDER BY id ASC LIMIT ?",
+                (after_id, *_DIALOGUE_ROLES, capped),
+            ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
     def search_between(
         self,
         start: str | None = None,

@@ -3389,6 +3389,7 @@ class PetWindow(QWidget):
             )
             observer.set_recent_history_provider(self._format_recent_history)
             observer.set_recent_chat_facts_unix_provider(self._recent_ordinary_chat_unix)
+            observer.set_history_entries_after_provider(self._observer_history_after_id)
             observer.set_relationship_guide(guide_text)
             observer.set_relationship_facts_provider(
                 lambda: self.memory_store.build_continuity_context()
@@ -3524,6 +3525,7 @@ class PetWindow(QWidget):
                         content=str(entry.content or ""),
                         created_at=str(entry.created_at or ""),
                         channel=str(entry.channel or ""),
+                        id=int(getattr(entry, "id", 0) or 0),
                     )
                     for entry in tail
                     if str(entry.role or "") in {"user", "assistant"}
@@ -3549,6 +3551,7 @@ class PetWindow(QWidget):
                     content=content,
                     created_at=created_at,
                     channel=source,
+                    id=int(message.get("id") or 0),
                 )
             )
         return lines
@@ -3557,6 +3560,29 @@ class PetWindow(QWidget):
         from app.perception.observer import latest_ordinary_chat_unix
 
         return latest_ordinary_chat_unix(self._observer_history_lines())
+
+    def _observer_history_after_id(self, after_id: int, limit: int):
+        from app.perception.observer import ObserverHistoryLine
+
+        store = getattr(self, "history_store", None)
+        if store is None:
+            return []
+        try:
+            entries = store.load_after_id(after_id, limit=limit)
+        except OSError as exc:
+            debug_log("ProactiveObserver", "读取主动交流后续历史失败", {"error": str(exc)})
+            raise
+        return [
+            ObserverHistoryLine(
+                role=str(entry.role or ""),
+                content=str(entry.content or ""),
+                created_at=str(entry.created_at or ""),
+                channel=str(entry.channel or ""),
+                id=int(getattr(entry, "id", 0) or 0),
+            )
+            for entry in entries
+            if str(entry.role or "") in {"user", "assistant"}
+        ]
 
     def _format_recent_history(self) -> str:
         """Format last few conversation turns for the observer decision LLM."""
@@ -7541,17 +7567,35 @@ class PetWindow(QWidget):
             return []
         history_ids: list[int] = []
         for i, segment in enumerate(clean_segments):
-            history_ids.append(
-                self._record_history(
-                    "assistant",
-                    segment.text,
-                    segment.translation,
-                    segment.tone,
-                    segment.portrait,
-                    channel=channel,
-                    _debug=_debug if i == 0 else None,
-                )
+            raw_id = self._record_history(
+                "assistant",
+                segment.text,
+                segment.translation,
+                segment.tone,
+                segment.portrait,
+                channel=channel,
+                _debug=_debug if i == 0 else None,
             )
+            try:
+                history_ids.append(int(raw_id or 0))
+            except (TypeError, ValueError):
+                history_ids.append(0)
+        if (
+            channel in {"proactive", "relationship"}
+            and history_ids
+            and all(entry_id > 0 for entry_id in history_ids)
+        ):
+            observer = getattr(self, "_proactive_observer", None)
+            record = getattr(observer, "record_proactive_exchange", None)
+            if callable(record):
+                source = "relationship" if channel == "relationship" else "screen"
+                text = "".join(
+                    str(getattr(segment, "text", "") or "") for segment in clean_segments
+                )
+                try:
+                    record(source=source, history_ids=list(history_ids), text=text)
+                except Exception:
+                    debug_log("PetWindow", "主动交流账本登记失败", {"source": source})
         return history_ids
 
     @Slot()

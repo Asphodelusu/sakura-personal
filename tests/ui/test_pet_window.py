@@ -5100,6 +5100,76 @@ def test_assistant_reply_history_records_tone_and_portrait() -> None:
     assert history == [("assistant", "どうしたの？", "怎么了？", "困惑", "张嘴疑问")]
 
 
+def test_observer_history_lines_include_persisted_ids() -> None:
+    from app.perception.observer import ObserverHistoryLine
+    from app.storage.chat_history import ChatHistoryEntry
+    from app.ui.pet_window import PetWindow
+
+    class Store:
+        def load_tail(self, limit: int):
+            assert limit == 40
+            return (
+                [
+                    ChatHistoryEntry(
+                        created_at="2026-08-29T20:16:00+08:00",
+                        role="assistant",
+                        content="明日の昼、どうする？",
+                        channel="proactive",
+                        id=12,
+                    ),
+                    ChatHistoryEntry(
+                        created_at="2026-08-29T20:16:10+08:00",
+                        role="user",
+                        content="听到了",
+                        id=13,
+                    ),
+                ],
+                False,
+            )
+
+        def load_after_id(self, entry_id: int, *, limit: int = 100):
+            assert entry_id == 12
+            return [
+                ChatHistoryEntry(
+                    created_at="2026-08-29T20:16:10+08:00",
+                    role="user",
+                    content="听到了",
+                    id=13,
+                )
+            ]
+
+    class Window:
+        history_store = Store()
+        messages: list = []
+        _observer_history_lines = PetWindow._observer_history_lines
+        _observer_history_after_id = PetWindow._observer_history_after_id
+
+    window = Window()
+    lines = window._observer_history_lines()
+    assert [line.id for line in lines] == [12, 13]
+    assert isinstance(lines[0], ObserverHistoryLine)
+    later = window._observer_history_after_id(12, 100)
+    assert [line.id for line in later] == [13]
+    assert later[0].role == "user"
+
+
+def test_observer_history_after_id_preserves_read_failure_signal() -> None:
+    import pytest
+
+    from app.ui.pet_window import PetWindow
+
+    class Store:
+        def load_after_id(self, entry_id: int, *, limit: int = 100):
+            raise OSError("history unavailable")
+
+    class Window:
+        history_store = Store()
+        _observer_history_after_id = PetWindow._observer_history_after_id
+
+    with pytest.raises(OSError, match="history unavailable"):
+        Window()._observer_history_after_id(12, 100)
+
+
 def test_chat_history_store_round_trips_tone_and_portrait() -> None:
     from app.storage.chat_history import ChatHistoryStore
 
