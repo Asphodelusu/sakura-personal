@@ -49,6 +49,7 @@ class _InnerThoughtLaunch:
 
     future: Future[Any]
     executor: ThreadPoolExecutor
+    interaction_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,23 @@ class _MemoryRecallLaunch:
     future: Future[Any]
     executor: ThreadPoolExecutor
 
+
+
+def build_relational_drive_fragment(summary: str) -> ContextFragment | None:
+    text = str(summary or "").strip()
+    if not text:
+        return None
+    return ContextFragment(
+        fragment_id="runtime.relational_drive",
+        source="runtime",
+        content=f"[短期内在状态]\n{text}",
+        trust="trusted",
+        priority=87,
+        token_budget=140,
+        sensitivity="private",
+        cache_scope="turn",
+        required=False,
+    )
 
 
 class AgentRuntimeContextMixin:
@@ -156,7 +174,16 @@ class AgentRuntimeContextMixin:
             "内心独白已与记忆召回并行启动",
             {"window": len(previous)},
         )
-        return _InnerThoughtLaunch(future=future, executor=executor)
+        interaction_id = str(getattr(self, "_relationship_drive_turn_id", "") or "").strip()
+        if not interaction_id:
+            from app.core.interaction import get_interaction_id
+
+            interaction_id = str(get_interaction_id() or "").strip()
+        return _InnerThoughtLaunch(
+            future=future,
+            executor=executor,
+            interaction_id=interaction_id,
+        )
 
 
     def _finalize_inner_thought_worker(
@@ -199,6 +226,9 @@ class AgentRuntimeContextMixin:
         finally:
             # 超时后勿 wait=True，否则仍会被后台 8s HTTP 拖死
             launch.executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+        settle = getattr(self, "_settle_relationship_drive_appraisal", None)
+        if callable(settle) and result.drive_appraisal is not None:
+            settle(getattr(launch, "interaction_id", "") or "", result.drive_appraisal)
         if result.text:
             self._inner_thought_window.push(result.text)
             debug_log(
@@ -279,6 +309,10 @@ class AgentRuntimeContextMixin:
         )
         if thought is not None:
             fragments.append(thought)
+        if getattr(self, "_should_inject_relationship_drive_fragment", lambda: False)():
+            drive = build_relational_drive_fragment(self.relationship_drive_summary())
+            if drive is not None:
+                fragments.append(drive)
 
         current_input = str(getattr(request, "current_input", "") or "").strip()
         media_fragment = build_media_context_fragment(current_input)

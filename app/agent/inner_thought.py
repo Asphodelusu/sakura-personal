@@ -11,9 +11,19 @@ from typing import Any, Literal, Sequence
 import httpx
 
 from app.core.debug_log import debug_log
+from app.core.relational_drive import DriveAppraisal, parse_drive_appraisal
 from app.llm.api_client import ApiRequestError, ChatMessage, OpenAICompatibleClient
 from app.llm.prompts.types import ContextFragment
 from app.perception.sensory_impression import sensory_impression_store
+
+# 可选 appraisal 头：只评新对话；不确定时省略，不把已注入状态当作新证据。
+DRIVE_APPRAISAL_OUTPUT_INSTRUCTION = (
+    "若新对话确实改变短期内在状态，可在 interest 后、正文前附三行；"
+    "不确定时省略，勿复述当前状态：\n"
+    "drive_kind: physical_arousal|erotic_salience|attachment_longing|afterglow|inhibition\n"
+    "drive_shift: rise|fall|hold\n"
+    "drive_strength: subtle|mild"
+)
 
 DEFAULT_INNER_THOUGHT_WINDOW_SIZE = 6
 # Flash 实测常要 4–6s；过短会误杀已返回的内容
@@ -40,6 +50,16 @@ _INTEREST_LINE_RE = re.compile(
     r"^\s*(?:interest|兴致|興趣|兴趣)\s*[:：]\s*(low|mid|high|低|中|高)\s*$",
     re.I,
 )
+_DRIVE_HEADER_RE = re.compile(
+    r"^\s*(drive_kind|drive_shift|drive_strength)\s*[:：]\s*(.*?)\s*$",
+    re.I,
+)
+_DRIVE_UNKNOWN_RE = re.compile(r"^\s*drive_[A-Za-z0-9_]+\s*[:：]", re.I)
+_DRIVE_HEADER_KEYS = {
+    "drive_kind": "kind",
+    "drive_shift": "direction",
+    "drive_strength": "strength",
+}
 
 
 @dataclass(frozen=True)
@@ -48,6 +68,7 @@ class InnerThoughtResult:
 
     text: str
     interest: InterestLevel | None = None
+    drive_appraisal: DriveAppraisal | None = None
 
 _STYLE_FEW_SHOTS = """示例 1（日常闲聊）：
 あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…
@@ -223,13 +244,17 @@ def parse_inner_thought_output(raw: object) -> InnerThoughtResult:
         interest = _INTEREST_ALIASES.get(alias) or _INTEREST_ALIASES.get(match.group(1))
         body_start = index + 1
         break
-    body = "\n".join(lines[body_start:]).strip()
     if interest is None:
         # 模型漏了独立首行时，整段当正文（本轮不注入篇幅块）
-        normalized = _normalize_thought_text(text)
-    else:
-        normalized = _normalize_thought_text(body)
-    return InnerThoughtResult(text=normalized, interest=interest)
+        return InnerThoughtResult(text=_normalize_thought_text(text), interest=None)
+    fields, consumed, invalid = _consume_drive_headers(lines[body_start:])
+    body = "\n".join(lines[body_start + consumed :]).strip()
+    appraisal = None if invalid else parse_drive_appraisal(fields)
+    return InnerThoughtResult(
+        text=_normalize_thought_text(body),
+        interest=interest,
+        drive_appraisal=appraisal,
+    )
 
 
 def build_inner_thought_fragment(
@@ -274,7 +299,8 @@ def build_inner_thought_system_prompt(character_name: str) -> str:
         "输出格式固定两段：\n"
         "1) 第一行：interest: low|mid|high\n"
         "2) 第二行起：内心独白正文（日文，不要再写 interest）\n"
-        "不要输出其它标记、前缀或解释。"
+        f"{DRIVE_APPRAISAL_OUTPUT_INSTRUCTION}\n"
+        "除上述可选 drive 头外，不要输出其它标记、前缀或解释。"
     )
 
 
@@ -410,6 +436,39 @@ def sensory_impression_text() -> str:
         return sensory_impression_store.format_chat_block() or ""
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _consume_drive_headers(lines: Sequence[str]) -> tuple[dict[str, str], int, bool]:
+    """Consume optional drive_* headers after interest. Fail-open on any defect."""
+    fields: dict[str, str] = {}
+    consumed = 0
+    invalid = False
+    seen_header = False
+    for index, line in enumerate(lines):
+        stripped = str(line or "").strip()
+        if not stripped:
+            if seen_header:
+                consumed = index + 1
+            continue
+        match = _DRIVE_HEADER_RE.match(stripped)
+        if match is None:
+            if _DRIVE_UNKNOWN_RE.match(stripped):
+                invalid = True
+                seen_header = True
+                consumed = index + 1
+                continue
+            break
+        seen_header = True
+        consumed = index + 1
+        key = _DRIVE_HEADER_KEYS[match.group(1).lower()]
+        value = match.group(2).strip()
+        if not value or key in fields:
+            invalid = True
+            continue
+        fields[key] = value
+    if fields and set(fields) != {"kind", "direction", "strength"}:
+        invalid = True
+    return fields, consumed, invalid
 
 
 def _window_labels(count: int) -> list[str]:

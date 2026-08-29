@@ -3342,6 +3342,24 @@ class PetWindow(QWidget):
         self.relationship_initiative_settings = rel
         return rel
 
+    def _configure_relationship_drive(self, profile) -> None:
+        setter = getattr(self.agent_runtime, "set_relationship_drive", None)
+        if not callable(setter) or profile is None:
+            return
+        from app.config.relationship_drive import RelationshipDriveSettings
+        from app.storage.paths import StoragePaths
+
+        try:
+            settings = self.settings_service.load_relationship_drive_settings()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("PetWindow", "关系驱动设置加载失败", {"error": str(exc)})
+            settings = RelationshipDriveSettings().normalized()
+        setter(
+            settings,
+            getattr(profile, "relationship_drive_profile", None),
+            StoragePaths(self.base_dir).relational_drive_for(getattr(profile, "id", "") or ""),
+        )
+
     def _init_proactive_observer(self) -> None:
         """Initialize the desktop-kanojo style proactive screen observer."""
         proactive_cfg = self.settings_service.load_proactive_config()
@@ -3353,6 +3371,9 @@ class PetWindow(QWidget):
         set_initiative = getattr(self.agent_runtime, "set_relationship_initiative", None)
         if callable(set_initiative):
             set_initiative(rel, guide_text)
+        configure_drive = getattr(self, "_configure_relationship_drive", None)
+        if callable(configure_drive):
+            configure_drive(self.character_profile)
         expected_guide = getattr(self.character_profile, "relationship_guide_path", None)
         if (
             expected_guide is not None
@@ -8488,6 +8509,9 @@ class PetWindow(QWidget):
         set_initiative = getattr(self.agent_runtime, "set_relationship_initiative", None)
         if callable(set_initiative):
             set_initiative(rel, guide_text)
+        configure_drive = getattr(self, "_configure_relationship_drive", None)
+        if callable(configure_drive):
+            configure_drive(profile)
         if profile.id != previous_character_id:
             self._relationship_generation = int(getattr(self, "_relationship_generation", 0) or 0) + 1
             self.messages = []
