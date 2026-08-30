@@ -423,6 +423,8 @@ class SubtitleTranslationWorker(QObject):
 
     finished = Signal(object)
     failed = Signal(object)
+    index_resolved = Signal(object)
+    index_failed = Signal(object)
 
     def __init__(
         self,
@@ -450,19 +452,57 @@ class SubtitleTranslationWorker(QObject):
             "translations": [],
         }
         try:
-            translate = getattr(self.provider, "translate", None)
-            if not callable(translate):
+            translate_indexed = getattr(self.provider, "translate_indexed", None)
+            if not callable(translate_indexed):
                 self.failed.emit(payload)
                 return
-            translations = translate(self.texts, source_lang="ja", target_lang="zh")
-            if not isinstance(translations, list):
-                self.failed.emit(payload)
-                return
-            payload["translations"] = [str(item or "").strip() for item in translations]
+            terminal: set[int] = set()
+
+            def emit_success(item: object) -> None:
+                index = int(getattr(item, "index", -1))
+                if index in terminal:
+                    return
+                terminal.add(index)
+                self.index_resolved.emit(self._index_payload(index, getattr(item, "translation", "")))
+
+            def emit_failure(index: object) -> None:
+                resolved = int(index)
+                if resolved in terminal:
+                    return
+                terminal.add(resolved)
+                self.index_failed.emit(self._index_payload(resolved, ""))
+
+            result = translate_indexed(
+                self.texts,
+                source_lang="ja",
+                target_lang="zh",
+                on_item=emit_success,
+                on_failed=emit_failure,
+            )
+            translations = [""] * len(self.texts)
+            items = getattr(result, "items", ()) or ()
+            for item in items:
+                index = int(getattr(item, "index", -1))
+                if 0 <= index < len(translations):
+                    translations[index] = str(getattr(item, "translation", "") or "").strip()
+            payload["translations"] = translations
+            payload["streamed"] = True
             self.finished.emit(payload)
         except Exception as exc:  # noqa: BLE001 — 翻译失败不得影响主回复
             payload["error"] = str(exc)
             self.failed.emit(payload)
+
+    def _index_payload(self, index: int, translation: object) -> dict[str, object]:
+        segment_index = self.segment_indexes[index] if 0 <= index < len(self.segment_indexes) else index
+        history_id = self.history_ids[index] if 0 <= index < len(self.history_ids) else 0
+        text = self.texts[index] if 0 <= index < len(self.texts) else ""
+        return {
+            "interaction_id": self.interaction_id,
+            "segment_index": segment_index,
+            "history_id": history_id,
+            "text": text,
+            "translation": str(translation or "").strip(),
+        }
 
 
 class TTSReadyWarmupWorker(QObject):
@@ -708,6 +748,8 @@ class PetWindow(QWidget):
     # 异步中文字幕回填（worker 线程 → UI 线程）
     subtitle_translation_finished = Signal(object)
     subtitle_translation_failed = Signal(object)
+    subtitle_translation_index_resolved = Signal(object)
+    subtitle_translation_index_failed = Signal(object)
 
     def __init__(
         self,
@@ -720,6 +762,8 @@ class PetWindow(QWidget):
         self.mobile_chat_requested.connect(self._enqueue_mobile_chat)
         self.subtitle_translation_finished.connect(self._on_subtitle_translation_finished)
         self.subtitle_translation_failed.connect(self._on_subtitle_translation_failed)
+        self.subtitle_translation_index_resolved.connect(self._on_subtitle_translation_index_resolved)
+        self.subtitle_translation_index_failed.connect(self._on_subtitle_translation_index_failed)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -7685,6 +7729,14 @@ class PetWindow(QWidget):
             else:
                 self._finalize_orphan_playback("empty_reply")
             return
+        targets = getattr(self, "_subtitle_patch_targets", None)
+        pending_id = str(
+            getattr(self, "_pending_subtitle_translation_interaction_id", "") or ""
+        )
+        if isinstance(targets, dict) and pending_id == str(interaction_id or ""):
+            for index in list(targets):
+                if 0 <= index < len(segments):
+                    targets[index] = segments[index]
         self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)
 
@@ -7720,10 +7772,16 @@ class PetWindow(QWidget):
 
         interaction_id = str(getattr(self, "active_interaction_id", "") or "")
         self._pending_subtitle_translation_interaction_id = interaction_id
+        self._subtitle_terminal_indexes = set()
+        self._subtitle_patch_targets = {index: segment for index, segment in pending}
         timeout_seconds = 6.0
         if settings is not None:
             timeout_seconds = float(getattr(settings, "gate_timeout_seconds", 6) or 6)
         controller = getattr(self, "subtitle_controller", None)
+        if controller is not None and settings is not None:
+            grace = getattr(settings, "late_patch_grace_ms", None)
+            if grace is not None:
+                controller.late_patch_grace_ms = int(grace)
         begin_gate = getattr(controller, "begin_translation_gate", None)
         if callable(begin_gate):
             begin_gate(timeout_seconds=timeout_seconds, interaction_id=interaction_id)
@@ -7759,6 +7817,8 @@ class PetWindow(QWidget):
         thread.started.connect(worker.run)
         worker.finished.connect(self.subtitle_translation_finished.emit)
         worker.failed.connect(self.subtitle_translation_failed.emit)
+        worker.index_resolved.connect(self.subtitle_translation_index_resolved.emit)
+        worker.index_failed.connect(self.subtitle_translation_index_failed.emit)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -7813,6 +7873,12 @@ class PetWindow(QWidget):
                 {"interaction_id": interaction_id, "pending_id": pending_id},
             )
             return
+        if payload.get("streamed"):
+            controller = getattr(self, "subtitle_controller", None)
+            finish_batch = getattr(controller, "finish_translation_batch", None)
+            if callable(finish_batch):
+                finish_batch()
+            return
         texts = payload.get("texts") if isinstance(payload.get("texts"), list) else []
         translations = (
             payload.get("translations") if isinstance(payload.get("translations"), list) else []
@@ -7820,11 +7886,34 @@ class PetWindow(QWidget):
         history_ids = (
             payload.get("history_ids") if isinstance(payload.get("history_ids"), list) else []
         )
-        self._apply_subtitle_translations(
+        segment_indexes = (
+            payload.get("segment_indexes") if isinstance(payload.get("segment_indexes"), list) else None
+        )
+        PetWindow._apply_subtitle_translations(
+            self,
             texts=[str(item or "") for item in texts],
             translations=[str(item or "") for item in translations],
             history_ids=[int(item or 0) for item in history_ids],
+            segment_indexes=(
+                [int(item) for item in segment_indexes] if segment_indexes is not None else None
+            ),
         )
+
+    def _is_stale_subtitle_translation(self, interaction_id: str) -> bool:
+        active_id = str(getattr(self, "active_interaction_id", "") or "")
+        pending_id = str(getattr(self, "_pending_subtitle_translation_interaction_id", "") or "")
+        if interaction_id and active_id and interaction_id != active_id:
+            return True
+        if pending_id and interaction_id and interaction_id != pending_id:
+            return True
+        return False
+
+    def _subtitle_terminal_index_keys(self) -> set[tuple[str, int]]:
+        keys = getattr(self, "_subtitle_terminal_indexes", None)
+        if keys is None:
+            self._subtitle_terminal_indexes = set()
+            keys = self._subtitle_terminal_indexes
+        return keys
 
     @Slot(object)
     def _on_subtitle_translation_failed(self, payload: object) -> None:
@@ -7835,15 +7924,67 @@ class PetWindow(QWidget):
             error = str(payload.get("error") or "")
             interaction_id = str(payload.get("interaction_id") or "")
         debug_log("PetWindow", "异步字幕翻译失败，保留日语原文", {"error": error})
-        active_id = str(getattr(self, "active_interaction_id", "") or "")
-        pending_id = str(getattr(self, "_pending_subtitle_translation_interaction_id", "") or "")
-        if interaction_id and active_id and interaction_id != active_id:
-            return
-        if pending_id and interaction_id and interaction_id != pending_id:
+        if PetWindow._is_stale_subtitle_translation(self, interaction_id):
             return
         controller = getattr(self, "subtitle_controller", None)
         release_gate = getattr(controller, "release_translation_gate", None)
         if callable(release_gate):
+            release_gate(fallback=True)
+
+    @Slot(object)
+    def _on_subtitle_translation_index_resolved(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        interaction_id = str(payload.get("interaction_id") or "")
+        if PetWindow._is_stale_subtitle_translation(self, interaction_id):
+            debug_log(
+                "PetWindow",
+                "丢弃过期字幕索引结果",
+                {"interaction_id": interaction_id},
+            )
+            return
+        translation = str(payload.get("translation") or "").strip()
+        if not translation:
+            return
+        segment_index = int(payload.get("segment_index") or 0)
+        key = (interaction_id, segment_index)
+        terminal = PetWindow._subtitle_terminal_index_keys(self)
+        if key in terminal:
+            return
+        terminal.add(key)
+        PetWindow._apply_subtitle_translation_index(
+            self,
+            segment_index=segment_index,
+            history_id=int(payload.get("history_id") or 0),
+            text=str(payload.get("text") or ""),
+            translation=translation,
+        )
+
+    @Slot(object)
+    def _on_subtitle_translation_index_failed(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        interaction_id = str(payload.get("interaction_id") or "")
+        if PetWindow._is_stale_subtitle_translation(self, interaction_id):
+            return
+        segment_index = int(payload.get("segment_index") or 0)
+        key = (interaction_id, segment_index)
+        terminal = PetWindow._subtitle_terminal_index_keys(self)
+        if key in terminal:
+            return
+        terminal.add(key)
+        controller = getattr(self, "subtitle_controller", None)
+        targets = getattr(self, "_subtitle_patch_targets", None)
+        target = targets.get(segment_index) if isinstance(targets, dict) else None
+        is_current = None
+        if target is not None:
+            is_current = getattr(controller, "current_segment", None) is target
+        consume = getattr(controller, "consume_index_failure", None)
+        if callable(consume):
+            consume(segment_index, is_current=is_current)
+            return
+        release_gate = getattr(controller, "release_translation_gate", None)
+        if callable(release_gate) and getattr(controller, "current_segment_index", None) == segment_index:
             release_gate(fallback=True)
 
     def _apply_subtitle_translations(
@@ -7852,62 +7993,104 @@ class PetWindow(QWidget):
         texts: list[str],
         translations: list[str],
         history_ids: list[int],
+        segment_indexes: list[int] | None = None,
+    ) -> None:
+        if not texts or not translations:
+            return
+        indexes = list(segment_indexes) if segment_indexes is not None else list(range(len(texts)))
+        for offset, text in enumerate(texts):
+            if offset >= len(translations):
+                break
+            zh = str(translations[offset] or "").strip()
+            if not zh:
+                continue
+            segment_index = indexes[offset] if offset < len(indexes) else offset
+            history_id = int(history_ids[offset] or 0) if offset < len(history_ids) else 0
+            PetWindow._apply_subtitle_translation_index(
+                self,
+                segment_index=segment_index,
+                history_id=history_id,
+                text=str(text or ""),
+                translation=zh,
+            )
+
+    def _apply_subtitle_translation_index(
+        self,
+        *,
+        segment_index: int,
+        history_id: int,
+        text: str,
+        translation: str,
     ) -> None:
         from app.ui.subtitle_translation import (
-            patch_segment_list_by_text,
+            patch_segment_by_index,
+            replace_segment_identity,
             with_segment_translation,
         )
 
-        if not texts or not translations:
+        _ = text
+        zh = str(translation or "").strip()
+        if not zh:
             return
         store = getattr(self, "history_store", None)
         update_translation = getattr(store, "update_translation", None)
-        for index, text in enumerate(texts):
-            if index >= len(translations):
-                break
-            zh = str(translations[index] or "").strip()
-            if not zh:
-                continue
-            ja = str(text or "").strip()
-            if not ja:
-                continue
-            if index < len(history_ids) and callable(update_translation):
-                entry_id = int(history_ids[index] or 0)
-                if entry_id > 0:
-                    try:
-                        update_translation(entry_id, zh)
-                    except Exception as exc:  # noqa: BLE001
-                        debug_log(
-                            "History",
-                            "回填字幕失败",
-                            {"id": entry_id, "error": str(exc)},
-                        )
-            patch_segment_list_by_text(self.reply_history_segments, ja, zh)
-            controller = getattr(self, "subtitle_controller", None)
-            if controller is None:
-                continue
-            patch_segment_list_by_text(getattr(controller, "pending_reply_segments", None), ja, zh)
-            for batch in list(getattr(controller, "queued_reply_segment_batches", []) or []):
-                patch_segment_list_by_text(batch, ja, zh)
-            current = getattr(controller, "current_segment", None)
-            if current is not None and str(current.text or "").strip() == ja:
-                updated = with_segment_translation(current, zh)
-                controller.current_segment = updated
-                release_gate = getattr(controller, "release_translation_gate", None)
-                if callable(release_gate):
-                    release_gate(fallback=False)
-                # 仅中文字幕模式才刷新显示；日语模式保持不变。
-                if getattr(self, "subtitle_language", "zh") == "zh":
-                    display = updated.display_text("zh")
-                    if display.strip():
-                        # 逐字进行中：更新底层文本；已显示完则立即刷新。
-                        if getattr(controller, "speech_timer", None) is not None and controller.speech_timer.isActive():
-                            controller.speech_text = " ".join(display.split())
-                            # 若已打出部分，继续；否则重启
-                            if controller.speech_index <= 0:
-                                controller.set_speech(display, pulse=False)
-                        else:
-                            controller.set_speech(display, pulse=False, instant=True)
+        if history_id > 0 and callable(update_translation):
+            try:
+                update_translation(history_id, zh)
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "History",
+                    "回填字幕失败",
+                    {"id": history_id, "error": str(exc)},
+                )
+
+        controller = getattr(self, "subtitle_controller", None)
+        targets = getattr(self, "_subtitle_patch_targets", None)
+        old = None
+        if isinstance(targets, dict) and segment_index in targets:
+            old = targets[segment_index]
+        reply_history = getattr(self, "reply_history_segments", None)
+        if old is None and reply_history and 0 <= segment_index < len(reply_history):
+            old = reply_history[segment_index]
+        if old is None and controller is not None:
+            if getattr(controller, "current_segment_index", None) == segment_index:
+                old = getattr(controller, "current_segment", None)
+        if old is None:
+            return
+        new = with_segment_translation(old, zh)
+        if isinstance(targets, dict):
+            targets[segment_index] = new
+        if reply_history:
+            if not replace_segment_identity(reply_history, old, new):
+                patch_segment_by_index(reply_history, segment_index, zh)
+                if 0 <= segment_index < len(reply_history):
+                    new = reply_history[segment_index]
+        if controller is None:
+            return
+        is_current = getattr(controller, "current_segment", None) is old
+        replace_segment_identity(getattr(controller, "pending_reply_segments", None), old, new)
+        for batch in list(getattr(controller, "queued_reply_segment_batches", []) or []):
+            replace_segment_identity(batch, old, new)
+        consume = getattr(controller, "consume_index_success", None)
+        if callable(consume):
+            consume(segment_index, new, is_current=is_current)
+            return
+        if getattr(controller, "current_segment", None) is old:
+            controller.current_segment = new
+            release_gate = getattr(controller, "release_translation_gate", None)
+            if callable(release_gate):
+                release_gate(fallback=False)
+            if getattr(self, "subtitle_language", "zh") == "zh":
+                display = new.display_text("zh")
+                set_speech = getattr(controller, "set_speech", None)
+                if callable(set_speech) and display.strip():
+                    timer = getattr(controller, "speech_timer", None)
+                    if timer is not None and timer.isActive():
+                        controller.speech_text = " ".join(display.split())
+                        if getattr(controller, "speech_index", 0) <= 0:
+                            set_speech(display, pulse=False)
+                    else:
+                        set_speech(display, pulse=False, instant=True)
 
     def _load_subtitle_language(self) -> str:
         system_values = self._load_system_config_values("ui")

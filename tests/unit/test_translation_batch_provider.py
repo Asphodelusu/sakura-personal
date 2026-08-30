@@ -210,6 +210,25 @@ def test_serial_adapter_stays_all_or_nothing() -> None:
     assert client.complete_raw.call_count == 3
 
 
+def test_serial_indexed_on_failed_emits_immediately_and_continues() -> None:
+    client = _client(["", "おはよう。", "二"])
+    provider = OpenAITranslationProvider(client, max_attempts=2, request_shape="serial")
+    seen_ok: list[TranslationIndexResult] = []
+    seen_fail: list[int] = []
+
+    result = provider.translate_indexed(
+        ["あ。", "い。"],
+        on_item=seen_ok.append,
+        on_failed=seen_fail.append,
+    )
+
+    assert seen_fail == [0]
+    assert [item.index for item in seen_ok] == [1]
+    assert seen_ok[0].translation == "二"
+    assert result.failed_indexes == (0,)
+    assert result.items == (TranslationIndexResult(index=1, translation="二"),)
+
+
 def test_serial_indexed_honors_request_shape_and_emits_each_plain_result() -> None:
     client = _client(["一", "二"])
     provider = OpenAITranslationProvider(client, max_attempts=2, request_shape="serial")

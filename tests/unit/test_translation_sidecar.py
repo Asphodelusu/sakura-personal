@@ -273,6 +273,296 @@ def test_refresh_llm_clients_rebuilds_translation_provider_from_new_chat_fast(
     assert window.translation_provider.client is new_client
 
 
+def test_late_patch_grace_defaults_clamps_and_zero_is_history_only(tmp_path: Path) -> None:
+    from app.config.translation_settings import TranslationSettings
+
+    service = AppSettingsService(tmp_path)
+    loaded = service.load_translation_settings()
+    assert loaded.late_patch_grace_ms == 1200
+
+    service.save_system_values("translation", {"custom_sibling": "keep-me"})
+    service.save_translation_settings(
+        TranslationSettings(
+            enabled=True,
+            gate_timeout_seconds=6,
+            max_attempts=2,
+            late_patch_grace_ms=99999,
+        )
+    )
+    clamped = service.load_translation_settings()
+    assert clamped.late_patch_grace_ms == 10000
+    system = load_yaml_mapping(service.system_config_path)
+    assert system["translation"]["custom_sibling"] == "keep-me"
+    assert system["translation"]["late_patch_grace_ms"] == 10000
+
+    service.save_translation_settings(
+        TranslationSettings(enabled=True, late_patch_grace_ms=0)
+    )
+    zero = service.load_translation_settings()
+    assert zero.late_patch_grace_ms == 0
+
+
+def test_worker_emits_first_serial_index_before_provider_finishes_remaining() -> None:
+    import threading
+
+    import pytest
+    from PySide6.QtCore import QCoreApplication, Qt
+
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not hasattr(qtcore, "QCoreApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+    QCoreApplication.instance() or QCoreApplication([])
+
+    from app.llm.openai_translation_provider import TranslationBatchResult, TranslationIndexResult
+    from app.ui.pet_window import SubtitleTranslationWorker
+
+    first_seen = threading.Event()
+    release_rest = threading.Event()
+    completed = threading.Event()
+    received: list[dict] = []
+
+    class _BlockingIndexedProvider:
+        def translate_indexed(self, texts, *, on_item=None, on_failed=None, **_kwargs):
+            _ = texts, on_failed
+            if on_item is not None:
+                on_item(TranslationIndexResult(index=0, translation="早安。"))
+            first_seen.set()
+            assert release_rest.wait(timeout=2.0)
+            if on_item is not None:
+                on_item(TranslationIndexResult(index=1, translation="喂。"))
+            completed.set()
+            return TranslationBatchResult(
+                items=(
+                    TranslationIndexResult(index=0, translation="早安。"),
+                    TranslationIndexResult(index=1, translation="喂。"),
+                ),
+                failed_indexes=(),
+                request_count=2,
+            )
+
+        def translate(self, texts, **_kwargs):
+            raise AssertionError("worker must call translate_indexed(), not translate()")
+
+    worker = SubtitleTranslationWorker(
+        _BlockingIndexedProvider(),
+        interaction_id="turn-stream",
+        texts=["おはよう。", "ねえ。"],
+        history_ids=[11, 12],
+        segment_indexes=[0, 1],
+    )
+    worker.index_resolved.connect(received.append, Qt.ConnectionType.DirectConnection)
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    assert first_seen.wait(timeout=1.0)
+    assert len(received) == 1
+    assert received[0]["interaction_id"] == "turn-stream"
+    assert received[0]["segment_index"] == 0
+    assert received[0]["history_id"] == 11
+    assert received[0]["translation"] == "早安。"
+    assert not completed.is_set()
+    release_rest.set()
+    thread.join(timeout=2.0)
+    assert completed.is_set()
+    assert [item["segment_index"] for item in received] == [0, 1]
+    assert [item["translation"] for item in received] == ["早安。", "喂。"]
+
+
+def test_identical_japanese_segments_receive_distinct_indexed_translations() -> None:
+    history = MagicMock()
+    first = ChatSegment("ねえ。", "温柔", "", "站立待机")
+    second = ChatSegment("ねえ。", "温柔", "", "站立待机")
+    controller = SimpleNamespace(
+        pending_reply_segments=[second],
+        queued_reply_segment_batches=[],
+        current_segment=first,
+        current_segment_index=0,
+        speech_timer=SimpleNamespace(isActive=lambda: False),
+        speech_index=0,
+        set_speech=MagicMock(),
+        release_translation_gate=MagicMock(),
+        consume_index_success=None,
+    )
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[first, second],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+    )
+
+    PetWindow._apply_subtitle_translations(
+        window,
+        texts=["ねえ。", "ねえ。"],
+        translations=["喂。", "嘿。"],
+        history_ids=[21, 22],
+        segment_indexes=[0, 1],
+    )
+
+    history.update_translation.assert_any_call(21, "喂。")
+    history.update_translation.assert_any_call(22, "嘿。")
+    assert window.reply_history_segments[0].translation == "喂。"
+    assert window.reply_history_segments[1].translation == "嘿。"
+    assert controller.current_segment.translation == "喂。"
+    assert controller.pending_reply_segments[0].translation == "嘿。"
+
+
+def test_duplicate_index_callback_changes_ui_and_history_only_once() -> None:
+    history = MagicMock()
+    current = ChatSegment("あ", "中性", "", "站立待机")
+    controller = SimpleNamespace(
+        pending_reply_segments=[],
+        queued_reply_segment_batches=[],
+        current_segment=current,
+        current_segment_index=0,
+        speech_timer=SimpleNamespace(isActive=lambda: False),
+        speech_index=0,
+        set_speech=MagicMock(),
+        release_translation_gate=MagicMock(),
+    )
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[current],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-dup",
+        _pending_subtitle_translation_interaction_id="turn-dup",
+    )
+    payload = {
+        "interaction_id": "turn-dup",
+        "segment_index": 0,
+        "history_id": 7,
+        "text": "あ",
+        "translation": "啊",
+    }
+    PetWindow._on_subtitle_translation_index_resolved(window, payload)
+    PetWindow._on_subtitle_translation_index_resolved(window, payload)
+
+    history.update_translation.assert_called_once_with(7, "啊")
+    controller.set_speech.assert_called_once()
+
+
+def test_stale_index_callback_does_not_change_bubble_or_history() -> None:
+    history = MagicMock()
+    current = ChatSegment("あ", "中性", "", "站立待机")
+    set_speech = MagicMock()
+    controller = SimpleNamespace(
+        pending_reply_segments=[],
+        queued_reply_segment_batches=[],
+        current_segment=current,
+        current_segment_index=0,
+        set_speech=set_speech,
+        release_translation_gate=MagicMock(),
+    )
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[current],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-new",
+        _pending_subtitle_translation_interaction_id="turn-new",
+    )
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-old",
+            "segment_index": 0,
+            "history_id": 9,
+            "text": "あ",
+            "translation": "啊",
+        },
+    )
+    history.update_translation.assert_not_called()
+    set_speech.assert_not_called()
+    assert controller.current_segment.translation == ""
+
+
+def test_translation_target_tracks_portrait_resolved_display_segment() -> None:
+    class _ResolvingProfile:
+        id = "sakura"
+
+        @staticmethod
+        def default_portrait_label() -> str:
+            return "站立待机"
+
+        @staticmethod
+        def resolve_portrait_label(
+            portrait: str,
+            tone: str,
+            *,
+            emotion: str | None = None,
+        ) -> str:
+            _ = portrait, tone, emotion
+            return "平静认真脸"
+
+    class _Controller:
+        def __init__(self) -> None:
+            self.current_segment = None
+            self.current_segment_index = None
+            self.pending_reply_segments = []
+            self.queued_reply_segment_batches = []
+
+        def show_segments(self, segments: list[ChatSegment]) -> None:
+            self.current_segment = segments[0]
+            self.current_segment_index = 0
+
+        def consume_index_success(
+            self,
+            segment_index: int,
+            updated: ChatSegment,
+            *,
+            is_current: bool | None = None,
+        ) -> str:
+            assert segment_index == 0
+            assert is_current is True
+            self.current_segment = updated
+            return "revealed"
+
+    original = ChatSegment("おはよう。", "认真", "", "未知立绘")
+    older = ChatSegment("前の会話。", "中性", "之前的对话。", "站立待机")
+    controller = _Controller()
+    history = MagicMock()
+    window = SimpleNamespace(
+        translation_provider=FakeTranslationProvider(),
+        translation_settings=SimpleNamespace(enabled=True, gate_timeout_seconds=6),
+        subtitle_language="zh",
+        active_interaction_id="turn-resolved-portrait",
+        character_profile=_ResolvingProfile(),
+        subtitle_controller=controller,
+        history_store=history,
+        reply_history_segments=[older],
+        reply_history_index=0,
+        _start_subtitle_translation_worker=MagicMock(),
+        _cancel_backchannel=lambda: None,
+        _exit_reply_history_review=lambda **_kwargs: None,
+        _update_reply_history_buttons=lambda: None,
+    )
+    window._remember_reply_history_segments = (
+        lambda segments: PetWindow._remember_reply_history_segments(window, segments)
+    )
+
+    PetWindow._schedule_subtitle_translations(window, [original], history_ids=[41])
+    PetWindow._show_reply_segments(window, [original])
+    displayed = controller.current_segment
+    assert displayed is not original
+    assert displayed.portrait == "平静认真脸"
+
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-resolved-portrait",
+            "segment_index": 0,
+            "history_id": 41,
+            "text": "おはよう。",
+            "translation": "早安。",
+        },
+    )
+
+    assert controller.current_segment.portrait == "平静认真脸"
+    assert controller.current_segment.translation == "早安。"
+    assert window.reply_history_segments[-1] is controller.current_segment
+    assert window.reply_history_segments[0] is older
+    history.update_translation.assert_called_once_with(41, "早安。")
+
+
 def test_stale_interaction_translation_is_discarded() -> None:
     window = MagicMock()
     window.active_interaction_id = "new-turn"

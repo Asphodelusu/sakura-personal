@@ -288,6 +288,351 @@ def test_multi_segment_missing_zh_holds_until_success_then_patches_and_completes
     controller.cancel_reply_flow()
 
 
+def test_first_serial_index_reaches_ui_before_remaining_indexes() -> None:
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    second = ChatSegment("ねえ。", "温柔", "", "站立待机")
+    history = MagicMock()
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[first, second],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-partial",
+        _pending_subtitle_translation_interaction_id="turn-partial",
+    )
+
+    controller.start_waiting_indicator()
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-partial")
+    controller.show_segments([first, second])
+    assert tts.on_started is not None
+    tts.on_started()
+    assert "おはよう" not in label.text
+    assert controller.pending_reply_segments[0].translation == ""
+
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-partial",
+            "segment_index": 0,
+            "history_id": 1,
+            "text": "おはよう。",
+            "translation": "早安。",
+        },
+    )
+
+    assert label.text == "早安。"
+    assert controller.current_segment is not None
+    assert controller.current_segment.translation == "早安。"
+    assert controller.pending_reply_segments[0].translation == ""
+    history.update_translation.assert_called_once_with(1, "早安。")
+    controller.cancel_reply_flow()
+
+
+def test_current_index_terminal_failure_releases_japanese_immediately() -> None:
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    segment = ChatSegment("おはよう。", "开心", "", "站立待机")
+    window = SimpleNamespace(
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-fail",
+        _pending_subtitle_translation_interaction_id="turn-fail",
+    )
+
+    controller.start_waiting_indicator()
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-fail")
+    controller.show_segments([segment])
+    assert tts.on_started is not None
+    tts.on_started()
+    assert "おはよう" not in label.text
+
+    PetWindow._on_subtitle_translation_index_failed(
+        window,
+        {
+            "interaction_id": "turn-fail",
+            "segment_index": 0,
+            "history_id": 3,
+            "text": "おはよう。",
+        },
+    )
+
+    assert "おはよう" in label.text
+    assert not controller._translation_gate_active
+    controller.cancel_reply_flow()
+
+
+def test_later_index_failure_does_not_release_current_segment() -> None:
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    second = ChatSegment("ねえ。", "温柔", "", "站立待机")
+    window = SimpleNamespace(
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-later-fail",
+        _pending_subtitle_translation_interaction_id="turn-later-fail",
+    )
+
+    controller.start_waiting_indicator()
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-later-fail")
+    controller.show_segments([first, second])
+    assert tts.on_started is not None
+    tts.on_started()
+    waiting = label.text
+
+    PetWindow._on_subtitle_translation_index_failed(
+        window,
+        {
+            "interaction_id": "turn-later-fail",
+            "segment_index": 1,
+            "history_id": 4,
+            "text": "ねえ。",
+        },
+    )
+
+    assert "おはよう" not in label.text
+    assert controller._translation_gate_active
+    assert controller.waiting_indicator_active
+    assert label.text == waiting
+    controller.current_segment = second
+    controller.current_segment_index = 1
+    assert not controller._should_hold_chinese_display()
+    controller.cancel_reply_flow()
+
+
+def test_queued_batch_index_zero_translation_does_not_replace_current_bubble() -> None:
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    current = ChatSegment("いまの台詞。", "中性", "现在的台词。", "站立待机")
+    queued = ChatSegment("次の台詞。", "温柔", "", "站立待机")
+    history = MagicMock()
+
+    controller.show_segments([current])
+    assert tts.on_started is not None
+    tts.on_started()
+    assert label.text == "现在的台词。"
+    controller.show_segments([queued])
+    assert controller.queued_reply_segment_batches == [[queued]]
+
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[current, queued],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-queued",
+        _pending_subtitle_translation_interaction_id="turn-queued",
+        _subtitle_patch_targets={0: queued},
+    )
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-queued",
+            "segment_index": 0,
+            "history_id": 31,
+            "text": "次の台詞。",
+            "translation": "下一句台词。",
+        },
+    )
+
+    assert controller.current_segment is current
+    assert label.text == "现在的台词。"
+    assert controller.queued_reply_segment_batches[0][0].translation == "下一句台词。"
+    history.update_translation.assert_called_once_with(31, "下一句台词。")
+    controller.cancel_reply_flow()
+
+
+def test_current_index_failure_keeps_batch_in_flight_until_worker_finishes() -> None:
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-partial-fail")
+    controller.show_segments([first])
+    assert tts.on_started is not None
+    tts.on_started()
+
+    assert controller.consume_index_failure(0, is_current=True) == "released_ja"
+    assert "おはよう" in label.text
+    assert controller._translation_in_flight
+
+    controller.finish_translation_batch()
+    assert not controller._translation_in_flight
+    controller.cancel_reply_flow()
+
+
+def test_zh_within_grace_replaces_current_japanese_and_restarts_dwell() -> None:
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtTest import QTest
+
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    controller.set_display_speed(5, 0)
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    second = ChatSegment("ねえ。", "温柔", "喂。", "站立待机")
+    history = MagicMock()
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[first, second],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-grace-in",
+        _pending_subtitle_translation_interaction_id="turn-grace-in",
+    )
+
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-grace-in")
+    controller.show_segments([first, second])
+    assert tts.on_started is not None
+    tts.on_started()
+    tts.on_finished()
+    controller.release_translation_gate(fallback=True)
+    assert "おはよう" in label.text
+    ja_dwell = controller._dialogue_reading_dwell_timer
+    assert ja_dwell.isActive()
+
+    QTest.qWait(200)
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-grace-in",
+            "segment_index": 0,
+            "history_id": 5,
+            "text": "おはよう。",
+            "translation": "早安。",
+        },
+    )
+    QCoreApplication.processEvents()
+
+    assert label.text == "早安。"
+    assert "おはよう" not in label.text
+    zh_dwell = controller._dialogue_reading_dwell_timer
+    assert zh_dwell.isActive()
+    assert int(zh_dwell.interval()) == LATE_FIRST_LINE_DWELL_MS
+    history.update_translation.assert_called_once_with(5, "早安。")
+    controller.cancel_reply_flow()
+
+
+def test_zh_after_grace_updates_history_but_not_current_bubble() -> None:
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    history = MagicMock()
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[first],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-grace-out",
+        _pending_subtitle_translation_interaction_id="turn-grace-out",
+    )
+
+    controller.late_patch_grace_ms = 0
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-grace-out")
+    controller.show_segments([first])
+    assert tts.on_started is not None
+    tts.on_started()
+    controller.release_translation_gate(fallback=True)
+    assert "おはよう" in label.text
+
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-grace-out",
+            "segment_index": 0,
+            "history_id": 6,
+            "text": "おはよう。",
+            "translation": "早安。",
+        },
+    )
+
+    assert "おはよう" in label.text
+    assert "早安" not in label.text
+    assert window.reply_history_segments[0].translation == "早安。"
+    history.update_translation.assert_called_once_with(6, "早安。")
+    controller.cancel_reply_flow()
+
+
+def test_zh_after_segment_advance_updates_history_but_never_revives_old_bubble() -> None:
+    from PySide6.QtCore import QCoreApplication
+
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    controller.set_display_speed(5, 0)
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    second = ChatSegment("ねえ。", "温柔", "喂。", "站立待机")
+    history = MagicMock()
+    window = SimpleNamespace(
+        history_store=history,
+        reply_history_segments=[first, second],
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-advanced",
+        _pending_subtitle_translation_interaction_id="turn-advanced",
+    )
+
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-advanced")
+    controller.show_segments([first, second])
+    assert tts.on_started is not None
+    tts.on_started()
+    tts.on_finished()
+    controller.release_translation_gate(fallback=True)
+    assert "おはよう" in label.text
+    QCoreApplication.processEvents()
+    _fire_dialogue_dwell(controller, LATE_FIRST_LINE_DWELL_MS)
+    if tts.on_started is not None:
+        tts.on_started()
+    assert label.text == "喂。"
+
+    PetWindow._on_subtitle_translation_index_resolved(
+        window,
+        {
+            "interaction_id": "turn-advanced",
+            "segment_index": 0,
+            "history_id": 8,
+            "text": "おはよう。",
+            "translation": "早安。",
+        },
+    )
+
+    assert label.text == "喂。"
+    assert "早安" not in label.text
+    assert "おはよう" not in label.text
+    assert window.reply_history_segments[0].translation == "早安。"
+    history.update_translation.assert_called_once_with(8, "早安。")
+    controller.cancel_reply_flow()
+
+
 def test_multi_segment_exposes_japanese_only_after_one_turn_level_timeout() -> None:
     from PySide6.QtCore import QCoreApplication
 

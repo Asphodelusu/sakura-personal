@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.llm.chat_reply import ChatSegment
@@ -304,6 +306,52 @@ def test_action_translation_failure_shows_japanese_then_holds() -> None:
     assert DIALOGUE_JA not in label.text
     hold = _require_timer(controller, ACTION_HOLD_MS, HOLD_TIMER_ATTR)
     assert hold.isActive()
+    controller.cancel_reply_flow()
+
+
+def test_action_index_terminal_failure_releases_japanese_immediately() -> None:
+    from PySide6.QtCore import QCoreApplication
+
+    from app.ui.pet_window import PetWindow
+
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    window = SimpleNamespace(
+        subtitle_controller=controller,
+        subtitle_language="zh",
+        active_interaction_id="turn-action-fail",
+        _pending_subtitle_translation_interaction_id="turn-action-fail",
+    )
+
+    controller.start_waiting_indicator()
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-action-fail")
+    controller.show_segments([_action_segment(), _dialogue_segment()])
+    assert controller.waiting_indicator_active
+    assert ACTION_JA not in label.text
+
+    PetWindow._on_subtitle_translation_index_failed(
+        window,
+        {
+            "interaction_id": "turn-action-fail",
+            "segment_index": 0,
+            "history_id": 30,
+            "text": ACTION_JA,
+        },
+    )
+
+    assert ACTION_JA in label.text
+    assert ACTION_ZH not in label.text
+    QCoreApplication.processEvents()
+    assert ACTION_JA in label.text
+    assert DIALOGUE_JA not in label.text
+    hold = _require_timer(controller, ACTION_HOLD_MS, HOLD_TIMER_ATTR)
+    assert hold.isActive()
+    deadline = getattr(controller, DEADLINE_TIMER_ATTR)
+    assert deadline is not None and deadline.isActive()
+    controller.finish_translation_batch()
+    assert not deadline.isActive()
     controller.cancel_reply_flow()
 
 

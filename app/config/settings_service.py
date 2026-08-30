@@ -704,6 +704,7 @@ class AppSettingsService:
             max_attempts=_int_value(section.get("max_attempts"), 2),
             validator_mode=str(section.get("validator_mode") or "v2"),
             request_shape=str(section.get("request_shape") or "serial"),
+            late_patch_grace_ms=_int_value(section.get("late_patch_grace_ms"), 1200),
         ).normalized()
 
     def save_translation_settings(self, settings) -> None:
@@ -721,6 +722,7 @@ class AppSettingsService:
         section["max_attempts"] = int(normalized.max_attempts)
         section["validator_mode"] = str(normalized.validator_mode)
         section["request_shape"] = str(normalized.request_shape)
+        section["late_patch_grace_ms"] = int(normalized.late_patch_grace_ms)
         data["translation"] = section
         save_yaml_mapping(self.system_config_path, data)
 

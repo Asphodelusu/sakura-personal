@@ -199,6 +199,7 @@ class OpenAITranslationProvider:
         source_lang: str = "ja",
         target_lang: str = "zh",
         on_item: Callable[[TranslationIndexResult], None] | None = None,
+        on_failed: Callable[[int], None] | None = None,
     ) -> TranslationBatchResult:
         if self.request_shape != "split_batch":
             return self._translate_serial_indexed(
@@ -206,6 +207,7 @@ class OpenAITranslationProvider:
                 source_lang=source_lang,
                 target_lang=target_lang,
                 on_item=on_item,
+                on_failed=on_failed,
             )
         _ = source_lang, target_lang
         started = time.perf_counter()
@@ -286,6 +288,9 @@ class OpenAITranslationProvider:
             attempts=request_count or 1,
             elapsed_ms=elapsed_ms,
         )
+        if on_failed is not None:
+            for index in failed_indexes:
+                on_failed(index)
         return TranslationBatchResult(
             items=items,
             failed_indexes=failed_indexes,
@@ -299,6 +304,7 @@ class OpenAITranslationProvider:
         source_lang: str,
         target_lang: str,
         on_item: Callable[[TranslationIndexResult], None] | None,
+        on_failed: Callable[[int], None] | None = None,
     ) -> TranslationBatchResult:
         _ = source_lang, target_lang
         started = time.perf_counter()
@@ -320,6 +326,8 @@ class OpenAITranslationProvider:
                 request_count += used
                 if not zh:
                     failed.append(index)
+                    if on_failed is not None:
+                        on_failed(index)
                     continue
                 item = TranslationIndexResult(index=index, translation=zh)
             items.append(item)

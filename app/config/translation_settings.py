@@ -15,6 +15,9 @@ TRANSLATION_VALIDATOR_MODE_DEFAULT = "v2"
 TRANSLATION_VALIDATOR_MODES = ("legacy", "v2")
 TRANSLATION_REQUEST_SHAPE_DEFAULT = "serial"
 TRANSLATION_REQUEST_SHAPES = ("serial", "split_batch")
+TRANSLATION_LATE_PATCH_GRACE_DEFAULT_MS = 1200
+TRANSLATION_LATE_PATCH_GRACE_MIN_MS = 0
+TRANSLATION_LATE_PATCH_GRACE_MAX_MS = 10000
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class TranslationSettings:
     max_attempts: int = TRANSLATION_MAX_ATTEMPTS_DEFAULT
     validator_mode: str = TRANSLATION_VALIDATOR_MODE_DEFAULT
     request_shape: str = TRANSLATION_REQUEST_SHAPE_DEFAULT
+    late_patch_grace_ms: int = TRANSLATION_LATE_PATCH_GRACE_DEFAULT_MS
 
     def normalized(self) -> "TranslationSettings":
         timeout = max(
@@ -45,10 +49,18 @@ class TranslationSettings:
         shape = str(self.request_shape or "").strip().lower()
         if shape not in TRANSLATION_REQUEST_SHAPES:
             shape = TRANSLATION_REQUEST_SHAPE_DEFAULT
+        grace = max(
+            TRANSLATION_LATE_PATCH_GRACE_MIN_MS,
+            min(
+                TRANSLATION_LATE_PATCH_GRACE_MAX_MS,
+                int(self.late_patch_grace_ms),
+            ),
+        )
         return TranslationSettings(
             enabled=bool(self.enabled),
             gate_timeout_seconds=timeout,
             max_attempts=attempts,
             validator_mode=mode,
             request_shape=shape,
+            late_patch_grace_ms=grace,
         )
