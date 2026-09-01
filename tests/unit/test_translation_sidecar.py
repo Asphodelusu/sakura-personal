@@ -306,12 +306,14 @@ def test_worker_emits_first_serial_index_before_provider_finishes_remaining() ->
     import threading
 
     import pytest
-    from PySide6.QtCore import QCoreApplication, Qt
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
 
-    qtcore = pytest.importorskip("PySide6.QtCore")
-    if not hasattr(qtcore, "QCoreApplication"):
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
-    QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
 
     from app.llm.openai_translation_provider import TranslationBatchResult, TranslationIndexResult
     from app.ui.pet_window import SubtitleTranslationWorker
