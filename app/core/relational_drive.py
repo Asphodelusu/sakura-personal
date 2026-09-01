@@ -54,15 +54,6 @@ _EFFECT_VECTORS: dict[str, dict[str, float]] = {
     },
 }
 
-_KIND_FIELDS = {
-    "physical_arousal": "physical_arousal",
-    "erotic_salience": "erotic_salience",
-    "attachment_longing": "attachment_longing",
-    "afterglow": "afterglow",
-    "inhibition": "inhibition",
-}
-
-
 class DriveKind(StrEnum):
     PHYSICAL_AROUSAL = "physical_arousal"
     EROTIC_SALIENCE = "erotic_salience"
@@ -91,6 +82,14 @@ class DriveEffectEvent(StrEnum):
     AFTERCARE = "aftercare"
     HESITATION = "hesitation"
     STOPPED = "stopped"
+
+
+_AFFECTIONATE_CONTACT_EVENTS = {
+    DriveEffectEvent.MUTUAL_AFFECTION,
+    DriveEffectEvent.MUTUAL_ESCALATION,
+    DriveEffectEvent.FULFILLED,
+    DriveEffectEvent.AFTERCARE,
+}
 
 
 def _finite_or(value: Any, default: float) -> float:
@@ -155,6 +154,10 @@ class RelationalDriveProfile:
     longing_growth_scale_hours: float = 36.0
     longing_saturation_hours: float = 72.0
     appraisal_sensitivity: float = 0.70
+    touch_grace_hours: float = 12.0
+    touch_growth_scale_hours: float = 48.0
+    touch_saturation_hours: float = 120.0
+    touch_hunger_cap: float = 0.55
 
     @classmethod
     def natural_default(cls) -> "RelationalDriveProfile":
@@ -174,7 +177,18 @@ class RelationalDriveProfile:
             longing_growth_scale_hours=_hours(self.longing_growth_scale_hours, 36.0),
             longing_saturation_hours=_hours(self.longing_saturation_hours, 72.0),
             appraisal_sensitivity=_unit(self.appraisal_sensitivity, 0.70),
+            touch_grace_hours=_hours(self.touch_grace_hours, 12.0),
+            touch_growth_scale_hours=_hours(self.touch_growth_scale_hours, 48.0),
+            touch_saturation_hours=_hours(self.touch_saturation_hours, 120.0),
+            touch_hunger_cap=_unit(self.touch_hunger_cap, 0.55),
         )
+
+
+@dataclass(frozen=True)
+class RelationalDriveTendencies:
+    touch_hunger: float
+    affection_pull: float
+    erotic_activation: float
 
 
 @dataclass(frozen=True)
@@ -186,6 +200,7 @@ class RelationalDriveState:
     inhibition: float
     updated_at: datetime
     last_meaningful_contact_at: datetime | None = None
+    last_affectionate_contact_at: datetime | None = None
 
     @classmethod
     def from_profile(
@@ -194,22 +209,30 @@ class RelationalDriveState:
         *,
         now: datetime,
         last_meaningful_contact_at: datetime | None = None,
+        last_affectionate_contact_at: datetime | None = None,
     ) -> "RelationalDriveState":
         clean = profile.normalized()
+        stamp = _aware(now)
         return cls(
             physical_arousal=clean.physical_baseline,
             erotic_salience=clean.salience_baseline,
             attachment_longing=clean.longing_baseline,
             afterglow=clean.afterglow_baseline,
             inhibition=clean.inhibition_baseline,
-            updated_at=_aware(now),
+            updated_at=stamp,
             last_meaningful_contact_at=(
                 _aware(last_meaningful_contact_at) if last_meaningful_contact_at else None
+            ),
+            last_affectionate_contact_at=(
+                _aware(last_affectionate_contact_at)
+                if last_affectionate_contact_at is not None
+                else stamp
             ),
         ).normalized()
 
     def normalized(self) -> "RelationalDriveState":
         contact = self.last_meaningful_contact_at
+        affectionate = self.last_affectionate_contact_at
         return RelationalDriveState(
             physical_arousal=_unit(self.physical_arousal, 0.0),
             erotic_salience=_unit(self.erotic_salience, 0.0),
@@ -218,10 +241,68 @@ class RelationalDriveState:
             inhibition=_unit(self.inhibition, 0.0),
             updated_at=_aware(self.updated_at),
             last_meaningful_contact_at=_aware(contact) if contact is not None else None,
+            last_affectionate_contact_at=_aware(affectionate) if affectionate is not None else None,
         )
 
     def with_values(self, **changes: Any) -> "RelationalDriveState":
         return replace(self, **changes).normalized()
+
+
+def derive_touch_hunger(
+    state: RelationalDriveState,
+    profile: RelationalDriveProfile,
+    now: datetime,
+) -> float:
+    if state.last_affectionate_contact_at is None:
+        return 0.0
+    clean = profile.normalized()
+    absence = min(
+        _elapsed_hours(state.last_affectionate_contact_at, now),
+        clean.touch_saturation_hours,
+    )
+    effective = max(0.0, absence - clean.touch_grace_hours)
+    if effective <= 0.0:
+        return 0.0
+    return clean.touch_hunger_cap * (
+        1.0 - math.exp(-effective / clean.touch_growth_scale_hours)
+    )
+
+
+def derive_drive_tendencies(
+    state: RelationalDriveState,
+    profile: RelationalDriveProfile,
+    now: datetime,
+) -> RelationalDriveTendencies:
+    current = state.normalized()
+    touch_hunger = derive_touch_hunger(current, profile, now)
+    affection_pull = _clamp(
+        current.attachment_longing + touch_hunger + current.afterglow - current.inhibition,
+        _UNIT_MIN,
+        _UNIT_MAX,
+    )
+    erotic_activation = _clamp(
+        current.physical_arousal
+        + current.erotic_salience
+        + current.attachment_longing * current.erotic_salience
+        + touch_hunger * current.erotic_salience
+        - current.inhibition,
+        _UNIT_MIN,
+        _UNIT_MAX,
+    )
+    return RelationalDriveTendencies(
+        touch_hunger=touch_hunger,
+        affection_pull=affection_pull,
+        erotic_activation=erotic_activation,
+    )
+
+
+_KIND_FIELDS = {
+    "physical_arousal": "physical_arousal",
+    "erotic_salience": "erotic_salience",
+    "attachment_longing": "attachment_longing",
+    "afterglow": "afterglow",
+    "inhibition": "inhibition",
+}
 
 
 @dataclass(frozen=True)
@@ -287,6 +368,7 @@ def evolve_relational_drive(
         inhibition=inhibition,
         updated_at=stamp if elapsed > 0.0 else current.updated_at,
         last_meaningful_contact_at=current.last_meaningful_contact_at,
+        last_affectionate_contact_at=current.last_affectionate_contact_at,
     ).normalized()
 
 
@@ -351,7 +433,14 @@ def apply_drive_effect(
         if protect_longing and field == "attachment_longing":
             continue
         values[field] = _apply_delta(values[field], delta * scale)
-    return evolved.with_values(**values, updated_at=_aware(now))
+    event = str(effect.event)
+    clean = profile.normalized()
+    if event in {DriveEffectEvent.FULFILLED, DriveEffectEvent.AFTERCARE}:
+        values["physical_arousal"] = max(values["physical_arousal"], clean.physical_baseline)
+    changes: dict[str, Any] = {**values, "updated_at": _aware(now)}
+    if event in _AFFECTIONATE_CONTACT_EVENTS:
+        changes["last_affectionate_contact_at"] = _aware(now)
+    return evolved.with_values(**changes)
 
 
 def drive_activation(state: RelationalDriveState) -> float:
@@ -397,8 +486,50 @@ _SUMMARIES = {
     "strong": "亲近和身体上的期待都更鲜明了。这是一种内在倾向，不是行动指令。",
 }
 
+_TOUCH_HUNGER_SUMMARY = (
+    "身体上还没有明显兴奋，但她更想被贴近、被抱住。这是一种内在倾向，不是行动指令。"
+)
+_EROTIC_SUMMARY = "亲近和身体上的期待都更鲜明了。这是一种内在倾向，不是行动指令。"
+_AFTERGLOW_SUMMARY = "刚得到满足，仍想黏在一起。这是一种内在倾向，不是行动指令。"
+_RESTRAINED_SUMMARY = "心里有欲望，但疲劳、环境或迟疑让她收着表达。这是一种内在倾向，不是行动指令。"
 
-def build_drive_summary(state: RelationalDriveState, previous_band: str | None = None) -> str:
+
+def _qualitative_summary(
+    state: RelationalDriveState,
+    profile: RelationalDriveProfile,
+    now: datetime,
+) -> str:
+    current = state.normalized()
+    clean = profile.normalized()
+    tendencies = derive_drive_tendencies(current, profile, now)
+    if current.afterglow >= 0.45 and tendencies.affection_pull >= 0.35:
+        return _AFTERGLOW_SUMMARY
+    if (
+        tendencies.erotic_activation >= 0.55
+        and current.inhibition >= 0.40
+        and current.inhibition >= tendencies.erotic_activation * 0.55
+    ):
+        return _RESTRAINED_SUMMARY
+    if (
+        tendencies.touch_hunger >= 0.20
+        and current.erotic_salience <= clean.salience_baseline + 0.08
+        and tendencies.erotic_activation < 0.55
+    ):
+        return _TOUCH_HUNGER_SUMMARY
+    if tendencies.erotic_activation >= 0.55:
+        return _EROTIC_SUMMARY
+    return _SUMMARIES[drive_band(current)]
+
+
+def build_drive_summary(
+    state: RelationalDriveState,
+    previous_band: str | None = None,
+    *,
+    profile: RelationalDriveProfile | None = None,
+    now: datetime | None = None,
+) -> str:
+    if profile is not None and now is not None:
+        return _qualitative_summary(state, profile, now)
     return _SUMMARIES[drive_band(state, previous_band)]
 
 

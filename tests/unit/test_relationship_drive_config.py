@@ -30,6 +30,54 @@ def test_natural_profile_mapping_uses_defaults() -> None:
     assert profile.physical_half_life_hours == 3.0
     assert profile.physical_baseline == 0.10
     assert profile.appraisal_sensitivity == 0.70
+    assert profile.touch_grace_hours == 12.0
+    assert profile.touch_growth_scale_hours == 48.0
+    assert profile.touch_saturation_hours == 120.0
+    assert profile.touch_hunger_cap == 0.55
+
+
+def test_touch_profile_fields_parse_and_normalize() -> None:
+    profile = profile_from_mapping(
+        {
+            "profile": "natural",
+            "touch_grace_hours": 6.0,
+            "touch_growth_scale_hours": 24.0,
+            "touch_saturation_hours": 96.0,
+            "touch_hunger_cap": 0.45,
+        }
+    )
+    assert profile is not None
+    assert profile.touch_grace_hours == 6.0
+    assert profile.touch_growth_scale_hours == 24.0
+    assert profile.touch_saturation_hours == 96.0
+    assert profile.touch_hunger_cap == 0.45
+
+    invalid = profile_from_mapping(
+        {"profile": "natural", "touch_hunger_cap": "nope", "touch_grace_hours": "bad"}
+    )
+    assert invalid is not None
+    assert invalid.touch_hunger_cap == 0.55
+    assert invalid.touch_grace_hours == 12.0
+
+
+def test_profile_to_mapping_includes_touch_fields() -> None:
+    from app.config.relationship_drive import profile_to_mapping
+
+    profile = profile_from_mapping({"profile": "natural", "touch_grace_hours": 8.0})
+    assert profile is not None
+    payload = profile_to_mapping(profile)
+    assert payload is not None
+    assert payload["touch_grace_hours"] == 8.0
+    assert payload["touch_growth_scale_hours"] == 48.0
+    assert payload["touch_saturation_hours"] == 120.0
+    assert payload["touch_hunger_cap"] == 0.55
+
+
+def test_profile_to_mapping_preserves_unknown_raw_keys() -> None:
+    from app.config.relationship_drive import profile_to_mapping
+
+    raw = {"profile": "natural", "custom_future_field": "keep-me"}
+    assert profile_to_mapping(None, raw=raw) == raw
 
 
 def test_invalid_values_fall_back_only_when_mapping_present() -> None:

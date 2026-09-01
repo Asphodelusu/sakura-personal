@@ -178,17 +178,13 @@ def test_effect_vectors_match_approved_semantics() -> None:
     fulfilled = apply_drive_effect(
         state, profile, DriveEffect(event="fulfilled", strength="mild"), start
     )
-    assert fulfilled.physical_arousal == pytest.approx(
-        _apply_delta(state.physical_arousal, -0.45), abs=1e-6
-    )
+    assert fulfilled.physical_arousal == pytest.approx(profile.physical_baseline, abs=1e-6)
     assert fulfilled.afterglow == pytest.approx(_apply_delta(state.afterglow, 0.55), abs=1e-6)
 
     aftercare = apply_drive_effect(
         state, profile, DriveEffect(event="aftercare", strength="mild"), start
     )
-    assert aftercare.physical_arousal == pytest.approx(
-        _apply_delta(state.physical_arousal, -0.10), abs=1e-6
-    )
+    assert aftercare.physical_arousal == pytest.approx(profile.physical_baseline, abs=1e-6)
     assert aftercare.afterglow == pytest.approx(_apply_delta(state.afterglow, 0.12), abs=1e-6)
 
     hesitation = apply_drive_effect(
@@ -299,3 +295,166 @@ def test_activation_bands_and_hysteresis() -> None:
         inhibition=0.0,
     )
     assert drive_band(strong) == "strong"
+
+
+# --- P4A Task 1: affectionate clock + derived touch hunger ---
+
+
+def test_new_state_starts_affectionate_clock_at_creation_time() -> None:
+    from app.core.relational_drive import derive_touch_hunger
+
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(RelationalDriveProfile.natural_default(), now=now)
+    assert state.last_affectionate_contact_at == now
+    assert derive_touch_hunger(state, RelationalDriveProfile.natural_default(), now) == pytest.approx(0.0)
+
+
+def test_touch_hunger_is_zero_inside_grace_then_grows_and_saturates() -> None:
+    from app.core.relational_drive import derive_touch_hunger
+
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start)
+    inside = derive_touch_hunger(state, profile, start + timedelta(hours=12))
+    day_two = derive_touch_hunger(state, profile, start + timedelta(hours=48))
+    saturated = derive_touch_hunger(state, profile, start + timedelta(hours=120))
+    much_later = derive_touch_hunger(state, profile, start + timedelta(hours=720))
+    assert inside == pytest.approx(0.0)
+    assert 0.0 < day_two < saturated <= profile.touch_hunger_cap
+    assert much_later == pytest.approx(saturated)
+
+
+def test_ordinary_contact_does_not_reset_touch_hunger() -> None:
+    from app.core.relational_drive import derive_touch_hunger
+
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        last_meaningful_contact_at=start + timedelta(hours=48),
+    )
+    assert derive_touch_hunger(state, profile, start + timedelta(hours=72)) > 0.0
+
+
+def test_derive_drive_tendencies_clamps_to_unit_interval() -> None:
+    from app.core.relational_drive import derive_drive_tendencies
+
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        physical_arousal=1.0,
+        erotic_salience=1.0,
+        attachment_longing=1.0,
+        afterglow=1.0,
+        inhibition=0.0,
+    )
+    tendencies = derive_drive_tendencies(state, profile, start + timedelta(hours=120))
+    assert 0.0 <= tendencies.touch_hunger <= 1.0
+    assert 0.0 <= tendencies.affection_pull <= 1.0
+    assert 0.0 <= tendencies.erotic_activation <= 1.0
+
+
+# --- P4A Task 2: qualifying effects + qualitative summaries ---
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["mutual_affection", "mutual_escalation", "fulfilled", "aftercare"],
+)
+def test_mutually_realized_effects_refresh_affectionate_contact(event: str) -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    later = start + timedelta(days=3)
+    state = RelationalDriveState.from_profile(profile, now=start)
+    updated = apply_drive_effect(state, profile, DriveEffect(event=event), later)
+    assert updated.last_affectionate_contact_at == later
+
+
+@pytest.mark.parametrize("event", ["hesitation", "stopped", "none"])
+def test_nonrealized_effects_do_not_refresh_affectionate_contact(event: str) -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start)
+    updated = apply_drive_effect(state, profile, DriveEffect(event=event), start + timedelta(days=2))
+    assert updated.last_affectionate_contact_at == start
+
+
+def test_fulfilled_releases_arousal_but_preserves_afterglow_and_nonzero_baseline() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=now).with_values(
+        physical_arousal=0.80,
+        erotic_salience=0.75,
+        attachment_longing=0.65,
+    )
+    updated = apply_drive_effect(state, profile, DriveEffect(event="fulfilled"), now)
+    assert profile.physical_baseline <= updated.physical_arousal < state.physical_arousal
+    assert updated.afterglow > state.afterglow
+    assert updated.attachment_longing > 0.0
+
+
+def _summary_for(state: RelationalDriveState, profile: RelationalDriveProfile, when: datetime) -> str:
+    return build_drive_summary(state, profile=profile, now=when)
+
+
+def test_summary_touch_hunger_signals_closeness_not_automatic_sex() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        erotic_salience=profile.salience_baseline,
+        physical_arousal=profile.physical_baseline,
+    )
+    when = start + timedelta(hours=72)
+    summary = _summary_for(state, profile, when)
+    assert "贴近" in summary or "靠近" in summary or "亲近" in summary
+    assert "行动指令" in summary
+
+
+def test_summary_high_erotic_activation_is_clearer() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        physical_arousal=0.85,
+        erotic_salience=0.80,
+        attachment_longing=0.70,
+        inhibition=0.05,
+    )
+    summary = _summary_for(state, profile, start)
+    assert "期待" in summary or "身体" in summary
+    assert "行动指令" in summary
+
+
+def test_summary_afterglow_signals_satisfied_closeness() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        physical_arousal=profile.physical_baseline,
+        erotic_salience=profile.salience_baseline,
+        afterglow=0.75,
+        attachment_longing=0.40,
+    )
+    summary = _summary_for(state, profile, start)
+    assert "满足" in summary or "黏" in summary or "贴近" in summary
+    assert "行动指令" in summary
+
+
+def test_summary_high_activation_with_inhibition_is_restrained() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start).with_values(
+        physical_arousal=0.80,
+        erotic_salience=0.75,
+        attachment_longing=0.60,
+        inhibition=0.55,
+    )
+    summary = _summary_for(state, profile, start)
+    assert "克制" in summary or "收着" in summary or "压着" in summary
+    assert "行动指令" in summary
+
+
+def test_build_drive_summary_without_profile_keeps_band_compatibility() -> None:
+    profile = RelationalDriveProfile.natural_default()
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RelationalDriveState.from_profile(profile, now=start)
+    legacy = build_drive_summary(state)
+    assert legacy == build_drive_summary(state, previous_band=None)
+    assert "行动指令" in legacy

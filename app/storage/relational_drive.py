@@ -19,7 +19,7 @@ from app.core.relational_drive import (
     evolve_relational_drive,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _LEDGER_LIMIT = 128
 
 
@@ -149,6 +149,18 @@ class RelationalDriveStore:
             return restored, [], True
         updated = _parse_dt(payload.get("updated_at")) or now
         contact = _parse_dt(payload.get("last_meaningful_contact_at"))
+        affectionate = _parse_dt(payload.get("last_affectionate_contact_at"))
+        try:
+            version = int(payload.get("version", 1) or 1)
+        except (TypeError, ValueError):
+            self._quarantine()
+            restored = self._baseline(now)
+            self._write(restored, [])
+            return restored, [], True
+        dirty = False
+        if version == 1 and affectionate is None:
+            affectionate = now
+            dirty = True
         state = RelationalDriveState(
             physical_arousal=payload.get("physical_arousal", self.profile.physical_baseline),
             erotic_salience=payload.get("erotic_salience", self.profile.salience_baseline),
@@ -157,13 +169,14 @@ class RelationalDriveStore:
             inhibition=payload.get("inhibition", self.profile.inhibition_baseline),
             updated_at=updated,
             last_meaningful_contact_at=contact,
+            last_affectionate_contact_at=affectionate,
         ).normalized()
         keys = [
             str(item)
             for item in payload.get("settled_keys", [])
             if isinstance(item, str) and item
         ]
-        return state, self._trim_keys(keys), False
+        return state, self._trim_keys(keys), dirty
 
     def _quarantine(self) -> None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -182,6 +195,7 @@ class RelationalDriveStore:
             "version": _SCHEMA_VERSION,
             "updated_at": _format_dt(current.updated_at),
             "last_meaningful_contact_at": _format_dt(current.last_meaningful_contact_at),
+            "last_affectionate_contact_at": _format_dt(current.last_affectionate_contact_at),
             "physical_arousal": current.physical_arousal,
             "erotic_salience": current.erotic_salience,
             "attachment_longing": current.attachment_longing,

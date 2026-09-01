@@ -20,6 +20,10 @@ _PROFILE_FIELDS = (
     "longing_growth_scale_hours",
     "longing_saturation_hours",
     "appraisal_sensitivity",
+    "touch_grace_hours",
+    "touch_growth_scale_hours",
+    "touch_saturation_hours",
+    "touch_hunger_cap",
 )
 
 

@@ -7,6 +7,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from app.core.relational_drive import DriveAppraisal, DriveEffect, RelationalDriveProfile
 from app.storage.paths import StoragePaths
 from app.storage.relational_drive import RelationalDriveStore
@@ -24,6 +26,75 @@ def test_relational_drive_path_is_per_character(tmp_path: Path) -> None:
     assert paths.relational_drive_for("Sakura") == (
         tmp_path / "data" / "runtime_state" / "Sakura-relational-drive.json"
     )
+
+
+def test_v1_migration_preserves_state_and_seeds_affectionate_anchor(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    old_meaningful = datetime(2026, 8, 20, tzinfo=UTC)
+    migration_now = old_meaningful
+    v1_physical = 0.42
+    old_keys = ["turn-legacy:effect"]
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": old_meaningful.isoformat(),
+                "last_meaningful_contact_at": old_meaningful.isoformat(),
+                "physical_arousal": v1_physical,
+                "erotic_salience": 0.22,
+                "attachment_longing": 0.31,
+                "afterglow": 0.08,
+                "inhibition": 0.05,
+                "settled_keys": old_keys,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = store.snapshot(migration_now)
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+    assert migrated.last_affectionate_contact_at == migration_now
+    assert migrated.physical_arousal == pytest.approx(v1_physical)
+    assert migrated.last_meaningful_contact_at == old_meaningful
+    assert payload["settled_keys"] == old_keys
+    assert payload["version"] == 2
+    assert payload["last_affectionate_contact_at"] == migration_now.isoformat()
+
+
+def test_note_contact_does_not_change_affectionate_anchor(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    later = start + timedelta(days=1)
+    store.reset(start)
+    contacted = store.note_contact("contact-only", later)
+    assert contacted.last_meaningful_contact_at == later
+    assert contacted.last_affectionate_contact_at == start
+
+
+def test_qualifying_effect_updates_affectionate_contact_once(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    later = start + timedelta(days=2)
+    effect = DriveEffect(event="mutual_affection", strength="mild")
+    assert store.settle_effect("turn-aff", effect, later) is True
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    assert payload["last_affectionate_contact_at"] == later.isoformat()
+
+
+def test_replayed_effect_keeps_first_affectionate_timestamp(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    first_touch = start + timedelta(hours=6)
+    replay_at = start + timedelta(days=1)
+    effect = DriveEffect(event="mutual_escalation", strength="mild")
+    store.settle_effect("turn-once", effect, first_touch)
+    store.settle_effect("turn-once", effect, replay_at)
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    assert payload["last_affectionate_contact_at"] == first_touch.isoformat()
 
 
 def test_gitignore_ignores_runtime_state() -> None:
@@ -132,6 +203,7 @@ def test_persisted_json_has_no_dialogue_or_event_bodies(tmp_path: Path) -> None:
         "version",
         "updated_at",
         "last_meaningful_contact_at",
+        "last_affectionate_contact_at",
         "physical_arousal",
         "erotic_salience",
         "attachment_longing",
@@ -142,7 +214,7 @@ def test_persisted_json_has_no_dialogue_or_event_bodies(tmp_path: Path) -> None:
     blob = raw.lower()
     for banned in ("fulfilled", "reason", "dialogue", "summary", "comment"):
         assert banned not in blob
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert isinstance(payload["physical_arousal"], float)
 
 
@@ -158,7 +230,34 @@ def test_corrupt_json_is_moved_aside_and_baseline_restored(tmp_path: Path) -> No
     assert siblings[0].read_text(encoding="utf-8") == "{not-json"
     assert store.path.is_file()
     restored = json.loads(store.path.read_text(encoding="utf-8"))
-    assert restored["version"] == 1
+    assert restored["version"] == 2
+    assert restored["last_affectionate_contact_at"] is not None
+    assert restored["last_meaningful_contact_at"] is None
+
+
+def test_invalid_schema_version_is_quarantined_and_baseline_restored(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": "broken",
+                "updated_at": "2026-09-01T00:00:00+00:00",
+                "physical_arousal": 0.95,
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+
+    restored = store.snapshot(now)
+
+    assert restored.physical_arousal == RelationalDriveProfile.natural_default().physical_baseline
+    quarantined = list(store.path.parent.glob("*.corrupt-*.json"))
+    assert len(quarantined) == 1
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert payload["last_affectionate_contact_at"] == now.isoformat()
 
 
 def test_concurrent_distinct_ids_preserve_both_changes(tmp_path: Path) -> None:
