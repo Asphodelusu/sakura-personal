@@ -3459,6 +3459,9 @@ class PetWindow(QWidget):
             observer.set_relationship_facts_provider(
                 lambda: self.memory_store.build_continuity_context()
             )
+            observer.set_relationship_drive_provider(
+                lambda: self.agent_runtime.relationship_drive_summary(fresh=True)
+            )
             observer._relationship_generation = int(
                 getattr(self, "_relationship_generation", 0) or 0
             )
@@ -5021,6 +5024,13 @@ class PetWindow(QWidget):
     ) -> None:
         self.messages = _without_transient_progress_messages(self.messages)
         reply = result.reply
+        runtime = getattr(self, "agent_runtime", None)
+        settle_drive = getattr(runtime, "settle_adopted_reply_drive", None)
+        if callable(settle_drive):
+            settle_drive(
+                str(getattr(self, "active_interaction_id", "") or ""),
+                reply,
+            )
         self._log_interaction_stage(
             "consume_agent_result",
             {

@@ -4975,6 +4975,13 @@ def test_web_progress_reply_shows_bubble_and_speaks_tts() -> None:
     window.subtitle_controller = FakeSubtitle()
     window.voice_playback_controller = FakePlayback()
     window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
+    window.agent_runtime = type(
+        "R",
+        (),
+        {"settle_adopted_reply_drive": lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("progress reply must not settle relational drive")
+        )},
+    )()
 
     segment = ChatSegment("調べるね。", "中性", "我查一下。", suppress_tts=False)
     window._handle_progress_reply(
@@ -5455,6 +5462,47 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     assert message_sources == [""]
     assert shown_segments == [[segment]]
     assert applied_results == [result]
+
+
+def test_consume_agent_result_settles_drive_before_history_translation_and_display() -> None:
+    from app.agent import AgentResult
+    from app.llm.chat_reply import ChatReply
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class RuntimeStub:
+        def settle_adopted_reply_drive(self, interaction_id, reply) -> bool:  # type: ignore[no-untyped-def]
+            assert interaction_id == "interaction-42"
+            assert reply is result.reply
+            calls.append("settle")
+            return True
+
+    class MinimalConsumeWindow:
+        _consume_agent_result = PetWindow._consume_agent_result
+
+    window = MinimalConsumeWindow()
+    window.messages = []
+    window.active_interaction_id = "interaction-42"
+    window.agent_runtime = RuntimeStub()
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_assistant_reply_history = (
+        lambda *_args, **_kwargs: calls.append("history") or [101]
+    )
+    window._schedule_subtitle_translations = (
+        lambda *_args, **_kwargs: calls.append("translations")
+    )
+    window._show_reply_segments = lambda *_args, **_kwargs: calls.append("show")
+    window._apply_pending_action_from_result = (
+        lambda *_args, **_kwargs: calls.append("actions")
+    )
+    result = AgentResult(
+        reply=ChatReply([ChatSegment("こっち。", "温柔", "过来。")])
+    )
+
+    window._consume_agent_result(result)
+
+    assert calls == ["settle", "history", "translations", "show", "actions"]
 
 
 def test_reply_history_buttons_disable_while_busy_or_playing() -> None:

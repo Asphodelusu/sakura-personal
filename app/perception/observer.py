@@ -981,6 +981,7 @@ class ProactiveObserver:
         self.relationship = relationship or RelationshipInitiativeSettings(proactive_enabled=False)
         self._relationship_guide = ""
         self._get_relationship_facts: Callable[[], str] = lambda: ""
+        self._get_relationship_drive: Callable[[], str] = lambda: ""
         self._last_relationship_spoken_at = 0.0
         self._last_relationship_silent_at = 0.0
         self._relationship_silence_streak = 0
@@ -1166,6 +1167,9 @@ class ProactiveObserver:
 
     def set_relationship_facts_provider(self, provider: Callable[[], str]) -> None:
         self._get_relationship_facts = provider
+
+    def set_relationship_drive_provider(self, provider: Callable[[], str]) -> None:
+        self._get_relationship_drive = provider
 
     def bump_relationship_generation(self) -> None:
         self._relationship_generation += 1
@@ -1611,6 +1615,12 @@ class ProactiveObserver:
             facts = self._get_relationship_facts()
             if facts:
                 parts.append(facts)
+        except Exception:
+            pass
+        try:
+            drive_summary = str(self._get_relationship_drive() or "").strip()
+            if drive_summary:
+                parts.append(f"[当前亲近倾向]\n{drive_summary}")
         except Exception:
             pass
         self._append_exchange_context(parts)

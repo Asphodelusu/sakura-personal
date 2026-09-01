@@ -65,6 +65,7 @@ from app.agent.runtime_limits import (
     normalize_runtime_loop_settings,
 )
 from app.plugins.models import ContextProviderContribution, PromptPatchContribution
+from app.llm.chat_reply import ChatReply
 
 from app.llm.prompts.runtime import PromptRuntime
 from app.llm.prompts.types import (
@@ -355,27 +356,61 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
             return
         self._relationship_drive_store = RelationalDriveStore(path, profile)
 
-    def relationship_drive_summary(self) -> str:
-        if self._relationship_drive_snapshot_ready:
+    def relationship_drive_summary(self, *, fresh: bool = False) -> str:
+        if not fresh and self._relationship_drive_snapshot_ready:
             return str(self._relationship_drive_turn_snapshot or "")
         store = self._relationship_drive_store
         if store is None:
-            self._relationship_drive_turn_snapshot = ""
-            self._relationship_drive_snapshot_ready = True
+            if not fresh:
+                self._relationship_drive_turn_snapshot = ""
+                self._relationship_drive_snapshot_ready = True
             return ""
         try:
             from datetime import datetime
 
             from app.core.relational_drive import build_drive_summary
 
-            state = store.snapshot(datetime.now().astimezone())
-            text = build_drive_summary(state)
+            now = datetime.now().astimezone()
+            state = store.snapshot(now)
+            text = build_drive_summary(state, profile=store.profile, now=now)
         except Exception as exc:  # noqa: BLE001
             debug_log("RelationalDrive", "snapshot error", {"error": type(exc).__name__})
             text = ""
-        self._relationship_drive_turn_snapshot = text
-        self._relationship_drive_snapshot_ready = True
+        if not fresh:
+            self._relationship_drive_turn_snapshot = text
+            self._relationship_drive_snapshot_ready = True
         return text
+
+    def settle_adopted_reply_drive(
+        self,
+        interaction_id: str,
+        reply: ChatReply,
+    ) -> bool:
+        from datetime import datetime
+
+        ident = str(interaction_id or "").strip()
+        store = self._relationship_drive_store
+        if store is None or not ident or ident != self._relationship_drive_turn_id:
+            debug_log("RelationalDrive", "effect ignored", {})
+            return False
+        effect = getattr(reply, "drive_effect", None)
+        if effect is None:
+            debug_log("RelationalDrive", "effect ignored", {})
+            return False
+        try:
+            settled = store.settle_effect(ident, effect, datetime.now().astimezone())
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RelationalDrive", "effect error", {"error": type(exc).__name__})
+            return False
+        debug_log(
+            "RelationalDrive",
+            "effect settled" if settled else "effect duplicate",
+            {},
+        )
+        if settled:
+            self._relationship_drive_turn_snapshot = None
+            self._relationship_drive_snapshot_ready = False
+        return settled
 
     def _begin_relationship_drive_user_turn(self) -> None:
         from datetime import datetime
