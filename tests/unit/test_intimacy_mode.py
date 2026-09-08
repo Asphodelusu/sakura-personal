@@ -369,16 +369,17 @@ class TestIntimacyGuidePromptGate:
     def test_inactive_mode_is_optional_guidance_not_behavior_gate(self) -> None:
         body = _intimacy_entry_hint_text()
         assert "不会自动开启" in body
-        assert "详细导演层" in body
-        assert "不是身体接触许可" in body
-        assert "未开启不限制拥抱、亲吻、前戏或性行为" in body
-        assert "稳定恋人关系" in body
-        assert "自然升温" in body
-        assert "真实迟疑" in body
-        assert "关系不足" in body
-        assert "重新认识" in body
-        assert "默认拒绝" in body
-        assert "也可以拒绝" in body or "自主判断" in body
+        assert "详细 guide" in body
+        assert "未开启时不注入详细 guide" in body
+        assert "当前人格、关系事实与演出约束" in body
+        assert "set_intimacy_mode(on=true)" in body
+        assert "set_intimacy_mode(on=false)" in body
+        assert "不是身体接触许可" not in body
+        assert "稳定恋人关系" not in body
+        assert "真实迟疑" not in body
+        assert "关系不足" not in body
+        assert "重新认识" not in body
+        assert "默认拒绝" not in body
         assert "不要动手描写" not in body
         assert "开启后才能" not in body
 
@@ -493,8 +494,12 @@ class TestIntimacyGuidePromptGate:
 
     def test_persona_softened_when_intimacy_focus(self) -> None:
         runtime = self._runtime_with_guide()
-        full = runtime._persona_sections(intimacy_focus=False)[0].body
-        soft = runtime._persona_sections(intimacy_focus=True)[0].body
+        full = "\n\n".join(
+            section.body for section in runtime._persona_sections(intimacy_focus=False)
+        )
+        soft = "\n\n".join(
+            section.body for section in runtime._persona_sections(intimacy_focus=True)
+        )
         assert "【当下专注】" in soft
         assert len(soft) < len(full)
         assert "勿复述战力" in soft

@@ -165,6 +165,7 @@ run.bat
 - [安装指南](docs/SETUP.md) — 上游 Release 完整包（`install.bat` / `runtime/`）说明
 - [macOS](docs/MACOS_SETUP.md) — macOS 源码与依赖
 - [技术说明](docs/TECHNICAL_README.md) — 架构与目录
+- [Prompt 装配与角色包适配](docs/PROMPT_ASSEMBLY.md) — 分层合同、自定义角色资源与验证边界
 - [更新日志](CHANGELOG.md) — 版本变更
 - [AGENTS.md](AGENTS.md) — 仓库内 AI Agent 协作约定
 

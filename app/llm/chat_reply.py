@@ -176,6 +176,72 @@ def structural_repair_is_faithful(
     return True
 
 
+def canonicalize_structural_repair(
+    original: str,
+    repaired: str,
+    *,
+    allowed_tones: list[str] | tuple[str, ...] | None = None,
+    allowed_portraits: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str | None, str]:
+    """校验结构修复并重建最小可信 JSON；失败时返回脱敏原因码。"""
+
+    original_units = extract_adoptable_japanese_units(original)
+    if not original_units:
+        return None, "source_unusable"
+
+    data, _repaired = _try_load_json(str(repaired or ""))
+    if not isinstance(data, dict):
+        return None, "invalid_json"
+
+    parsed = parse_chat_reply_result(repaired)
+    if parsed.needs_retry:
+        return None, parsed.reason or "invalid_segments"
+    segments = [segment for segment in parsed.reply.segments if segment.text.strip()]
+    if not segments:
+        return None, "invalid_segments"
+
+    original_text = normalize_japanese_text("".join(original_units))
+    repaired_text = normalize_japanese_text("".join(segment.text for segment in segments))
+    if original_text != repaired_text:
+        return None, "japanese_changed"
+
+    tones = {str(item).strip() for item in (allowed_tones or []) if str(item).strip()}
+    portraits = {
+        str(item).strip() for item in (allowed_portraits or []) if str(item).strip()
+    }
+    for segment in segments:
+        tone = segment.tone.strip()
+        portrait = segment.portrait.strip()
+        if tones and tone and tone not in tones:
+            return None, "tone_not_allowed"
+        if portraits and portrait and portrait not in portraits:
+            return None, "portrait_not_allowed"
+
+    canonical = json.dumps(
+        {
+            "segments": [
+                {
+                    "ja": segment.text.strip(),
+                    "zh": "",
+                    "tone": segment.tone.strip() or DEFAULT_TONE,
+                    "portrait": segment.portrait.strip(),
+                }
+                for segment in segments
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if not structural_repair_is_faithful(
+        original,
+        canonical,
+        allowed_tones=allowed_tones,
+        allowed_portraits=allowed_portraits,
+    ):
+        return None, "canonical_validation_failed"
+    return canonical, ""
+
+
 def _optional_drive_effect(data: dict[str, Any]):
     from app.core.relational_drive import parse_drive_effect
 

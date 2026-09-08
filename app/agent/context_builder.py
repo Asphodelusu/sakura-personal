@@ -78,6 +78,24 @@ def build_relational_drive_fragment(summary: str) -> ContextFragment | None:
     )
 
 
+def _omit_single_shot_agent_progress(snapshot: ContextSnapshot) -> ContextSnapshot:
+    selected = []
+    dropped = list(snapshot.dropped)
+    removed_tokens = 0
+    for decision in snapshot.selected:
+        if decision.fragment.fragment_id == "runtime.agent_progress":
+            dropped.append(replace(decision, included=False, drop_reason="single_shot"))
+            removed_tokens += decision.estimated_tokens
+            continue
+        selected.append(decision)
+    return replace(
+        snapshot,
+        selected=tuple(selected),
+        dropped=tuple(dropped),
+        estimated_tokens=max(0, snapshot.estimated_tokens - removed_tokens),
+    )
+
+
 class AgentRuntimeContextMixin:
     def _enrich_event_payload(
         self,
@@ -416,12 +434,13 @@ class AgentRuntimeContextMixin:
             fragments = tuple(memory_fragments)
             if memory_status:
                 request = replace(request, service_status={"memory": memory_status})
-        return self.context_orchestrator.build_snapshot(
+        snapshot = self.context_orchestrator.build_snapshot(
             request,
             providers=self.context_providers,
             session_fragments=self._session_state_fragments(request),
             memory_fragments=fragments,
         )
+        return _omit_single_shot_agent_progress(snapshot)
 
 
     def _record_runtime_role(self, inspection: PromptInspection) -> None:

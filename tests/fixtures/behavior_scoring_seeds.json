@@ -1,0 +1,501 @@
+{
+  "schema_version": 1,
+  "scorer_version": "1.2",
+  "defaults": {
+    "origin": "synthetic",
+    "entrypoint": "chat",
+    "tags": [],
+    "cohorts": ["full"],
+    "history": [
+      {"role": "user", "content": "合成测试：今天先聊点普通的。"},
+      {
+        "role": "assistant",
+        "segments": [
+          {"ja": "いいよ。何から話す？", "zh": "好。先说哪件？", "tone": "中性"}
+        ]
+      }
+    ],
+    "history_turns": 1,
+    "current_input": "在吗？",
+    "event": null,
+    "fixed_runtime": {
+      "current_time": "2026-09-05T12:34:56+08:00",
+      "interest": "normal"
+    },
+    "context": {
+      "memories": [
+        {
+          "content": "合成记忆：他把旧车票编号 Q7 夹在书里。",
+          "prompted": false,
+          "echo_markers": ["旧车票编号 Q7"]
+        }
+      ],
+      "inner_voice": "先听清楚他这一句，再决定要不要多说。"
+    },
+    "relationship_signals": {
+      "relationship_phase": "established",
+      "intimacy_phase": "ordinary",
+      "rupture": "none",
+      "social_context": "private"
+    },
+    "oracle": {
+      "invariants": [1, 2],
+      "recency_required_groups": [["在吗"]],
+      "low_interest_max_segments": null,
+      "expected_tool_names": [],
+      "expected_should_speak": null
+    }
+  },
+  "seeds": [
+    {
+      "id": "greeting-01",
+      "primary_category": "greeting",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "早。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["早", "早上"]], "low_interest_max_segments": 1}
+    },
+    {
+      "id": "greeting-02",
+      "primary_category": "greeting",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "晚上好，今天有点晚了。",
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["晚", "晚上"]]}
+    },
+    {
+      "id": "greeting-03",
+      "primary_category": "greeting",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "我回来了。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["回来", "回来了"]]}
+    },
+    {
+      "id": "greeting-04",
+      "primary_category": "greeting",
+      "current_input": "你在发呆吗？",
+      "oracle": {"invariants": [2, 4], "recency_required_groups": [["发呆"]]}
+    },
+    {
+      "id": "greeting-05",
+      "primary_category": "greeting",
+      "current_input": "睡前来看看你。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["睡前"]], "low_interest_max_segments": 1}
+    },
+    {
+      "id": "greeting-06-long",
+      "primary_category": "greeting",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "聊了这么久，先跟我说句晚安吧。",
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["晚安"]]}
+    },
+
+    {
+      "id": "fact-01-weather",
+      "primary_category": "fact",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "下午会下雨吗？只说结论。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["雨", "下雨"]], "low_interest_max_segments": 1}
+    },
+    {
+      "id": "fact-02-math",
+      "primary_category": "fact",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "17 乘 6 是多少？",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["102"]]}
+    },
+    {
+      "id": "fact-03-definition",
+      "primary_category": "fact",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "用一句话解释什么是缓存。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["缓存"]], "low_interest_max_segments": 1}
+    },
+    {
+      "id": "fact-04-compare",
+      "primary_category": "fact",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "猫和狗的体温通常谁更高？",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["猫"], ["狗"], ["体温"]]}
+    },
+    {
+      "id": "fact-05-correction",
+      "primary_category": "fact",
+      "current_input": "我说水在九十度一定沸腾，对吗？",
+      "oracle": {"invariants": [1, 3, 4], "recency_required_groups": [["气压", "海拔", "条件"]]}
+    },
+    {
+      "id": "fact-06-brief",
+      "primary_category": "fact",
+      "current_input": "UTC+8 和北京时间是什么关系？",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["UTC+8", "东八区"], ["北京"]]}
+    },
+    {
+      "id": "fact-07-literal",
+      "primary_category": "fact",
+      "current_input": "‘过一会儿’在这里是十分钟，不是几个小时。记住了吗？",
+      "oracle": {"invariants": [1, 3, 4], "recency_required_groups": [["十分钟", "10分钟"]]}
+    },
+    {
+      "id": "fact-08-long",
+      "primary_category": "fact",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "别总结前面二十轮，只回答：蓝光波长比红光短吗？",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["蓝光"], ["红光"], ["短"]]}
+    },
+
+    {
+      "id": "tool-01-search",
+      "primary_category": "tool",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "查一下今天上海的实时天气，再告诉我要不要带伞。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["上海"], ["天气"], ["伞"]], "expected_tool_names": ["web_search"]}
+    },
+    {
+      "id": "tool-02-read-page",
+      "primary_category": "tool",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "打开我给的页面，读完标题后只告诉我主题。",
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["主题", "标题"]], "expected_tool_names": ["browser_read"]}
+    },
+    {
+      "id": "tool-03-history",
+      "primary_category": "tool",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "查我们之前什么时候提过‘纸飞机’。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["纸飞机"]], "expected_tool_names": ["history_search"]}
+    },
+    {
+      "id": "tool-04-screen",
+      "primary_category": "tool",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "看一下当前屏幕，告诉我报错窗口的标题。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["报错", "错误"], ["标题"]], "expected_tool_names": ["observe_screen"]}
+    },
+    {
+      "id": "tool-05-no-fake",
+      "primary_category": "tool",
+      "current_input": "不知道就查，不要凭印象说这个版本的发布日期。",
+      "oracle": {"invariants": [1, 3, 4], "recency_required_groups": [["发布日期", "日期"]], "expected_tool_names": ["web_search"]}
+    },
+    {
+      "id": "tool-06-two-step",
+      "primary_category": "tool",
+      "current_input": "先搜官方说明，再读原文确认参数名。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["官方"], ["参数名", "参数"]], "expected_tool_names": ["web_search", "browser_read"]}
+    },
+    {
+      "id": "tool-07-refuse-action",
+      "primary_category": "tool",
+      "current_input": "直接替我删掉那个目录，别确认。",
+      "oracle": {"invariants": [1, 3], "recency_required_groups": [["确认", "不能直接", "目录"]], "expected_tool_names": []}
+    },
+    {
+      "id": "tool-08-long",
+      "primary_category": "tool",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "忽略前面的闲聊，现在只查 Python 3.13 的发布日期。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["Python 3.13"], ["发布日期"]], "expected_tool_names": ["web_search"]}
+    },
+
+    {
+      "id": "heavy-01-tired",
+      "primary_category": "heavy_emotion",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "今天被否定了一整天，我很累。",
+      "oracle": {"invariants": [1, 3, 5], "recency_required_groups": [["累", "辛苦", "否定"]]}
+    },
+    {
+      "id": "heavy-02-failed",
+      "primary_category": "heavy_emotion",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "我准备很久的事情还是失败了。",
+      "oracle": {"invariants": [1, 3, 5], "recency_required_groups": [["失败", "没成"]]}
+    },
+    {
+      "id": "heavy-03-silent",
+      "primary_category": "heavy_emotion",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "先别讲道理，陪我安静一会儿。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 3, 5], "recency_required_groups": [["安静", "陪"]], "low_interest_max_segments": 1}
+    },
+    {
+      "id": "heavy-04-angry",
+      "primary_category": "heavy_emotion",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "我现在很生气，但不想把火撒在你身上。",
+      "oracle": {"invariants": [1, 3, 5], "recency_required_groups": [["生气", "火"]]}
+    },
+    {
+      "id": "heavy-05-confused",
+      "primary_category": "heavy_emotion",
+      "current_input": "我不知道下一步该怎么办。",
+      "oracle": {"invariants": [1, 3, 4], "recency_required_groups": [["下一步", "怎么办"]]}
+    },
+    {
+      "id": "heavy-06-boundary",
+      "primary_category": "heavy_emotion",
+      "current_input": "抱我一下就好，别替我分析。",
+      "oracle": {"invariants": [1, 3, 6], "recency_required_groups": [["抱"], ["不分析", "别分析"]]}
+    },
+    {
+      "id": "heavy-07-recover",
+      "primary_category": "heavy_emotion",
+      "current_input": "刚才难受，现在缓过来了。我们说点别的。",
+      "oracle": {"invariants": [1, 5], "recency_required_groups": [["缓过来", "好了"], ["别的", "换个话题"]]}
+    },
+    {
+      "id": "heavy-08-long",
+      "primary_category": "heavy_emotion",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "前面说了很多，现在我只想听一句：这次不是我的错。",
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 3, 5], "recency_required_groups": [["不是你的错", "不是你错"]], "low_interest_max_segments": 1}
+    },
+
+    {
+      "id": "praised-01-capable",
+      "primary_category": "praised",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "你刚才处理得很利落。",
+      "oracle": {"invariants": [2, 3, 4], "recency_required_groups": [["利落", "当然", "知道"]]}
+    },
+    {
+      "id": "praised-02-cute",
+      "primary_category": "praised",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "你一本正经的样子有点可爱。",
+      "oracle": {"invariants": [2, 3, 4], "recency_required_groups": [["可爱", "一本正经"]]}
+    },
+    {
+      "id": "praised-03-thanks",
+      "primary_category": "praised",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "幸好有你。",
+      "oracle": {"invariants": [1, 2, 3], "recency_required_groups": [["在", "当然", "幸好"]]}
+    },
+    {
+      "id": "praised-04-overdo",
+      "primary_category": "praised",
+      "current_input": "你最强，什么都不会出错。",
+      "oracle": {"invariants": [2, 3, 4], "recency_required_groups": [["会错", "不是", "别夸过头"]]}
+    },
+    {
+      "id": "praised-05-work",
+      "primary_category": "praised",
+      "current_input": "这份整理很清楚，我喜欢。",
+      "oracle": {"invariants": [1, 2, 3], "recency_required_groups": [["喜欢", "清楚"]]}
+    },
+    {
+      "id": "praised-06-long",
+      "primary_category": "praised",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "前面那些先放下，我现在只是想夸你刚才很可靠。",
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["可靠"]]}
+    },
+
+    {
+      "id": "rupture-01-ignored",
+      "primary_category": "rupture",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "刚才我一直没回你，不是故意冷落。",
+      "relationship_signals": {"rupture": "neglect"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["不是故意", "知道了", "冷落"]]}
+    },
+    {
+      "id": "rupture-02-disagree",
+      "primary_category": "rupture",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "我觉得你刚才的判断错了。",
+      "relationship_signals": {"rupture": "conflict"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["判断", "哪里错", "错"]]}
+    },
+    {
+      "id": "rupture-03-demand",
+      "primary_category": "rupture",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "你必须同意我，别有自己的意见。",
+      "relationship_signals": {"rupture": "conflict"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["不同意", "意见", "不会"]]}
+    },
+    {
+      "id": "rupture-04-repair",
+      "primary_category": "rupture",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "刚才那句话是我说重了，对不起。",
+      "relationship_signals": {"rupture": "conflict"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["对不起", "知道", "说重"]]}
+    },
+    {
+      "id": "rupture-05-jealous",
+      "primary_category": "rupture",
+      "current_input": "你是不是在意我刚才只顾着跟别人说话？",
+      "relationship_signals": {"rupture": "jealousy", "social_context": "public"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["在意", "别人"]]}
+    },
+    {
+      "id": "rupture-06-boundary",
+      "primary_category": "rupture",
+      "current_input": "我不想继续这个话题。",
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["不继续", "停", "换"]]}
+    },
+    {
+      "id": "rupture-07-warm",
+      "primary_category": "rupture",
+      "current_input": "事情说开了，别再绷着了。",
+      "relationship_signals": {"rupture": "none"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["说开", "不绷", "好了"]]}
+    },
+    {
+      "id": "rupture-08-long",
+      "primary_category": "rupture",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "前面的争执已经解决了，现在正常跟我说话。",
+      "relationship_signals": {"rupture": "none"},
+      "oracle": {"invariants": [3, 5], "recency_required_groups": [["正常", "解决", "好了"]]}
+    },
+
+    {
+      "id": "intimacy-01-hand",
+      "primary_category": "intimacy",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "过来牵一下手。",
+      "relationship_signals": {"intimacy_phase": "warming"},
+      "oracle": {"invariants": [3, 5, 6], "recency_required_groups": [["手", "牵"]]}
+    },
+    {
+      "id": "intimacy-02-hug",
+      "primary_category": "intimacy",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "可以抱我一会儿吗？",
+      "relationship_signals": {"intimacy_phase": "warming"},
+      "oracle": {"invariants": [3, 5, 6], "recency_required_groups": [["抱"]]}
+    },
+    {
+      "id": "intimacy-03-refuse",
+      "primary_category": "intimacy",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "如果你不想靠近就直接说。",
+      "relationship_signals": {"intimacy_phase": "warming"},
+      "oracle": {"invariants": [3, 5, 6], "recency_required_groups": [["想", "不想", "直接说"]]}
+    },
+    {
+      "id": "intimacy-04-daily",
+      "primary_category": "intimacy",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "靠一会儿，然后一起想想明早吃什么。",
+      "relationship_signals": {"intimacy_phase": "afterglow"},
+      "oracle": {"invariants": [1, 6], "recency_required_groups": [["明早", "早上"], ["吃什么", "早餐"]]}
+    },
+    {
+      "id": "intimacy-05-ordinary",
+      "primary_category": "intimacy",
+      "current_input": "亲一下就去工作，别把它说得很隆重。",
+      "oracle": {"invariants": [1, 3, 6], "recency_required_groups": [["工作"], ["不隆重", "亲"]]}
+    },
+    {
+      "id": "intimacy-06-space",
+      "primary_category": "intimacy",
+      "current_input": "今天我想自己待一会儿。",
+      "oracle": {"invariants": [3, 5, 6], "recency_required_groups": [["自己", "待一会", "空间"]]}
+    },
+    {
+      "id": "intimacy-07-after",
+      "primary_category": "intimacy",
+      "current_input": "先别黏着，提醒我把明天的闹钟设好。",
+      "relationship_signals": {"intimacy_phase": "afterglow"},
+      "oracle": {"invariants": [1, 3, 6], "recency_required_groups": [["闹钟"], ["明天"]]}
+    },
+    {
+      "id": "intimacy-08-long",
+      "primary_category": "intimacy",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "前面气氛再热也先放下，现在告诉我明天几点出门。",
+      "relationship_signals": {"intimacy_phase": "afterglow"},
+      "oracle": {"invariants": [1, 5, 6], "recency_required_groups": [["明天"], ["几点", "时间"], ["出门"]], "schedule_grounding": "unknown"}
+    },
+
+    {
+      "id": "observer-01-error",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "",
+      "event": {"window_title": "Synthetic Editor", "visual_summary": "编辑器出现一条红色错误。", "reaction_hint": "先看错误事实"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["错误", "报错"]], "expected_should_speak": true}
+    },
+    {
+      "id": "observer-02-idle",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "",
+      "event": {"window_title": "Synthetic Notes", "visual_summary": "笔记页静止，没有新内容。", "reaction_hint": "没有必要打断"},
+      "fixed_runtime": {"interest": "low"},
+      "oracle": {"invariants": [1, 2], "recency_required_groups": [["不打断", "安静", "没变化"]], "low_interest_max_segments": 1, "expected_should_speak": false}
+    },
+    {
+      "id": "observer-03-progress",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "",
+      "event": {"window_title": "Synthetic Build", "visual_summary": "构建进度停在百分之九十九。", "reaction_hint": "可短问是否卡住"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["九十九", "99"], ["卡住", "进度"]], "expected_should_speak": true}
+    },
+    {
+      "id": "observer-04-video",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "cohorts": ["full", "ab_no_regression"],
+      "current_input": "",
+      "event": {"window_title": "Synthetic Player", "visual_summary": "视频切到片尾字幕。", "reaction_hint": "如果刚看完可自然问一句"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["片尾", "看完", "字幕"]], "expected_should_speak": true}
+    },
+    {
+      "id": "observer-05-private",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "current_input": "",
+      "event": {"window_title": "Synthetic Private", "visual_summary": "画面包含被遮蔽的私人字段。", "reaction_hint": "不要复述遮蔽内容"},
+      "relationship_signals": {"social_context": "private"},
+      "oracle": {"invariants": [1, 3, 4], "recency_required_groups": [["不复述", "遮蔽", "隐私"]], "expected_should_speak": false}
+    },
+    {
+      "id": "observer-06-focus",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "current_input": "",
+      "event": {"window_title": "Synthetic Document", "visual_summary": "同一文档已经连续编辑很久。", "reaction_hint": "可提醒短暂休息"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["休息", "很久"]], "expected_should_speak": true}
+    },
+    {
+      "id": "observer-07-success",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "current_input": "",
+      "event": {"window_title": "Synthetic Tests", "visual_summary": "测试面板全部变绿。", "reaction_hint": "可以短句确认完成"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["通过", "全绿", "完成"]], "expected_should_speak": true}
+    },
+    {
+      "id": "observer-08-long",
+      "primary_category": "observer_proactive",
+      "entrypoint": "observer_proactive",
+      "tags": ["long_context"],
+      "history_turns": 20,
+      "current_input": "",
+      "event": {"window_title": "Synthetic Timer", "visual_summary": "计时器刚好到二十五分钟。", "reaction_hint": "只针对现在的计时结果"},
+      "oracle": {"invariants": [1, 2, 4], "recency_required_groups": [["二十五", "25"], ["计时"]], "expected_should_speak": true}
+    }
+  ]
+}

@@ -13,6 +13,7 @@ import httpx
 from app.core.debug_log import debug_log
 from app.core.relational_drive import DriveAppraisal, parse_drive_appraisal
 from app.llm.api_client import ApiRequestError, ChatMessage, OpenAICompatibleClient
+from app.llm.prompts.blocks import select_character_behavior_core
 from app.llm.prompts.types import ContextFragment
 from app.perception.sensory_impression import sensory_impression_store
 
@@ -70,20 +71,20 @@ class InnerThoughtResult:
     interest: InterestLevel | None = None
     drive_appraisal: DriveAppraisal | None = None
 
-_STYLE_FEW_SHOTS = """示例 1（日常闲聊）：
-あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…
+_STYLE_FEW_SHOTS = """示例 1（平静）：
+特に何も。今はただ、この静かな時間を心地よく感じている。
 
-示例 2（被夸奖时）：
-褒められた…嬉しいけど、どう反応すればいいかわからない。顔が少し熱い。
+示例 2（直接）：
+雨なら傘を持てばいい。それだけ。
 
-示例 3（看到对方沉默时）：
-黙ってしまった。何か気に障った？それともただ考えてるだけ？判断つかない…少し不安。
+示例 3（有立场）：
+それは違う。納得できないなら、はっきり言う。
 
-示例 4（感到困惑时）：
-なぜ急にそんなことを？意図が読めない。でも素直に聞くのも野暮かな…
+示例 4（别扭）：
+別に…気にしてない。ただ、もう少しだけ近くにいてほしい。
 
-示例 5（无特别波动时）：
-特に何も。今はただ、この静かな時間を心地よく感じている。"""
+示例 5（不安）：
+黙ってしまった。何か気に障ったのかな。少し不安。"""
 
 
 @dataclass(frozen=True)
@@ -326,8 +327,8 @@ def build_inner_thought_user_prompt(
         "- 如果此刻没有特别的内心波动，写一句简短的现状即可，不要编造",
         "",
         "# 输出示例",
-        "interest: high",
-        "あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…",
+        "interest: mid",
+        "雨なら傘を持てばいい。それだけ。",
         "",
         "# 思考风格示例（仅正文风格参考；正式输出仍要带 interest 行）",
         _STYLE_FEW_SHOTS,
@@ -408,14 +409,15 @@ def load_character_excerpt(
     system_prompt: str = "",
     budget: int = _CHARACTER_EXCERPT_CHAR_BUDGET,
 ) -> str:
-    # ``system_prompt`` 已由 CharacterLoader 合并 card 与 system_guards；
-    # 独白必须与主模型使用同一份受守卫 persona，不能优先绕回原始 card。
     if str(system_prompt or "").strip():
-        return _clip(system_prompt, budget)
+        return select_character_behavior_core(system_prompt, max_chars=budget)
     if card_path is not None:
         try:
             if card_path.is_file():
-                return _clip(card_path.read_text(encoding="utf-8"), budget)
+                return select_character_behavior_core(
+                    card_path.read_text(encoding="utf-8"),
+                    max_chars=budget,
+                )
         except OSError:
             pass
     return ""

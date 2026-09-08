@@ -3,6 +3,10 @@
 .nanobot/
 sessions/
 
+# 本地 Agent 协作与私有 prompt / 评测产物（可能包含完整角色材料和模型输出）
+/.agents/
+/.local/
+
 .env
 .env.migrated
 

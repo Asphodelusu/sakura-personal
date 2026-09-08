@@ -31,10 +31,10 @@ from app.llm.chat_reply import (
     ChatReply,
     ChatReplyParseResult,
     _try_load_json,
+    canonicalize_structural_repair,
     classify_chat_reply_failure,
     extract_adoptable_japanese_units,
     parse_chat_reply_result,
-    structural_repair_is_faithful,
 )
 from app.llm.context_trimming import trim_messages_for_model
 
@@ -187,6 +187,7 @@ class AgentRuntimeReplyMixin:
             "你是 JSON 结构修复器，不是角色。"
             "只输出合法 JSON："
             '{"segments":[{"ja":"自然日语","zh":"","tone":"中性","portrait":""}]}。'
+            "zh 必须为空字符串，禁止翻译。"
             f"{tone_rule}{portrait_rule}"
             "不得改写日文语义，不得调换分段顺序，不得新增事实。"
             "不要解释，不要使用 Markdown，不要调用工具。"
@@ -256,14 +257,19 @@ class AgentRuntimeReplyMixin:
             debug_log("AgentRuntime", "结构修复快车道失败，回退语义合成", {"error": str(exc)})
             return None
         tones, portraits = self._structural_repair_enums()
-        if structural_repair_is_faithful(
+        canonical, rejection_reason = canonicalize_structural_repair(
             raw_content,
             repaired,
             allowed_tones=tones,
             allowed_portraits=portraits,
-        ):
-            return repaired
-        debug_log("AgentRuntime", "结构修复结果未通过等价校验，回退语义合成")
+        )
+        if canonical is not None:
+            return canonical
+        debug_log(
+            "AgentRuntime",
+            "结构修复结果未通过等价校验，回退语义合成",
+            {"reason": rejection_reason},
+        )
         return None
 
 

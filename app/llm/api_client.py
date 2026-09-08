@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
+from collections.abc import Collection
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
@@ -15,6 +18,7 @@ from app.core.debug_log import debug_log, summarize_messages
 from app.core.interaction import get_interaction_id
 from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
 from app.llm.payload_inspection import (
+    RUNTIME_CONTEXT_USER_PREFIX,
     attach_usage,
     extract_usage_metrics,
     inspect_chat_payload,
@@ -53,6 +57,21 @@ class ApiConfigError(RuntimeError):
 
 class ApiRequestError(RuntimeError):
     """API 请求失败。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_message: str = "",
+        error_code: str = "",
+        error_param: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_message = error_message
+        self.error_code = error_code
+        self.error_param = error_param
 
 
 @dataclass(frozen=True)
@@ -150,11 +169,36 @@ class ChatCompletionTurn:
     runtime_context_role: str = "system"
 
 
+class RuntimeContextSystemRejection(str, Enum):
+    NONE = "none"
+    MID_SYSTEM_REJECTED = "mid_system_rejected"
+    NONINITIAL_SYSTEM_REJECTED = "noninitial_system_rejected"
+
+
+@dataclass(frozen=True)
+class RuntimeContextCapability:
+    key: tuple[str, str]
+    trailing_system_ok: bool = True
+    mid_array_system_ok: bool = True
+    successful_user_fallback_calls: int = 0
+
+    @property
+    def fallback_tier(self) -> int:
+        if not self.trailing_system_ok:
+            return 2
+        if not self.mid_array_system_ok:
+            return 1
+        return 0
+
+
 class OpenAICompatibleClient:
     def __init__(self, settings: ApiSettings) -> None:
         self.settings = settings
         self._unsupported_chat_params: set[str] = set()
-        self._runtime_context_role = "system"
+        self._runtime_context_capabilities: dict[
+            tuple[str, str], RuntimeContextCapability
+        ] = {}
+        self._settings_generation = 0
         # 可选事件发射器（由宿主注入），用于派发 llm.request.* 插件事件。
         self._event_emit: Callable[[str, dict[str, Any] | None], None] | None = None
         self._http: httpx.Client | None = None
@@ -253,7 +297,8 @@ class OpenAICompatibleClient:
         """运行时更新 API 配置，供设置界面保存后立即生效。"""
         self.settings = settings
         self._unsupported_chat_params.clear()
-        self._runtime_context_role = "system"
+        self._runtime_context_capabilities.clear()
+        self._settings_generation += 1
         self._close_http()
 
     def warm_connection(self, *, timeout_seconds: float = 8.0) -> bool:
@@ -299,7 +344,70 @@ class OpenAICompatibleClient:
 
     @property
     def runtime_context_role(self) -> str:
-        return self._runtime_context_role
+        capability = self.runtime_context_capability([])
+        return _runtime_context_role_for_capability(capability)
+
+    def runtime_context_capability(
+        self,
+        messages: list[ChatMessage] | None = None,
+        *,
+        endpoint: str | None = None,
+        model: str | None = None,
+    ) -> RuntimeContextCapability:
+        """返回指定端点与实际模型的 runtime role 能力快照。"""
+        resolved_model = model or self._resolve_request_model(messages or [])
+        key = _runtime_context_capability_key(
+            endpoint if endpoint is not None else self.settings.base_url,
+            resolved_model,
+        )
+        capability = self._runtime_context_capabilities.get(key)
+        if capability is None:
+            capability = RuntimeContextCapability(key=key)
+            self._runtime_context_capabilities[key] = capability
+        return capability
+
+    def _downgrade_runtime_context_capability(
+        self,
+        *,
+        key: tuple[str, str],
+        generation: int,
+        rejection: RuntimeContextSystemRejection,
+    ) -> bool:
+        if generation != self._settings_generation:
+            return False
+        current = self._runtime_context_capabilities.get(key)
+        if current is None:
+            current = RuntimeContextCapability(key=key)
+        if rejection == RuntimeContextSystemRejection.NONINITIAL_SYSTEM_REJECTED:
+            updated = replace(
+                current,
+                trailing_system_ok=False,
+                mid_array_system_ok=False,
+            )
+        elif rejection == RuntimeContextSystemRejection.MID_SYSTEM_REJECTED:
+            updated = replace(current, mid_array_system_ok=False)
+        else:
+            return False
+        if updated == current:
+            return False
+        self._runtime_context_capabilities[key] = updated
+        return True
+
+    def _record_runtime_user_fallback_success(
+        self,
+        *,
+        key: tuple[str, str],
+        generation: int,
+    ) -> None:
+        if generation != self._settings_generation:
+            return
+        current = self._runtime_context_capabilities.get(key)
+        if current is None or current.fallback_tier == 0:
+            return
+        self._runtime_context_capabilities[key] = replace(
+            current,
+            successful_user_fallback_calls=current.successful_user_fallback_calls + 1,
+        )
 
 
     def resolve_dialogue_params(self) -> tuple[float, dict[str, Any]]:
@@ -484,13 +592,18 @@ class OpenAICompatibleClient:
         _ = task
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
-        runtime_context_role = self._runtime_context_role
         request_model = self._resolve_request_model(messages)
+        request_generation = self._settings_generation
+        capability = self.runtime_context_capability(messages, model=request_model)
+        capability_key = capability.key
+        runtime_context_role = _runtime_context_role_for_capability(capability)
         payload = _build_chat_completion_payload(
             model=request_model,
-            system_prompt=system_prompt,
+            system_prompt=_system_prompt_with_runtime_context(
+                system_prompt, runtime_context, capability
+            ),
             messages=_messages_with_runtime_context(
-                messages, runtime_context, runtime_context_role
+                messages, runtime_context, capability
             ),
             temperature=temperature,
             chat_params=chat_params,
@@ -534,16 +647,29 @@ class OpenAICompatibleClient:
                 max_attempts=max_attempts,
             )
         except ApiRequestError as exc:
+            rejection = _classify_runtime_context_system_rejection(
+                exc,
+                runtime_message_index=_runtime_context_system_message_indices(
+                    payload["messages"], runtime_context
+                ),
+            )
             if (
                 runtime_context.strip()
-                and runtime_context_role == "system"
-                and _is_runtime_context_role_unsupported_error(exc)
+                and capability.fallback_tier < 2
+                and self._downgrade_runtime_context_capability(
+                    key=capability_key,
+                    generation=request_generation,
+                    rejection=rejection,
+                )
             ):
-                self._runtime_context_role = "user"
+                capability = self.runtime_context_capability(messages, model=request_model)
+                runtime_context_role = _runtime_context_role_for_capability(capability)
                 payload = _build_chat_completion_payload(
                     model=request_model,
-                    system_prompt=system_prompt,
-                    messages=_messages_with_runtime_context(messages, runtime_context, "user"),
+                    system_prompt=_system_prompt_with_runtime_context(
+                        system_prompt, runtime_context, capability
+                    ),
+                    messages=_messages_with_runtime_context(messages, runtime_context, capability),
                     temperature=temperature,
                     chat_params=chat_params,
                     base_url=self.settings.base_url,
@@ -577,6 +703,11 @@ class OpenAICompatibleClient:
             raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
 
         result = str(content).strip() if content else ""
+        if runtime_context.strip() and runtime_context_role == "user":
+            self._record_runtime_user_fallback_success(
+                key=capability_key,
+                generation=request_generation,
+            )
         usage = data.get("usage") if isinstance(data, dict) else None
         self._finish_payload_inspection(
             inspection,
@@ -603,16 +734,10 @@ class OpenAICompatibleClient:
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
         check_cancelled(cancel_checker)
         request_model = self._resolve_request_model(messages)
-        payload = _build_chat_completion_payload(
-            model=request_model,
-            system_prompt=system_prompt,
-            messages=_messages_with_runtime_context(
-                messages, runtime_context, self._runtime_context_role
-            ),
-            temperature=temperature,
-            chat_params={**chat_params, "stream": True},
-            base_url=self.settings.base_url,
-        )
+        request_generation = self._settings_generation
+        capability = self.runtime_context_capability(messages, model=request_model)
+        capability_key = capability.key
+        runtime_context_role = _runtime_context_role_for_capability(capability)
         debug_log(
             "API",
             "准备发送流式聊天补全请求",
@@ -621,68 +746,123 @@ class OpenAICompatibleClient:
                 "model": request_model,
                 "model_split_enabled": self.settings.model_split_enabled,
                 "temperature": temperature,
-                "message_count": len(payload["messages"]),
             },
         )
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        model_name = payload.get("model")
+        model_name = request_model
         self._emit_llm_event("llm.request.started", {"model": model_name})
-        try:
-            client = self._http_client()
-            with client.stream(
-                "POST",
-                "/chat/completions",
-                content=body,
-                headers={"Content-Type": "application/json"},
-                timeout=httpx.Timeout(
-                    self.settings.timeout_seconds,
-                    read=self.settings.timeout_seconds,
+        role_fallback_attempts = 0
+        while True:
+            check_cancelled(cancel_checker)
+            payload = _build_chat_completion_payload(
+                model=request_model,
+                system_prompt=_system_prompt_with_runtime_context(
+                    system_prompt, runtime_context, capability
                 ),
-            ) as response:
-                if response.status_code >= 400:
-                    error_body = response.read().decode("utf-8", errors="replace")
-                    raise ApiRequestError(
-                        _format_api_http_error(
-                            response.status_code, error_body, str(response.url)
+                messages=_messages_with_runtime_context(
+                    messages, runtime_context, capability
+                ),
+                temperature=temperature,
+                chat_params={**chat_params, "stream": True},
+                base_url=self.settings.base_url,
+            )
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            response_accepted = False
+            try:
+                client = self._http_client()
+                with client.stream(
+                    "POST",
+                    "/chat/completions",
+                    content=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=httpx.Timeout(
+                        self.settings.timeout_seconds,
+                        read=self.settings.timeout_seconds,
+                    ),
+                ) as response:
+                    if response.status_code >= 400:
+                        error_body = response.read().decode("utf-8", errors="replace")
+                        raise _api_request_error(
+                            response.status_code,
+                            error_body,
+                            str(response.url),
                         )
+                    response_accepted = True
+                    for line in response.iter_lines():
+                        check_cancelled(cancel_checker)
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            delta = chunk["choices"][0]["delta"]
+                        except (KeyError, IndexError, TypeError):
+                            continue
+                        delta_content = delta.get("content")
+                        if isinstance(delta_content, str) and delta_content:
+                            yield delta_content
+                        if include_reasoning:
+                            reasoning = delta.get("reasoning_content")
+                            if isinstance(reasoning, str) and reasoning:
+                                yield reasoning
+                break
+            except ApiRequestError as exc:
+                rejection = _classify_runtime_context_system_rejection(
+                    exc,
+                    runtime_message_index=_runtime_context_system_message_indices(
+                        payload["messages"], runtime_context
+                    ),
+                )
+                if (
+                    not response_accepted
+                    and runtime_context.strip()
+                    and role_fallback_attempts < 2
+                    and capability.fallback_tier < 2
+                    and self._downgrade_runtime_context_capability(
+                        key=capability_key,
+                        generation=request_generation,
+                        rejection=rejection,
                     )
-                for line in response.iter_lines():
+                ):
+                    role_fallback_attempts += 1
                     check_cancelled(cancel_checker)
-                    line = line.strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    try:
-                        delta = chunk["choices"][0]["delta"]
-                    except (KeyError, IndexError, TypeError):
-                        continue
-                    delta_content = delta.get("content")
-                    if isinstance(delta_content, str) and delta_content:
-                        yield delta_content
-                    if include_reasoning:
-                        reasoning = delta.get("reasoning_content")
-                        if isinstance(reasoning, str) and reasoning:
-                            yield reasoning
-        except (httpx.HTTPStatusError, httpx.ConnectError,
-                httpx.NetworkError, httpx.RemoteProtocolError,
-                httpx.ReadTimeout) as exc:
-            self._emit_llm_event(
-                "llm.request.failed",
-                {"model": model_name, "error": str(exc)},
+                    capability = self.runtime_context_capability(messages, model=request_model)
+                    runtime_context_role = _runtime_context_role_for_capability(capability)
+                    debug_log(
+                        "API",
+                        "流式端点拒绝非首位 system，已在握手阶段回退为 user 上下文",
+                        {"error": str(exc)},
+                    )
+                    continue
+                self._emit_llm_event(
+                    "llm.request.failed",
+                    {"model": model_name, "error": str(exc)},
+                )
+                raise
+            except (httpx.HTTPStatusError, httpx.ConnectError,
+                    httpx.NetworkError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout) as exc:
+                self._emit_llm_event(
+                    "llm.request.failed",
+                    {"model": model_name, "error": str(exc)},
+                )
+                raise ApiRequestError(f"API 流式请求失败：{exc}") from exc
+            except Exception:
+                self._emit_llm_event(
+                    "llm.request.failed",
+                    {"model": model_name, "error": "stream_error"},
+                )
+                raise
+        if runtime_context.strip() and runtime_context_role == "user":
+            self._record_runtime_user_fallback_success(
+                key=capability_key,
+                generation=request_generation,
             )
-            raise ApiRequestError(f"API 流式请求失败：{exc}") from exc
-        except Exception:
-            self._emit_llm_event(
-                "llm.request.failed",
-                {"model": model_name, "error": "stream_error"},
-            )
-            raise
         self._emit_llm_event("llm.request.finished", {"model": model_name})
 
     def complete_with_tools(
@@ -711,14 +891,19 @@ class OpenAICompatibleClient:
             chat_params["tool_choice"] = tool_choice
         if structured_response and "response_format" not in chat_params:
             chat_params["response_format"] = STRUCTURED_JSON_RESPONSE_FORMAT
-        runtime_context_role = self._runtime_context_role
+        request_model = self._resolve_request_model(messages)
+        request_generation = self._settings_generation
+        capability = self.runtime_context_capability(messages, model=request_model)
+        capability_key = capability.key
+        runtime_context_role = _runtime_context_role_for_capability(capability)
         request_messages = _messages_with_runtime_context(
-            messages, runtime_context, runtime_context_role
+            messages, runtime_context, capability
         )
-        request_model = self._resolve_request_model(request_messages)
         payload = _build_chat_completion_payload(
             model=request_model,
-            system_prompt=system_prompt,
+            system_prompt=_system_prompt_with_runtime_context(
+                system_prompt, runtime_context, capability
+            ),
             messages=request_messages,
             temperature=temperature,
             chat_params=chat_params,
@@ -755,17 +940,29 @@ class OpenAICompatibleClient:
                 cancel_checker=cancel_checker,
             )
         except ApiRequestError as exc:
+            rejection = _classify_runtime_context_system_rejection(
+                exc,
+                runtime_message_index=_runtime_context_system_message_indices(
+                    payload["messages"], runtime_context
+                ),
+            )
             if (
                 runtime_context.strip()
-                and runtime_context_role == "system"
-                and _is_runtime_context_role_unsupported_error(exc)
+                and capability.fallback_tier < 2
+                and self._downgrade_runtime_context_capability(
+                    key=capability_key,
+                    generation=request_generation,
+                    rejection=rejection,
+                )
             ):
-                self._runtime_context_role = "user"
-                runtime_context_role = "user"
+                capability = self.runtime_context_capability(messages, model=request_model)
+                runtime_context_role = _runtime_context_role_for_capability(capability)
                 payload = _build_chat_completion_payload(
                     model=request_model,
-                    system_prompt=system_prompt,
-                    messages=_messages_with_runtime_context(messages, runtime_context, "user"),
+                    system_prompt=_system_prompt_with_runtime_context(
+                        system_prompt, runtime_context, capability
+                    ),
+                    messages=_messages_with_runtime_context(messages, runtime_context, capability),
                     temperature=temperature,
                     chat_params=chat_params,
                     base_url=self.settings.base_url,
@@ -829,6 +1026,11 @@ class OpenAICompatibleClient:
                     "tool_count": len(tools or []),
                     "structured_response": structured_response,
                 },
+            )
+        if runtime_context.strip() and runtime_context_role == "user":
+            self._record_runtime_user_fallback_success(
+                key=capability_key,
+                generation=request_generation,
             )
         return ChatCompletionTurn(
             content=str(content or "").strip(),
@@ -1000,12 +1202,8 @@ class OpenAICompatibleClient:
                         status_code not in {429, 500, 502, 503, 504}
                         or attempt == attempts
                     ):
-                        raise ApiRequestError(
-                            _format_api_http_error(status_code, response_body, url)
-                        )
-                    last_error = ApiRequestError(
-                        _format_api_http_error(status_code, response_body, url)
-                    )
+                        raise _api_request_error(status_code, response_body, url)
+                    last_error = _api_request_error(status_code, response_body, url)
                 else:
                     debug_log(
                         "API",
@@ -1034,7 +1232,7 @@ class OpenAICompatibleClient:
                     },
                 )
                 if status_code not in {429, 500, 502, 503, 504} or attempt == attempts:
-                    raise ApiRequestError(_format_api_http_error(status_code, error_body, url)) from exc
+                    raise _api_request_error(status_code, error_body, url) from exc
                 last_error = exc
             except (httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 debug_log(
@@ -1192,6 +1390,33 @@ def _format_api_http_error(status_code: int, error_body: str, url: str) -> str:
     return f"API HTTP {status_code}: {error_body}"
 
 
+def _api_request_error(status_code: int, error_body: str, url: str) -> ApiRequestError:
+    error_message = ""
+    error_code = ""
+    error_param = ""
+    try:
+        payload = json.loads(error_body)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error_message = str(error.get("message") or "").strip()
+            error_code = str(error.get("code") or "").strip()
+            error_param = str(error.get("param") or "").strip()
+        elif isinstance(error, str):
+            error_message = error.strip()
+    elif error_body.strip():
+        error_message = error_body.strip()
+    return ApiRequestError(
+        _format_api_http_error(status_code, error_body, url),
+        status_code=status_code,
+        error_message=error_message,
+        error_code=error_code,
+        error_param=error_param,
+    )
+
+
 def _looks_like_google_ai_studio_auth_error(error_body: str, url: str) -> bool:
     parsed = urlparse(url)
     if parsed.netloc.lower() != "generativelanguage.googleapis.com":
@@ -1271,28 +1496,164 @@ def _build_chat_completion_payload(
 def _messages_with_runtime_context(
     messages: list[ChatMessage],
     runtime_context: str,
-    role: str,
+    role: str | RuntimeContextCapability,
 ) -> list[ChatMessage]:
     if not runtime_context.strip():
         return [*messages]
     content = runtime_context.strip()
-    if role == "user":
-        content = (
-            "[Sakura runtime context; system-provided facts, not a user request]\n"
-            + content
+    facts, now, has_slots = _split_runtime_context_slots(content)
+    if not has_slots:
+        role_name = _runtime_context_role_for_capability(role) if isinstance(role, RuntimeContextCapability) else role
+        if role_name == "user":
+            content = RUNTIME_CONTEXT_USER_PREFIX + content
+        return [*messages, {"role": role_name, "content": content}]
+
+    fallback_tier = role.fallback_tier if isinstance(role, RuntimeContextCapability) else (0 if role == "system" else 1)
+    assembled = [*messages]
+    insert_at = next(
+        (
+            index
+            for index in range(len(assembled) - 1, -1, -1)
+            if assembled[index].get("role") == "user"
+            and not str(assembled[index].get("content") or "").startswith(RUNTIME_CONTEXT_USER_PREFIX)
+        ),
+        len(assembled),
+    )
+    if facts:
+        facts_role = "system" if fallback_tier == 0 else "user"
+        facts_content = facts
+        if facts_role == "user":
+            facts_content = RUNTIME_CONTEXT_USER_PREFIX + facts_content
+        assembled.insert(insert_at, {"role": facts_role, "content": facts_content})
+    if now and fallback_tier < 2:
+        assembled.append({"role": "system", "content": now})
+    return assembled
+
+
+def _system_prompt_with_runtime_context(
+    system_prompt: str,
+    runtime_context: str,
+    capability: RuntimeContextCapability,
+) -> str:
+    if capability.fallback_tier != 2:
+        return system_prompt
+    _facts, now, has_slots = _split_runtime_context_slots(runtime_context)
+    if not has_slots or not now:
+        return system_prompt
+    return "\n\n".join(part for part in (system_prompt.strip(), now) if part)
+
+
+def _split_runtime_context_slots(runtime_context: str) -> tuple[str, str, bool]:
+    from app.llm.prompts.runtime import RUNTIME_FACTS_SLOT_MARKER, RUNTIME_NOW_SLOT_MARKER
+
+    content = runtime_context.strip()
+    facts_at = content.find(RUNTIME_FACTS_SLOT_MARKER)
+    now_at = content.find(RUNTIME_NOW_SLOT_MARKER)
+    if facts_at < 0 or now_at < 0 or facts_at >= now_at:
+        return content, "", False
+    facts_body = content[facts_at + len(RUNTIME_FACTS_SLOT_MARKER) : now_at].strip()
+    now_body = content[now_at + len(RUNTIME_NOW_SLOT_MARKER) :].strip()
+    facts = content[facts_at:now_at].strip() if facts_body else ""
+    now = content[now_at:].strip() if now_body else ""
+    return facts, now, True
+
+
+def _runtime_context_capability_key(base_url: str, model: str) -> tuple[str, str]:
+    normalized = _normalize_openai_base_url(base_url)
+    parsed = urlparse(normalized)
+    endpoint = urlunparse(
+        parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
         )
-    return [*messages, {"role": role, "content": content}]
+    ).rstrip("/")
+    return endpoint, model.strip()
+
+
+def _runtime_context_role_for_capability(capability: RuntimeContextCapability) -> str:
+    return "system" if capability.fallback_tier == 0 else "user"
+
+
+def _runtime_context_system_message_indices(
+    messages: list[ChatMessage],
+    runtime_context: str,
+) -> frozenset[int]:
+    """返回当前 wire payload 中由 runtime context 产生的非首位 system 索引。"""
+
+    from app.llm.prompts.runtime import RUNTIME_FACTS_SLOT_MARKER, RUNTIME_NOW_SLOT_MARKER
+
+    content = runtime_context.strip()
+    if not content:
+        return frozenset()
+    facts, now, has_slots = _split_runtime_context_slots(content)
+    runtime_slots = {slot for slot in (facts, now) if slot}
+    indices: set[int] = set()
+    for index, message in enumerate(messages):
+        if index == 0 or message.get("role") != "system":
+            continue
+        message_content = str(message.get("content") or "").strip()
+        if has_slots:
+            if message_content in runtime_slots:
+                indices.add(index)
+        elif message_content == content:
+            indices.add(index)
+    return frozenset(indices)
+
+
+_MESSAGE_INDEX_PATTERN = re.compile(r"messages(?:\[|\.)(\d+)(?:\])?", re.IGNORECASE)
+_NONINITIAL_SYSTEM_PATTERNS = (
+    re.compile(r"system\s+(?:message|messages|role).*\bmust\s+(?:be|appear)\s+first\b"),
+    re.compile(r"\bonly\s+one\s+system\s+message\b.*\ballowed\b"),
+    re.compile(r"system\s+(?:message|messages|role).*\bonly\b.*\bbeginning\b"),
+    re.compile(r"system\s+(?:message|messages|role).*\bnot\s+allowed\b.*\bafter\b"),
+)
+_MID_SYSTEM_PATTERNS = (
+    re.compile(
+        r"system\s+(?:message|messages|role).*\bnot\s+allowed\b.*"
+        r"(?:\bmiddle\b|\bmid[- ]array\b|\bbetween\b)"
+    ),
+    re.compile(
+        r"(?:\bmiddle\b|\bmid[- ]array\b|\bbetween\b).*"
+        r"system\s+(?:message|messages|role).*\bnot\s+allowed\b"
+    ),
+)
+
+
+def _classify_runtime_context_system_rejection(
+    exc: ApiRequestError,
+    *,
+    runtime_message_index: int | Collection[int],
+) -> RuntimeContextSystemRejection:
+    if exc.status_code not in {400, 422}:
+        return RuntimeContextSystemRejection.NONE
+    text = " ".join(str(exc.error_message or "").lower().split())
+    if not text:
+        return RuntimeContextSystemRejection.NONE
+    indexed_text = f"{exc.error_param} {text}"
+    referenced_indices = {
+        int(match.group(1)) for match in _MESSAGE_INDEX_PATTERN.finditer(indexed_text)
+    }
+    runtime_indices = (
+        {runtime_message_index}
+        if isinstance(runtime_message_index, int)
+        else {int(index) for index in runtime_message_index}
+    )
+    if not runtime_indices:
+        return RuntimeContextSystemRejection.NONE
+    if referenced_indices.isdisjoint(runtime_indices) and referenced_indices:
+        return RuntimeContextSystemRejection.NONE
+    if any(pattern.search(text) for pattern in _NONINITIAL_SYSTEM_PATTERNS):
+        return RuntimeContextSystemRejection.NONINITIAL_SYSTEM_REJECTED
+    if any(pattern.search(text) for pattern in _MID_SYSTEM_PATTERNS):
+        return RuntimeContextSystemRejection.MID_SYSTEM_REJECTED
+    return RuntimeContextSystemRejection.NONE
 
 
 def _is_runtime_context_role_unsupported_error(exc: ApiRequestError) -> bool:
-    text = str(exc).lower()
-    role_markers = ("system", "role", "messages")
-    rejection_markers = (
-        "unsupported", "not support", "invalid", "must be first",
-        "only one", "not allowed", "unexpected", "order",
-    )
-    return any(marker in text for marker in role_markers) and any(
-        marker in text for marker in rejection_markers
+    """兼容旧调用方；没有消息位置时只接受无索引的明确拒绝。"""
+    return (
+        _classify_runtime_context_system_rejection(exc, runtime_message_index=-1)
+        != RuntimeContextSystemRejection.NONE
     )
 
 
