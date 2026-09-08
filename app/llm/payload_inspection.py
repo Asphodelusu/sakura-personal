@@ -14,9 +14,18 @@ from app.llm.prompts.runtime import estimate_prompt_tokens
 ESTIMATED_IMAGE_PART_TOKENS = 28_000
 
 KNOWN_REQUEST_PURPOSES = frozenset(
-    {"initial", "tool_step", "semantic_compose", "structural_repair"}
+    {
+        "initial",
+        "tool_step",
+        "semantic_compose",
+        "structural_repair",
+        "subtitle_translation",
+        "subtitle_translation_retry",
+    }
 )
-_RUNTIME_USER_PREFIX = "[Sakura runtime context; system-provided facts, not a user request]\n"
+RUNTIME_CONTEXT_USER_PREFIX = (
+    "[Sakura runtime context; system-provided facts, not a user request]\n"
+)
 
 
 @dataclass(frozen=True)
@@ -151,21 +160,75 @@ def _message_content_text(message: Mapping[str, Any] | None) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-def _split_runtime_message(
+def _split_runtime_slots(runtime_context: str) -> tuple[str, str, bool]:
+    from app.llm.prompts.runtime import RUNTIME_FACTS_SLOT_MARKER, RUNTIME_NOW_SLOT_MARKER
+
+    cleaned = str(runtime_context or "").strip()
+    facts_at = cleaned.find(RUNTIME_FACTS_SLOT_MARKER)
+    now_at = cleaned.find(RUNTIME_NOW_SLOT_MARKER)
+    if facts_at < 0 or now_at < 0 or facts_at >= now_at:
+        return cleaned, "", False
+    facts_body = cleaned[facts_at + len(RUNTIME_FACTS_SLOT_MARKER) : now_at].strip()
+    now_body = cleaned[now_at + len(RUNTIME_NOW_SLOT_MARKER) :].strip()
+    facts = cleaned[facts_at:now_at].strip() if facts_body else ""
+    now = cleaned[now_at:].strip() if now_body else ""
+    return facts, now, True
+
+
+def _take_matching_runtime_message(
+    messages: list[Any],
+    expected: str,
+) -> tuple[list[Any], Mapping[str, Any] | None]:
+    if not expected:
+        return messages, None
+    wrapped = (RUNTIME_CONTEXT_USER_PREFIX + expected).strip()
+    for index, item in enumerate(messages):
+        message = item if isinstance(item, Mapping) else None
+        if _message_content_text(message) not in {expected, wrapped}:
+            continue
+        return [*messages[:index], *messages[index + 1 :]], message
+    return messages, None
+
+
+def _split_runtime_messages(
     messages: list[Any],
     runtime_context: str,
-) -> tuple[list[Any], Mapping[str, Any] | None, bool]:
+) -> tuple[
+    Mapping[str, Any] | None,
+    list[Any],
+    Mapping[str, Any] | None,
+    Mapping[str, Any] | None,
+    bool,
+]:
     cleaned = str(runtime_context or "").strip()
+    first = messages[0] if messages and isinstance(messages[0], Mapping) else None
+    system_message = first if first is not None and first.get("role") == "system" else None
+    remainder = messages[1:] if system_message is not None else list(messages)
     if not cleaned:
-        return list(messages), None, True
-    if not messages:
-        return [], None, False
-    last = messages[-1] if isinstance(messages[-1], Mapping) else None
-    last_text = _message_content_text(last)
-    wrapped = (_RUNTIME_USER_PREFIX + cleaned).strip()
-    if last is not None and last_text in {cleaned, wrapped}:
-        return list(messages[:-1]), last, True
-    return list(messages), None, False
+        return system_message, remainder, None, None, True
+
+    facts, now, has_slots = _split_runtime_slots(cleaned)
+    if not has_slots:
+        conversation, runtime_message = _take_matching_runtime_message(remainder, cleaned)
+        return system_message, conversation, runtime_message, None, runtime_message is not None
+
+    cleaned_system = system_message
+    now_message: Mapping[str, Any] | None = None
+    if system_message is not None:
+        system_text = _message_content_text(system_message)
+        suffix = "\n\n" + now
+        if system_text == now or system_text.endswith(suffix):
+            static_text = "" if system_text == now else system_text[: -len(suffix)].rstrip()
+            cleaned_system = {**dict(system_message), "content": static_text}
+            now_message = {"role": "system", "content": now}
+
+    conversation, facts_message = _take_matching_runtime_message(remainder, facts)
+    conversation, trailing_now = _take_matching_runtime_message(conversation, now)
+    if now_message is None:
+        now_message = trailing_now
+    facts_clear = not facts or facts_message is not None
+    now_clear = not now or now_message is not None
+    return cleaned_system, conversation, facts_message, now_message, facts_clear and now_clear
 
 
 def inspect_chat_payload(
@@ -182,11 +245,14 @@ def inspect_chat_payload(
     usage: Mapping[str, Any] | None = None,
 ) -> PayloadInspection:
     messages = list(payload.get("messages") or [])
-    first = messages[0] if messages and isinstance(messages[0], Mapping) else None
-    system_message = first if first is not None and first.get("role") == "system" else None
-    remainder = messages[1:] if system_message is not None else list(messages)
-    conversation, runtime_message, runtime_clear = _split_runtime_message(
-        remainder, runtime_context
+    (
+        system_message,
+        conversation,
+        runtime_facts_message,
+        runtime_now_message,
+        runtime_clear,
+    ) = _split_runtime_messages(
+        messages, runtime_context
     )
     image_parts = _count_image_parts(messages)
     if image_parts:
@@ -231,16 +297,35 @@ def inspect_chat_payload(
             stable_bytes = len(prefix)
             stable_hash = hashlib.sha256(prefix).hexdigest()
 
+    runtime_values = [
+        value
+        for value in (runtime_facts_message, runtime_now_message)
+        if value is not None
+    ]
     partitions: dict[str, PayloadPartition | None] = {
         "system": _partition_from_value(system_message or ""),
         "messages": _partition_from_value(conversation),
         "runtime": (
             None
             if not runtime_clear
+            else (_empty_partition() if not runtime_values else _partition_from_value(runtime_values))
+        ),
+        "runtime_facts": (
+            None
+            if not runtime_clear
             else (
                 _empty_partition()
-                if runtime_message is None
-                else _partition_from_value(runtime_message)
+                if runtime_facts_message is None
+                else _partition_from_value(runtime_facts_message)
+            )
+        ),
+        "runtime_now": (
+            None
+            if not runtime_clear
+            else (
+                _empty_partition()
+                if runtime_now_message is None
+                else _partition_from_value(runtime_now_message)
             )
         ),
         "tools": _partition_from_value(payload.get("tools") or []),

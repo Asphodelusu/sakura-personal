@@ -78,3 +78,5 @@ def test_init_and_character_switch_wire_b_without_qt() -> None:
     assert "_restart_proactive_observer" in text
     assert "set_relationship_guide" in text
     assert "build_continuity_context" in text
+    assert "set_relationship_drive_provider" in text
+    assert "relationship_drive_summary(fresh=True)" in text

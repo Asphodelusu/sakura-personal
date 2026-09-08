@@ -3,10 +3,12 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import sys
 from collections.abc import Iterable
 from typing import Any
 
 from tests.support.pyside6_stub import install_pyside6_stub_if_missing, is_pyside6_stub_active
+from tests.support.production_data_guard import ProductionDataWriteGuard
 
 install_pyside6_stub_if_missing()
 
@@ -15,6 +17,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYTEST_QT_API", "pyside6")
+
+
+_PRODUCTION_DATA_WRITE_GUARD = ProductionDataWriteGuard(
+    Path(__file__).resolve().parents[1] / "data"
+)
+sys.addaudithook(_PRODUCTION_DATA_WRITE_GUARD.audit)
 
 
 _THREAD_ATTR_NAMES = (
@@ -82,6 +90,62 @@ def isolate_runtime_file_log(
     )
     yield
     _close_file_logger_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_memory_store_base_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep implicit ``MemoryStore()`` roots out of the checkout's data tree."""
+    import app.agent.memory as memory_module
+
+    original_resolve_base_dir = memory_module._resolve_base_dir
+
+    def _resolve_test_base_dir(base_dir: Path | None) -> Path:
+        if base_dir is None:
+            return tmp_path / "sakura-test-runtime"
+        return original_resolve_base_dir(base_dir)
+
+    monkeypatch.setattr(memory_module, "_resolve_base_dir", _resolve_test_base_dir)
+
+
+@pytest.fixture(autouse=True)
+def isolate_checkout_plugin_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Load real checkout plugins without creating their production data dirs."""
+    from app.storage.paths import StoragePaths
+
+    checkout_root = Path(__file__).resolve().parents[1]
+    original_plugin_data_for = StoragePaths.plugin_data_for
+
+    def _plugin_data_for(paths: StoragePaths, plugin_id: str) -> Path:
+        if paths.base_dir.resolve() == checkout_root:
+            isolated_paths = StoragePaths(tmp_path / "sakura-test-runtime")
+            return original_plugin_data_for(isolated_paths, plugin_id)
+        return original_plugin_data_for(paths, plugin_id)
+
+    monkeypatch.setattr(StoragePaths, "plugin_data_for", _plugin_data_for)
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_tts_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep provider-created TTS cache files out of production data."""
+    import app.voice.tts as tts_module
+
+    original_resolve_project_root = tts_module._resolve_project_root
+
+    def _resolve_test_project_root(base_dir: Path | None = None) -> Path:
+        if base_dir is None:
+            return tmp_path / "sakura-test-runtime"
+        return original_resolve_project_root(base_dir)
+
+    monkeypatch.setattr(tts_module, "_resolve_project_root", _resolve_test_project_root)
 
 
 @pytest.fixture(autouse=True)

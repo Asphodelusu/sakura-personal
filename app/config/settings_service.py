@@ -651,6 +651,25 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_relationship_drive_settings(self):
+        from app.config.relationship_drive import settings_from_mapping
+
+        return settings_from_mapping(self._system_section("relationship_drive"))
+
+    def save_relationship_drive_settings(self, settings) -> None:
+        from app.config.relationship_drive import RelationshipDriveSettings
+
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, RelationshipDriveSettings)
+            else RelationshipDriveSettings().normalized()
+        )
+        data = load_yaml_mapping(self.system_config_path)
+        section = _mapping(data.get("relationship_drive"))
+        section["enabled"] = bool(normalized.enabled)
+        data["relationship_drive"] = section
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_relationship_initiative_settings(self):
         from app.config.relationship_initiative import settings_from_mapping
 
@@ -683,6 +702,9 @@ class AppSettingsService:
             enabled=_bool_value(section.get("enabled"), False),
             gate_timeout_seconds=_int_value(section.get("gate_timeout_seconds"), 6),
             max_attempts=_int_value(section.get("max_attempts"), 2),
+            validator_mode=str(section.get("validator_mode") or "v2"),
+            request_shape=str(section.get("request_shape") or "serial"),
+            late_patch_grace_ms=_int_value(section.get("late_patch_grace_ms"), 1200),
         ).normalized()
 
     def save_translation_settings(self, settings) -> None:
@@ -694,11 +716,14 @@ class AppSettingsService:
             else TranslationSettings().normalized()
         )
         data = load_yaml_mapping(self.system_config_path)
-        data["translation"] = {
-            "enabled": bool(normalized.enabled),
-            "gate_timeout_seconds": int(normalized.gate_timeout_seconds),
-            "max_attempts": int(normalized.max_attempts),
-        }
+        section = _mapping(data.get("translation"))
+        section["enabled"] = bool(normalized.enabled)
+        section["gate_timeout_seconds"] = int(normalized.gate_timeout_seconds)
+        section["max_attempts"] = int(normalized.max_attempts)
+        section["validator_mode"] = str(normalized.validator_mode)
+        section["request_shape"] = str(normalized.request_shape)
+        section["late_patch_grace_ms"] = int(normalized.late_patch_grace_ms)
+        data["translation"] = section
         save_yaml_mapping(self.system_config_path, data)
 
     def load_backchannel_settings(self) -> BackchannelSettings:

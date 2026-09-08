@@ -4,7 +4,10 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.core.relational_drive import DriveEffect
 
 
 DEFAULT_TONE = "中性"
@@ -53,6 +56,7 @@ class ChatSegment:
 @dataclass(frozen=True)
 class ChatReply:
     segments: list[ChatSegment]
+    drive_effect: DriveEffect | None = None
 
     @property
     def text(self) -> str:
@@ -172,6 +176,80 @@ def structural_repair_is_faithful(
     return True
 
 
+def canonicalize_structural_repair(
+    original: str,
+    repaired: str,
+    *,
+    allowed_tones: list[str] | tuple[str, ...] | None = None,
+    allowed_portraits: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str | None, str]:
+    """校验结构修复并重建最小可信 JSON；失败时返回脱敏原因码。"""
+
+    original_units = extract_adoptable_japanese_units(original)
+    if not original_units:
+        return None, "source_unusable"
+
+    data, _repaired = _try_load_json(str(repaired or ""))
+    if not isinstance(data, dict):
+        return None, "invalid_json"
+
+    parsed = parse_chat_reply_result(repaired)
+    if parsed.needs_retry:
+        return None, parsed.reason or "invalid_segments"
+    segments = [segment for segment in parsed.reply.segments if segment.text.strip()]
+    if not segments:
+        return None, "invalid_segments"
+
+    original_text = normalize_japanese_text("".join(original_units))
+    repaired_text = normalize_japanese_text("".join(segment.text for segment in segments))
+    if original_text != repaired_text:
+        return None, "japanese_changed"
+
+    tones = {str(item).strip() for item in (allowed_tones or []) if str(item).strip()}
+    portraits = {
+        str(item).strip() for item in (allowed_portraits or []) if str(item).strip()
+    }
+    for segment in segments:
+        tone = segment.tone.strip()
+        portrait = segment.portrait.strip()
+        if tones and tone and tone not in tones:
+            return None, "tone_not_allowed"
+        if portraits and portrait and portrait not in portraits:
+            return None, "portrait_not_allowed"
+
+    canonical = json.dumps(
+        {
+            "segments": [
+                {
+                    "ja": segment.text.strip(),
+                    "zh": "",
+                    "tone": segment.tone.strip() or DEFAULT_TONE,
+                    "portrait": segment.portrait.strip(),
+                }
+                for segment in segments
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if not structural_repair_is_faithful(
+        original,
+        canonical,
+        allowed_tones=allowed_tones,
+        allowed_portraits=allowed_portraits,
+    ):
+        return None, "canonical_validation_failed"
+    return canonical, ""
+
+
+def _optional_drive_effect(data: dict[str, Any]):
+    from app.core.relational_drive import parse_drive_effect
+
+    if "drive_effect" not in data:
+        return None
+    return parse_drive_effect(data.get("drive_effect"))
+
+
 def parse_chat_reply(content: str) -> ChatReply:
     """解析模型返回；坏结构化回复会降级成安全提示，避免原文泄到 UI。"""
     return parse_chat_reply_result(content).reply
@@ -201,7 +279,10 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
         segments, has_language_issue = _parse_segments(data)
         if segments:
             return ChatReplyParseResult(
-                ChatReply(_normalize_malformed_segments(segments)),
+                ChatReply(
+                    _normalize_malformed_segments(segments),
+                    drive_effect=_optional_drive_effect(data),
+                ),
                 ok=not has_language_issue,
                 needs_retry=has_language_issue,
                 repaired=repaired,
@@ -379,7 +460,11 @@ def sanitize_reply_tones(reply: ChatReply, allowed_tones: list[str] | None) -> C
             changed = True
         else:
             new_segments.append(segment)
-    return ChatReply(new_segments) if changed else reply
+    return (
+        ChatReply(segments=new_segments, drive_effect=reply.drive_effect)
+        if changed
+        else reply
+    )
 
 
 def _parse_segments(data: dict[str, Any]) -> tuple[list[ChatSegment], bool]:

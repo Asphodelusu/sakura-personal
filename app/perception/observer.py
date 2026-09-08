@@ -24,6 +24,11 @@ import httpx
 from loguru import logger
 
 from app.core.debug_log import debug_log
+from app.llm.prompts.blocks import (
+    extract_character_identity_anchor,
+    select_character_behavior_core,
+    select_relationship_guide_core_sections,
+)
 from app.perception.privacy import PrivacyGuard
 from app.perception.proactive_config import ProactiveConfig
 from app.perception.screen_capture import ScreenCapture
@@ -913,6 +918,8 @@ class ProactiveObserver:
         self._chat_api_key = chat_api_key
         self._chat_api_model = chat_api_model
         self._system_prompt = system_prompt
+        self._identity_anchor = extract_character_identity_anchor(system_prompt)
+        self._behavior_core = select_character_behavior_core(system_prompt)
         self._speech_decision_configured = bool(chat_api_base_url and chat_api_key and chat_api_model)
         self.config = config or ProactiveConfig()
         self.privacy = privacy or PrivacyGuard()
@@ -981,6 +988,7 @@ class ProactiveObserver:
         self.relationship = relationship or RelationshipInitiativeSettings(proactive_enabled=False)
         self._relationship_guide = ""
         self._get_relationship_facts: Callable[[], str] = lambda: ""
+        self._get_relationship_drive: Callable[[], str] = lambda: ""
         self._last_relationship_spoken_at = 0.0
         self._last_relationship_silent_at = 0.0
         self._relationship_silence_streak = 0
@@ -1166,6 +1174,9 @@ class ProactiveObserver:
 
     def set_relationship_facts_provider(self, provider: Callable[[], str]) -> None:
         self._get_relationship_facts = provider
+
+    def set_relationship_drive_provider(self, provider: Callable[[], str]) -> None:
+        self._get_relationship_drive = provider
 
     def bump_relationship_generation(self) -> None:
         self._relationship_generation += 1
@@ -1578,18 +1589,24 @@ class ProactiveObserver:
         await self._do_relationship_evaluation()
 
     async def _decide_relationship_speech(self) -> dict | None:
-        from app.config.relationship_initiative import (
-            expression_bias_guidance,
-            relationship_decision_instruction,
-        )
+        from app.config.relationship_initiative import relationship_decision_instruction
 
         bias = str(getattr(self.relationship, "expression_bias", "") or "natural")
         instruction = relationship_decision_instruction(bias)
-        system_prompt = (
-            (self._system_prompt.strip() + "\n\n" + instruction)
-            if self._system_prompt.strip()
-            else instruction
+        guide = self._role_admission_layers(
+            *(
+                body
+                for _, body in select_relationship_guide_core_sections(
+                    self._relationship_guide
+                )
+            )
         )
+        persona = self._role_admission_layers(
+            self._identity_anchor,
+            self._behavior_core,
+            guide,
+        )
+        system_prompt = (persona + "\n\n" + instruction) if persona else instruction
 
         now_local = datetime.now().astimezone().isoformat(timespec="seconds")
         since_user = max(0, int(time.monotonic() - self._last_user_at))
@@ -1597,10 +1614,6 @@ class ProactiveObserver:
             f"[当前时间]\n{now_local}",
             f"[距上次互动]\n{since_user}s",
         ]
-        guide = (self._relationship_guide or "").strip()
-        if guide:
-            parts.append(f"[关系指南]\n{guide}")
-        parts.append(expression_bias_guidance(bias))
         try:
             chat_ctx = self._get_recent_history()
             if chat_ctx:
@@ -1611,6 +1624,12 @@ class ProactiveObserver:
             facts = self._get_relationship_facts()
             if facts:
                 parts.append(facts)
+        except Exception:
+            pass
+        try:
+            drive_summary = str(self._get_relationship_drive() or "").strip()
+            if drive_summary:
+                parts.append(f"[当前亲近倾向]\n{drive_summary}")
         except Exception:
             pass
         self._append_exchange_context(parts)
@@ -1948,9 +1967,10 @@ class ProactiveObserver:
         if not self._speech_decision_configured:
             return None
 
+        persona = self._role_admission_layers(self._identity_anchor, self._behavior_core)
         system_prompt = (
-            (self._system_prompt.strip() + _SPEECH_DECISION_INSTRUCTION)
-            if self._system_prompt.strip()
+            (persona + _SPEECH_DECISION_INSTRUCTION)
+            if persona
             else _SPEECH_DECISION_INSTRUCTION.lstrip()
         )
 
@@ -2552,10 +2572,14 @@ class ProactiveObserver:
             lines.append(line)
         return "\n".join(lines)
 
+    def _role_admission_layers(self, *parts: str) -> str:
+        return "\n\n".join(part.strip() for part in parts if str(part or "").strip())
+
     def _build_full_system_prompt(self) -> str:
         parts = []
-        if self._system_prompt.strip():
-            parts.append(self._system_prompt.strip())
+        anchor = (self._identity_anchor or "").strip()
+        if anchor:
+            parts.append(anchor)
         parts.append(_PROACTIVE_SYSTEM_PROMPT)
         return "\n\n---\n\n".join(parts)
 

@@ -33,6 +33,9 @@ ACTION_READING_HOLD_PER_CHAR_MS = 40
 ACTION_READING_HOLD_MIN_MS = 720
 ACTION_READING_HOLD_MAX_MS = 1200
 ACTION_TRANSLATION_DEADLINE_MS = 12_000
+LATE_PATCH_GRACE_MS = 1200
+TRANSLATION_INDEX_RESOLVED_ZH = "resolved_zh"
+TRANSLATION_INDEX_RESOLVED_JA = "resolved_ja"
 DIALOGUE_DWELL_BASE_MS = 500
 DIALOGUE_DWELL_PER_CHAR_MS = 80
 DIALOGUE_DWELL_MIN_MS = 1000
@@ -114,6 +117,11 @@ class SubtitleController(QObject):
         self._translation_gate_interaction_id = ""
         self._translation_in_flight = False
         self._translation_deadline_generation = 0
+        self.current_segment_index: int | None = None
+        self._next_reply_segment_index = 0
+        self.late_patch_grace_ms = LATE_PATCH_GRACE_MS
+        self._translation_index_state: dict[int, str] = {}
+        self._ja_committed_at: dict[int, float] = {}
         self._action_translation_deadline_token = 0
         self._translation_gate_timer = QTimer(self)
         self._translation_gate_timer.setSingleShot(True)
@@ -391,6 +399,7 @@ class SubtitleController(QObject):
     def reset_current_segment_progress(self) -> None:
         self.voice_playback.discard_prepared()
         self.current_segment = None
+        self.current_segment_index = None
         self.reply_advance_token += 1
         self.current_segment_sequence_id = None
         self.current_segment_speech_done = False
@@ -401,6 +410,7 @@ class SubtitleController(QObject):
 
     def _start_reply_segments_now(self, segments: list[ChatSegment]) -> None:
         self.reply_sequence_id += 1
+        self._next_reply_segment_index = 0
         self.pending_reply_segments = segments
         self._log_stage(
             "reply_segments_ready",
@@ -425,6 +435,8 @@ class SubtitleController(QObject):
             return
 
         segment = self.pending_reply_segments.pop(0)
+        self.current_segment_index = self._next_reply_segment_index
+        self._next_reply_segment_index += 1
         debug_log(
             "PetWindow",
             "展示下一段回复",
@@ -586,6 +598,8 @@ class SubtitleController(QObject):
         interaction_id: str = "",
     ) -> None:
         """在中文字幕后补完成前挡住日语展示；超时后回退日语以免卡死。"""
+        self._translation_index_state.clear()
+        self._ja_committed_at.clear()
         self._translation_gate_active = True
         self._translation_in_flight = True
         self._translation_gate_interaction_id = str(interaction_id or "")
@@ -603,17 +617,26 @@ class SubtitleController(QObject):
             },
         )
 
-    def release_translation_gate(self, *, fallback: bool = False) -> None:
+    def release_translation_gate(
+        self,
+        *,
+        fallback: bool = False,
+        preserve_in_flight: bool = False,
+    ) -> None:
         """结束门闩。fallback=True 时展示日语回退并放行分段推进。"""
         was_active = self._translation_gate_active
         was_in_flight = self._translation_in_flight
-        self._clear_translation_lifecycle()
+        self._clear_translation_gate()
         if not fallback:
             if was_active or was_in_flight:
                 self._log_stage("translation_gate_released", {"fallback": False})
             return
+        if not preserve_in_flight:
+            self._clear_translation_in_flight()
         if self.current_segment is None:
             return
+        if self.current_segment_index is not None:
+            self._ja_committed_at.setdefault(self.current_segment_index, time.monotonic())
         self._log_stage("translation_gate_released", {"fallback": True})
         self.set_speech(
             self.current_segment.display_text(self.subtitle_language),
@@ -636,6 +659,86 @@ class SubtitleController(QObject):
     def _clear_translation_lifecycle(self) -> None:
         self._clear_translation_gate()
         self._clear_translation_in_flight()
+        self._translation_index_state.clear()
+        self._ja_committed_at.clear()
+
+    def is_translation_index_terminal(self, segment_index: int | None) -> bool:
+        if segment_index is None:
+            return False
+        return self._translation_index_state.get(segment_index) in {
+            TRANSLATION_INDEX_RESOLVED_ZH,
+            TRANSLATION_INDEX_RESOLVED_JA,
+        }
+
+    def consume_index_success(
+        self,
+        segment_index: int,
+        updated: ChatSegment,
+        *,
+        is_current: bool | None = None,
+    ) -> str:
+        if self.is_translation_index_terminal(segment_index):
+            return "ignored"
+        current_match = self.current_segment_index == segment_index
+        if is_current is not None:
+            current_match = bool(is_current)
+        if not current_match:
+            self._translation_index_state[segment_index] = TRANSLATION_INDEX_RESOLVED_ZH
+            return "history_only"
+        was_held = self._should_hold_chinese_display()
+        ja_committed = segment_index in self._ja_committed_at
+        self._translation_index_state[segment_index] = TRANSLATION_INDEX_RESOLVED_ZH
+        self.current_segment = updated
+        if was_held or not ja_committed:
+            self.release_translation_gate(fallback=False)
+            self._reveal_translated_current(updated)
+            return "revealed"
+        if self._within_late_patch_grace(segment_index):
+            self._reveal_translated_current(updated)
+            return "replaced"
+        return "history_only"
+
+    def consume_index_failure(
+        self,
+        segment_index: int,
+        *,
+        is_current: bool | None = None,
+    ) -> str:
+        if self.is_translation_index_terminal(segment_index):
+            return "ignored"
+        self._translation_index_state[segment_index] = TRANSLATION_INDEX_RESOLVED_JA
+        current_match = self.current_segment_index == segment_index
+        if is_current is not None:
+            current_match = bool(is_current)
+        if not current_match:
+            return "queued_only"
+        self.release_translation_gate(fallback=True, preserve_in_flight=True)
+        return "released_ja"
+
+    def finish_translation_batch(self) -> None:
+        self._clear_translation_in_flight()
+
+    def _reveal_translated_current(self, updated: ChatSegment) -> None:
+        if self.subtitle_language != "zh":
+            return
+        display = updated.display_text("zh")
+        if not display.strip():
+            return
+        if self.speech_timer.isActive():
+            self.speech_text = " ".join(display.split())
+            if self.speech_index <= 0:
+                self.set_speech(display, pulse=False)
+            return
+        self.set_speech(display, pulse=False, instant=True)
+
+    def _within_late_patch_grace(self, segment_index: int) -> bool:
+        grace = int(getattr(self, "late_patch_grace_ms", LATE_PATCH_GRACE_MS) or 0)
+        if grace <= 0:
+            return False
+        committed = self._ja_committed_at.get(segment_index)
+        if committed is None:
+            return True
+        return (time.monotonic() - committed) * 1000 < grace
 
     def _stop_hold_and_dwell_timers(self) -> None:
         if self._action_reading_hold_timer.isActive():
@@ -662,6 +765,10 @@ class SubtitleController(QObject):
             _is_silent_visible_action(self.current_segment)
             and not self.current_segment_speech_done
         ):
+            if self.current_segment_index is not None:
+                self._translation_index_state[self.current_segment_index] = (
+                    TRANSLATION_INDEX_RESOLVED_JA
+                )
             self.release_translation_gate(fallback=True)
             return
         self._clear_translation_in_flight()
@@ -673,6 +780,8 @@ class SubtitleController(QObject):
         if segment is None:
             return False
         if str(segment.translation or "").strip():
+            return False
+        if self.is_translation_index_terminal(self.current_segment_index):
             return False
         if _is_silent_visible_action(segment):
             return self._translation_in_flight

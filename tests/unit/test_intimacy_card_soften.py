@@ -21,6 +21,8 @@ def test_soften_keeps_guards_and_focus_overlay() -> None:
     assert "夜乃桜" in soft
     assert soft.count("日常设定细节") < full.count("日常设定细节")
     assert len(soft) < len(full)
+    assert soft.index("【身份锚】") < soft.index("【人格设定】")
+    assert soft.index("【当下专注】") < soft.index("【演出约束】")
 
 
 def test_soften_truncates_long_persona_section() -> None:

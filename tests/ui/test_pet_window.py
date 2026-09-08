@@ -4711,43 +4711,40 @@ def test_manual_screenshot_text_input_records_marker_without_image_data() -> Non
     assert "data:image/jpeg;base64" not in history[0][1]
 
 
-def test_visual_context_is_injected_for_screenshot_followup() -> None:
+def test_visual_context_is_injected_for_screenshot_followup(tmp_path: Path) -> None:
     from app.ui.pet_window import _add_visual_context_to_messages
 
-    path = Path("data") / f"test_visual_context_{uuid.uuid4().hex}.jsonl"
-    try:
-        store = VisualObservationStore(path)
-        store.append(
-            VisualObservationRecord(
-                id="vis_recent",
-                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-                source="manual_screenshot",
-                user_text="帮我看这里",
-                screen_name="manual-selection",
-                width=320,
-                height=180,
-                summary="截图里是聊天气泡。",
-                visible_texts=["屏幕上的那句台词"],
-                uncertain_texts=[],
-                notable_elements=["聊天窗口"],
-                confidence=0.9,
-            )
+    path = tmp_path / "visual_observations.jsonl"
+    store = VisualObservationStore(path)
+    store.append(
+        VisualObservationRecord(
+            id="vis_recent",
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            source="manual_screenshot",
+            user_text="帮我看这里",
+            screen_name="manual-selection",
+            width=320,
+            height=180,
+            summary="截图里是聊天气泡。",
+            visible_texts=["屏幕上的那句台词"],
+            uncertain_texts=[],
+            notable_elements=["聊天窗口"],
+            confidence=0.9,
         )
+    )
 
-        messages = _add_visual_context_to_messages(
-            [{"role": "user", "content": "刚才截图里有什么台词？"}],
-            user_text="刚才截图里有什么台词？",
-            store=store,
-            has_current_image=False,
-        )
+    messages = _add_visual_context_to_messages(
+        [{"role": "user", "content": "刚才截图里有什么台词？"}],
+        user_text="刚才截图里有什么台词？",
+        store=store,
+        has_current_image=False,
+    )
 
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert "visual_id=vis_recent" in messages[0]["content"]
-        assert "屏幕上的那句台词" in messages[0]["content"]
-        assert messages[1]["content"] == "刚才截图里有什么台词？"
-    finally:
-        path.unlink(missing_ok=True)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert "visual_id=vis_recent" in messages[0]["content"]
+    assert "屏幕上的那句台词" in messages[0]["content"]
+    assert messages[1]["content"] == "刚才截图里有什么台词？"
 
 
 def test_set_busy_disables_manual_screenshot_button() -> None:
@@ -4975,6 +4972,13 @@ def test_web_progress_reply_shows_bubble_and_speaks_tts() -> None:
     window.subtitle_controller = FakeSubtitle()
     window.voice_playback_controller = FakePlayback()
     window.bubble_auto_hide = type("B", (), {"notify_speaking": lambda *_a, **_k: None})()
+    window.agent_runtime = type(
+        "R",
+        (),
+        {"settle_adopted_reply_drive": lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("progress reply must not settle relational drive")
+        )},
+    )()
 
     segment = ChatSegment("調べるね。", "中性", "我查一下。", suppress_tts=False)
     window._handle_progress_reply(
@@ -5455,6 +5459,47 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     assert message_sources == [""]
     assert shown_segments == [[segment]]
     assert applied_results == [result]
+
+
+def test_consume_agent_result_settles_drive_before_history_translation_and_display() -> None:
+    from app.agent import AgentResult
+    from app.llm.chat_reply import ChatReply
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class RuntimeStub:
+        def settle_adopted_reply_drive(self, interaction_id, reply) -> bool:  # type: ignore[no-untyped-def]
+            assert interaction_id == "interaction-42"
+            assert reply is result.reply
+            calls.append("settle")
+            return True
+
+    class MinimalConsumeWindow:
+        _consume_agent_result = PetWindow._consume_agent_result
+
+    window = MinimalConsumeWindow()
+    window.messages = []
+    window.active_interaction_id = "interaction-42"
+    window.agent_runtime = RuntimeStub()
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_assistant_reply_history = (
+        lambda *_args, **_kwargs: calls.append("history") or [101]
+    )
+    window._schedule_subtitle_translations = (
+        lambda *_args, **_kwargs: calls.append("translations")
+    )
+    window._show_reply_segments = lambda *_args, **_kwargs: calls.append("show")
+    window._apply_pending_action_from_result = (
+        lambda *_args, **_kwargs: calls.append("actions")
+    )
+    result = AgentResult(
+        reply=ChatReply([ChatSegment("こっち。", "温柔", "过来。")])
+    )
+
+    window._consume_agent_result(result)
+
+    assert calls == ["settle", "history", "translations", "show", "actions"]
 
 
 def test_reply_history_buttons_disable_while_busy_or_playing() -> None:

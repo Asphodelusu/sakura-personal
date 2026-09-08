@@ -96,6 +96,65 @@ def test_relationship_eval_does_not_capture_or_call_vlm() -> None:
     observer._chat_completion.assert_not_called()
 
 
+def test_relationship_decision_reads_drive_summary_once_in_existing_request() -> None:
+    observer = _obs()
+    provider_calls = 0
+
+    def _summary() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "身体上的冲动平缓，但她很想贴近。这是一种内在倾向，不是行动指令。"
+
+    observer.set_relationship_drive_provider(_summary)
+    observer._post_speech_decision = AsyncMock(
+        return_value={"should_speak": False, "reason": "今は静かにする"}
+    )
+
+    asyncio.run(observer._decide_relationship_speech())
+
+    assert provider_calls == 1
+    observer._post_speech_decision.assert_awaited_once()
+    messages = observer._post_speech_decision.await_args.args[0]
+    user_text = messages[-1]["content"]
+    assert user_text.count("[当前亲近倾向]") == 1
+    assert user_text.count("身体上的冲动平缓，但她很想贴近") == 1
+
+
+def test_relationship_drive_provider_failure_is_omitted_without_blocking_decision() -> None:
+    observer = _obs()
+    observer.set_relationship_drive_provider(
+        lambda: (_ for _ in ()).throw(OSError("state unavailable"))
+    )
+    observer._post_speech_decision = AsyncMock(
+        return_value={"should_speak": False, "reason": "今は静かにする"}
+    )
+
+    asyncio.run(observer._decide_relationship_speech())
+
+    observer._post_speech_decision.assert_awaited_once()
+    messages = observer._post_speech_decision.await_args.args[0]
+    assert "[当前亲近倾向]" not in messages[-1]["content"]
+
+
+def test_ineligible_relationship_tick_never_reads_drive_provider(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
+    observer = _obs(proactive_enabled=False)
+    observer.set_relationship_drive_provider(
+        lambda: (_ for _ in ()).throw(AssertionError("disabled B must not read drive"))
+    )
+    observer._do_relationship_evaluation = AsyncMock()
+    observer._do_evaluation = AsyncMock()
+
+    with (
+        patch("app.perception.observer.get_active_window_pid", return_value=10_001),
+        patch("app.perception.observer.time.monotonic", return_value=10_000.0),
+    ):
+        asyncio.run(observer._dispatch_proactive_tick(10_000.0))
+
+    observer._do_relationship_evaluation.assert_not_called()
+    observer._do_evaluation.assert_not_called()
+
+
 def test_screen_trigger_wins_same_tick_and_does_not_consume_relationship(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("app.perception.observer.get_idle_seconds", lambda: 0.0)
     observer = _obs()

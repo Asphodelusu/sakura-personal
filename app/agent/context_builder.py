@@ -49,6 +49,7 @@ class _InnerThoughtLaunch:
 
     future: Future[Any]
     executor: ThreadPoolExecutor
+    interaction_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,41 @@ class _MemoryRecallLaunch:
     future: Future[Any]
     executor: ThreadPoolExecutor
 
+
+
+def build_relational_drive_fragment(summary: str) -> ContextFragment | None:
+    text = str(summary or "").strip()
+    if not text:
+        return None
+    return ContextFragment(
+        fragment_id="runtime.relational_drive",
+        source="runtime",
+        content=f"[短期内在状态]\n{text}",
+        trust="trusted",
+        priority=87,
+        token_budget=140,
+        sensitivity="private",
+        cache_scope="turn",
+        required=False,
+    )
+
+
+def _omit_single_shot_agent_progress(snapshot: ContextSnapshot) -> ContextSnapshot:
+    selected = []
+    dropped = list(snapshot.dropped)
+    removed_tokens = 0
+    for decision in snapshot.selected:
+        if decision.fragment.fragment_id == "runtime.agent_progress":
+            dropped.append(replace(decision, included=False, drop_reason="single_shot"))
+            removed_tokens += decision.estimated_tokens
+            continue
+        selected.append(decision)
+    return replace(
+        snapshot,
+        selected=tuple(selected),
+        dropped=tuple(dropped),
+        estimated_tokens=max(0, snapshot.estimated_tokens - removed_tokens),
+    )
 
 
 class AgentRuntimeContextMixin:
@@ -156,7 +192,16 @@ class AgentRuntimeContextMixin:
             "内心独白已与记忆召回并行启动",
             {"window": len(previous)},
         )
-        return _InnerThoughtLaunch(future=future, executor=executor)
+        interaction_id = str(getattr(self, "_relationship_drive_turn_id", "") or "").strip()
+        if not interaction_id:
+            from app.core.interaction import get_interaction_id
+
+            interaction_id = str(get_interaction_id() or "").strip()
+        return _InnerThoughtLaunch(
+            future=future,
+            executor=executor,
+            interaction_id=interaction_id,
+        )
 
 
     def _finalize_inner_thought_worker(
@@ -199,6 +244,9 @@ class AgentRuntimeContextMixin:
         finally:
             # 超时后勿 wait=True，否则仍会被后台 8s HTTP 拖死
             launch.executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+        settle = getattr(self, "_settle_relationship_drive_appraisal", None)
+        if callable(settle) and result.drive_appraisal is not None:
+            settle(getattr(launch, "interaction_id", "") or "", result.drive_appraisal)
         if result.text:
             self._inner_thought_window.push(result.text)
             debug_log(
@@ -279,6 +327,10 @@ class AgentRuntimeContextMixin:
         )
         if thought is not None:
             fragments.append(thought)
+        if getattr(self, "_should_inject_relationship_drive_fragment", lambda: False)():
+            drive = build_relational_drive_fragment(self.relationship_drive_summary())
+            if drive is not None:
+                fragments.append(drive)
 
         current_input = str(getattr(request, "current_input", "") or "").strip()
         media_fragment = build_media_context_fragment(current_input)
@@ -382,12 +434,13 @@ class AgentRuntimeContextMixin:
             fragments = tuple(memory_fragments)
             if memory_status:
                 request = replace(request, service_status={"memory": memory_status})
-        return self.context_orchestrator.build_snapshot(
+        snapshot = self.context_orchestrator.build_snapshot(
             request,
             providers=self.context_providers,
             session_fragments=self._session_state_fragments(request),
             memory_fragments=fragments,
         )
+        return _omit_single_shot_agent_progress(snapshot)
 
 
     def _record_runtime_role(self, inspection: PromptInspection) -> None:

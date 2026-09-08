@@ -229,6 +229,14 @@ class StoragePaths:
     def instance_lock(self) -> Path:
         return self._data / "sakura.lock"
 
+    @property
+    def runtime_state_dir(self) -> Path:
+        return self._data / "runtime_state"
+
+    def relational_drive_for(self, character_id: str) -> Path:
+        stem = sanitize_file_stem(character_id)
+        return self.runtime_state_dir / f"{stem}-relational-drive.json"
+
     def qdrant_lock(self) -> Path:
         """qdrant 内部锁文件位置；仅用于自检报告残留，不由 Sakura 管理。"""
         return self.memory_dir / "qdrant" / ".lock"
@@ -245,5 +253,6 @@ class StoragePaths:
             self.notes_dir,
             self.tts_cache_dir,
             self.logs_dir,
+            self.runtime_state_dir,
         ]:
             d.mkdir(parents=True, exist_ok=True)

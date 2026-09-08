@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from app.agent.runtime import AgentRuntime
 from app.llm.api_client import ChatCompletionTurn, OpenAICompatibleClient
 from app.llm.chat_reply import (
+    canonicalize_structural_repair,
     classify_chat_reply_failure,
     structural_repair_is_faithful,
 )
@@ -38,6 +41,31 @@ ILLEGAL_TONE_JSON = json.dumps(
         "segments": [
             {"ja": JA_PROSE, "zh": "", "tone": "狂暴", "portrait": "站立待机"}
         ]
+    },
+    ensure_ascii=False,
+)
+ILLEGAL_PORTRAIT_JSON = json.dumps(
+    {
+        "segments": [
+            {"ja": JA_PROSE, "zh": "", "tone": "中性", "portrait": "平静认真脸"}
+        ]
+    },
+    ensure_ascii=False,
+)
+OVERREACHING_REPAIR_JSON = json.dumps(
+    {
+        "segments": [
+            {
+                "ja": JA_PROSE,
+                "zh": "……打开了哦。今天好像是阴天。",
+                "tone": "中性",
+                "portrait": "站立待机",
+                "suppress_tts": True,
+                "unexpected": "must be discarded",
+            }
+        ],
+        "drive_effect": {"event": "mutual_affection", "strength": "mild"},
+        "unexpected": "must be discarded",
     },
     ensure_ascii=False,
 )
@@ -207,6 +235,45 @@ def test_plain_japanese_uses_minimal_structural_repair() -> None:
     assert "synthetic-runtime" not in repair_blob
     assert JA_PROSE in repair_blob
     assert "不得改写" in repair_blob or "改写日文" in repair_blob
+    assert "zh 必须为空字符串" in repair_blob
+    assert "禁止翻译" in repair_blob
+
+
+def test_translated_structural_repair_is_canonicalized_without_semantic_compose() -> None:
+    canonical, reason = canonicalize_structural_repair(
+        JA_PROSE,
+        OVERREACHING_REPAIR_JSON,
+        allowed_tones=["中性"],
+        allowed_portraits=["站立待机"],
+    )
+    assert reason == ""
+    assert canonical is not None
+    assert json.loads(canonical) == {
+        "segments": [
+            {"ja": JA_PROSE, "zh": "", "tone": "中性", "portrait": "站立待机"}
+        ]
+    }
+
+    client = _client()
+    client.complete_with_tools.side_effect = [
+        _turn(JA_PROSE),
+        _turn(OVERREACHING_REPAIR_JSON),
+        _turn(LEGAL_JSON),
+    ]
+
+    result = AgentRuntime(client, PERSONA).handle_user_message(
+        [{"role": "user", "content": "synthetic-user-hi"}]
+    )
+
+    assert _purposes(client) == ["initial", "structural_repair"]
+    assert result.reply.drive_effect is None
+    assert len(result.reply.segments) == 1
+    segment = result.reply.segments[0]
+    assert segment.text == JA_PROSE
+    assert segment.translation == ""
+    assert segment.tone == "中性"
+    assert segment.portrait == "站立待机"
+    assert not segment.suppress_tts
 
 
 def test_rewritten_or_illegal_repair_falls_back_to_semantic_compose() -> None:
@@ -220,6 +287,39 @@ def test_rewritten_or_illegal_repair_falls_back_to_semantic_compose() -> None:
         [{"role": "user", "content": "synthetic-user-hi"}]
     )
     assert _purposes(client) == ["initial", "structural_repair", "semantic_compose"]
+
+
+@pytest.mark.parametrize(
+    ("repaired", "expected_reason"),
+    [
+        (REWRITTEN_JSON, "japanese_changed"),
+        (ILLEGAL_TONE_JSON, "tone_not_allowed"),
+        (ILLEGAL_PORTRAIT_JSON, "portrait_not_allowed"),
+        ("not json", "invalid_json"),
+    ],
+)
+def test_structural_repair_rejection_logs_safe_reason_code(
+    repaired: str,
+    expected_reason: str,
+) -> None:
+    runtime = AgentRuntime(
+        _client(),
+        PERSONA,
+        reply_tones=["中性"],
+        reply_portraits=["站立待机"],
+    )
+    runtime._compose_structural_repair = MagicMock(return_value=repaired)  # type: ignore[attr-defined]
+
+    with patch("app.agent.reply_composer.debug_log") as mock_log:
+        assert runtime._try_structural_repair(JA_PROSE) is None  # type: ignore[attr-defined]
+
+    rejection_calls = [
+        call
+        for call in mock_log.call_args_list
+        if len(call.args) >= 2 and call.args[1] == "结构修复结果未通过等价校验，回退语义合成"
+    ]
+    assert len(rejection_calls) == 1
+    assert rejection_calls[0].args[2] == {"reason": expected_reason}
 
 
 def test_tool_result_that_changes_answer_stays_on_semantic_compose() -> None:

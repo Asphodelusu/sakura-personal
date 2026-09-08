@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.agent.builtin_tools import _memory_update_arguments, create_builtin_tool_registry
 from app.agent.memory import MemoryStore
 
@@ -38,11 +40,11 @@ def test_memory_update_arguments_maps_new_content_alias() -> None:
     assert mapped == {"id": "802392db-test", "content": "更新后的记忆内容"}
 
 
-def test_builtin_memory_update_accepts_new_content_alias() -> None:
+def test_builtin_memory_update_accepts_new_content_alias(tmp_path: Path) -> None:
     fake = FakeMem0()
     registry = create_builtin_tool_registry(
-        __import__("pathlib").Path("test_builtin_memory_update_alias"),
-        memory=MemoryStore(memory_client=fake),
+        tmp_path,
+        memory=MemoryStore(base_dir=tmp_path, memory_client=fake),
     )
     remember_result = registry.execute("memory_remember", {"content": "对方喜欢热咖啡"})
     assert remember_result.success

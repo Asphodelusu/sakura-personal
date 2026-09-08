@@ -513,6 +513,39 @@ def test_character_archive_preserves_optional_relationship_guide() -> None:
     assert loaded.relationship_guide_path.read_text(encoding="utf-8") == "主动靠近，不复读台词库。"
 
 
+def test_character_archive_preserves_optional_relationship_drive() -> None:
+    root = _runtime_root("relationship_drive")
+    source_root = root / "source"
+    profile = _build_character_package(source_root)
+    manifest_path = profile.package_dir / "character.json"
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["relationship_drive"] = {"profile": "natural", "physical_baseline": 0.10}
+    manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    profile = CharacterRegistry(source_root).get("demo")
+    archive_path = root / "demo.char"
+    export_character_archive(profile, archive_path)
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+    assert manifest["character"]["relationship_drive"]["profile"] == "natural"
+    imported = import_character_archive(archive_path, source_root)
+    loaded = CharacterRegistry(source_root).get(imported.character_id)
+    assert loaded.relationship_drive_profile is not None
+    assert loaded.relationship_drive_profile.physical_baseline == 0.10
+
+
+def test_character_archive_does_not_synthesize_relationship_drive() -> None:
+    root = _runtime_root("no_relationship_drive")
+    profile = _build_character_package(root / "source")
+    archive_path = root / "demo.char"
+    export_character_archive(profile, archive_path)
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+    assert "relationship_drive" not in manifest["character"]
+    result = import_character_archive(archive_path, root / "source")
+    loaded = CharacterRegistry(root / "source").get(result.character_id)
+    assert loaded.relationship_drive_profile is None
+
+
 def test_character_archive_without_relationship_guide_still_roundtrips() -> None:
     root = _runtime_root("no_relationship_guide")
     profile = _build_character_package(root / "source")

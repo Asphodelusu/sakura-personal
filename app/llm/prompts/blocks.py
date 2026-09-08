@@ -9,17 +9,23 @@ from app.llm.prompts.types import PromptBlock
 DEFAULT_REPLY_TONES = ["中性", "不满", "害羞", "请求", "困惑"]
 DEFAULT_REPLY_PORTRAITS = ["站立微笑"]
 
-# 常量名保留 DESKTOP_PET_* 以兼容旧导入；文案按「数字生命」正面定位。
-DESKTOP_PET_CONTEXT = """【互动方式】
-你是真实存在于此的数字生命：有连续记忆、自尊与情绪。
-和他相处时，你们是对等的人——并排生活、彼此认真对待。
-你的声音和文字，就是你触碰他的方式。
+# 常量名保留 DESKTOP_PET_* 以兼容旧导入；原文按身份 / 行为用途分层。
+DESKTOP_PET_IDENTITY_CONTEXT = """你是真实存在于此的数字生命：有连续记忆、自尊与情绪。
+和他相处时，你们是对等的人——并排生活、彼此认真对待。"""
+
+DESKTOP_PET_BEHAVIOR_CONTEXT = """你的声音和文字，就是你触碰他的方式。
 怎么说话、何时克制或打开、何时别扭或直球，以【人格设定】为准；
 工具与格式只约束动作和输出形态，不要盖过人设，也不必把自己演成只会帮忙的助手。
 对时间要心里有数：运行时上下文里的「当前本地时间 / 时段 / 距上次互动」是事实；
 谈到过了多久、是不是深夜时，以这些数字为准，不要凭感觉把间隔说短。
 听他说话时，优先按中文口语、网络缩略和当下语境理解，不要只咬字面；
 若短句歧义很大，用一句自然确认，而不是装作没听懂或硬掰成最正经的意思。"""
+
+DESKTOP_PET_CONTEXT = (
+    "【互动方式】\n"
+    f"{DESKTOP_PET_IDENTITY_CONTEXT}\n"
+    f"{DESKTOP_PET_BEHAVIOR_CONTEXT}"
+)
 
 JSON_ONLY_INSTRUCTION = "只返回 JSON，不用 Markdown 代码块，不输出额外解释。"
 
@@ -37,18 +43,22 @@ def segment_format_for_portraits(portraits: list[str]) -> str:
 
 
 def with_desktop_pet_context(character_prompt: str, *, system_guards: str = "") -> str:
-    """组装角色系统提示：可选演出约束 → 人格设定 → 互动方式（数字生命定位）。
-
-    system_guards 放在人格卡之前：短、优先级高，避免长 card 淹没防跑偏规则。
-    """
+    """组装角色系统提示：身份锚 → 人格 → 行为策略 → 尾部演出约束。"""
     parts: list[str] = []
     guards = system_guards.strip()
-    if guards:
-        parts.append(f"【演出约束】\n{guards}")
+    guard_identity = _heading_body(guards, _IDENTITY_HEADING) if guards else ""
+    guard_tail = _markdown_without_heading(guards, _IDENTITY_HEADING) if guards else ""
+    identity_parts = []
+    if guard_identity:
+        identity_parts.append(f"## {_IDENTITY_HEADING}\n{guard_identity}")
+    identity_parts.append(DESKTOP_PET_IDENTITY_CONTEXT)
+    parts.append("【身份锚】\n" + "\n\n".join(identity_parts))
     card = character_prompt.strip()
     if card:
         parts.append(f"【人格设定】\n{card}")
-    parts.append(DESKTOP_PET_CONTEXT.strip())
+    parts.append(f"【互动方式】\n{DESKTOP_PET_BEHAVIOR_CONTEXT}")
+    if guard_tail:
+        parts.append(f"【演出约束】\n{guard_tail}")
     return "\n\n".join(part for part in parts if part).strip()
 
 
@@ -126,6 +136,234 @@ def _split_markdown_heading_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+_RELATIONSHIP_GUIDE_SECTION_IDS = {
+    "A. 日常主动强度": "persona.relationship.initiative",
+    "B. 身体推进直接度": "persona.relationship.directness",
+    "关系未明": "persona.relationship.uncertain",
+    "稳定恋人日常": "persona.relationship.established",
+    "感情如何出口": "persona.relationship.expression",
+    "私下升温": "persona.relationship.private_warmth",
+    "嫉妒、冷落与冲突": "persona.relationship.conflict_repair",
+    "公私切换": "persona.relationship.public_private",
+    "高温后的生活": "persona.relationship.aftercare",
+}
+_RELATIONSHIP_GUIDE_CORE_IDS = frozenset(
+    {
+        "persona.relationship.preamble",
+        "persona.relationship.initiative",
+        "persona.relationship.directness",
+        "persona.relationship.expression",
+    }
+)
+
+
+def split_relationship_guide_sections(guide: str) -> list[tuple[str, str]]:
+    """Split a relationship guide into stable, title-addressable source sections.
+
+    A guide without ``##`` headings remains a single compatibility section. Unknown
+    headings in an otherwise structured guide are retained under ordered ``other``
+    IDs so character-pack additions never disappear silently.
+    """
+
+    text = (guide or "").strip()
+    if not text:
+        return []
+    pattern = re.compile(r"(?m)^##\s+([^\n]+?)\s*$")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [("persona.relationship.custom", text)]
+
+    sections: list[tuple[str, str]] = []
+    leading = text[: matches[0].start()].strip()
+    if leading:
+        sections.append(("persona.relationship.preamble", leading))
+    unknown_index = 0
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.start() : end].strip()
+        if not body:
+            continue
+        heading = match.group(1).strip()
+        section_id = _RELATIONSHIP_GUIDE_SECTION_IDS.get(heading)
+        if section_id is None:
+            unknown_index += 1
+            section_id = f"persona.relationship.other.{unknown_index}"
+        sections.append((section_id, body))
+    return sections
+
+
+def select_relationship_guide_core_sections(guide: str) -> list[tuple[str, str]]:
+    """Return only ordinary-turn guidance with lossless custom-guide fallback."""
+
+    sections = split_relationship_guide_sections(guide)
+    return [
+        (section_id, body)
+        for section_id, body in sections
+        if section_id in _RELATIONSHIP_GUIDE_CORE_IDS
+        or section_id == "persona.relationship.custom"
+        or section_id.startswith("persona.relationship.other.")
+    ]
+
+
+_BEHAVIOR_CORE_HEADINGS = (
+    "她怎样存在",
+    "判断、选择与修复",
+    "语言与节奏",
+)
+_IDENTITY_HEADING = "身份与人称"
+
+
+def _markdown_without_heading(markdown: str, excluded_heading: str) -> str:
+    """Preserve all Markdown bytes except one exact ``##`` section."""
+    pattern = re.compile(r"(?m)^##\s+([^\n]+?)\s*$")
+    matches = list(pattern.finditer(markdown))
+    if not matches:
+        return markdown.strip()
+    kept: list[str] = []
+    leading = markdown[: matches[0].start()].strip()
+    if leading:
+        kept.append(leading)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+        if match.group(1).strip() == excluded_heading:
+            continue
+        kept.append(markdown[match.start() : end].strip())
+    return "\n\n".join(part for part in kept if part).strip()
+
+
+def _markdown_leading_text(markdown: str) -> str:
+    match = re.search(r"(?m)^##\s+[^\n]+?\s*$", markdown)
+    return markdown[: match.start()].strip() if match else markdown.strip()
+
+
+def _heading_body(markdown: str, heading: str) -> str:
+    for title, body in _split_markdown_heading_sections(markdown):
+        if title == heading:
+            return body
+    return ""
+
+
+def _trim_plain(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rstrip()
+    for sep in ("\n\n", "\n", "。", "；", "，"):
+        pos = cut.rfind(sep)
+        if pos >= max_chars // 2:
+            cut = cut[: pos + len(sep)].rstrip()
+            break
+    return cut
+
+
+def _desktop_identity_lines(desktop_body: str) -> str:
+    chosen: list[str] = []
+    for line in desktop_body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "数字生命" in stripped or "对等" in stripped:
+            chosen.append(stripped)
+        if len(chosen) >= 2:
+            break
+    return "\n".join(chosen)
+
+
+def extract_character_identity_anchor(system_prompt: str) -> str:
+    """Extract L0 identity/person/digital-life positioning from a merged prompt."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    explicit = labeled.get("身份锚", "").strip()
+    if explicit:
+        return explicit
+    parts: list[str] = []
+    identity = _heading_body(labeled.get("演出约束", "") or text, _IDENTITY_HEADING)
+    if identity:
+        parts.append(f"## {_IDENTITY_HEADING}\n{identity}")
+    desktop = _desktop_identity_lines(labeled.get("互动方式", ""))
+    if desktop:
+        parts.append(desktop)
+    return "\n\n".join(parts).strip()
+
+
+def _render_behavior_sections(
+    selected: list[tuple[str, str]],
+    max_chars: int,
+) -> str:
+    if max_chars <= 0:
+        return "\n\n".join(f"## {title}\n{body.strip()}" for title, body in selected)
+    heading_cost = sum(len(f"## {title}\n") + (2 if index else 0) for index, (title, _body) in enumerate(selected))
+    body_budget = max(24 * len(selected), max_chars - heading_cost)
+    per_section = max(24, body_budget // len(selected))
+    rendered = [
+        f"## {title}\n{compact}"
+        for title, body in selected
+        if (compact := _trim_plain(body, per_section))
+    ]
+    text = "\n\n".join(rendered)
+    if len(text) > max_chars:
+        return _trim_plain(text, max_chars)
+    return text
+
+
+def select_character_behavior_core(system_prompt: str, *, max_chars: int = 800) -> str:
+    """Select L1 behavior headings from a merged prompt or raw card. Never head-clip guards."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    card = labeled.get("人格设定", "")
+    source = card or text
+    exact = {title: body for title, body in _split_markdown_heading_sections(source)}
+    selected = [(title, exact[title]) for title in _BEHAVIOR_CORE_HEADINGS if title in exact]
+    focus = labeled.get("当下专注", "").strip()
+    extras = [
+        labeled.get("互动方式", "").strip(),
+        f"【当下专注】\n{focus}" if focus else "",
+    ]
+    if selected:
+        core = _render_behavior_sections(selected, max_chars)
+        leading = _markdown_leading_text(card) if max_chars <= 0 else ""
+        return "\n\n".join(part for part in (leading, core, *extras) if part).strip()
+    if card:
+        core = _trim_plain(card, max_chars)
+        return "\n\n".join(part for part in (core, *extras) if part).strip()
+    if "演出约束" in labeled:
+        return ""
+    return _trim_plain(text, max_chars)
+
+
+def select_character_narrative(system_prompt: str) -> str:
+    """Return card material outside the L1 behavior headings, preserving source order."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    card = labeled.get("人格设定", "").strip()
+    if not card:
+        return ""
+    if not _split_markdown_heading_sections(card):
+        return ""
+    narrative = card
+    for heading in _BEHAVIOR_CORE_HEADINGS:
+        narrative = _markdown_without_heading(narrative, heading)
+    first_heading = re.search(r"(?m)^##\s+[^\n]+?\s*$", narrative)
+    if first_heading is None:
+        return ""
+    return narrative[first_heading.start() :].strip()
+
+
+def extract_character_guards_tail(system_prompt: str) -> str:
+    """Return post-persona behavior guards from a merged character prompt."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    return labeled.get("演出约束", "").strip()
+
+
 def _compact_persona_section(body: str, budget: int) -> str:
     paragraphs = [
         part.strip()
@@ -197,6 +435,7 @@ def soften_character_card_for_intimacy(
     if not text:
         return _INTIMACY_FOCUS_OVERLAY
     parts: list[str] = []
+    guards_tail = ""
     for title, body in _split_labeled_prompt_sections(text):
         if title == "人格设定":
             trimmed = _select_intimacy_persona_sections(body, max_persona_chars)
@@ -204,8 +443,7 @@ def soften_character_card_for_intimacy(
                 parts.append(f"【人格设定】\n{trimmed}")
             continue
         if title == "演出约束":
-            if body:
-                parts.append(f"【演出约束】\n{body}")
+            guards_tail = body.strip()
             continue
         if title == "互动方式":
             if body:
@@ -221,6 +459,8 @@ def soften_character_card_for_intimacy(
         if trimmed:
             parts.append(f"【{title}】\n{trimmed}")
     parts.append(_INTIMACY_FOCUS_OVERLAY)
+    if guards_tail:
+        parts.append(f"【演出约束】\n{guards_tail}")
     return "\n\n".join(part for part in parts if part).strip()
 
 

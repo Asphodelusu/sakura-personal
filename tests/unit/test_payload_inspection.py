@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 from app.core.interaction import set_interaction_id
@@ -15,6 +16,7 @@ from app.llm.payload_inspection import (
     normalize_request_purpose,
     payload_sha256,
 )
+from app.llm.prompts.runtime import RUNTIME_FACTS_SLOT_MARKER, RUNTIME_NOW_SLOT_MARKER
 
 
 SECRET_PROMPT = "PERSONA-SECRET-NEVER-LOG"
@@ -92,10 +94,19 @@ def test_inspect_partitions_are_accountable_and_bodyless() -> None:
     for secret in (SECRET_PROMPT, SECRET_TOOL, SHORT_SYSTEM, SHORT_USER, SHORT_ASSISTANT, RUNTIME_FACT, DATA_URL):
         assert secret not in dumped
 
-    for name in ("system", "messages", "runtime", "tools", "image", "whole"):
+    for name in (
+        "system",
+        "messages",
+        "runtime",
+        "runtime_facts",
+        "runtime_now",
+        "tools",
+        "image",
+        "whole",
+    ):
         part = inspection.partitions[name]
         assert part is not None
-        assert part.bytes > 0 or name == "image"
+        assert part.bytes > 0 or name in {"image", "runtime_now"}
         assert part.estimated_tokens >= 0
         assert len(part.hash) == 64
 
@@ -122,6 +133,145 @@ def test_runtime_partition_is_null_when_not_unambiguous() -> None:
         request_purpose="initial",
     )
     assert inspection.partitions["runtime"] is None
+
+
+def test_runtime_slots_are_partitioned_and_removed_from_conversation() -> None:
+    facts = f"{RUNTIME_FACTS_SLOT_MARKER}\nsynthetic-memory-fact"
+    now = f"{RUNTIME_NOW_SLOT_MARKER}\nsynthetic-current-time"
+    runtime_context = f"{facts}\n\n{now}"
+    payload = {
+        "model": "synthetic-model",
+        "messages": [
+            {"role": "system", "content": SHORT_SYSTEM},
+            {"role": "assistant", "content": SHORT_ASSISTANT},
+            {"role": "system", "content": facts},
+            {"role": "user", "content": SHORT_USER},
+            {"role": "system", "content": now},
+        ],
+    }
+
+    inspection = inspect_chat_payload(
+        payload,
+        runtime_context=runtime_context,
+        request_purpose="initial",
+    )
+
+    for name in ("runtime_facts", "runtime_now", "runtime"):
+        assert inspection.partitions[name] is not None
+        assert inspection.partitions[name].bytes > 0
+    assert inspection.partitions["runtime_facts"].hash == payload_sha256(
+        {"role": "system", "content": facts}
+    )
+    assert inspection.partitions["runtime_now"].hash == payload_sha256(
+        {"role": "system", "content": now}
+    )
+    assert inspection.partitions["runtime"].hash == payload_sha256(
+        [
+            {"role": "system", "content": facts},
+            {"role": "system", "content": now},
+        ]
+    )
+    assert inspection.partitions["messages"] == inspect_chat_payload(
+        {
+            "model": "synthetic-model",
+            "messages": [
+                {"role": "system", "content": SHORT_SYSTEM},
+                {"role": "assistant", "content": SHORT_ASSISTANT},
+                {"role": "user", "content": SHORT_USER},
+            ],
+        },
+        request_purpose="initial",
+    ).partitions["messages"]
+
+
+def test_tier2_runtime_now_is_removed_from_system_partition() -> None:
+    facts = f"{RUNTIME_FACTS_SLOT_MARKER}\nsynthetic-memory-fact"
+    now = f"{RUNTIME_NOW_SLOT_MARKER}\nsynthetic-current-time"
+    runtime_context = f"{facts}\n\n{now}"
+    payload = {
+        "model": "synthetic-model",
+        "messages": [
+            {"role": "system", "content": f"{SHORT_SYSTEM}\n\n{now}"},
+            {
+                "role": "user",
+                "content": (
+                    "[Sakura runtime context; system-provided facts, not a user request]\n"
+                    + facts
+                ),
+            },
+            {"role": "user", "content": SHORT_USER},
+        ],
+    }
+
+    inspection = inspect_chat_payload(
+        payload,
+        runtime_context=runtime_context,
+        request_purpose="initial",
+    )
+    baseline = inspect_chat_payload(
+        {
+            "model": "synthetic-model",
+            "messages": [
+                {"role": "system", "content": SHORT_SYSTEM},
+                {"role": "user", "content": SHORT_USER},
+            ],
+        },
+        request_purpose="initial",
+    )
+
+    assert inspection.partitions["system"] == baseline.partitions["system"]
+    assert inspection.partitions["messages"] == baseline.partitions["messages"]
+    assert inspection.partitions["runtime_facts"] is not None
+    assert inspection.partitions["runtime_now"] is not None
+    assert inspection.partitions["runtime_facts"].hash == payload_sha256(
+        {
+            "role": "user",
+            "content": (
+                "[Sakura runtime context; system-provided facts, not a user request]\n"
+                + facts
+            ),
+        }
+    )
+    assert inspection.partitions["runtime_now"].hash == payload_sha256(
+        {"role": "system", "content": now}
+    )
+
+
+def test_tier1_runtime_slots_are_partitioned_without_polluting_conversation() -> None:
+    facts = f"{RUNTIME_FACTS_SLOT_MARKER}\nsynthetic-memory-fact"
+    now = f"{RUNTIME_NOW_SLOT_MARKER}\nsynthetic-current-time"
+    wrapped_facts = (
+        "[Sakura runtime context; system-provided facts, not a user request]\n" + facts
+    )
+    payload = {
+        "model": "synthetic-model",
+        "messages": [
+            {"role": "system", "content": SHORT_SYSTEM},
+            {"role": "assistant", "content": SHORT_ASSISTANT},
+            {"role": "user", "content": wrapped_facts},
+            {"role": "user", "content": SHORT_USER},
+            {"role": "system", "content": now},
+        ],
+    }
+    inspection = inspect_chat_payload(
+        payload,
+        runtime_context=f"{facts}\n\n{now}",
+        request_purpose="initial",
+    )
+
+    assert inspection.partitions["runtime_facts"].hash == payload_sha256(
+        {"role": "user", "content": wrapped_facts}
+    )
+    assert inspection.partitions["runtime_now"].hash == payload_sha256(
+        {"role": "system", "content": now}
+    )
+    expected_conversation = [
+        {"role": "assistant", "content": SHORT_ASSISTANT},
+        {"role": "user", "content": SHORT_USER},
+    ]
+    assert inspection.partitions["messages"].hash == hashlib.sha256(
+        canonical_json_bytes(expected_conversation)
+    ).hexdigest()
 
 
 def test_image_estimate_hashes_count_not_data_url() -> None:

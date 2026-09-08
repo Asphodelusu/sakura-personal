@@ -23,6 +23,7 @@ from app.llm.prompts.types import ContextSnapshot, PromptRecipe, PromptSection
 
 
 _INTIMACY_EXTRA_TONES: tuple[str, ...] = ("亲密", "H")
+_PLUGIN_PROMPT_PATCH_TOKEN_BUDGET = 600
 
 
 def _intimacy_entry_hint_text() -> str:
@@ -32,13 +33,9 @@ def _intimacy_entry_hint_text() -> str:
         "# 可选亲密导演层\n"
         f"只有对方整句发送「{INTIMACY_ENTER_PHRASE}」时，系统才开启详细 guide、扩展节奏与自动续投；"
         "不会自动开启，也不会因对话自然升温而开启。\n"
-        "这只是详细导演层，不是身体接触许可开关。"
-        "未开启不限制拥抱、亲吻、前戏或性行为。"
-        "稳定恋人关系中，这些互动可以依据既有关系、记忆和双方当下反应自然升温；"
-        "出现真实迟疑、退开或拒绝时才停下确认。\n"
-        f"未发送「{INTIMACY_ENTER_PHRASE}」不表示关系不足、需要重新认识或默认拒绝；"
-        "你仍按自己的判断回应，也可以拒绝。\n"
-        "不要猜测或调用 set_intimacy_mode(on=true)。需要结束已开启的导演层时才调用 on=false。"
+        "未开启时不注入详细 guide；继续按当前人格、关系事实与演出约束回应。\n"
+        "不要猜测或调用 set_intimacy_mode(on=true)。"
+        "需要结束已开启的导演层时才调用 set_intimacy_mode(on=false)。"
     )
 
 
@@ -49,6 +46,24 @@ def _apply_patch_text(reply_protocol: str, patch_text: str) -> str:
     return f"{reply_protocol.strip()}\n\n{patch_text}"
 
 
+def _prompt_layer_rank(section_id: str) -> int:
+    if section_id == "persona.identity_anchor":
+        return 0
+    if section_id == "persona.behavior_core":
+        return 1
+    if section_id.startswith(
+        ("persona.narrative", "persona.relationship", "persona.intimacy", "plugin_patch.")
+    ):
+        return 2
+    if section_id.startswith("reply."):
+        return 3
+    if section_id.startswith(("agent.", "context.", "tools.", "event.", "final_reply.")):
+        return 4
+    if section_id == "persona.guards_tail":
+        return 5
+    raise ValueError(f"unmapped prompt section: {section_id}")
+
+
 
 class AgentRuntimePromptMixin:
     def _persona_sections(self, *, intimacy_focus: bool = False) -> list[PromptSection]:
@@ -57,37 +72,69 @@ class AgentRuntimePromptMixin:
             from app.llm.prompts.blocks import soften_character_card_for_intimacy
 
             persona_body = soften_character_card_for_intimacy(persona_body)
-        sections = [
-            PromptSection(
-                section_id="persona.character",
-                body=persona_body,
-                source="character",
-                sensitivity="private",
-            )
-        ]
-        relationship_section = self._build_relationship_guide_section()
-        if relationship_section is not None:
-            sections.append(relationship_section)
+        from app.llm.prompts.blocks import (
+            extract_character_guards_tail,
+            extract_character_identity_anchor,
+            select_character_behavior_core,
+            select_character_narrative,
+        )
+        from app.llm.prompts.runtime import estimate_prompt_tokens, truncate_to_token_budget
+
+        sections: list[PromptSection] = []
+        layered_persona = (
+            ("persona.identity_anchor", extract_character_identity_anchor(persona_body)),
+            ("persona.behavior_core", select_character_behavior_core(persona_body, max_chars=0)),
+            ("persona.narrative", select_character_narrative(persona_body)),
+        )
+        for section_id, body in layered_persona:
+            if body:
+                sections.append(
+                    PromptSection(
+                        section_id=section_id,
+                        body=body,
+                        source="character",
+                        sensitivity="private",
+                    )
+                )
+        sections.extend(self._build_relationship_guide_sections())
         # 亲密专注当下：跳过插件往人格前缀塞的长补充，避免再把注意力拉回日常设定
         if not intimacy_focus:
-            sections.extend(
-                PromptSection(
-                    section_id=f"plugin_patch.{patch.patch_id}",
-                    body=patch.system_prompt_append.strip(),
-                    source=f"plugin:{patch.patch_id}",
+            remaining_patch_tokens = _PLUGIN_PROMPT_PATCH_TOKEN_BUDGET
+            for patch in getattr(self, "prompt_patches", []):
+                body = patch.system_prompt_append.strip()
+                if not body or remaining_patch_tokens <= 0:
+                    continue
+                body, _truncated = truncate_to_token_budget(body, remaining_patch_tokens)
+                if not body:
+                    continue
+                sections.append(
+                    PromptSection(
+                        section_id=f"plugin_patch.{patch.patch_id}",
+                        body=body,
+                        source=f"plugin:{patch.patch_id}",
+                    )
                 )
-                for patch in getattr(self, "prompt_patches", [])
-                if patch.system_prompt_append.strip()
+                remaining_patch_tokens -= estimate_prompt_tokens(body)
+        guards_tail = extract_character_guards_tail(persona_body)
+        if guards_tail:
+            sections.append(
+                PromptSection(
+                    section_id="persona.guards_tail",
+                    body=guards_tail,
+                    source="character",
+                    sensitivity="private",
+                )
             )
         return sections
 
 
-    def _build_relationship_guide_section(self) -> PromptSection | None:
+    def _build_relationship_guide_sections(self) -> list[PromptSection]:
         from app.config.relationship_initiative import (
             RELATIONSHIP_GUIDE_TOKEN_BUDGET,
             expression_bias_guidance,
         )
         from app.core.debug_log import debug_log
+        from app.llm.prompts.blocks import select_relationship_guide_core_sections
         from app.llm.prompts.runtime import estimate_prompt_tokens, truncate_to_token_budget
 
         settings = getattr(self, "_relationship_settings", None)
@@ -99,13 +146,36 @@ class AgentRuntimePromptMixin:
                 "A 注入",
                 {"injected": False, "enabled": enabled, "chars": 0, "tokens": 0},
             )
-            return None
+            return []
         bias = expression_bias_guidance(getattr(settings, "expression_bias", "natural"))
-        body, truncated = truncate_to_token_budget(
-            f"{guide}\n\n{bias}",
-            RELATIONSHIP_GUIDE_TOKEN_BUDGET,
-        )
-        tokens = estimate_prompt_tokens(body)
+        candidates = [
+            *select_relationship_guide_core_sections(guide),
+            ("persona.relationship.expression_bias", bias),
+        ]
+        sections: list[PromptSection] = []
+        remaining_tokens = RELATIONSHIP_GUIDE_TOKEN_BUDGET
+        truncated = False
+        for section_id, candidate in candidates:
+            if remaining_tokens <= 0:
+                truncated = True
+                break
+            body, body_truncated = truncate_to_token_budget(candidate, remaining_tokens)
+            if not body:
+                truncated = True
+                continue
+            sections.append(
+                PromptSection(
+                    section_id=section_id,
+                    body=body,
+                    source="character",
+                    sensitivity="private",
+                    cache_scope="static",
+                    token_budget=remaining_tokens,
+                )
+            )
+            remaining_tokens -= estimate_prompt_tokens(body)
+            truncated = truncated or body_truncated
+        tokens = sum(estimate_prompt_tokens(section.body) for section in sections)
         debug_log(
             "RelationshipInitiative",
             "A 注入",
@@ -115,16 +185,10 @@ class AgentRuntimePromptMixin:
                 "tokens": tokens,
                 "truncated": truncated,
                 "bias": getattr(settings, "expression_bias", "natural"),
+                "sections": [section.section_id for section in sections],
             },
         )
-        return PromptSection(
-            section_id="persona.relationship_guide",
-            body=body,
-            source="character",
-            sensitivity="private",
-            cache_scope="static",
-            token_budget=RELATIONSHIP_GUIDE_TOKEN_BUDGET,
-        )
+        return sections
 
 
     def _intimacy_focus_active(self) -> bool:
@@ -234,23 +298,27 @@ class AgentRuntimePromptMixin:
         middle_sections: list[PromptSection],
         *,
         intimacy_focus: bool | None = None,
+        include_intimacy: bool = True,
+        include_narrative: bool = True,
     ) -> list[PromptSection]:
-        """统一 recipe 段落组装：persona 开头 + 中间段 + 可选 intimacy 结尾。
-
-        各 prompt recipe（工具循环 / 最终合成 / 主动事件）都遵循
-        「人格段在前、功能段居中、亲密节奏段收尾」的顺序，这里收敛公共部分，
-        避免每处重复拼接 persona 与 intimacy 段落。
-        """
+        """统一按 L0 → L1 → L2 → L3 → L4 → L4' 装配静态段落。"""
         if intimacy_focus is None:
             intimacy_focus = self._intimacy_focus_active()
-        sections = [
-            *self._persona_sections(intimacy_focus=intimacy_focus),
-            *middle_sections,
-        ]
-        intimacy_section = self._build_intimacy_section()
-        if intimacy_section is not None:
-            sections.append(intimacy_section)
-        return sections
+        sections = [*self._persona_sections(intimacy_focus=intimacy_focus)]
+        if not include_narrative:
+            sections = [
+                section
+                for section in sections
+                if not section.section_id.startswith(
+                    ("persona.narrative", "persona.relationship", "persona.intimacy")
+                )
+            ]
+        if include_intimacy:
+            intimacy_section = self._build_intimacy_section()
+            if intimacy_section is not None:
+                sections.append(intimacy_section)
+        sections.extend(middle_sections)
+        return sorted(sections, key=lambda section: _prompt_layer_rank(section.section_id))
 
 
     def _prompt_runtime(self) -> PromptRuntime:
@@ -372,6 +440,10 @@ class AgentRuntimePromptMixin:
                 prompt_portraits,
                 portrait_hints=self._portrait_hints(current_input=current_input) or None,
                 verbosity_guidance=verbosity or None,
+                include_drive_effect=(
+                    getattr(self.character_profile, "relationship_drive_profile", None)
+                    is not None
+                ),
             ),
             _plugin_patch_text,
         )
@@ -481,10 +553,11 @@ class AgentRuntimePromptMixin:
             max_tool_calls_per_turn=self.runtime_loop_settings.max_tool_calls_per_turn,
             extra_instructions=self._combine_extra_instructions(extra_instructions),
         )
-        sections = [
-            *self._persona_sections(),
-            PromptSection("agent.proactive", proactive_rules),
-        ]
+        sections = self._assemble_recipe_sections(
+            [PromptSection("agent.proactive", proactive_rules)],
+            include_intimacy=False,
+            include_narrative=False,
+        )
         return self._prompt_runtime().build(
             PromptRecipe("proactive_tool_loop", sections), snapshot
         )
@@ -541,11 +614,14 @@ class AgentRuntimePromptMixin:
             self._prompt_reply_portraits(),
             event_type=event_type,
         )
-        sections = [
-            *self._persona_sections(),
-            PromptSection("event.rules", event_rules),
-            PromptSection("reply.patch", self._reply_protocol_patch_text()),
-        ]
+        sections = self._assemble_recipe_sections(
+            [
+                PromptSection("event.rules", event_rules),
+                PromptSection("reply.patch", self._reply_protocol_patch_text()),
+            ],
+            include_intimacy=False,
+            include_narrative=False,
+        )
         return self._prompt_runtime().build(PromptRecipe("event_reply", sections), snapshot)
 
 

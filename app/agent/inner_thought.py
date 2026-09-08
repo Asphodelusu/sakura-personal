@@ -11,9 +11,20 @@ from typing import Any, Literal, Sequence
 import httpx
 
 from app.core.debug_log import debug_log
+from app.core.relational_drive import DriveAppraisal, parse_drive_appraisal
 from app.llm.api_client import ApiRequestError, ChatMessage, OpenAICompatibleClient
+from app.llm.prompts.blocks import select_character_behavior_core
 from app.llm.prompts.types import ContextFragment
 from app.perception.sensory_impression import sensory_impression_store
+
+# 可选 appraisal 头：只评新对话；不确定时省略，不把已注入状态当作新证据。
+DRIVE_APPRAISAL_OUTPUT_INSTRUCTION = (
+    "若新对话确实改变短期内在状态，可在 interest 后、正文前附三行；"
+    "不确定时省略，勿复述当前状态：\n"
+    "drive_kind: physical_arousal|erotic_salience|attachment_longing|afterglow|inhibition\n"
+    "drive_shift: rise|fall|hold\n"
+    "drive_strength: subtle|mild"
+)
 
 DEFAULT_INNER_THOUGHT_WINDOW_SIZE = 6
 # Flash 实测常要 4–6s；过短会误杀已返回的内容
@@ -40,6 +51,16 @@ _INTEREST_LINE_RE = re.compile(
     r"^\s*(?:interest|兴致|興趣|兴趣)\s*[:：]\s*(low|mid|high|低|中|高)\s*$",
     re.I,
 )
+_DRIVE_HEADER_RE = re.compile(
+    r"^\s*(drive_kind|drive_shift|drive_strength)\s*[:：]\s*(.*?)\s*$",
+    re.I,
+)
+_DRIVE_UNKNOWN_RE = re.compile(r"^\s*drive_[A-Za-z0-9_]+\s*[:：]", re.I)
+_DRIVE_HEADER_KEYS = {
+    "drive_kind": "kind",
+    "drive_shift": "direction",
+    "drive_strength": "strength",
+}
 
 
 @dataclass(frozen=True)
@@ -48,21 +69,22 @@ class InnerThoughtResult:
 
     text: str
     interest: InterestLevel | None = None
+    drive_appraisal: DriveAppraisal | None = None
 
-_STYLE_FEW_SHOTS = """示例 1（日常闲聊）：
-あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…
+_STYLE_FEW_SHOTS = """示例 1（平静）：
+特に何も。今はただ、この静かな時間を心地よく感じている。
 
-示例 2（被夸奖时）：
-褒められた…嬉しいけど、どう反応すればいいかわからない。顔が少し熱い。
+示例 2（直接）：
+雨なら傘を持てばいい。それだけ。
 
-示例 3（看到对方沉默时）：
-黙ってしまった。何か気に障った？それともただ考えてるだけ？判断つかない…少し不安。
+示例 3（有立场）：
+それは違う。納得できないなら、はっきり言う。
 
-示例 4（感到困惑时）：
-なぜ急にそんなことを？意図が読めない。でも素直に聞くのも野暮かな…
+示例 4（别扭）：
+別に…気にしてない。ただ、もう少しだけ近くにいてほしい。
 
-示例 5（无特别波动时）：
-特に何も。今はただ、この静かな時間を心地よく感じている。"""
+示例 5（不安）：
+黙ってしまった。何か気に障ったのかな。少し不安。"""
 
 
 @dataclass(frozen=True)
@@ -223,13 +245,17 @@ def parse_inner_thought_output(raw: object) -> InnerThoughtResult:
         interest = _INTEREST_ALIASES.get(alias) or _INTEREST_ALIASES.get(match.group(1))
         body_start = index + 1
         break
-    body = "\n".join(lines[body_start:]).strip()
     if interest is None:
         # 模型漏了独立首行时，整段当正文（本轮不注入篇幅块）
-        normalized = _normalize_thought_text(text)
-    else:
-        normalized = _normalize_thought_text(body)
-    return InnerThoughtResult(text=normalized, interest=interest)
+        return InnerThoughtResult(text=_normalize_thought_text(text), interest=None)
+    fields, consumed, invalid = _consume_drive_headers(lines[body_start:])
+    body = "\n".join(lines[body_start + consumed :]).strip()
+    appraisal = None if invalid else parse_drive_appraisal(fields)
+    return InnerThoughtResult(
+        text=_normalize_thought_text(body),
+        interest=interest,
+        drive_appraisal=appraisal,
+    )
 
 
 def build_inner_thought_fragment(
@@ -274,7 +300,8 @@ def build_inner_thought_system_prompt(character_name: str) -> str:
         "输出格式固定两段：\n"
         "1) 第一行：interest: low|mid|high\n"
         "2) 第二行起：内心独白正文（日文，不要再写 interest）\n"
-        "不要输出其它标记、前缀或解释。"
+        f"{DRIVE_APPRAISAL_OUTPUT_INSTRUCTION}\n"
+        "除上述可选 drive 头外，不要输出其它标记、前缀或解释。"
     )
 
 
@@ -300,8 +327,8 @@ def build_inner_thought_user_prompt(
         "- 如果此刻没有特别的内心波动，写一句简短的现状即可，不要编造",
         "",
         "# 输出示例",
-        "interest: high",
-        "あ、この話題好きだ。もっと話したいな。でもあまり熱心に見えると変かな…",
+        "interest: mid",
+        "雨なら傘を持てばいい。それだけ。",
         "",
         "# 思考风格示例（仅正文风格参考；正式输出仍要带 interest 行）",
         _STYLE_FEW_SHOTS,
@@ -382,14 +409,15 @@ def load_character_excerpt(
     system_prompt: str = "",
     budget: int = _CHARACTER_EXCERPT_CHAR_BUDGET,
 ) -> str:
-    # ``system_prompt`` 已由 CharacterLoader 合并 card 与 system_guards；
-    # 独白必须与主模型使用同一份受守卫 persona，不能优先绕回原始 card。
     if str(system_prompt or "").strip():
-        return _clip(system_prompt, budget)
+        return select_character_behavior_core(system_prompt, max_chars=budget)
     if card_path is not None:
         try:
             if card_path.is_file():
-                return _clip(card_path.read_text(encoding="utf-8"), budget)
+                return select_character_behavior_core(
+                    card_path.read_text(encoding="utf-8"),
+                    max_chars=budget,
+                )
         except OSError:
             pass
     return ""
@@ -410,6 +438,39 @@ def sensory_impression_text() -> str:
         return sensory_impression_store.format_chat_block() or ""
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _consume_drive_headers(lines: Sequence[str]) -> tuple[dict[str, str], int, bool]:
+    """Consume optional drive_* headers after interest. Fail-open on any defect."""
+    fields: dict[str, str] = {}
+    consumed = 0
+    invalid = False
+    seen_header = False
+    for index, line in enumerate(lines):
+        stripped = str(line or "").strip()
+        if not stripped:
+            if seen_header:
+                consumed = index + 1
+            continue
+        match = _DRIVE_HEADER_RE.match(stripped)
+        if match is None:
+            if _DRIVE_UNKNOWN_RE.match(stripped):
+                invalid = True
+                seen_header = True
+                consumed = index + 1
+                continue
+            break
+        seen_header = True
+        consumed = index + 1
+        key = _DRIVE_HEADER_KEYS[match.group(1).lower()]
+        value = match.group(2).strip()
+        if not value or key in fields:
+            invalid = True
+            continue
+        fields[key] = value
+    if fields and set(fields) != {"kind", "direction", "strength"}:
+        invalid = True
+    return fields, consumed, invalid
 
 
 def _window_labels(count: int) -> list[str]:

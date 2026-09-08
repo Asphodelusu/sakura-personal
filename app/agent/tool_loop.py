@@ -185,6 +185,9 @@ class AgentRuntimeToolLoopMixin:
         cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
         check_cancelled(cancel_checker)
+        begin_drive = getattr(self, "_begin_relationship_drive_user_turn", None)
+        if callable(begin_drive):
+            begin_drive()
         turn_started_at = time.perf_counter()
         allow_screen_observation = (
             self.model_vision_enabled

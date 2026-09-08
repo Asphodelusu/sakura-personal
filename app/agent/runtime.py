@@ -65,6 +65,7 @@ from app.agent.runtime_limits import (
     normalize_runtime_loop_settings,
 )
 from app.plugins.models import ContextProviderContribution, PromptPatchContribution
+from app.llm.chat_reply import ChatReply
 
 from app.llm.prompts.runtime import PromptRuntime
 from app.llm.prompts.types import (
@@ -245,6 +246,14 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         self._relationship_guide = ""
         self._relationship_settings = RelationshipInitiativeSettings().normalized()
         self._relationship_guide_warned = False
+        from app.config.relationship_drive import RelationshipDriveSettings
+
+        self._relationship_drive_settings = RelationshipDriveSettings().normalized()
+        self._relationship_drive_store = None
+        self._relationship_drive_turn_id = ""
+        self._relationship_drive_turn_snapshot: str | None = None
+        self._relationship_drive_snapshot_ready = False
+        self._relationship_drive_settled_appraisal_ids: set[str] = set()
 
     @property
     def vision_api_client(self) -> OpenAICompatibleClient | None:
@@ -306,6 +315,7 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
         self.character_profile = character_profile
         # 换角色后清空内心独白窗口，避免串戏
         self._inner_thought_window.clear()
+        self._clear_relationship_drive_store()
         self._reload_lore_index()
         if character_profile is not None:
             self.character_id = character_profile.id.strip()
@@ -325,6 +335,135 @@ class AgentRuntime(AgentRuntimePromptMixin, AgentRuntimeReplyMixin, AgentRuntime
             else RelationshipInitiativeSettings().normalized()
         )
         self._relationship_guide = str(guide_text or "").strip()
+
+    def set_relationship_drive(self, settings, profile, state_path) -> None:
+        from pathlib import Path
+
+        from app.config.relationship_drive import RelationshipDriveSettings
+        from app.storage.relational_drive import RelationalDriveStore
+
+        self._clear_relationship_drive_store()
+        normalized = (
+            settings.normalized()
+            if isinstance(settings, RelationshipDriveSettings)
+            else RelationshipDriveSettings().normalized()
+        )
+        self._relationship_drive_settings = normalized
+        if not normalized.enabled or profile is None:
+            return
+        path = Path(state_path) if state_path else None
+        if path is None:
+            return
+        self._relationship_drive_store = RelationalDriveStore(path, profile)
+
+    def relationship_drive_summary(self, *, fresh: bool = False) -> str:
+        if not fresh and self._relationship_drive_snapshot_ready:
+            return str(self._relationship_drive_turn_snapshot or "")
+        store = self._relationship_drive_store
+        if store is None:
+            if not fresh:
+                self._relationship_drive_turn_snapshot = ""
+                self._relationship_drive_snapshot_ready = True
+            return ""
+        try:
+            from datetime import datetime
+
+            from app.core.relational_drive import build_drive_summary
+
+            now = datetime.now().astimezone()
+            state = store.snapshot(now)
+            text = build_drive_summary(state, profile=store.profile, now=now)
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RelationalDrive", "snapshot error", {"error": type(exc).__name__})
+            text = ""
+        if not fresh:
+            self._relationship_drive_turn_snapshot = text
+            self._relationship_drive_snapshot_ready = True
+        return text
+
+    def settle_adopted_reply_drive(
+        self,
+        interaction_id: str,
+        reply: ChatReply,
+    ) -> bool:
+        from datetime import datetime
+
+        ident = str(interaction_id or "").strip()
+        store = self._relationship_drive_store
+        if store is None or not ident or ident != self._relationship_drive_turn_id:
+            debug_log("RelationalDrive", "effect ignored", {})
+            return False
+        effect = getattr(reply, "drive_effect", None)
+        if effect is None:
+            debug_log("RelationalDrive", "effect ignored", {})
+            return False
+        try:
+            settled = store.settle_effect(ident, effect, datetime.now().astimezone())
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RelationalDrive", "effect error", {"error": type(exc).__name__})
+            return False
+        debug_log(
+            "RelationalDrive",
+            "effect settled" if settled else "effect duplicate",
+            {},
+        )
+        if settled:
+            self._relationship_drive_turn_snapshot = None
+            self._relationship_drive_snapshot_ready = False
+        return settled
+
+    def _begin_relationship_drive_user_turn(self) -> None:
+        from datetime import datetime
+
+        from app.core.interaction import get_interaction_id
+
+        self._relationship_drive_turn_id = str(get_interaction_id() or "").strip()
+        self._relationship_drive_turn_snapshot = None
+        self._relationship_drive_snapshot_ready = False
+        self._relationship_drive_settled_appraisal_ids = set()
+        store = self._relationship_drive_store
+        interaction_id = self._relationship_drive_turn_id
+        if store is None or not interaction_id:
+            return
+        try:
+            store.note_contact(interaction_id, datetime.now().astimezone())
+            debug_log("RelationalDrive", "contact recorded", {})
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RelationalDrive", "contact error", {"error": type(exc).__name__})
+
+    def _settle_relationship_drive_appraisal(self, interaction_id: str, appraisal) -> None:
+        from datetime import datetime
+
+        ident = str(interaction_id or "").strip()
+        store = self._relationship_drive_store
+        if store is None or not ident or appraisal is None:
+            return
+        if ident in self._relationship_drive_settled_appraisal_ids:
+            debug_log("RelationalDrive", "appraisal duplicate", {})
+            return
+        self._relationship_drive_settled_appraisal_ids.add(ident)
+        try:
+            settled = store.settle_appraisal(ident, appraisal, datetime.now().astimezone())
+            debug_log(
+                "RelationalDrive",
+                "appraisal settled" if settled else "appraisal duplicate",
+                {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RelationalDrive", "appraisal error", {"error": type(exc).__name__})
+
+    def _clear_relationship_drive_store(self) -> None:
+        self._relationship_drive_store = None
+        self._relationship_drive_turn_id = ""
+        self._relationship_drive_turn_snapshot = None
+        self._relationship_drive_snapshot_ready = False
+        self._relationship_drive_settled_appraisal_ids = set()
+
+    def _should_inject_relationship_drive_fragment(self) -> bool:
+        if self._relationship_drive_store is None:
+            return False
+        settings = getattr(self, "_relationship_settings", None)
+        return bool(getattr(settings, "in_turn_enabled", False))
 
     def _reload_lore_index(self) -> None:
         profile = self.character_profile

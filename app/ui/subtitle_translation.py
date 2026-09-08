@@ -61,6 +61,39 @@ def apply_translations_to_segments(
     return updated
 
 
+def patch_segment_by_index(
+    segments: list[ChatSegment] | None,
+    index: int,
+    translation: str,
+) -> bool:
+    """就地按原始下标回填译文。日语正文不是身份。"""
+    if not segments or index < 0 or index >= len(segments):
+        return False
+    zh = str(translation or "").strip()
+    if not zh:
+        return False
+    if str(segments[index].translation or "").strip() == zh:
+        return False
+    segments[index] = with_segment_translation(segments[index], zh)
+    return True
+
+
+def replace_segment_identity(
+    segments: list[ChatSegment] | None,
+    old: ChatSegment,
+    new: ChatSegment,
+) -> bool:
+    """就地替换仍指向 old 的槽位；不按日语正文搜索。"""
+    if not segments:
+        return False
+    changed = False
+    for index, segment in enumerate(segments):
+        if segment is old:
+            segments[index] = new
+            changed = True
+    return changed
+
+
 def patch_segment_list_by_text(
     segments: list[ChatSegment] | None,
     text: str,

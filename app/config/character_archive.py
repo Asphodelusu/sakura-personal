@@ -274,6 +274,9 @@ def export_character_archive(profile: CharacterProfile, output_path: Path, *, in
             profile.relationship_guide_path,
             "relationship_guide",
         )
+    drive_mapping = getattr(profile, "relationship_drive_mapping", None)
+    if isinstance(drive_mapping, dict) and drive_mapping:
+        character_manifest["relationship_drive"] = dict(drive_mapping)
     if include_voice and profile.voice is not None:
         character_manifest["voice"] = {
             "gpt_model": archive_path_for_resource(profile.voice.gpt_model_path, "voice/models"),
@@ -514,6 +517,9 @@ def _normalized_import_character_data(
         normalized["relationship_guide"] = _package_path_text(
             _archive_resource_path(guide_raw, "character.relationship_guide")
         )
+    drive_raw = character_data.get("relationship_drive")
+    if isinstance(drive_raw, dict) and drive_raw:
+        normalized["relationship_drive"] = dict(drive_raw)
 
     voice_data = character_data.get("voice")
     if voice_data is not None:
@@ -734,6 +740,9 @@ def _package_character_data(character_manifest: dict[str, Any]) -> dict[str, Any
         package_data["relationship_guide"] = _package_path_text(
             _archive_resource_path(guide_raw, "character.relationship_guide")
         )
+    drive_raw = character_manifest.get("relationship_drive")
+    if isinstance(drive_raw, dict) and drive_raw:
+        package_data["relationship_drive"] = dict(drive_raw)
     voice_data = character_manifest.get("voice")
     if isinstance(voice_data, dict):
         package_data["voice"] = _package_voice_data(voice_data)
