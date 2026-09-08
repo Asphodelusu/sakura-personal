@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from pathlib import Path
 
 import pytest
@@ -85,7 +84,7 @@ def test_chat_worker_forwards_progress_signal() -> None:
     assert finished_replies == ["完成了。"]
 
 
-def test_chat_worker_records_visual_observation_before_reply() -> None:
+def test_chat_worker_records_visual_observation_before_reply(tmp_path: Path) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -128,40 +127,37 @@ def test_chat_worker_records_visual_observation_before_reply() -> None:
             )
 
     app = QApplication.instance() or QApplication([])
-    path = Path("data") / f"test_worker_visual_{uuid.uuid4().hex}.jsonl"
-    try:
-        worker = ChatWorker(
-            Runtime(),  # type: ignore[arg-type]
-            [{"role": "user", "content": "帮我看截图"}],
-            visual_observation_store=VisualObservationStore(path),
-            visual_observation_jobs=[
-                VisualObservationJob(
-                    id="vis_worker",
-                    source="manual_screenshot",
-                    user_text="帮我看截图",
-                    observation=ScreenObservation(
-                        data_url="data:image/jpeg;base64,worker",
-                        width=320,
-                        height=180,
-                        captured_at="2026-05-31T12:00:00+08:00",
-                        screen_name="manual-selection",
-                    ),
-                )
-            ],
-        )
-        finished_replies = []
-        worker.finished.connect(lambda result: finished_replies.append(result.reply.translation))
+    path = tmp_path / "visual_observations.jsonl"
+    worker = ChatWorker(
+        Runtime(),  # type: ignore[arg-type]
+        [{"role": "user", "content": "帮我看截图"}],
+        visual_observation_store=VisualObservationStore(path),
+        visual_observation_jobs=[
+            VisualObservationJob(
+                id="vis_worker",
+                source="manual_screenshot",
+                user_text="帮我看截图",
+                observation=ScreenObservation(
+                    data_url="data:image/jpeg;base64,worker",
+                    width=320,
+                    height=180,
+                    captured_at="2026-05-31T12:00:00+08:00",
+                    screen_name="manual-selection",
+                ),
+            )
+        ],
+    )
+    finished_replies = []
+    worker.finished.connect(lambda result: finished_replies.append(result.reply.translation))
 
-        worker.run()
-        app.processEvents()
+    worker.run()
+    app.processEvents()
 
-        raw = path.read_text(encoding="utf-8")
-        assert "vis_worker" in raw
-        assert "可以追问的台词" in raw
-        assert "data:image" not in raw
-        assert finished_replies == ["我记下来了。"]
-    finally:
-        path.unlink(missing_ok=True)
+    raw = path.read_text(encoding="utf-8")
+    assert "vis_worker" in raw
+    assert "可以追问的台词" in raw
+    assert "data:image" not in raw
+    assert finished_replies == ["我记下来了。"]
 
 
 def test_event_worker_forwards_progress_signal() -> None:

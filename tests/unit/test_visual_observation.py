@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -92,35 +91,34 @@ def test_summarize_visual_observation_uses_high_detail_for_screen_contexts() -> 
     assert record.summary == "屏幕上有一段代码。"
 
 
-def test_visual_observation_store_redacts_sensitive_text_and_omits_images() -> None:
-    path = Path("data") / f"test_visual_{uuid.uuid4().hex}.jsonl"
-    try:
-        store = VisualObservationStore(path)
-        store.append(
-            VisualObservationRecord(
-                id="vis_secret",
-                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-                source="manual_screenshot",
-                user_text="密码: 123456",
-                screen_name="DISPLAY1",
-                width=100,
-                height=100,
-                summary="看到 API_KEY=secret-value",
-                visible_texts=["token: abcdefghijklmnopqrstuvwxyz"],
-                uncertain_texts=[],
-                notable_elements=[],
-                confidence=0.8,
-            )
+def test_visual_observation_store_redacts_sensitive_text_and_omits_images(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "visual_observations.jsonl"
+    store = VisualObservationStore(path)
+    store.append(
+        VisualObservationRecord(
+            id="vis_secret",
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            source="manual_screenshot",
+            user_text="密码: 123456",
+            screen_name="DISPLAY1",
+            width=100,
+            height=100,
+            summary="看到 API_KEY=secret-value",
+            visible_texts=["token: abcdefghijklmnopqrstuvwxyz"],
+            uncertain_texts=[],
+            notable_elements=[],
+            confidence=0.8,
         )
+    )
 
-        raw = path.read_text(encoding="utf-8")
-        assert "123456" not in raw
-        assert "secret-value" not in raw
-        assert "abcdefghijklmnopqrstuvwxyz" not in raw
-        assert "data:image" not in raw
-        assert "[REDACTED]" in raw
-    finally:
-        path.unlink(missing_ok=True)
+    raw = path.read_text(encoding="utf-8")
+    assert "123456" not in raw
+    assert "secret-value" not in raw
+    assert "abcdefghijklmnopqrstuvwxyz" not in raw
+    assert "data:image" not in raw
+    assert "[REDACTED]" in raw
 
 
 def test_visual_context_message_contains_recent_ocr_text() -> None:

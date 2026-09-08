@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.agent.builtin_tools import create_mobile_tool_registry
 from app.agent.memory import MemoryStore
 from app.agent.session_state_context import build_session_state_fragment
@@ -25,7 +27,7 @@ class _HostStub:
         self.agent_runtime = _RuntimeStub(patches)
 
 
-def test_mobile_tool_registry_exposes_memory_write_not_desktop() -> None:
+def test_mobile_tool_registry_exposes_memory_write_not_desktop(tmp_path: Path) -> None:
     class FakeMem0:
         def add(self, content, *, user_id, metadata, infer=False):
             return {
@@ -39,7 +41,9 @@ def test_mobile_tool_registry_exposes_memory_write_not_desktop() -> None:
                 ]
             }
 
-    registry = create_mobile_tool_registry(MemoryStore(memory_client=FakeMem0()))
+    registry = create_mobile_tool_registry(
+        MemoryStore(base_dir=tmp_path, memory_client=FakeMem0())
+    )
     names = {tool.name for tool in registry.all()}
     assert "memory_remember" in names
     assert "memory_search" in names

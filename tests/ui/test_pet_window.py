@@ -4711,43 +4711,40 @@ def test_manual_screenshot_text_input_records_marker_without_image_data() -> Non
     assert "data:image/jpeg;base64" not in history[0][1]
 
 
-def test_visual_context_is_injected_for_screenshot_followup() -> None:
+def test_visual_context_is_injected_for_screenshot_followup(tmp_path: Path) -> None:
     from app.ui.pet_window import _add_visual_context_to_messages
 
-    path = Path("data") / f"test_visual_context_{uuid.uuid4().hex}.jsonl"
-    try:
-        store = VisualObservationStore(path)
-        store.append(
-            VisualObservationRecord(
-                id="vis_recent",
-                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-                source="manual_screenshot",
-                user_text="帮我看这里",
-                screen_name="manual-selection",
-                width=320,
-                height=180,
-                summary="截图里是聊天气泡。",
-                visible_texts=["屏幕上的那句台词"],
-                uncertain_texts=[],
-                notable_elements=["聊天窗口"],
-                confidence=0.9,
-            )
+    path = tmp_path / "visual_observations.jsonl"
+    store = VisualObservationStore(path)
+    store.append(
+        VisualObservationRecord(
+            id="vis_recent",
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            source="manual_screenshot",
+            user_text="帮我看这里",
+            screen_name="manual-selection",
+            width=320,
+            height=180,
+            summary="截图里是聊天气泡。",
+            visible_texts=["屏幕上的那句台词"],
+            uncertain_texts=[],
+            notable_elements=["聊天窗口"],
+            confidence=0.9,
         )
+    )
 
-        messages = _add_visual_context_to_messages(
-            [{"role": "user", "content": "刚才截图里有什么台词？"}],
-            user_text="刚才截图里有什么台词？",
-            store=store,
-            has_current_image=False,
-        )
+    messages = _add_visual_context_to_messages(
+        [{"role": "user", "content": "刚才截图里有什么台词？"}],
+        user_text="刚才截图里有什么台词？",
+        store=store,
+        has_current_image=False,
+    )
 
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert "visual_id=vis_recent" in messages[0]["content"]
-        assert "屏幕上的那句台词" in messages[0]["content"]
-        assert messages[1]["content"] == "刚才截图里有什么台词？"
-    finally:
-        path.unlink(missing_ok=True)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert "visual_id=vis_recent" in messages[0]["content"]
+    assert "屏幕上的那句台词" in messages[0]["content"]
+    assert messages[1]["content"] == "刚才截图里有什么台词？"
 
 
 def test_set_busy_disables_manual_screenshot_button() -> None:

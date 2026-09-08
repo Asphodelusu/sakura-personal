@@ -986,9 +986,10 @@ def test_memory_store_uses_vendored_mem0_path_first() -> None:
 
 
 def test_builtin_registry_registers_mem0_memory_tools() -> None:
+    root = _runtime_root_path("builtin_memory_tools")
     registry = create_builtin_tool_registry(
-        _runtime_root_path("builtin_memory_tools"),
-        memory=MemoryStore(memory_client=FakeMem0()),
+        root,
+        memory=MemoryStore(base_dir=root, memory_client=FakeMem0()),
     )
 
     descriptions = {tool["name"]: tool for tool in registry.describe_tools()}
@@ -1002,9 +1003,10 @@ def test_builtin_registry_registers_mem0_memory_tools() -> None:
 
 def test_builtin_memory_update_tool_updates_existing_memory() -> None:
     fake = FakeMem0()
+    root = _runtime_root_path("builtin_memory_update_tool")
     registry = create_builtin_tool_registry(
-        _runtime_root_path("builtin_memory_update_tool"),
-        memory=MemoryStore(memory_client=fake),
+        root,
+        memory=MemoryStore(base_dir=root, memory_client=fake),
     )
     remember_result = registry.execute(
         "memory_remember",
