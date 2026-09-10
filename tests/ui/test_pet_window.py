@@ -5502,6 +5502,53 @@ def test_consume_agent_result_settles_drive_before_history_translation_and_displ
     assert calls == ["settle", "history", "translations", "show", "actions"]
 
 
+@pytest.mark.parametrize("followup", [False, True])
+def test_normal_reply_settles_adopted_effect_in_store(tmp_path, followup) -> None:
+    import json
+    from types import SimpleNamespace
+    from app.agent import AgentResult
+    from app.core.interaction import set_interaction_id, clear_interaction_id
+    from app.core.relational_drive import DriveEffect
+    from app.ui.pet_window import PetWindow
+    from tests.unit.test_relationship_drive_settlement import _runtime, _reply
+
+    runtime = _runtime(tmp_path)
+    set_interaction_id("interaction-adopted")
+    runtime._begin_relationship_drive_user_turn()
+    reply = _reply(DriveEffect(event="mutual_affection", strength="mild"))
+    observed = []
+
+    def read_settled(*_args, **_kwargs):
+        payload = json.loads(runtime._relationship_drive_store.path.read_text(encoding="utf-8"))
+        observed.append(sum(key.split(":")[-2:] == ["interaction-adopted", "effect"]
+                            for key in payload["settled_keys"]))
+        return []
+
+    window = SimpleNamespace(
+        messages=[], active_interaction_id="interaction-adopted", agent_runtime=runtime,
+        _cancel_intimacy_continue=lambda: None,
+        _log_interaction_stage=lambda *_a, **_k: None,
+        _queue_screen_observation_followup=lambda _r: followup,
+        _record_assistant_reply_history=read_settled,
+        _emit_plugin_event=lambda *_a, **_k: None,
+        character_profile=SimpleNamespace(id="synthetic"),
+        _schedule_subtitle_translations=lambda *_a, **_k: None,
+        _show_reply_segments=lambda *_a: None,
+        _apply_pending_action_from_result=lambda *_a: None,
+    )
+    try:
+        PetWindow._handle_reply(window, AgentResult(reply=reply))
+        PetWindow._handle_reply(window, AgentResult(reply=reply))
+        if followup:
+            assert observed == []
+            read_settled()
+            assert observed == [0]
+        else:
+            assert observed == [1, 1]
+    finally:
+        clear_interaction_id()
+
+
 def test_reply_history_buttons_disable_while_busy_or_playing() -> None:
     from app.ui.pet_window import PetWindow
 

@@ -4462,6 +4462,13 @@ class PetWindow(QWidget):
             self._log_interaction_stage("screen_observation_followup_queued")
             return
         reply = result.reply
+        runtime = getattr(self, "agent_runtime", None)
+        settle_drive = getattr(runtime, "settle_adopted_reply_drive", None)
+        if callable(settle_drive):
+            settle_drive(
+                str(getattr(self, "active_interaction_id", "") or ""),
+                reply,
+            )
         self.messages.append({"role": "assistant", "content": reply.text})
         history_ids = self._record_assistant_reply_history(reply, _debug=result._debug)
         self._log_interaction_stage("assistant_message_recorded")

@@ -334,6 +334,86 @@ def test_first_serial_index_reaches_ui_before_remaining_indexes() -> None:
     controller.cancel_reply_flow()
 
 
+@pytest.mark.parametrize("first_failed", [False, True])
+@pytest.mark.parametrize("second_outcome", ["translated", "timeout"])
+def test_resolved_first_index_does_not_release_untranslated_second(first_failed, second_outcome) -> None:
+    from app.ui.pet_window import PetWindow
+
+    app = _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    segments = [
+        ChatSegment("おはよう。", "开心", "", "站立待机"),
+        ChatSegment("ねえ。", "温柔", "", "站立待机"),
+        ChatSegment("次。", "温柔", "下一句。", "站立待机"),
+    ]
+    window = SimpleNamespace(
+        subtitle_controller=controller, subtitle_language="zh",
+        reply_history_segments=list(segments), active_interaction_id="turn-partial",
+        _pending_subtitle_translation_interaction_id="turn-partial",
+    )
+    controller.begin_translation_gate(timeout_seconds=6, interaction_id="turn-partial")
+    controller.show_segments(list(segments))
+    tts.on_started()
+    payload = {"interaction_id": "turn-partial", "segment_index": 0,
+               "translation": "早安。", "text": segments[0].text}
+    if first_failed:
+        PetWindow._on_subtitle_translation_index_failed(window, payload)
+    else:
+        PetWindow._on_subtitle_translation_index_resolved(window, payload)
+    tts.on_finished()
+    _fire_dialogue_dwell(controller, 1000)
+    tts.on_started()
+    tts.on_finished()
+    app.processEvents()
+    try:
+        assert controller.current_segment_index == 1
+        assert not controller.current_segment_speech_done
+        assert not controller.reply_advance_scheduled
+        assert segments[1].text not in label.text
+        assert len(tts.spoken) == 2
+        if second_outcome == "translated":
+            PetWindow._on_subtitle_translation_index_resolved(
+                window, {"interaction_id": "turn-partial", "segment_index": 1,
+                         "translation": "喂。", "text": segments[1].text},
+            )
+            assert label.text == "喂。"
+        else:
+            assert controller._translation_gate_timer.isActive()
+            controller._translation_gate_timer.stop()
+            controller._translation_gate_timer.timeout.emit()
+            assert label.text == segments[1].text
+        _fire_dialogue_dwell(controller, 1000)
+        assert len(tts.spoken) == 3
+    finally:
+        controller.cancel_reply_flow()
+
+
+def test_batch_timeout_does_not_redisplay_already_translated_current_line(monkeypatch) -> None:
+    _qt_app_or_skip()
+    label = _DummyLabel()
+    tts = _DelayedTTS()
+    controller = _build_controller(label, tts, [])
+    first = ChatSegment("おはよう。", "开心", "", "站立待机")
+    controller.begin_translation_gate(timeout_seconds=6)
+    controller.show_segments([first, ChatSegment("ねえ。", "温柔", "", "站立待机")])
+    tts.on_started()
+    controller.consume_index_success(0, ChatSegment(first.text, first.tone, "早安。", first.portrait))
+    tts.on_finished()
+    token = controller.reply_advance_token
+    visible_at = controller._segment_visible_monotonic
+    monkeypatch.setattr("app.ui.subtitle_controller.time.monotonic", lambda: visible_at + 3)
+    controller._translation_gate_timer.stop()
+    controller._translation_gate_timer.timeout.emit()
+    try:
+        assert label.text == "早安。"
+        assert controller._segment_visible_monotonic == visible_at
+        assert controller.reply_advance_token == token
+    finally:
+        controller.cancel_reply_flow()
+
+
 def test_current_index_terminal_failure_releases_japanese_immediately() -> None:
     from app.ui.pet_window import PetWindow
 
