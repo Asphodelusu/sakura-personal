@@ -2,6 +2,7 @@
 param(
     [string]$CacheDirectory = "",
     [string]$OutputDirectory = "",
+    [string]$PersonalMem0Dependencies = "",
     [switch]$KeepStaging,
     [switch]$Updater,
     [switch]$UpdaterArtifacts
@@ -63,6 +64,21 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "命令失败（exit $LASTEXITCODE）：$Program $($Arguments -join ' ')"
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($PersonalMem0Dependencies)) {
+    $personalSourcePreflight = @'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from tools.release.stage_distribution import validate_personal_dependency_source
+for output in sys.argv[3:]:
+    validate_personal_dependency_source(Path(sys.argv[2]), Path(output), "windows-x64")
+'@
+    & $python -B -c $personalSourcePreflight $projectRoot $PersonalMem0Dependencies $buildRoot $releaseStage $portableStage
+    if ($LASTEXITCODE -ne 0) {
+        throw "个人 Memory 依赖目录不安全或不完整，未清理任何构建目录。"
     }
 }
 
@@ -136,13 +152,20 @@ try {
         Remove-StageDirectory $stage
     }
 
-    Invoke-Checked $python @(
+    $personalMem0Arguments = @()
+    if (-not [string]::IsNullOrWhiteSpace($PersonalMem0Dependencies)) {
+        $personalMem0Arguments = @(
+            "--personal-mem0-dependencies", [IO.Path]::GetFullPath($PersonalMem0Dependencies)
+        )
+    }
+
+    Invoke-Checked $python (@(
         (Join-Path $projectRoot "tools\release\stage_distribution.py"),
         "--target", "windows-x64",
         "--python-root", $pythonRoot,
         "--output", $releaseStage,
         "--smoke"
-    )
+    ) + $personalMem0Arguments)
     $tauriConfigArguments = @(
         (Join-Path $projectRoot "tools\release\tauri_release_config.py"),
         "--target", "windows-x64",
@@ -194,14 +217,14 @@ try {
         Copy-Item -LiteralPath $generatedSignature -Destination $updaterSignature -Force
     }
 
-    Invoke-Checked $python @(
+    Invoke-Checked $python (@(
         (Join-Path $projectRoot "tools\release\stage_distribution.py"),
         "--target", "windows-x64",
         "--python-root", $pythonRoot,
         "--output", $portableStage,
         "--portable",
         "--smoke"
-    )
+    ) + $personalMem0Arguments)
     $shell = Join-Path $projectRoot "desktop\src-tauri\target\release\sakura.exe"
     Copy-Item -LiteralPath $shell -Destination (Join-Path $portableStage "sakura.exe") -Force
     Remove-Item -LiteralPath (Join-Path $portableStage "release-inventory.json") -Force

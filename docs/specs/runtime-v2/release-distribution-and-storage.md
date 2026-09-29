@@ -92,6 +92,13 @@ wheelhouse 以保证首次启动离线可用；普通第三方插件不强制携
 `python/tools/`，共享下载缓存只做物理去重，不改变插件 import 隔离。具体过渡合同见
 [Plugin Runtime v4](sakura-plugin-runtime-v4.md)。
 
+个人 Windows 构建可向 `scripts/package_windows.ps1` 显式传入
+`-PersonalMem0Dependencies <已安装的 Python 3.12 依赖目录>`。Setup 与 Portable staging 只把该目录复制到
+`sakura.memory.mem0` 的 dependency root，不改变 Core 或其他插件的依赖。源目录如有
+`.sakura-dependencies.json`，须符合现行 marker 格式。staging 写入标准发行 marker，并在裁剪后的目录中以
+Python 3.12 的隔离进程导入 `numpy`、`torch`、`sentence_transformers`、核对来源；通过后才生成完整发行清单。导入成功只证明这些包在
+当前解释器中可加载；现成安装目录不是可重复解析的 wheel 锁文件，也不证明完整离线重建能力。
+
 当前物理路径固定为：预装插件使用只读的 `distribution_root/plugins/dependencies/<plugin-id>/`，普通用户插件
 使用可写的 `user_root/data/plugin-runtime/dependencies/<plugin-id>/`。两者使用同一 marker、fingerprint 和
 Runner 校验；普通启动只读取并验证，不把预装环境复制到 user root，也不自动安装或修复。

@@ -70,9 +70,10 @@ FORBIDDEN_PARTS = {
 FORBIDDEN_SUFFIXES = {".ckpt", ".pth", ".safetensors"}
 IGNORED_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store"}
 DEPENDENCY_TEST_DIRECTORIES = {"test", "tests"}
+PERSONAL_IMPORTS = ("numpy", "torch", "sentence_transformers")
 
 
-def copy_tree(source: Path, target: Path) -> None:
+def copy_tree(source: Path, target: Path, *, extra_ignored: tuple[str, ...] = ()) -> None:
     shutil.copytree(
         source,
         target,
@@ -85,6 +86,7 @@ def copy_tree(source: Path, target: Path) -> None:
             ".mypy_cache",
             ".ruff_cache",
             *sorted(FORBIDDEN_PARTS),
+            *extra_ignored,
         ),
     )
 
@@ -146,11 +148,65 @@ def _python_version(executable: Path) -> str:
     return result.stdout.strip()
 
 
-def stage_bundled_dependencies(stage: Path, target: str) -> None:
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except OSError as error:
+        raise ValueError("PERSONAL_DEPENDENCIES_PATH_UNSAFE") from error
+    return path.is_symlink() or bool(
+        getattr(details, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def validate_personal_dependency_source(source: Path, output: Path, target: str) -> Path:
+    if target != "windows-x64":
+        raise ValueError("PERSONAL_DEPENDENCIES_WINDOWS_ONLY")
+    source = Path(source).absolute()
+    output = Path(output).absolute()
+    if not source.is_dir():
+        raise ValueError("PERSONAL_DEPENDENCIES_INCOMPLETE")
+    for part in (source, *source.parents):
+        if _is_reparse_point(part):
+            raise ValueError("PERSONAL_DEPENDENCIES_PATH_UNSAFE")
+    resolved_source = source.resolve()
+    resolved_output = output.resolve()
+    if (
+        resolved_source == resolved_output
+        or resolved_source in resolved_output.parents
+        or resolved_output in resolved_source.parents
+    ):
+        raise ValueError("PERSONAL_DEPENDENCIES_PATH_UNSAFE")
+    for root, dirs, files in os.walk(source, followlinks=False):
+        for name in (*dirs, *files):
+            if _is_reparse_point(Path(root) / name):
+                raise ValueError("PERSONAL_DEPENDENCIES_PATH_UNSAFE")
+    if any(not (source / name / "__init__.py").is_file() for name in PERSONAL_IMPORTS):
+        raise ValueError("PERSONAL_DEPENDENCIES_INCOMPLETE")
+    marker_path = source / ".sakura-dependencies.json"
+    if marker_path.exists():
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("PERSONAL_DEPENDENCIES_MARKER_INVALID") from error
+        if (
+            not isinstance(marker, dict)
+            or marker.get("schemaVersion") != 1
+            or marker.get("kind") != "requirements.txt"
+            or marker.get("python") != "3.12"
+        ):
+            raise ValueError("PERSONAL_DEPENDENCIES_MARKER_INVALID")
+    return resolved_source
+
+
+def stage_bundled_dependencies(
+    stage: Path, target: str, *, personal_dependencies: Path | None = None
+) -> None:
     executable = python_executable(stage / "python", target)
     suffix = ".exe" if target == "windows-x64" else ""
     uv = stage / "python/tools" / f"uv{suffix}"
     python_version = _python_version(executable)
+    if personal_dependencies is not None and python_version != "3.12":
+        raise ValueError("PERSONAL_DEPENDENCIES_PYTHON_INVALID")
     dependency_parent = stage / "plugins/dependencies"
     dependency_parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -165,28 +221,35 @@ def stage_bundled_dependencies(stage: Path, target: str) -> None:
         plugin_id = _manifest_plugin_id(plugin_root / "plugin.yaml")
         requirements = plugin_root / "requirements.txt"
         dependency_root = dependency_parent / plugin_id
-        dependency_root.mkdir()
-        subprocess.run(
-            [
-                str(uv),
-                "pip",
-                "install",
-                "--target",
-                str(dependency_root),
-                "--python",
-                str(executable),
-                "--no-python-downloads",
-                "--link-mode",
-                "clone" if target == "macos-arm64" else "hardlink",
-                "--no-progress",
-                "--requirements",
-                str(requirements),
-            ],
-            check=True,
-            cwd=plugin_root,
-            env=uv_download_environment(plugin_root, environment),
-            timeout=600,
-        )
+        if directory_name == "sakura_mem0" and personal_dependencies is not None:
+            copy_tree(
+                personal_dependencies,
+                dependency_root,
+                extra_ignored=("*.whl", ".lock"),
+            )
+        else:
+            dependency_root.mkdir()
+            subprocess.run(
+                [
+                    str(uv),
+                    "pip",
+                    "install",
+                    "--target",
+                    str(dependency_root),
+                    "--python",
+                    str(executable),
+                    "--no-python-downloads",
+                    "--link-mode",
+                    "clone" if target == "macos-arm64" else "hardlink",
+                    "--no-progress",
+                    "--requirements",
+                    str(requirements),
+                ],
+                check=True,
+                cwd=plugin_root,
+                env=uv_download_environment(plugin_root, environment),
+                timeout=600,
+            )
         marker = {
             "schemaVersion": 1,
             "kind": "requirements.txt",
@@ -196,6 +259,57 @@ def stage_bundled_dependencies(stage: Path, target: str) -> None:
             json.dumps(marker, ensure_ascii=False, sort_keys=True),
             encoding="utf-8",
         )
+
+
+def verify_personal_imports(
+    executable: Path, dependency_root: Path, plugin_root: Path, plugin_sdk_root: Path
+) -> None:
+    """Prove private imports with a fresh isolated interpreter, without loading models."""
+    script = (
+        "import importlib, sys\n"
+        "from pathlib import Path\n"
+        f"root = Path({str(dependency_root)!r}).resolve()\n"
+        f"roots = [{str(plugin_sdk_root)!r}, {str(plugin_root)!r}, str(root)]\n"
+        "stdlib = [item for item in sys.path if item and 'site-packages' not in item "
+        "and 'dist-packages' not in item]\n"
+        "sys.path[:] = list(dict.fromkeys([*roots, *stdlib]))\n"
+        f"for name in {PERSONAL_IMPORTS!r}:\n"
+        "    module = importlib.import_module(name)\n"
+        "    origin = Path(module.__file__).resolve()\n"
+        "    if not origin.is_relative_to(root):\n"
+        "        raise ImportError(f'{name} outside private root: {origin}')\n"
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment.update({
+        "PYTHONNOUSERSITE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "ANONYMIZED_TELEMETRY": "False",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    })
+    subprocess.run(
+        [str(executable), "-I", "-B", "-S", "-c", script],
+        check=True,
+        cwd=plugin_root,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+
+
+def smoke_personal_dependencies(stage: Path, target: str) -> None:
+    if target != "windows-x64":
+        raise ValueError("PERSONAL_DEPENDENCIES_WINDOWS_ONLY")
+    verify_personal_imports(
+        python_executable(stage / "python", target),
+        stage / "plugins/dependencies/sakura.memory.mem0",
+        stage / "plugins/builtin/sakura_mem0",
+        stage / "core/app/plugin_sdk",
+    )
 
 
 def _manifest_value(path: Path, key: str) -> str:
@@ -445,7 +559,16 @@ def inventory(stage: Path, target: str) -> dict[str, object]:
     }
 
 
-def assemble(repo: Path, python_source: Path, output: Path, target: str, *, portable: bool) -> None:
+def assemble(
+    repo: Path, python_source: Path, output: Path, target: str, *, portable: bool,
+    personal_dependencies: Path | None = None,
+) -> None:
+    if personal_dependencies is not None:
+        personal_dependencies = validate_personal_dependency_source(
+            personal_dependencies, output, target
+        )
+        if _python_version(python_executable(python_source, target)) != "3.12":
+            raise ValueError("PERSONAL_DEPENDENCIES_PYTHON_INVALID")
     if output.exists() and any(output.iterdir()):
         raise ValueError("STAGING_OUTPUT_NOT_EMPTY")
     output.mkdir(parents=True, exist_ok=True)
@@ -459,13 +582,15 @@ def assemble(repo: Path, python_source: Path, output: Path, target: str, *, port
     (output / "plugins").mkdir(exist_ok=True)
     copy_tree(repo / "plugins/builtin", output / "plugins/builtin")
     move_tools(output / "python", target)
-    stage_bundled_dependencies(output, target)
+    stage_bundled_dependencies(output, target, personal_dependencies=personal_dependencies)
     prune_non_runtime_files(output, target)
     if target == "windows-x64":
         write_windows_pth(output / "python")
     if portable:
         (output / "portable.flag").write_bytes(b"")
     validate_layout(output, target, portable=portable)
+    if personal_dependencies is not None:
+        smoke_personal_dependencies(output, target)
     try:
         from .diagnostic_build import write_mapping
     except ImportError:
@@ -484,13 +609,17 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--portable", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--personal-mem0-dependencies", type=Path)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     python_root = args.python_root.resolve()
     output = args.output.resolve()
     if output == repo or repo in output.parents and output.name in {"data", "characters", "plugins"}:
         raise SystemExit("STAGING_OUTPUT_UNSAFE")
-    assemble(repo, python_root, output, args.target, portable=args.portable)
+    assemble(
+        repo, python_root, output, args.target, portable=args.portable,
+        personal_dependencies=args.personal_mem0_dependencies,
+    )
     if args.smoke:
         smoke(output, args.target)
     report = json.loads((output / "release-inventory.json").read_text(encoding="utf-8"))
