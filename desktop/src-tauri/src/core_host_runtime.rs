@@ -4631,6 +4631,13 @@ mod tests {
         let source = repo_root().join("tests/fixtures/runtime_v2/wp_3_01/ready");
         copy_fixture_tree(&source, &app_root);
         let (provider_url, provider) = wp_3_02_local_provider();
+        // The local server supplies one main-chat response. Optional thought
+        // requests are covered separately by the Python Core integration tests.
+        fs::write(
+            app_root.join("config/system_config.yaml"),
+            "config_version: 1\ninner_thought:\n  enabled: false\n",
+        )
+        .expect("local Provider fixture settings should write");
         fs::write(
             app_root.join("config/api.yaml"),
             format!(

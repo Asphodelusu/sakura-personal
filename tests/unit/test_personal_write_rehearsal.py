@@ -14,6 +14,7 @@ def test_write_rehearsal_requires_admission_before_model_load(tmp_path, dependen
     assert calls == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Working-copy creation uses Windows filesystem admission")
 def test_fresh_baseline_copy_writes_and_reopens_without_unlocking_default(tmp_path, dependencies, monkeypatch):
     from tools.personal_memory_write_rehearsal import prepare_rehearsal
     from plugins.builtin.sakura_mem0.index_contract import COPY_STATE_FILE
