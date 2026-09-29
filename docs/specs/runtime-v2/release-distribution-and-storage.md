@@ -112,6 +112,7 @@ Setup 与 Portable 两次 staging。staging 只改写 `plugins/builtin/sakura_me
 Runner 校验；普通启动只读取并验证，不把预装环境复制到 user root，也不自动安装或修复。
 
 个人日用记忆使用显式 `plugin:PersonalDailyPlugin` 入口；默认插件和只读入口不会因为出现日用标记而获得写入能力。
+日用入口在构造回忆边界及其加载线程之前，仅在当前进程把 `FASTEMBED_CACHE_PATH` 指到宿主存储 `cache/memory/bm25`，并设置 `HF_HUB_OFFLINE=1`。这两项在日用运行时存活期间保持有效；上下文清理和 setup 失败都会恢复进入前的值。默认插件、只读回忆和写入演练不修改它们。不新增用户选项，也不在准入检查前创建该缓存目录。
 迁移工具须在停写迁移完成后建立 memory 根内的 `.personal-daily.json`：字段严格为
 `schemaVersion: 1`、`purpose: "personal-memory-daily"`、`root`（实际 memory 根绝对路径）和
 `scopes`（允许的非空、唯一角色 ID 列表）。仍须通过完整副本、索引及模型身份、存储结构和未完成写入检查。

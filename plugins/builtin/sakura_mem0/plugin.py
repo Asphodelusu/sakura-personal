@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -627,6 +628,35 @@ def _model_download_error_detail(code: str) -> str:
     return f"{messages[safe_code]}（{safe_code}）"
 
 
+def _retain_daily_bm25_cache(context: object, storage: object) -> None:
+    """Point FastEmbed at the host BM25 cache until this daily context closes.
+
+    Setup failure closes the context and runs effects in reverse. Registering
+    the restore before runtime close keeps the variables while that runtime,
+    including its load thread, is still alive.
+    """
+    cache_path = str(Path(storage.resolve("cache", "memory")) / "bm25")
+    previous = {
+        "FASTEMBED_CACHE_PATH": os.environ.get("FASTEMBED_CACHE_PATH"),
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE"),
+    }
+    os.environ["FASTEMBED_CACHE_PATH"] = cache_path
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+    def restore() -> None:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    try:
+        getattr(context, "effect")(restore)
+    except Exception:
+        restore()
+        raise
+
+
 class SakuraMem0Plugin:
     def __init__(
         self,
@@ -659,6 +689,8 @@ class SakuraMem0Plugin:
             else:
                 from personal_runtime import PersonalRecallBoundary
             storage = getattr(context, "get")("sakura.host.storage")
+            if self._personal_daily:
+                _retain_daily_bm25_cache(context, storage)
             character = getattr(context, "get")("sakura.host.character").current()
             character_id = str(character.get("id") or "")
             curation_options = None
