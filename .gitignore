@@ -54,11 +54,15 @@ data/chat_history.jsonl
 data/chat_history/
 data/tasks.json
 data/memory/
+data/memory_backup_*/
 data/memory.json
 data/memory_curation_state.json
 data/reminders.json
 data/visual_observations/
 data/runtime_events/
+data/runtime_state/
+data/hf-cache/
+data/intimacy_guide.txt
 data/notes/
 data/tts_bundles/
 data/logs/
