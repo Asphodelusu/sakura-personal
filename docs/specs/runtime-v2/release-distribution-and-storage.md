@@ -99,6 +99,14 @@ wheelhouse 以保证首次启动离线可用；普通第三方插件不强制携
 Python 3.12 的隔离进程导入 `numpy`、`torch`、`sentence_transformers`、核对来源；通过后才生成完整发行清单。导入成功只证明这些包在
 当前解释器中可加载；现成安装目录不是可重复解析的 wheel 锁文件，也不证明完整离线重建能力。
 
+`-PersonalDaily` 必须与 `-PersonalMem0Dependencies` 一起使用，且只适用于 Windows。脚本把该开关转发给
+Setup 与 Portable 两次 staging。staging 只改写 `plugins/builtin/sakura_mem0/plugin.yaml` 的 `entry`：
+源入口必须是 `plugin:SakuraMem0Plugin`，改写结果是 `plugin:PersonalDailyPlugin`；`id`、`version` 和其余字段保持原样，
+仓库内源清单保持原入口。源入口不符、缺少个人依赖或目标不是 Windows 时，在创建输出前拒绝。未传 `-PersonalDaily` 时，
+复制个人依赖仍保留默认入口 `plugin:SakuraMem0Plugin`。改写发生在布局校验、个人依赖导入核对和发行清单之前。
+`-PersonalDaily` 不能与 `-Updater` 或 `-UpdaterArtifacts` 同时使用，并且 `VERSION` 必须含预发布连字符 `-`；
+上述组合以及缺少个人依赖，都在清理构建目录、编译和创建输出目录之前拒绝。个人日用包使用带预发布标记的版本，由用户手动更新。
+
 当前物理路径固定为：预装插件使用只读的 `distribution_root/plugins/dependencies/<plugin-id>/`，普通用户插件
 使用可写的 `user_root/data/plugin-runtime/dependencies/<plugin-id>/`。两者使用同一 marker、fingerprint 和
 Runner 校验；普通启动只读取并验证，不把预装环境复制到 user root，也不自动安装或修复。

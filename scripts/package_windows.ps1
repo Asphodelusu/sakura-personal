@@ -4,6 +4,7 @@ param(
     [string]$OutputDirectory = "",
     [string]$PersonalMem0Dependencies = "",
     [switch]$KeepStaging,
+    [switch]$PersonalDaily,
     [switch]$Updater,
     [switch]$UpdaterArtifacts
 )
@@ -19,6 +20,17 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 $version = (& $python (Join-Path $projectRoot "tools\release\versioning.py")).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
     throw "无法读取发行版本。"
+}
+if ($PersonalDaily) {
+    if ($Updater -or $UpdaterArtifacts) {
+        throw "-PersonalDaily 不能与 -Updater 或 -UpdaterArtifacts 同时使用。"
+    }
+    if ($version -notmatch '-') {
+        throw "-PersonalDaily 需要带连字符的预发布 VERSION。"
+    }
+    if ([string]::IsNullOrWhiteSpace($PersonalMem0Dependencies)) {
+        throw "-PersonalDaily 需要显式的 -PersonalMem0Dependencies。"
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($CacheDirectory)) {
@@ -157,6 +169,9 @@ try {
         $personalMem0Arguments = @(
             "--personal-mem0-dependencies", [IO.Path]::GetFullPath($PersonalMem0Dependencies)
         )
+    }
+    if ($PersonalDaily) {
+        $personalMem0Arguments += "--personal-daily"
     }
 
     Invoke-Checked $python (@(

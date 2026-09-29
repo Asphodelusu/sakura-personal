@@ -328,6 +328,43 @@ def _manifest_plugin_id(path: Path) -> str:
     return plugin_id
 
 
+_PERSONAL_DAILY_SOURCE_ENTRY = "plugin:SakuraMem0Plugin"
+_PERSONAL_DAILY_STAGED_ENTRY = "plugin:PersonalDailyPlugin"
+
+
+def _reject_invalid_personal_daily(
+    repo: Path, target: str, personal_dependencies: Path | None, personal_daily: bool
+) -> None:
+    if not personal_daily:
+        return
+    if target != "windows-x64":
+        raise ValueError("PERSONAL_DAILY_WINDOWS_ONLY")
+    if personal_dependencies is None:
+        raise ValueError("PERSONAL_DAILY_DEPENDENCIES_REQUIRED")
+    source_entry = _manifest_value(repo / "plugins/builtin/sakura_mem0/plugin.yaml", "entry")
+    if source_entry != _PERSONAL_DAILY_SOURCE_ENTRY:
+        raise ValueError("PERSONAL_DAILY_ENTRY_UNEXPECTED")
+
+
+def _switch_staged_personal_daily_entry(stage: Path) -> None:
+    path = stage / "plugins/builtin/sakura_mem0/plugin.yaml"
+    if _manifest_value(path, "entry") != _PERSONAL_DAILY_SOURCE_ENTRY:
+        raise ValueError("PERSONAL_DAILY_ENTRY_UNEXPECTED")
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    replaced = False
+    rewritten: list[str] = []
+    for line in lines:
+        body = line.rstrip("\r\n")
+        if not replaced and re.fullmatch(r"entry:\s*.+", body):
+            rewritten.append(f"entry: {_PERSONAL_DAILY_STAGED_ENTRY}{line[len(body):]}")
+            replaced = True
+        else:
+            rewritten.append(line)
+    if not replaced:
+        raise ValueError("PERSONAL_DAILY_ENTRY_UNEXPECTED")
+    path.write_text("".join(rewritten), encoding="utf-8")
+
+
 def smoke_bundled_entries(stage: Path, target: str) -> None:
     executable = python_executable(stage / "python", target)
     runner = stage / "core/app/plugins/plugin_runner_v4.py"
@@ -562,7 +599,9 @@ def inventory(stage: Path, target: str) -> dict[str, object]:
 def assemble(
     repo: Path, python_source: Path, output: Path, target: str, *, portable: bool,
     personal_dependencies: Path | None = None,
+    personal_daily: bool = False,
 ) -> None:
+    _reject_invalid_personal_daily(repo, target, personal_dependencies, personal_daily)
     if personal_dependencies is not None:
         personal_dependencies = validate_personal_dependency_source(
             personal_dependencies, output, target
@@ -581,6 +620,8 @@ def assemble(
     copy_tree(repo / "app", output / "core/app")
     (output / "plugins").mkdir(exist_ok=True)
     copy_tree(repo / "plugins/builtin", output / "plugins/builtin")
+    if personal_daily:
+        _switch_staged_personal_daily_entry(output)
     move_tools(output / "python", target)
     stage_bundled_dependencies(output, target, personal_dependencies=personal_dependencies)
     prune_non_runtime_files(output, target)
@@ -610,6 +651,7 @@ def main() -> int:
     parser.add_argument("--portable", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--personal-mem0-dependencies", type=Path)
+    parser.add_argument("--personal-daily", action="store_true")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     python_root = args.python_root.resolve()
@@ -619,6 +661,7 @@ def main() -> int:
     assemble(
         repo, python_root, output, args.target, portable=args.portable,
         personal_dependencies=args.personal_mem0_dependencies,
+        personal_daily=args.personal_daily,
     )
     if args.smoke:
         smoke(output, args.target)
