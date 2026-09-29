@@ -4,9 +4,9 @@ name: Test
 on:
   workflow_dispatch:
   push:
-    branches: [main, dev]
+    branches: [main, dev, dev6]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, dev6]
 
 permissions:
   contents: read

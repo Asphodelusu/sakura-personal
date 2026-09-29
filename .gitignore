@@ -1,5 +1,6 @@
 .vscode/
 .codex/
+/.local/
 
 .env
 .env.migrated
@@ -31,6 +32,8 @@ desktop/src-tauri/tauri.release.json
 characters/
 !tests/fixtures/runtime_v2/wp_0_02/dataset/characters/
 !tests/fixtures/runtime_v2/wp_0_02/dataset/characters/**
+!tests/fixtures/runtime_v2/wp_3_01/ready/characters/
+!tests/fixtures/runtime_v2/wp_3_01/ready/characters/**
 
 .pytest_cache/
 .pytest-basetemp/
