@@ -15,7 +15,7 @@ try:
         load_personal_core_profile_record,
         patch_personal_core_profile_sections,
     )
-    from .personal_records import _require_write_rehearsal
+    from .personal_records import _require_write_mode
     from .support import OperationCancelled, log_event
 except ImportError:
     from personal_core_candidates import CoreCandidateQueue, CoreCandidateQueueError, exclusive_json_path_lock
@@ -30,7 +30,7 @@ except ImportError:
         load_personal_core_profile_record,
         patch_personal_core_profile_sections,
     )
-    from personal_records import _require_write_rehearsal
+    from personal_records import _require_write_mode
     from support import OperationCancelled, log_event
 
 
@@ -112,11 +112,12 @@ class _CompletionAdapter:
 
 
 class _ProfileStore:
-    def __init__(self, memory_dir, scope, cancel, closed):
+    def __init__(self, memory_dir, scope, cancel, closed, *, daily=False):
         self._memory_dir = memory_dir
         self._scope = scope
         self._cancel = cancel
         self._closed = closed
+        self._daily = daily
 
     def core_profile(self):
         return load_personal_core_profile_record(self._memory_dir, self._scope)
@@ -131,6 +132,7 @@ class _ProfileStore:
             candidate_ids=candidate_ids,
             migrate_legacy=migrate_legacy,
             cancel_checker=self._check_open,
+            daily=self._daily,
         )
 
     def _check_open(self):
@@ -139,9 +141,10 @@ class _ProfileStore:
 
 
 class ProfileMaintenance:
-    def __init__(self, memory_dir, scope, *, settings=None, clock=None, cancel_event=None):
+    def __init__(self, memory_dir, scope, *, settings=None, clock=None, cancel_event=None, daily=False):
         self._memory_dir = Path(memory_dir)
         self._scope = str(scope)
+        self._daily = daily
         self._settings = _settings(settings)
         self._clock = clock or (lambda: __import__("datetime").datetime.now().astimezone())
         self._cancel = cancel_event or threading.Event()
@@ -166,7 +169,8 @@ class ProfileMaintenance:
     def persist_candidates(self, entries, payloads):
         if not self.enabled():
             return None
-        _require_write_rehearsal(self._memory_dir)
+        _require_write_mode(self._memory_dir, self._scope, daily=self._daily,
+                            write_rehearsal=not self._daily)
         grounded = []
         for payload in payloads or ():
             if len(grounded) >= MAX_CORE_CANDIDATES_PER_JOB:
@@ -181,12 +185,14 @@ class ProfileMaintenance:
     def run(self, trigger, completion):
         if not self.enabled():
             return None
-        _require_write_rehearsal(self._memory_dir)
+        _require_write_mode(self._memory_dir, self._scope, daily=self._daily,
+                            write_rehearsal=not self._daily)
         if self._closed.is_set():
             return None
         maintainer = CoreProfileMaintainer(
             api_client=_CompletionAdapter(completion, self._cancel, self._closed),
-            memory_store=_ProfileStore(self._memory_dir, self._scope, self._cancel, self._closed),
+            memory_store=_ProfileStore(self._memory_dir, self._scope, self._cancel, self._closed,
+                                       daily=self._daily),
             queue=self._queue_store(),
             state_store=self._state_store(),
             settings=self._settings,

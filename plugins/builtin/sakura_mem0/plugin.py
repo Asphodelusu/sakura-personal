@@ -632,13 +632,19 @@ class SakuraMem0Plugin:
         self,
         runtime_factory: Callable[[object], SakuraMem0Runtime] | None = None,
         *, personal_snapshot: Path | None = None, personal_write_rehearsal: bool = False,
+        personal_daily: bool = False,
     ) -> None:
         if runtime_factory is not None and personal_snapshot is not None:
             raise ValueError("PERSONAL_RUNTIME_FACTORY_CONFLICT")
         self._personal_snapshot = personal_snapshot
         if personal_write_rehearsal and personal_snapshot is None:
             raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        if personal_daily and personal_snapshot is None:
+            raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        if personal_daily and personal_write_rehearsal:
+            raise ValueError("PERSONAL_WRITE_MODE_CONFLICT")
         self._personal_write_rehearsal = personal_write_rehearsal
+        self._personal_daily = personal_daily
         self._runtime_factory = runtime_factory or _default_runtime
 
     def setup(self, context: object) -> None:
@@ -657,7 +663,7 @@ class SakuraMem0Plugin:
             character_id = str(character.get("id") or "")
             curation_options = None
             timeline = None
-            if self._personal_write_rehearsal:
+            if self._personal_write_rehearsal or self._personal_daily:
                 slots = getattr(context, "get")("sakura.host.model_slots")
                 timeline = getattr(context, "get")("sakura.host.timeline")
                 curation_options = {
@@ -668,13 +674,13 @@ class SakuraMem0Plugin:
                 }
             boundary = PersonalRecallBoundary(Path(storage.resolve("data", "memory")),
                                               character_id, self._personal_snapshot,
-                                              curation_options=curation_options)
+                                              curation_options=curation_options, daily=self._personal_daily)
             runtime = SakuraMem0Runtime(Path(getattr(context, "data_path")(".")),
                                        character_id, boundary=boundary, timeline=timeline)
         else:
             runtime = self._runtime_factory(context)
         getattr(context, "effect")(runtime.close)
-        if self._personal_snapshot is None or self._personal_write_rehearsal:
+        if self._personal_snapshot is None or self._personal_write_rehearsal or self._personal_daily:
             getattr(context, "on")(HOST_CHAT_COMPLETED_EVENT, runtime.note_completed_chat)
         getattr(context, "get")("sakura.host.context").register(
             {
@@ -760,6 +766,15 @@ class PersonalWriteRehearsalPlugin:
         if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
             raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
         SakuraMem0Plugin(personal_snapshot=Path(snapshot), personal_write_rehearsal=True).setup(context)
+
+
+class PersonalDailyPlugin:
+    """Explicit personal daily entry; admission remains path and scope bound."""
+    def setup(self, context):
+        snapshot = context.config.get().get("personalSnapshot")
+        if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
+            raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        SakuraMem0Plugin(personal_snapshot=Path(snapshot), personal_daily=True).setup(context)
 
 
 def _default_runtime(context: object) -> SakuraMem0Runtime:

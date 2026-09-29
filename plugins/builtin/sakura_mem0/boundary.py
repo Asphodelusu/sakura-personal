@@ -738,6 +738,7 @@ class MemoryBoundary:
                             self._character_id,
                             settings=core_maintainer_from_config(self._curation_config_getter()),
                             cancel_event=self._curation_cancel,
+                            daily=bool(getattr(self._store, "personal_daily", False)),
                         )
                         with self._lock:
                             self._profile_maintenance = maintenance

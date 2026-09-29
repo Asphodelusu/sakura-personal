@@ -57,8 +57,8 @@ def rehearsal(tmp_path, dependencies, monkeypatch):
         effect()
 
 
-def start(context):
-    plugin.PersonalWriteRehearsalPlugin().setup(context)
+def start(context, *, daily=False):
+    (plugin.PersonalDailyPlugin() if daily else plugin.PersonalWriteRehearsalPlugin()).setup(context)
     runtime = context.tools[-1][1].__self__
     runtime._boundary._thread.join(5)
     assert runtime._boundary._status == 'ready'
@@ -177,7 +177,8 @@ def test_duplicate_event_during_active_job_is_coalesced(rehearsal, monkeypatch):
     assert not boundary._curation._curation_active
 
 
-def test_enabled_core_maintainer_updates_profile_after_cursor(rehearsal):
+@pytest.mark.parametrize("daily", [False, True])
+def test_enabled_core_maintainer_updates_profile_after_cursor(rehearsal, daily):
     from datetime import datetime, timezone
 
     from app.storage.timeline import NewTimelineEntry, TimelineKind
@@ -185,6 +186,12 @@ def test_enabled_core_maintainer_updates_profile_after_cursor(rehearsal):
 
     context, timeline, calls, client = rehearsal
     memory = context.root / "data/memory"
+    if daily:
+        (memory / '.personal-write-rehearsal.json').unlink()
+        (memory / '.personal-daily.json').write_text(json.dumps({
+            'schemaVersion': 1, 'purpose': 'personal-memory-daily',
+            'root': str(memory.resolve()), 'scopes': ['sakura'],
+        }), encoding='utf-8')
     updated = "2026-09-20T00:00:00+00:00"
     sections = {name: "" for name in ("今の関係", "あなたについて知っていること", "今の私", "大切な約束と境界")}
     (memory / "core_profiles.json").write_text(json.dumps({"sakura": {
@@ -229,7 +236,7 @@ def test_enabled_core_maintainer_updates_profile_after_cursor(rehearsal):
         }]}, ensure_ascii=False)
 
     client.complete_raw = complete_raw
-    boundary = start(context)
+    boundary = start(context, daily=daily)
     event(context, timeline)
     joined(boundary)
     fragment = read_personal_core_profile(memory, "sakura")
@@ -245,4 +252,11 @@ def test_write_plugin_rejects_unadmitted_copy_before_opening(rehearsal):
     (context.root / 'data/memory/.personal-write-rehearsal.json').unlink()
     with pytest.raises(ValueError, match='REHEARSAL_REQUIRED'):
         plugin.PersonalWriteRehearsalPlugin().setup(context)
+    assert not context.events and not context.tools and calls == []
+
+
+def test_daily_plugin_rejects_missing_marker_before_model_load(rehearsal):
+    context, _, calls, _ = rehearsal
+    with pytest.raises(ValueError, match='PERSONAL_DAILY'):
+        plugin.PersonalDailyPlugin().setup(context)
     assert not context.events and not context.tools and calls == []

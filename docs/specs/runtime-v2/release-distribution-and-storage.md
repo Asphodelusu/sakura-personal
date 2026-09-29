@@ -103,6 +103,13 @@ Python 3.12 的隔离进程导入 `numpy`、`torch`、`sentence_transformers`、
 使用可写的 `user_root/data/plugin-runtime/dependencies/<plugin-id>/`。两者使用同一 marker、fingerprint 和
 Runner 校验；普通启动只读取并验证，不把预装环境复制到 user root，也不自动安装或修复。
 
+个人日用记忆使用显式 `plugin:PersonalDailyPlugin` 入口；默认插件和只读入口不会因为出现日用标记而获得写入能力。
+迁移工具须在停写迁移完成后建立 memory 根内的 `.personal-daily.json`：字段严格为
+`schemaVersion: 1`、`purpose: "personal-memory-daily"`、`root`（实际 memory 根绝对路径）和
+`scopes`（允许的非空、唯一角色 ID 列表）。仍须通过完整副本、索引及模型身份、存储结构和未完成写入检查。
+记忆操作与档案维护会复查日用准入；标记缺失、损坏或角色不匹配时拒绝操作，不回退到演练模式。
+该标记是内部迁移准入记录，不是操作系统访问控制。仅添加入口和校验不代表正式数据已迁移或桌面已验收。
+
 主 Python 运行时只读且不执行 pip。Memory 不携带约 91 MB 模型，Genie/GPT-SoVITS 不携带本体、环境或
 模型；Playwright 的 Python 包和浏览器资源都随可选插件流程取得。
 

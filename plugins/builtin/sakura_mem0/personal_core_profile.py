@@ -1,7 +1,7 @@
 """Current-scope view of memory_dir/core_profiles.json.
 
-Reads never rewrite the file. Section patches are a separate explicit write
-and still require the personal write-rehearsal gate.
+Reads never rewrite the file. Section patches require explicit rehearsal or
+daily admission.
 """
 import json
 import re
@@ -212,12 +212,12 @@ def load_personal_core_profile_record(memory_dir, scope):
 
 def patch_personal_core_profile_sections(
     memory_dir, scope, base_updated_at, sections, *, candidate_ids=None, migrate_legacy=False,
-    cancel_checker=None,
+    cancel_checker=None, daily=False,
 ):
     """Whitelist section update. Validation failure leaves the source and backup unchanged."""
     memory_dir = Path(memory_dir).absolute()
     scope = str(scope)
-    _admit_write(memory_dir)
+    _admit_write(memory_dir, scope, daily=daily)
     if any(_unsupported_link(path) for path in (memory_dir, *memory_dir.parents)):
         raise CoreProfileStorageError("常驻档案路径不可写")
     path = memory_dir / "core_profiles.json"
@@ -225,6 +225,7 @@ def patch_personal_core_profile_sections(
     _require_plain_profile_file(path.with_name(path.name + ".bak"))
     _require_plain_profile_file(path.with_name(path.name + ".lock"))
     with _exclusive_profile_lock(path):
+        _admit_write(memory_dir, scope, daily=daily)
         if cancel_checker is not None:
             cancel_checker()
         _require_plain_profile_file(path)
@@ -236,12 +237,12 @@ def patch_personal_core_profile_sections(
         )
 
 
-def _admit_write(memory_dir):
+def _admit_write(memory_dir, scope, *, daily=False):
     if __package__:
-        from .personal_records import _require_write_rehearsal
+        from .personal_records import _require_write_mode
     else:
-        from personal_records import _require_write_rehearsal
-    _require_write_rehearsal(memory_dir)
+        from personal_records import _require_write_mode
+    _require_write_mode(memory_dir, scope, daily=daily, write_rehearsal=not daily)
 
 
 def _scope_conflict(record, scope):

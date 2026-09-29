@@ -1,4 +1,4 @@
-"""Personal recall plus explicit disposable-copy curation rehearsal."""
+"""Personal recall and explicitly admitted rehearsal or daily curation."""
 import threading
 import stat
 from pathlib import Path
@@ -26,6 +26,8 @@ class _CurationStore(PersonalCurationStore):
 
     No model lifecycle is exposed on this internal curation-only surface.
     """
+    personal_daily = False
+
     def add_status_listener(self, listener):
         pass  # Ready before construction; no asynchronous model state remains.
 
@@ -48,7 +50,7 @@ class _CurationStore(PersonalCurationStore):
 
 
 class PersonalRecallBoundary:
-    def __init__(self, memory_dir, character_id, snapshot, *, curation_options=None):
+    def __init__(self, memory_dir, character_id, snapshot, *, curation_options=None, daily=False):
         memory_dir = Path(memory_dir).absolute()
         root = memory_dir.parent.parent
         # Plugin workers cannot import Core's migration modules. Check only the
@@ -61,8 +63,10 @@ class PersonalRecallBoundary:
         if not (root / COPY_STATE_FILE).is_file():
             raise ValueError("PERSONAL_MIGRATION_COPY_REQUIRED")
         require_complete_copy(root)
-        if curation_options is not None:
-            personal_records._require_write_rehearsal(memory_dir)
+        if daily and curation_options is None:
+            raise ValueError("PERSONAL_DAILY_CURATION_REQUIRED")
+        personal_records._require_write_mode(memory_dir, character_id, daily=daily,
+                                             write_rehearsal=curation_options is not None and not daily)
         personal_records._scope(character_id)
         self.scope = character_id
         self._memory_dir = memory_dir
@@ -70,6 +74,7 @@ class PersonalRecallBoundary:
         self._records = None
         self._curation = None
         self._curation_options = curation_options
+        self._daily = daily
         self._pending_timeline = None
         self._status = "loading"
         self._closed = False
@@ -82,11 +87,14 @@ class PersonalRecallBoundary:
         curation = None
         try:
             records = personal_records.open_personal_memory_from_snapshot(memory_dir, snapshot=snapshot,
-                write_rehearsal=self._curation_options is not None)
+                write_rehearsal=self._curation_options is not None and not self._daily,
+                daily=self._daily, scope=self.scope if self._daily else None)
             if self._curation_options is not None:
+                store = _CurationStore(records, self.scope, profile_candidates=True)
+                store.personal_daily = self._daily
                 curation = MemoryBoundary(memory_dir.parent.parent, self.scope,
                     memory_dir=memory_dir,
-                    memory_store=_CurationStore(records, self.scope, profile_candidates=True),
+                    memory_store=store,
                     **self._curation_options)
             with self._lock:
                 if not self._closed:

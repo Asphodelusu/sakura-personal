@@ -26,6 +26,7 @@ else:
 
 PENDING = "personal_write_pending.json"
 WRITE_REHEARSAL = ".personal-write-rehearsal.json"
+DAILY = ".personal-daily.json"
 
 
 def _admission_path(value):
@@ -53,6 +54,41 @@ def _require_write_rehearsal(root):
             raise ValueError("invalid admission")
     except (OSError, ValueError) as exc:
         raise ValueError("PERSONAL_WRITE_REHEARSAL_REQUIRED") from exc
+
+
+def _require_daily(root, scope):
+    root = Path(root).absolute()
+    try:
+        _scope(scope)
+        for path in (root, *root.parents, root / DAILY, root / ".sakura-personal-copy.json"):
+            info = path.lstat()
+            if (path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400
+                    or path.is_file() and info.st_nlink != 1):
+                raise ValueError("linked path")
+        marker = _read_object(root / DAILY)
+        copied = _read_object(root / ".sakura-personal-copy.json")
+        scopes = marker.get("scopes")
+        if (set(marker) != {"schemaVersion", "purpose", "root", "scopes"}
+                or type(marker["schemaVersion"]) is not int or marker["schemaVersion"] != 1
+                or marker["purpose"] != "personal-memory-daily"
+                or not isinstance(marker["root"], str)
+                or Path(_admission_path(marker["root"])) != Path(_admission_path(str(root)))
+                or not isinstance(scopes, list) or not scopes
+                or any(not isinstance(item, str) or item != _scope(item) for item in scopes)
+                or len(scopes) != len(set(scopes)) or scope not in scopes
+                or copied.get("state") != "complete"):
+            raise ValueError("invalid daily admission")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("PERSONAL_DAILY_ADMISSION_REQUIRED") from exc
+
+
+def _require_write_mode(root, scope, *, daily=False, write_rehearsal=False):
+    if daily and write_rehearsal:
+        raise ValueError("PERSONAL_WRITE_MODE_CONFLICT")
+    if daily:
+        _require_daily(root, scope)
+    elif write_rehearsal:
+        _require_write_rehearsal(root)
 
 
 def _scope(value):
@@ -133,18 +169,25 @@ class _Metadata:
 
 
 class PersonalMemoryRecords:
-    def __init__(self, root, session, metadata, *, recall_only=False):
+    def __init__(self, root, session, metadata, *, recall_only=False, daily_scope=None):
         self._root = root
         self._session = session
         self._metadata = metadata
         self._lock = threading.RLock()
         self._recall_only = recall_only
+        self._daily_scope = daily_scope
 
     @contextmanager
     def _operation(self, scope):
         _scope(scope)
+        if self._daily_scope is not None:
+            if scope != self._daily_scope:
+                raise ValueError("PERSONAL_DAILY_SCOPE_INVALID")
+            _require_daily(self._root, scope)
         with self._lock:
             with self._session.operation() as backend:
+                if self._daily_scope is not None:
+                    _require_daily(self._root, scope)
                 _check_pending(self._root)
                 yield backend
 
@@ -152,6 +195,8 @@ class PersonalMemoryRecords:
     def _write(self, operation):
         if self._recall_only:
             raise RuntimeError("PERSONAL_LEGACY_RECALL_ONLY")
+        if self._daily_scope is not None:
+            _require_daily(self._root, self._daily_scope)
         marker = self._root / PENDING
         # Exclusive creation is also protection against overlapping writers.
         with marker.open("x", encoding="utf-8") as output:
@@ -352,9 +397,8 @@ class PersonalMemoryRecords:
                 self._session.close()
 
 
-def open_personal_memory(memory_dir, *, identity, encoder, write_rehearsal=False):
-    if write_rehearsal:
-        _require_write_rehearsal(Path(memory_dir).absolute())
+def open_personal_memory(memory_dir, *, identity, encoder, write_rehearsal=False, daily=False, scope=None):
+    _require_write_mode(Path(memory_dir).absolute(), scope, daily=daily, write_rehearsal=write_rehearsal)
     root = Path(memory_dir).resolve()
     _check_pending(root)
     paths = _metadata_paths(root)
@@ -365,10 +409,11 @@ def open_personal_memory(memory_dir, *, identity, encoder, write_rehearsal=False
         session.close()
         raise
     return PersonalMemoryRecords(root, session, metadata,
-                                 recall_only="legacy_marker" in identity and not write_rehearsal)
+                                 recall_only="legacy_marker" in identity and not (write_rehearsal or daily),
+                                 daily_scope=scope if daily else None)
 
 
-def open_personal_memory_from_snapshot(memory_dir, *, snapshot, write_rehearsal=False):
+def open_personal_memory_from_snapshot(memory_dir, *, snapshot, write_rehearsal=False, daily=False, scope=None):
     """Open an exclusive work copy with a local encoder and layout admission.
 
     No model discovery, download, index rebuild, or default plugin activation.
@@ -376,8 +421,7 @@ def open_personal_memory_from_snapshot(memory_dir, *, snapshot, write_rehearsal=
     a bounded sample of existing dense vectors and default to recall-only.
     Explicit write_rehearsal additionally requires a path-bound disposable copy.
     """
-    if write_rehearsal:
-        _require_write_rehearsal(Path(memory_dir).absolute())
+    _require_write_mode(Path(memory_dir).absolute(), scope, daily=daily, write_rehearsal=write_rehearsal)
     root = Path(memory_dir).resolve()
     _check_pending(root)
     _metadata_paths(root)
@@ -389,7 +433,8 @@ def open_personal_memory_from_snapshot(memory_dir, *, snapshot, write_rehearsal=
     _index_config(root, identity)
     encoder = LocalPersonalEncoder(snapshot, identity)
     try:
-        return open_personal_memory(root, identity=identity, encoder=encoder, write_rehearsal=write_rehearsal)
+        return open_personal_memory(root, identity=identity, encoder=encoder,
+                                    write_rehearsal=write_rehearsal, daily=daily, scope=scope)
     except BaseException:
         encoder.close()
         raise
