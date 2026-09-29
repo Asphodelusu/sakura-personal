@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import ipaddress
 import json
 import os
@@ -211,18 +212,38 @@ def user_facing_path(value: str | Path) -> str:
     return _subprocess_path(value) if str(value) else ""
 
 
-def _verify_wav(path: Path) -> bool:
+_SILENT_PEAK_16BIT = 32
+
+
+def _wav_problem(path: Path) -> str | None:
     try:
         if not path.is_file() or path.stat().st_size <= 0:
-            return False
+            return "TTS_AUDIO_FORMAT_INVALID"
         with wave.open(str(path), "rb") as handle:
-            return (
-                handle.getnchannels() in (1, 2)
-                and handle.getsampwidth() > 0
-                and handle.getframerate() > 0
-            )
+            if (
+                handle.getnchannels() not in (1, 2)
+                or handle.getsampwidth() <= 0
+                or handle.getframerate() <= 0
+            ):
+                return "TTS_AUDIO_FORMAT_INVALID"
+            width = handle.getsampwidth()
+            pcm = handle.readframes(handle.getnframes())
     except (OSError, EOFError, wave.Error):
-        return False
+        return "TTS_AUDIO_FORMAT_INVALID"
+    # Some synthesis failures answer with a short all-zero WAV instead of an error.
+    if width == 2 and pcm:
+        samples = array.array("h")
+        try:
+            samples.frombytes(pcm[: len(pcm) - len(pcm) % 2])
+        except ValueError:
+            return "TTS_AUDIO_FORMAT_INVALID"
+        if samples and max(abs(sample) for sample in samples) < _SILENT_PEAK_16BIT:
+            return "TTS_AUDIO_SILENT"
+    return None
+
+
+def _verify_wav(path: Path) -> bool:
+    return _wav_problem(path) is None
 
 
 @dataclass(frozen=True)
@@ -765,11 +786,12 @@ class GPTSoVITSSynthesisEngine:
         ) as handle:
             handle.write(audio)
             path = Path(handle.name)
-        if not _verify_wav(path):
+        problem = _wav_problem(path)
+        if problem is not None:
             path.unlink(missing_ok=True)
             diagnose(
                 "TTS_AUDIO_INVALID",
-                "TTS_AUDIO_FORMAT_INVALID",
+                problem,
                 "audio_validation",
                 "AudioValidationError",
             )

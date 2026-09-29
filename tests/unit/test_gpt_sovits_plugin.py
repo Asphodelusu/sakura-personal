@@ -32,7 +32,7 @@ def _wav_bytes() -> bytes:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(16_000)
-        handle.writeframes(b"\x01\x00" * 320)
+        handle.writeframes((1000).to_bytes(2, "little", signed=True) * 320)
     return output.getvalue()
 
 
