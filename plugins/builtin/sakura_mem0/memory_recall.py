@@ -192,20 +192,23 @@ def _select_memories(
         content = str(raw.get("content") or raw.get("memory") or "").strip()
         if not content:
             continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         dedupe_key = " ".join(content.lower().split())
-        if dedupe_key in seen or _is_expired(raw.get("expires_at"), now):
+        if dedupe_key in seen or any(
+            _is_expired(_memory_field(raw, metadata, name, camel), now)
+            for name, camel in (("expires_at", "expiresAt"), ("valid_until", "validUntil"))
+        ):
             continue
         score = _optional_score(raw.get("score"))
         if score is not None and score < threshold:
             continue
-        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         created_in_turn_id = str(
-            raw.get("created_in_turn_id") or metadata.get("created_in_turn_id") or ""
+            _memory_field(raw, metadata, "created_in_turn_id", "createdInTurnId") or ""
         ).strip()
         if excluded_created_in_turn_id and created_in_turn_id == excluded_created_in_turn_id:
             continue
         source = str(raw.get("source") or metadata.get("source") or "inferred").strip().lower()
-        updated_at = str(raw.get("updated_at") or metadata.get("updated_at") or "").strip()
+        updated_at = str(_memory_field(raw, metadata, "updated_at", "updatedAt") or "").strip()
         normalized.append(
             {
                 "id": str(raw.get("id") or raw.get("memory_id") or "").strip(),
@@ -225,6 +228,14 @@ def _select_memories(
         )
     )
     return normalized[:limit]
+
+
+def _memory_field(raw: dict[str, Any], metadata: dict[str, Any], name: str, camel: str) -> Any:
+    # Boundaries publish camelCase projections; stores and older callers use snake_case.
+    for value in (raw.get(camel), raw.get(name), metadata.get(name)):
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _optional_score(value: Any) -> float | None:

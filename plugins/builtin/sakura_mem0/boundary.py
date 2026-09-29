@@ -1235,6 +1235,8 @@ def _project_memory(raw: Mapping[str, object], scope: str) -> dict[str, object] 
         "sourceEntryIds": field("source_entry_ids", []),
         "createdInTurnId": field("created_in_turn_id"),
         "evidenceKind": field("evidence_kind"),
+        "expiresAt": field("expires_at"),
+        "validUntil": field("valid_until"),
     }
     for key, value in optional_fields.items():
         if key == "sourceEntryIds":

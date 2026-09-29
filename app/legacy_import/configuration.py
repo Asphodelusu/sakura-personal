@@ -162,7 +162,56 @@ def migrate_configuration(
         _write_tts_plugin_config(staged, tts, new_tts_root, tts_provider=tts_provider)
         counts["ttsConfig"] = 1
     _migrate_core_maintainer(system, staged, existing_user_root=existing_user_root)
+    _migrate_curation_model(api, staged, existing_user_root=existing_user_root)
     return counts
+
+
+def _migrate_curation_model(
+    api: Mapping[str, Any], staged: Path, *, existing_user_root: Path | None = None,
+) -> None:
+    """Carry the Qt memory_curation slot into the mem0 plugin's own selection."""
+    from app.config.model_slots import normalize_provider_models
+
+    relative = "data/plugins/sakura.memory.mem0/config.json"
+    destination = staged / relative
+
+    def selection(path: Path) -> tuple[str, str] | None:
+        if not path.is_file():
+            return None
+        try:
+            values = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise LegacyImportError("LEGACY_CURATION_MODEL_CONFIG_INVALID", "staging", relative) from exc
+        if isinstance(values, dict) and (values.get("curationProfileId") or values.get("curationModel")):
+            return str(values.get("curationProfileId") or ""), str(values.get("curationModel") or "")
+        return None
+
+    if selection(destination) is not None:
+        return
+    # The new location is authoritative: keep an explicit current choice over the Qt slot.
+    chosen = selection(existing_user_root / relative) if existing_user_root is not None else None
+    if chosen is None:
+        slots = api.get("model_slots")
+        slot = slots.get("memory_curation") if isinstance(slots, Mapping) else None
+        if not isinstance(slot, Mapping):
+            return
+        profile_id = str(slot.get("profile_id") or "").strip()
+        model = str(slot.get("model") or "").strip()
+        profile = next(
+            (item for item in api.get("api_profiles") or []
+             if isinstance(item, Mapping) and item.get("id") == profile_id),
+            None,
+        )
+        if not profile_id or not model or profile is None or model not in normalize_provider_models(profile.get("models")):
+            return
+        chosen = (profile_id, model)
+    payload: dict[str, Any] = {}
+    if destination.is_file():
+        loaded = json.loads(destination.read_text(encoding="utf-8"))
+        payload = dict(loaded) if isinstance(loaded, dict) else {}
+    payload["curationProfileId"], payload["curationModel"] = chosen
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _migrate_core_maintainer(
