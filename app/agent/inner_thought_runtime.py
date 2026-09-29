@@ -57,6 +57,7 @@ class InnerThoughtCoordinator:
         self._worker: Thread | None = None
         self._appraisal_sink: AppraisalSink | None = None
         self._incomplete_logged = False
+        self._turn_interest: str | None = None
 
     def configure(
         self,
@@ -134,6 +135,7 @@ class InnerThoughtCoordinator:
         with self._lock:
             if self._closed:
                 return False
+            self._turn_interest = None
             if not should_generate_inner_thought(
                 self._settings,
                 api_client=self._client,
@@ -228,6 +230,25 @@ class InnerThoughtCoordinator:
 
             return build_inner_thought_fragment(self._window, character_name=self._character_name)
 
+    def verbosity_fragment(self) -> ContextFragment | None:
+        from app.agent.reply_verbosity import decision_from_interest, format_verbosity_guidance
+
+        with self._lock:
+            decision = decision_from_interest(self._turn_interest)
+        if decision is None:
+            return None
+        return ContextFragment(
+            fragment_id="runtime.reply_verbosity",
+            source="runtime",
+            content=format_verbosity_guidance(decision),
+            trust="trusted",
+            priority=87,
+            token_budget=160,
+            sensitivity="private",
+            cache_scope="turn",
+            required=False,
+        )
+
     def wait_until_idle(self, timeout: float = 2.0) -> bool:
         worker = self._worker
         if worker is None or not worker.is_alive():
@@ -281,6 +302,7 @@ class InnerThoughtCoordinator:
             return
         if result.text:
             self._window.push(result.text)
+        self._turn_interest = result.interest
         appraisal = result.drive_appraisal
         sink = self._appraisal_sink
         if appraisal is None or sink is None:
@@ -303,6 +325,7 @@ class InnerThoughtCoordinator:
 
     def _retire(self, *, clear_window: bool) -> None:
         self._epoch += 1
+        self._turn_interest = None
         if clear_window:
             self._window.clear()
         work = self._active

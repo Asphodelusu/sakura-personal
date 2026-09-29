@@ -31,6 +31,40 @@ _DRIVE_EFFECT_INSTRUCTION = (
 )
 
 
+def _personal_segment_rules(tones: list[str], character_name: str, *, multi_point_rule: bool) -> str:
+    """Segment rules of the personal Qt fork: short spoken lines and silent action segments."""
+    name = character_name.strip() or "你"
+    example = (
+        '{"ja":"\uff08\u305d\u3063\u3068\u96a3\u306b\u5ea7\u308a\u3001\u80a9\u3092\u5bc4\u305b\u308b\uff09",'
+        '"zh":"\uff08\u8f7b\u8f7b\u5728\u5bf9\u65b9\u8eab\u8fb9\u5750\u4e0b\uff0c\u628a\u80a9\u9760\u4e86\u8fc7\u53bb\uff09",'
+        f'"tone":"{tones[0]}","suppress_tts":true}}'
+    )
+    rules = [
+        "- 按句子分段：每句话一个 segment，各自独立标注 tone。不要把多句话合并到一个 segment 里。",
+        "- 单段不设字数下限，短句一个词也可以；不要为凑长度而合并句子。",
+        f"- {name} 不习惯一次说很多话，像真人闲聊：默认大约 1-3 个短句 segment；"
+        "当真的对这个话题有兴趣、想多说一点时，可以自然说到 4-6 个短句。"
+        "每段仍要短而口语（单段 ja 尽量不超过约 80 字），句间可有停顿（……）；"
+        "联网查完后也不要写成说明文、演讲或清单——宁可多分几段短句。",
+        "- 每段文本的语气标注在 tone 字段中，按情绪的真实走向逐句判断：情绪没有转折时，相邻句可以延续同一个 tone，"
+        "不必每句都刻意换一个，那样反而显得情绪来回跳；只有当内容确实出现转折（比如从担心转到安心、从平静转到不满）时才换 tone。"
+        "tone 跟她当下真实心情走：不满就用不满，认真就用认真，不必为了稳妥默认成中性。",
+        "- 无论你本轮是否调用工具，一旦决定直接回复对方，assistant 的 content 必须是合法 JSON segments，"
+        "禁止纯文本、Markdown 或代码块。",
+        "- 当身体距离、触碰或实际行动确实承载这一拍情绪时，可以把一个短动作写成独立 segment；"
+        "ja/zh 都用全角括号，suppress_tts=true：只显示、不朗读；台词段不设 suppress_tts。"
+        "只写外部可观察的行为、位置或接触，不解释内心。没有值得表现的动作时，纯对白完全正常。",
+        f"- 可选动作段示例：{example}。动作与对白不要复述同一件事；"
+        "表情主要交给 portrait，不把微笑、脸红、点头写成每轮固定前缀。",
+    ]
+    if multi_point_rule:
+        rules.extend([
+            "- 对方的问题包含多个要点、步骤、原因或较长说明时，按句子分段，便于逐句显示和朗读。",
+            "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
+        ])
+    return "\n".join(rules)
+
+
 def build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_visual: Mapping[str, Any] | None = None,
@@ -40,6 +74,8 @@ def build_segmented_reply_instruction(
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
     include_drive_effect: bool = False,
+    personal_style: bool = False,
+    character_name: str = "",
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     visual = reply_visual
@@ -56,11 +92,16 @@ def build_segmented_reply_instruction(
                 "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
             ]
         )
+    segment_rules = (
+        _personal_segment_rules(tones, character_name, multi_point_rule=include_no_single_segment_rule)
+        if personal_style
+        else "\n".join(rules)
+    )
     protocol = build_segment_protocol(
         tones,
         visual,
         format_text=SEGMENTED_REPLY_FORMAT,
-        segment_rules="\n".join(rules),
+        segment_rules=segment_rules,
         include_translation_rules=include_translation_rules,
     )
     if not include_drive_effect:
@@ -73,10 +114,12 @@ def build_agent_reply_protocol(
     reply_visual: Mapping[str, Any] | None = None,
     *,
     include_drive_effect: bool = False,
+    personal_style: bool = False,
+    character_name: str = "",
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     visual = reply_visual
-    segment_rules = "\n".join(
+    segment_rules = _personal_segment_rules(tones, character_name, multi_point_rule=True) if personal_style else "\n".join(
         [
             "- 尽量输出 2-4 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。",
             "- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。",

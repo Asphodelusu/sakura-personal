@@ -139,13 +139,16 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
                 needs_retry=True,
                 reason="invalid_json",
             )
-        return ChatReplyParseResult(ChatReply([ChatSegment(content, DEFAULT_TONE)]), ok=True)
+        return ChatReplyParseResult(
+            ChatReply(_split_action_segments([ChatSegment(content, DEFAULT_TONE)])),
+            ok=True,
+        )
 
     if isinstance(data, dict):
         segments, has_language_issue = _parse_segments(data)
         if segments:
             return ChatReplyParseResult(
-                ChatReply(segments, drive_effect=_optional_drive_effect(data)),
+                ChatReply(_split_action_segments(segments), drive_effect=_optional_drive_effect(data)),
                 ok=not has_language_issue,
                 needs_retry=has_language_issue,
                 repaired=repaired,
@@ -210,7 +213,10 @@ def _parse_segments(data: dict[str, Any]) -> tuple[list[ChatSegment], bool]:
     if text:
         tone = data.get("tone")
         translation = _clean_first_text(data, "zh", "chinese", "translation")
-        segment, has_language_issue = _build_segment(text, tone, translation, data.get("portrait"), data.get("control"))
+        segment, has_language_issue = _build_segment(
+            text, tone, translation, data.get("portrait"), data.get("control"),
+            suppress_tts=_flag(data.get("suppress_tts")),
+        )
         return [segment], has_language_issue
 
     return [], False
@@ -227,16 +233,34 @@ def _parse_segment(item: Any) -> tuple[ChatSegment | None, bool]:
     if not text:
         return None, False
     translation = _clean_first_text(item, "zh", "chinese", "translation")
-    return _build_segment(text, item.get("tone"), translation, item.get("portrait"), item.get("control"))
+    return _build_segment(
+        text, item.get("tone"), translation, item.get("portrait"), item.get("control"),
+        suppress_tts=_flag(item.get("suppress_tts")),
+    )
 
 
-def _build_segment(text: str, tone: Any, translation: str, portrait: Any, control: Any = None) -> tuple[ChatSegment, bool]:
+def _flag(value: Any) -> bool:
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _build_segment(
+    text: str,
+    tone: Any,
+    translation: str,
+    portrait: Any,
+    control: Any = None,
+    *,
+    suppress_tts: bool = False,
+) -> tuple[ChatSegment, bool]:
     text = text.strip()
     translation = translation.strip()
     # 只在 ja 明显是中文、zh 明显是日文时交换，避免误判“ 大丈夫 ”这类日语汉字句。
     if text and translation and _looks_chinese(text) and _looks_japanese(translation):
         text, translation = translation, text
-        return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait), control=control), False
+        return ChatSegment(
+            text, _clean_tone(tone), translation, _clean_portrait(portrait),
+            suppress_tts=suppress_tts, control=control,
+        ), False
 
     if text and _has_obvious_chinese(text):
         fallback_translation = translation or text
@@ -252,7 +276,106 @@ def _build_segment(text: str, tone: Any, translation: str, portrait: Any, contro
             True,
         )
 
-    return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait), control=control), False
+    return ChatSegment(
+        text, _clean_tone(tone), translation, _clean_portrait(portrait),
+        suppress_tts=suppress_tts, control=control,
+    ), False
+
+
+_ACTION_OPEN = "\uff08"
+_ACTION_CLOSE = "\uff09"
+
+
+def _split_action_segments(segments: list[ChatSegment]) -> list[ChatSegment]:
+    """Split fullwidth-bracket actions into their own silent segments."""
+    result: list[ChatSegment] = []
+    for segment in segments:
+        result.extend(_split_action_segment(segment))
+    return result
+
+
+def _split_action_segment(segment: ChatSegment) -> list[ChatSegment]:
+    ja_pieces = _action_pieces(segment.text)
+    if not ja_pieces:
+        return [segment]
+    if len(ja_pieces) == 1 and ja_pieces[0][0] == segment.text and (not ja_pieces[0][1] or segment.suppress_tts):
+        return [segment]
+    zh_pieces = _action_pieces(segment.translation) if segment.translation.strip() else []
+    paired = len(ja_pieces) == len(zh_pieces) and all(
+        ja_action == zh_action for (_ja, ja_action), (_zh, zh_action) in zip(ja_pieces, zh_pieces)
+    )
+    split = len(ja_pieces) > 1
+    pieces: list[ChatSegment] = []
+    for index, (text, is_action) in enumerate(ja_pieces):
+        if paired:
+            translation = zh_pieces[index][0]
+        else:
+            translation = "" if split else segment.translation
+        pieces.append(ChatSegment(
+            text,
+            segment.tone,
+            translation,
+            segment.portrait,
+            suppress_tts=True if is_action else segment.suppress_tts,
+            control=segment.control if index == 0 else None,
+        ))
+    return pieces
+
+
+def _action_pieces(text: str) -> list[tuple[str, bool]]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    pieces: list[tuple[str, bool]] = []
+    for unit in lines if len(lines) > 1 else [stripped]:
+        split = _split_fullwidth_actions(unit)
+        pieces.extend(split if split is not None else [(unit, False)])
+    return pieces
+
+
+def _split_fullwidth_actions(text: str) -> list[tuple[str, bool]] | None:
+    spans = _fullwidth_action_spans(text)
+    if not spans:
+        return None
+    pieces: list[tuple[str, bool]] = []
+    cursor = 0
+    for start, end in spans:
+        dialogue = text[cursor:start].strip()
+        if dialogue:
+            pieces.append((dialogue, False))
+        pieces.append((text[start:end].strip(), True))
+        cursor = end
+    dialogue = text[cursor:].strip()
+    if dialogue:
+        pieces.append((dialogue, False))
+    return pieces
+
+
+def _fullwidth_action_spans(text: str) -> list[tuple[int, int]] | None:
+    # Any stray close or nested open makes the shape ambiguous; keep it as dialogue.
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == _ACTION_CLOSE:
+            return None
+        if char != _ACTION_OPEN:
+            index += 1
+            continue
+        close_at = None
+        for probe in range(index + 1, len(text)):
+            if text[probe] == _ACTION_OPEN:
+                return None
+            if text[probe] == _ACTION_CLOSE:
+                close_at = probe
+                break
+        if close_at is None:
+            return None
+        if text[index + 1 : close_at].strip():
+            spans.append((index, close_at + 1))
+        index = close_at + 1
+    return spans
 
 
 def _clean_tone(value: Any) -> str:

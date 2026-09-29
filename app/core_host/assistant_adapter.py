@@ -227,6 +227,8 @@ class AssistantAdapter:
                 state_path=StoragePaths(self._user_root).relational_drive_for(profile.id),
                 character_id=profile.id,
             )
+            # Personal characters (with a guards file) keep the Qt-era reply style and silent actions.
+            runtime.configure_personal_reply(personal_style=profile.system_guards_path is not None)
             from app.core_host.inner_thought_settings import attach_inner_thought
 
             attach_inner_thought(runtime, self._user_root)

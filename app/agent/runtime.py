@@ -144,6 +144,7 @@ class AgentRuntime:
 
         self._relationship = RelationshipTurnAdapter()
         self._inner_thought = InnerThoughtCoordinator()
+        self._personal_style = False
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -248,6 +249,9 @@ class AgentRuntime:
 
     def begin_relationship_user_turn(self, interaction_id: str) -> None:
         self._relationship.begin_user_turn(interaction_id)
+
+    def configure_personal_reply(self, *, personal_style: bool) -> None:
+        self._personal_style = bool(personal_style)
 
     def configure_inner_thought(
         self,
@@ -360,6 +364,9 @@ class AgentRuntime:
         thought = self._inner_thought.fragment()
         if thought is not None:
             fragments.append(thought)
+        verbosity = self._inner_thought.verbosity_fragment()
+        if verbosity is not None:
+            fragments.append(verbosity)
         drive = self._relationship.fragment()
         if drive is not None:
             fragments.append(drive)
@@ -1667,6 +1674,8 @@ class AgentRuntime:
                 self.reply_tones,
                 self.reply_visual,
                 include_drive_effect=self._relationship.accepts_effect_instruction,
+                personal_style=self._personal_style,
+                character_name=self.character_name,
             )
         )
         context_strategy = build_context_acquisition_strategy(
@@ -1698,8 +1707,14 @@ class AgentRuntime:
                 "- 如果 playwright_ 浏览器工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。",
                 "- 需要网页交互时，只能基于当前页面真实内容选择工具，不要臆造 selector、target 或页面内容。",
                 self._combine_extra_instructions(extra_instructions),
-                "- 用户说‘几分钟后/几秒后/一会儿后’等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。",
-                "- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。",
+                *(
+                    [
+                        "- 用户说‘几分钟后/几秒后/一会儿后’等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。",
+                        "- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。",
+                    ]
+                    if self.tools.get("add_reminder") is not None
+                    else []
+                ),
                 "- 扩展工具的用途、参数和风险以 API tools 列表中的实际 descriptor 为准，不要依赖固定插件名。",
             ]
         )
@@ -1854,10 +1869,8 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
 def _reply_has_display_translation(reply: ChatReply) -> bool:
     """最终回复需要中文显示文本，避免兼容模型的纯日语正文漏到中文字幕 UI。"""
 
-    return any(
-        segment.text.strip() and segment.translation.strip()
-        for segment in reply.segments
-    )
+    shown = [segment for segment in reply.segments if segment.text.strip()]
+    return bool(shown) and all(segment.translation.strip() for segment in shown)
 
 
 def _reply_trace_mapping(reply: ChatReply) -> dict[str, Any]:
