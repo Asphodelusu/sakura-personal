@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from app.plugin_sdk.sakura_process import terminate_process_tree
 from app.plugins.dependencies import PluginDependencyError, PluginDependencyRoots
+from app.plugins.process_paths import process_path
 from app.plugins.inventory import RuntimePluginSpec
 from app.plugins.models import PLUGIN_API_V4_VERSION, PluginSpec
 from app.plugins.host_services import HOST_CALLER, HOST_CALLER_LOG_METADATA
@@ -246,7 +247,7 @@ class _PluginProcess:
                     # directory open as its CWD. API v4 exposes explicit
                     # plugin data/config paths, so the private data directory
                     # is the stable working directory for the runner.
-                    cwd=data_dir,
+                    cwd=process_path(data_dir),
                     env=environment,
                     bufsize=0,
                     start_new_session=os.name != "nt",

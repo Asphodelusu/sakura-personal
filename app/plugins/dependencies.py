@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from app.plugin_sdk.sakura_downloads import uv_download_environment
+from app.plugins.process_paths import process_path
 from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
 from app.storage.runtime_roots import DistributionPaths
@@ -300,7 +301,7 @@ class PluginDependencyRoots:
         try:
             result = subprocess.run(
                 command,
-                cwd=plugin_root,
+                cwd=process_path(plugin_root),
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

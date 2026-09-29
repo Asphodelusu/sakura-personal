@@ -14,7 +14,9 @@ from typing import Any, Mapping, Sequence
 
 _PRIVATE_RUNTIME_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_PRIVATE_RUNTIME_ROOT))
+from process_paths import process_path
 from sakura_plugin_sdk import PluginApiError, PluginContext, RpcPeer
+sys.modules.pop("process_paths", None)
 sys.modules.pop("sakura_plugin_sdk", None)
 
 
@@ -51,6 +53,28 @@ class _CoreImportBlocker(importlib.abc.MetaPathFinder):
         return None
 
 
+def _private_origin_matches(module: object, init: Path) -> bool:
+    origin = getattr(module, "__file__", None)
+    if not isinstance(origin, str):
+        return False
+    try:
+        return Path(origin).resolve() == init.resolve()
+    except OSError:
+        return False
+
+
+def _require_private_origin(module: object, init: Path, name: str) -> None:
+    if not _private_origin_matches(module, init):
+        raise ImportError(f"private {name} was not loaded from the plugin dependency root")
+
+
+def _drop_package_modules(package: str) -> None:
+    prefix = package + "."
+    for name in list(sys.modules):
+        if name == package or name.startswith(prefix):
+            sys.modules.pop(name, None)
+
+
 class PluginRunner:
     def __init__(
         self,
@@ -64,14 +88,17 @@ class PluginRunner:
     ) -> None:
         self.plugin_id = plugin_id
         self.generation_id = generation_id
-        self.plugin_root = plugin_root
-        self.dependency_root = dependency_root
-        self.data_dir = data_dir
+        self.plugin_root = Path(process_path(plugin_root))
+        self.dependency_root = (
+            Path(process_path(dependency_root)) if dependency_root is not None else None
+        )
+        self.data_dir = Path(process_path(data_dir))
         self.entry = entry
         self._context: PluginContext | None = None
         self._initialized = False
         self._close_lock = threading.Lock()
         self._windows_dll_handles: list[object] = []
+        self._native_preload_error: BaseException | None = None
         input_stream = sys.stdin.buffer
         output_stream = sys.stdout.buffer
         sys.stdout = sys.stderr
@@ -85,6 +112,7 @@ class PluginRunner:
 
     def run(self) -> int:
         self._prepare_import_path()
+        self._preload_private_native()
         self._peer.start(thread_name=f"sakura-plugin-{self.plugin_id}-reader")
         self._peer.wait()
         self._close_context()
@@ -101,7 +129,7 @@ class PluginRunner:
             raise PluginApiError("PLUGIN_ENTRY_INVALID", plugin_id=self.plugin_id)
 
     def _prepare_import_path(self) -> None:
-        sdk_root = str(Path(__file__).resolve().parents[1] / "plugin_sdk")
+        sdk_root = process_path(Path(__file__).resolve().parents[1] / "plugin_sdk")
         roots = [sdk_root, str(self.plugin_root)]
         if self.dependency_root is not None:
             roots.extend(
@@ -112,7 +140,7 @@ class PluginRunner:
                 )
             )
         stdlib = [
-            item
+            process_path(item)
             for item in sys.path
             if item
             and "site-packages" not in item
@@ -138,6 +166,68 @@ class PluginRunner:
         system32 = self.dependency_root / "pywin32_system32"
         if system32.is_dir():
             self._windows_dll_handles.append(os.add_dll_directory(str(system32)))
+
+    def _preload_private_native(self) -> None:
+        """Load private NumPy, then SciPy linalg, before the stdin reader blocks."""
+
+        if os.name != "nt" or self.dependency_root is None:
+            return
+        saved_path = list(sys.path)
+        try:
+            sys.path.insert(0, str(self.dependency_root))
+            self._load_private_numpy()
+            if self._native_preload_error is None:
+                self._load_private_scipy_linalg()
+        finally:
+            sys.path[:] = saved_path
+
+    def _load_private_numpy(self) -> None:
+        assert self.dependency_root is not None
+        init = self.dependency_root / "numpy" / "__init__.py"
+        if not init.is_file():
+            return
+        try:
+            module = importlib.import_module("numpy")
+            _require_private_origin(module, init, "numpy")
+        except Exception as error:
+            _drop_package_modules("numpy")
+            self._native_preload_error = error
+
+    def _load_private_scipy_linalg(self) -> None:
+        assert self.dependency_root is not None
+        package_init = self.dependency_root / "scipy" / "__init__.py"
+        linalg_init = self.dependency_root / "scipy" / "linalg" / "__init__.py"
+        if not package_init.is_file() or not linalg_init.is_file():
+            return
+        try:
+            linalg = importlib.import_module("scipy.linalg")
+            scipy_module = sys.modules.get("scipy")
+            if scipy_module is None:
+                raise ImportError("private scipy was not loaded from the plugin dependency root")
+            _require_private_origin(scipy_module, package_init, "scipy")
+            _require_private_origin(linalg, linalg_init, "scipy.linalg")
+            self._require_loaded_private_numpy()
+        except Exception as error:
+            _drop_package_modules("scipy")
+            self._drop_numpy_if_untrusted()
+            self._native_preload_error = error
+
+    def _require_loaded_private_numpy(self) -> None:
+        assert self.dependency_root is not None
+        init = self.dependency_root / "numpy" / "__init__.py"
+        module = sys.modules.get("numpy")
+        if module is None or not init.is_file():
+            return
+        _require_private_origin(module, init, "numpy")
+
+    def _drop_numpy_if_untrusted(self) -> None:
+        assert self.dependency_root is not None
+        init = self.dependency_root / "numpy" / "__init__.py"
+        module = sys.modules.get("numpy")
+        if module is None or not init.is_file():
+            return
+        if not _private_origin_matches(module, init):
+            _drop_package_modules("numpy")
 
     def _handle_request(self, name: str, payload: Mapping[str, Any]) -> object:
         if name == "runtime.initialize":
@@ -187,6 +277,8 @@ class PluginRunner:
         raise PluginApiError("PLUGIN_REQUEST_UNKNOWN")
 
     def _initialize(self) -> object:
+        if self._native_preload_error is not None:
+            raise self._native_preload_error
         if self._initialized:
             raise PluginApiError("PLUGIN_ALREADY_INITIALIZED", plugin_id=self.plugin_id)
         module_name, separator, class_name = self.entry.partition(":")

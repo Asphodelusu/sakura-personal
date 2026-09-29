@@ -178,6 +178,7 @@ class ReadinessController:
         self._session_published_callback: Callable[[], None] | None = None
         self._application_tools: ToolRegistry | None = None
         self._application_mcp: MCPToolProvider | None = None
+        self._starting_plugin_application: object | None = None
         self._plugin_application: object | None = None
         self._chat_boundary: object | None = None
 
@@ -421,19 +422,27 @@ class ReadinessController:
             self._session = None
             worker = self._worker
             initializer = self._claim_initializer_close_locked()
-            plugin_application = self._plugin_application
+            plugin_application = (
+                self._plugin_application
+                if self._plugin_application is not None
+                else self._starting_plugin_application
+            )
             self._plugin_application = None
+            self._starting_plugin_application = None
             application_mcp = self._application_mcp
             self._application_mcp = None
         if initializer is not None:
             self._start_initializer_close(initializer)
+        # The initializer may be blocked in plugin startup; stopping the owned
+        # plugin processes is what lets that worker return before the deadline.
+        self._close_application_resources([plugin_application])
         if worker is not None:
             worker.join(timeout=max(0.0, deadline - monotonic()))
         with self._lock:
             close_thread = self._initializer_close_thread
         if close_thread is not None:
             close_thread.join(timeout=max(0.0, deadline - monotonic()))
-        self._close_application_resources([application_mcp, plugin_application])
+        self._close_application_resources([application_mcp])
         with self._lock:
             background_error = self._background_close_error
             self._background_close_error = None
@@ -515,14 +524,28 @@ class ReadinessController:
                     chat_boundary = self._chat_boundary
                 if chat_boundary is not None:
                     plugin_application.bind_chat_boundary(chat_boundary)
-                plugin_application.start()
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._starting_plugin_application = plugin_application
+                    unpublished_resources.remove(plugin_application)
+                try:
+                    plugin_application.start()
+                except BaseException:
+                    with self._lock:
+                        if self._starting_plugin_application is plugin_application:
+                            self._starting_plugin_application = None
+                            unpublished_resources.append(plugin_application)
+                    raise
             with self._lock:
                 application_closed = self._closed
                 if not application_closed:
                     self._application_tools = application_tools
                     self._application_mcp = application_mcp
                     self._plugin_application = plugin_application
-                    unpublished_resources.clear()
+                    self._starting_plugin_application = None
+                    if application_mcp is not None:
+                        unpublished_resources.remove(application_mcp)
             if application_closed:
                 return
 
@@ -605,7 +628,9 @@ class ReadinessController:
                 self._start_initializer_close(claimed)
 
         finally:
-            # Ownership transfers only when all Application resources are published.
+            # The controller owns a starting or published plugin application and
+            # published MCP; only objects it never claimed, or that a failed start
+            # returned here, remain with this thread.
             self._close_application_resources(unpublished_resources)
 
     def _claim_initializer_close_locked(self) -> object | None:

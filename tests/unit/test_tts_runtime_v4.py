@@ -363,7 +363,8 @@ def test_tts_provider_crash_leaves_hub_and_unrelated_provider_running(
                 item["pluginId"]: item
                 for item in application.public_snapshot()["plugins"]
             }
-            if after["sakura.tts.gpt-sovits"]["state"] == "failed":
+            # "failed" is published before process/scope cleanup completes.
+            if after["sakura.tts.gpt-sovits"]["reasonCode"] == "PLUGIN_PROCESS_EXITED":
                 break
             time.sleep(0.02)
         else:
