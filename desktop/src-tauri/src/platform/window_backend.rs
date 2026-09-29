@@ -449,6 +449,19 @@ impl WindowInteractionBackend for NativeWindowInteractionBackend {
     fn prepare_window(&self, window: &tauri::WebviewWindow) -> PlatformResult<()> {
         #[cfg(windows)]
         {
+            // WebView2 multiplies monitor DPI by the Windows accessibility text scale.
+            // The shaped pet surface uses monitor-DPI coordinates for both its native
+            // clip and pointer routing, so cancel only that extra WebView multiplier.
+            // Ordinary settings/history windows keep their accessibility scaling.
+            let text_scale = windows::UI::ViewManagement::UISettings::new()
+                .and_then(|settings| settings.TextScaleFactor())
+                .map_err(|error| map_error("prepare_window", error.to_string()))?;
+            if !text_scale.is_finite() || text_scale <= 0.0 {
+                return Err(map_error("prepare_window", "invalid Windows text scale"));
+            }
+            window
+                .set_zoom(1.0 / text_scale)
+                .map_err(|error| map_error("prepare_window", error.to_string()))?;
             // Tauri owns the portable declaration; Win32 readback makes the Windows
             // invariant observable before SetWindowRgn can expose non-client pixels.
             let decorations_started = std::time::Instant::now();

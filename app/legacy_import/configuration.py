@@ -68,6 +68,7 @@ def migrate_configuration(
     tts = api.pop("tts", None)
     _merge_allowed_env(source, api)
     compatibility_fallbacks = int(api_missing) + _normalize_api(api)
+    _preserve_canonical_inner_thought_slots(api, existing_user_root)
     _write_yaml(target_config / "api.yaml", api)
     counts["config"] = counts.get("config", 0) + 1
 
@@ -76,6 +77,20 @@ def migrate_configuration(
     for key in ("tool_loop", "screen_awareness", "memory_curation"):
         if isinstance(system.get(key), Mapping):
             current_system[key] = dict(system[key])
+    for key in ("relationship_drive", "relationship_initiative", "inner_thought"):
+        value = system.get(key)
+        if isinstance(value, Mapping):
+            current_system[key] = dict(value)
+    if existing_user_root is not None:
+        canonical = _load_yaml(
+            existing_user_root / "config" / "system_config.yaml",
+            required=False,
+        )
+        for key in ("relationship_drive", "relationship_initiative", "inner_thought"):
+            if key not in canonical:
+                continue
+            preserved = canonical[key]
+            current_system[key] = dict(preserved) if isinstance(preserved, Mapping) else preserved
     screen_awareness = current_system.get("screen_awareness")
     if isinstance(screen_awareness, dict):
         legacy_context_enabled = screen_awareness.pop("screen_context_enabled", None)
@@ -146,7 +161,62 @@ def migrate_configuration(
     if isinstance(tts, Mapping):
         _write_tts_plugin_config(staged, tts, new_tts_root, tts_provider=tts_provider)
         counts["ttsConfig"] = 1
+    _migrate_core_maintainer(system, staged, existing_user_root=existing_user_root)
     return counts
+
+
+def _migrate_core_maintainer(
+    system: Mapping[str, Any], staged: Path, *, existing_user_root: Path | None = None,
+) -> None:
+    """Map legacy memory.core_maintainer into the staged mem0 plugin config only."""
+    from plugins.builtin.sakura_mem0.personal_core_maintainer import CoreMaintainerSettings
+
+    relative = "data/plugins/sakura.memory.mem0/config.json"
+    destination = staged / relative
+    existing: dict[str, Any] | None = None
+    if destination.is_file():
+        try:
+            loaded = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise LegacyImportError("LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", relative) from exc
+        if not isinstance(loaded, dict):
+            raise LegacyImportError("LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", relative)
+        if "coreMaintainer" in loaded:
+            return
+        existing = loaded
+    if existing_user_root is not None:
+        current = existing_user_root / relative
+        if current.is_file():
+            try:
+                current_values = json.loads(current.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise LegacyImportError("LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", relative) from exc
+            if not isinstance(current_values, dict):
+                raise LegacyImportError("LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", relative)
+            existing = {**current_values, **(existing or {})}
+            if "coreMaintainer" in existing:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                return
+    memory = system.get("memory", None)
+    if memory is None:
+        raw: Mapping[str, Any] | None = None
+    elif not isinstance(memory, Mapping):
+        raise LegacyImportError("LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", "data/config/system_config.yaml")
+    elif "core_maintainer" not in memory:
+        raw = None
+    else:
+        candidate = memory.get("core_maintainer")
+        if not isinstance(candidate, Mapping):
+            raise LegacyImportError(
+                "LEGACY_CORE_MAINTAINER_CONFIG_INVALID", "staging", "data/config/system_config.yaml"
+            )
+        raw = candidate
+    settings = CoreMaintainerSettings() if raw is None else CoreMaintainerSettings.from_mapping(raw)
+    payload = dict(existing or {})
+    payload["coreMaintainer"] = settings.to_mapping()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def add_character_extensions(
@@ -170,6 +240,8 @@ def add_character_extensions(
         if not character_id:
             raise LegacyImportError("LEGACY_CHARACTER_MANIFEST_INVALID", "staging", relative)
         ids.append(character_id)
+        if not isinstance(value.get("extensions", {}), dict):
+            raise LegacyImportError("LEGACY_CHARACTER_EXTENSION_INVALID", "staging", relative)
         if isinstance(value.get("extensions"), dict):
             value["extensions"].pop("sakura.tts", None)
         theme = value.get("theme")
@@ -179,7 +251,7 @@ def add_character_extensions(
             # values remain valid and should migrate unchanged.
             theme["source"] = "package"
         voice = value.get("voice")
-        if isinstance(voice, Mapping):
+        if isinstance(voice, Mapping) and "sakura.tts.gpt-sovits" not in value.get("extensions", {}):
             tone_refs = voice.get("tone_refs")
             if isinstance(tone_refs, str) and tone_refs.strip():
                 extensions = value.setdefault("extensions", {})
@@ -205,10 +277,16 @@ def add_character_extensions(
                     gpt_provider["gptModel"] = voice["gpt_model"]
                 if isinstance(voice.get("sovits_model"), str) and voice["sovits_model"].strip():
                     gpt_provider["sovitsModel"] = voice["sovits_model"]
-                if (
-                    staged / "characters" / manifest.parent.name / "voice" / "onnx"
-                ).is_dir() or _matching_onnx_dir(legacy_onnx_root, character_id) is not None:
-                    genie_provider.setdefault("onnxModelDir", "voice/onnx")
+        if (
+            staged / "characters" / manifest.parent.name / "voice" / "onnx"
+        ).is_dir() or _matching_onnx_dir(legacy_onnx_root, character_id) is not None:
+            extensions = value.setdefault("extensions", {})
+            genie_provider = extensions.setdefault("sakura.tts.genie", {})
+            if not isinstance(genie_provider, dict):
+                raise LegacyImportError("LEGACY_CHARACTER_EXTENSION_INVALID", "staging", relative)
+            genie_provider.setdefault("onnxModelDir", "voice/onnx")
+        if "sakura.tts.gpt-sovits" in value.get("extensions", {}):
+            value.pop("voice", None)
         manifest.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if len({value.casefold() for value in ids}) != len(ids):
         raise LegacyImportError("LEGACY_CHARACTER_ID_CONFLICT", "validating")
@@ -226,6 +304,27 @@ def _normalize_character_selection(staged: Path, ids: tuple[str, ...]) -> None:
     if len(matches) == 1 and matches[0] != current.strip():
         value["current_character_id"] = matches[0]
         _write_yaml(path, value)
+
+
+def _preserve_canonical_inner_thought_slots(
+    api: dict[str, Any],
+    existing_user_root: Path | None,
+) -> None:
+    """Keep an already explicit fast or inner-thought slot ahead of the legacy copy."""
+
+    if existing_user_root is None:
+        return
+    canonical = _load_yaml(existing_user_root / "config" / "api.yaml", required=False)
+    slots = canonical.get("model_slots")
+    if not isinstance(slots, Mapping):
+        return
+    migrated = api.get("model_slots")
+    if not isinstance(migrated, dict):
+        migrated = {}
+        api["model_slots"] = migrated
+    for key in ("inner_thought", "chat_fast"):
+        if key in slots:
+            migrated[key] = slots[key]
 
 
 def _load_yaml(path: Path, *, required: bool) -> dict[str, Any]:

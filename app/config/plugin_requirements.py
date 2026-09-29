@@ -60,8 +60,8 @@ def requirements_for_manifest(manifest, *, include_tts=True):
         requirements.append({"kind": "visual", "type": "sakura.visual.portrait@1", "plugins": [{"id": "sakura.portrait", "name": "立绘"}]})
     if include_tts:
         mapping = lambda value: value if isinstance(value, Mapping) else {}
-        voice = mapping(manifest.get("voice"))
         extensions = mapping(manifest.get("extensions"))
+        voice = {} if "sakura.tts.gpt-sovits" in extensions else mapping(manifest.get("voice"))
         shared = mapping(extensions.get("sakura.tts.gpt-sovits"))
         # This is the existing shared model-resource contract, not a demand to
         # install its namesake provider. Genie can consume it via conversion.

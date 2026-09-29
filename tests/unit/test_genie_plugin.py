@@ -991,7 +991,7 @@ def test_genie_voice_inheritance_preserves_explicit_values() -> None:
     manifest = {"voice": {"gpt_model": "legacy.ckpt", "sovits_model": "legacy.pth", "ref_lang": "ja"},
                 "extensions": {"sakura.tts.gpt-sovits": {"gptModel": "studio.ckpt", "toneRefs": "studio.txt"}}}
     explicit = {"gptModel": "genie.ckpt", "toneRefs": "genie.txt", "onnxModelDir": "custom", "refLang": "zh"}
-    assert _effective_voice_extension(manifest, explicit) == {**explicit, "sovitsModel": "legacy.pth"}
+    assert _effective_voice_extension(manifest, explicit) == explicit
     assert _effective_voice_extension(manifest, {"gptModel": None})["gptModel"] is None
 
 

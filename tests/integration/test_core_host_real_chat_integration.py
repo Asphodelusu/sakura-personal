@@ -89,7 +89,7 @@ class _ProviderHandler(BaseHTTPRequestHandler):
                     "segments": [
                         {
                             "ja": "おかえり。",
-                            "zh": "欢迎回来。",
+                            "zh": "" if type(self).outcome == "missing-translation" else "欢迎回来。",
                             "tone": "中性",
                             "portrait": "neutral",
                         }
@@ -275,9 +275,14 @@ def _stop(process: subprocess.Popen[bytes]) -> None:
                 stream.close()
 
 
-def _configure_app_root(tmp_path: Path, port: int) -> Path:
+def _configure_app_root(tmp_path: Path, port: int, *, inner_thought: bool = False) -> Path:
     app_root = tmp_path / "app-root"
     shutil.copytree(SOURCE_ROOT, app_root)
+    # Provider protocol tests count main-chat calls. Exercise the optional
+    # thought lane explicitly instead of sharing its calls with that counter.
+    system_path = app_root / "config/system_config.yaml"
+    with system_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\ninner_thought:\n  enabled: {str(inner_thought).lower()}\n")
     (app_root / "config/api.yaml").write_text(
         "\n".join(
             [
@@ -1648,9 +1653,10 @@ def test_invalid_provider_json_fails_once_without_poisoning_core(tmp_path: Path)
         _stop_provider(server, provider_thread)
 
 
-def test_cancel_interrupts_blocked_provider_read_with_one_terminal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("inner_thought", [False, True])
+def test_cancel_interrupts_blocked_provider_read_with_one_terminal(tmp_path: Path, inner_thought: bool) -> None:
     server, provider_thread = _start_provider("blocked-read")
-    app_root = _configure_app_root(tmp_path, server.server_address[1])
+    app_root = _configure_app_root(tmp_path, server.server_address[1], inner_thought=inner_thought)
     process = _start_host(app_root)
     try:
         _wait_ready(process)
@@ -1752,8 +1758,9 @@ def test_cancel_interrupts_provider_retry_sleep(tmp_path: Path) -> None:
         _stop_provider(server, provider_thread)
 
 
-def test_invalid_structured_reply_is_failed_not_legacy_fallback(tmp_path: Path) -> None:
-    server, provider_thread = _start_provider("invalid-content")
+@pytest.mark.parametrize("outcome", ["invalid-content", "missing-translation"])
+def test_invalid_structured_reply_is_failed_not_legacy_fallback(tmp_path: Path, outcome: str) -> None:
+    server, provider_thread = _start_provider(outcome)
     app_root = _configure_app_root(tmp_path, server.server_address[1])
     process = _start_host(app_root)
     try:
@@ -1778,6 +1785,16 @@ def test_invalid_structured_reply_is_failed_not_legacy_fallback(tmp_path: Path) 
             "details": {},
         }
         assert len(_ProviderHandler.requests) == 2
+        _ProviderHandler.outcome = "complete"
+        _send(process, _request("recovered", "chat.send", {
+            "message": "try again", "operationId": "recovered",
+        }))
+        recovered = [_read(process), _read(process), _read(process)]
+        assert recovered[0]["name"] == "chat.started"
+        assert {frame["name"] for frame in recovered[1:]} == {"chat.send", "chat.completed"}
+        terminal = next(frame for frame in recovered if frame["name"] == "chat.completed")
+        assert terminal["payload"]["operationId"] == "recovered"
+        assert len(_ProviderHandler.requests) == 3
         _exchange(process, _request("shutdown", "system.shutdown", {}))
         assert process.wait(timeout=5) == 0
     finally:

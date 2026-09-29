@@ -25,6 +25,11 @@ from typing import Any, Callable, Iterable
 from sakura_http import urlopen_direct_for_loopback as urlopen_current_proxy
 
 try:
+    from .index_contract import require_supported_index_layout
+except ImportError:
+    from index_contract import require_supported_index_layout
+
+try:
     from .support import (
         ResourceRegistry,
         StoragePaths,
@@ -445,6 +450,8 @@ class _DisabledGrpcModule(ModuleType):
     """Provide import-only gRPC symbols for Qdrant's unused remote code path."""
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
         value = type(f"DisabledGrpc_{_diagnostic_token(name)}", (), {})
         setattr(self, name, value)
         return value
@@ -553,6 +560,7 @@ def validate_existing_memory_store(memory_dir: Path) -> None:
     incompatibilities that metadata-only checks cannot detect.
     """
 
+    require_supported_index_layout(memory_dir)
     qdrant_path = Path(memory_dir) / "qdrant"
     if not qdrant_path.is_dir() or not any(path.is_file() for path in qdrant_path.rglob("*")):
         return
@@ -650,6 +658,7 @@ class MemoryStore:
         self.base_dir = _resolve_base_dir(self.base_dir)
         paths = StoragePaths(self.base_dir)
         self.memory_dir = Path(self.memory_dir or paths.memory_dir)
+        require_supported_index_layout(self.memory_dir)
         self.memory_cache_dir = Path(self.memory_cache_dir or paths.memory_cache_dir)
         self.scope_id = _normalize_scope_id(self.scope_id)
         self.resource_registry = self.resource_registry or ResourceRegistry()
@@ -1001,6 +1010,7 @@ class MemoryStore:
         """生成不含 Provider/LLM 的本地 raw vector backend 配置。"""
 
         assert self.memory_dir is not None
+        require_supported_index_layout(self.memory_dir)
         qdrant_path = self.memory_dir / "qdrant"
 
         return {

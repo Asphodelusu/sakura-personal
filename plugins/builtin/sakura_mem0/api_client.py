@@ -36,9 +36,12 @@ class CurationApiError(RuntimeError):
 class OpenAICompatibleClient:
     """Narrow no-retry client used only by the plugin-owned curator."""
 
-    def __init__(self, settings: ApiSettings, **_kwargs: object) -> None:
+    def __init__(self, settings: ApiSettings, *, request_limit: int | None = None, **_kwargs: object) -> None:
         self._settings = settings
         self._requests_sent = 0
+        self._request_limit = (
+            MAX_CURATION_HTTP_REQUESTS_PER_JOB if request_limit is None else int(request_limit)
+        )
 
     @property
     def requests_sent(self) -> int:
@@ -80,7 +83,7 @@ class OpenAICompatibleClient:
             },
             method="POST",
         )
-        if self._requests_sent >= MAX_CURATION_HTTP_REQUESTS_PER_JOB:
+        if self._requests_sent >= self._request_limit:
             raise CurationApiError("CURATION_REQUEST_LIMIT_EXCEEDED")
         # Reserve the request before urlopen: timeouts and transport failures may
         # still consume provider quota and must count against the job fuse.

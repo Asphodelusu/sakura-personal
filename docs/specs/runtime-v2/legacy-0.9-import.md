@@ -3,10 +3,112 @@ kind: spec
 status: normative
 audience: maintainer
 source_of_truth: self
-updated: 2026-09-11
+updated: 2026-09-14
 ---
 
 # Sakura 0.9.x 到 Runtime v2 数据迁移合同
+
+## 个人 SQLite 聊天历史边界
+
+个人 Qt 版 `ChatHistoryStore` 将每个角色的 JSONL 路径映射为同名 `.db`，SQLite 为当前写入源。
+个人候选已将 `.db` 接入原有 Timeline 转换与增量合并路径；同角色以 SQLite 为准，
+不重复导入残留 JSONL。只接受已停写、无待合并 WAL 的离线来源，以只读 immutable 连接校验
+完整性、表结构、行 ID、字段类型和带时区时间；不推测无时区时间，不对源库 checkpoint。
+损坏或无法完整表达的记录返回 `LEGACY_PERSONAL_HISTORY_INVALID`，未合并日志或孤立旁文件返回
+`LEGACY_PERSONAL_HISTORY_WAL_PENDING`，均不退回 JSONL。
+
+Timeline 内 `personal_history_rows` 保存角色、源相对路径、SQLite 行 ID、目标 entry_id、
+assistant 分句序号及完整原始字段 JSON；error 行归档为 `legacy_error` 系统条目。
+重复导入沿用源身份，原始字段变化也纳入冲突预览和确认，映射随增量事务写入。
+已有同角色 JSONL 导入或另一源路径的目标返回 `LEGACY_PERSONAL_HISTORY_IDENTITY_CONFLICT`，
+避免无可靠对应关系时重复导入。此时需要新的迁移目标，不能凭时间戳猜测身份。
+上述仅经合成数据验证；真实数据复制、个人 Memory 接入和日常运行切换仍待验收。
+个人 Qt 的记忆写入使用 evidence 摘录，不生成聊天行 ID 引用，因此不凭摘录补造引用。
+已有新版 source_entry_ids 继续按角色审计；无引用单独计数，不等同于出处已验证。
+
+## 个人候选的离线副本机制
+
+`app.legacy_import.personal_copy.prepare_personal_copy` 是内部离线复制原语，无生产 CLI，
+不自动探测或停止日常安装进程。调用者须独占目标父目录，并在调用全程保持源停写，
+通过必填 `source_is_quiescent` 核验；回调、文件状态盘点和逐字节比较本身不能证明停写。
+
+源目标不得重叠，目标必须不存在；拒绝路径中的符号链接、Windows reparse point、硬链接和
+特殊文件。保留未知文件、空目录及数据库伴随文件；不打开源数据库，不计算新摘要。
+空间检查后建立新目标，并先写 `.sakura-personal-copy.json` 的 incomplete 状态；复制后
+逐字节比较内容并复查源盘点，只有全部成功才替换为 complete。状态只表示复制完成，
+不代表 SQLite、编码器或业务语义验收通过，也不承诺断电耐久性。
+
+取消、源变化、重新出现写入者、内容不一致或 I/O 失败时，保留未完成目录，不覆盖重试。
+从基准副本恢复也只新建目标，保留失败工作副本。含 `personal_write_pending.json` 的源，
+或已带有未完成/损坏复制状态的基准，拒绝作为复制源。
+记忆准入与旧导入检查副本祖先目录的状态；未完成或损坏状态返回
+`PERSONAL_COPY_INCOMPLETE` / `LEGACY_PERSONAL_COPY_INCOMPLETE`。
+
+当前仅合成目录验证。真实停写所有权、独立基准保管和运行时切换仍未接入，
+不能把该函数作为真实数据迁移一键入口。
+
+### 个人副本联合验收入口
+
+`memory_contract.inspect_personal_migration` 接受独占的工作副本根、明确的编码身份和
+编码器；要求根目录存在 complete 复制标记，Timeline 已由历史转换器生成。
+调用前检查祖先状态、整个副本的 link/hardlink/pending 边界，读取 Timeline 后再打开
+个人索引与实体/访问元数据库，调用既有引用审计，返回不含正文的计数及问题分类。
+资源在成功、取消、准入拒绝和审计失败时关闭；编码器自调用开始归此入口负责释放。
+审计问题返回 `ok=false`，准入或读取失败抛异常，不把失败转成空报告。
+
+该入口现可传 `snapshot`，由 `open_personal_memory_from_snapshot` 从绑定读取编码身份，
+按个人 Qt 相同的路径/内容 SHA-256 算法核对本地工件，离线加载 SentenceTransformer，
+设置绑定的 max_seq_length，检查实际维度并在加载后再次核对摘要。禁止远程代码加载，
+保持 encode-default 语义，不添加 query 前缀或归一化。snapshot 与注入 identity/encoder 互斥。
+记录入口提供固定角色过滤的 search，复用现有操作租约与关闭流程。
+
+该入口不转换/复制数据、不修改默认导入准入、不启动 Core，也不发布切换资格。
+后端打开可能维护数据库内部状态，因此不得对基准或日常数据调用；complete 标记只证明
+复制流程完成，不能证明实际独占，调用者仍负责独占工作目录。注入编码身份仍是调用者声明，
+不是实际模型身份已验证。本地 snapshot 路径已接通；384/1024 维替身测试验证调用合同。
+2026-09-17 已在本机现有 BGE-M3 snapshot 上完成真实 SentenceTransformer + Qdrant/SQLite
+合成数据验收：1024 维编码、同角色召回、跨角色隔离、关闭拒绝、重开及副本联合审计通过，
+模型工件前后摘要一致。测试显式禁止网络/LLM，实体 NLP 使用替身，因此不覆盖完整实体抽取、
+Core/plugin 启动、真实记忆迁移或真实停写。MiniLM 未发现本地模型，仍只有替身验证。
+
+### Windows 源文件占用保护
+
+`personal_windows_copy.prepare_windows_personal_copy` 包装上述离线原语，并要求同样的外部
+停写核验。仅支持本地 Windows 目录，不接收 UNC 路径。先盘点，再按目录优先的顺序以
+CreateFileW 的只读共享方式持有原生句柄，全部取得后再次核对盘点；持有至复制结束。
+已有写入句柄或删除共享冲突会拒绝复制；持有期间现存源文件不能写入、删除或替换。
+失败和取消都关闭已取得的句柄，不强制结束进程、不创建或清理日常实例锁。
+
+此方式不是卷快照。目录新增文件仍可能发生，由复制盘点拒绝；进程是否退出、多个存储是否
+属于同一业务时点仍需调用者保证。原生句柄不替代外部停写回调，不足以独立授权真实复制。
+当前 Windows 真实文件共享行为只在合成目录验收，尚未测试日常 Qt 进程退出和重新启动。
+
+## 个人候选：尚不支持的记忆布局
+
+隔离宿主可显式构造 `SakuraMem0Plugin(personal_snapshot=...)` 启用个人召回试运行。
+它从 Host storage/character 接口取当前角色及数据目录，要求根目录 complete 副本标记，
+检查记忆目录的链接边界，后台加载模型。仅注册现有 context provider 与 memory_search；
+不注册管理写入、下载入口、自动整理或完成事件，默认插件构造行为不变。
+加载期间立即返回 loading；加载/搜索失败返回 degraded 和空结果，避免伪造命中。
+退出等待加载或已有查询结束，关闭个人记录与模型；不强制中断模型加载。
+本阶段按角色检索及 layer 过滤复用个人记录和已有 DTO/召回投影；layer 在返回候选中筛选。
+独立 worker 可显式选择 `plugin:PersonalRecallPlugin` 入口，并在插件私有 config.json
+配置绝对路径 personalSnapshot。原 plugin.yaml 仍指向默认入口；不通过默认配置隐式启用。
+个人模块同时支持包导入与 runner 的顶层模块导入，禁止访问 Core 私有模块的约束保持有效。
+真实 BGE-M3 + 合成数据库已通过 Python 3.11 的真实 `-I -S` Plugin API v4 子进程验收，
+包括 RPC 注册、搜索、context、角色隔离、模型缺失降级和关闭；Host 服务响应由测试提供。
+尚未验收桌面 Python 3.12 的个人插件依赖、完整 Core 初始化/主对话及 UI 生命周期，
+不能称为生产接线完成。
+
+源或目标 `data/memory` 存在 `active_index.json` 或 `indexes` 时，预检、首次导入和增量导入
+返回 `LEGACY_PERSONAL_MEMORY_UNSUPPORTED`，在复制和数据库合并前停止。标记损坏、类型错误或断链
+也不能降级成空库；不隔离这些数据后宣称成功，不读取指针选择旧根目录作为替代。
+MemoryStore 创建、后端配置和已有库验证同样在打开后端前拒绝，原因码为
+`MEMORY_PERSONAL_INDEX_UNSUPPORTED`。插件创建失败不等于已经验证主对话可以降级运行。
+
+这是个人 ST 编码器、多代索引和关联存储接入之前的保护边界，不是迁移实现。
+它不能识别所有没有布局标记的旧 ST 库；同名模型、相同维度或普通 384 维合成库测试通过，
+均不能证明 SentenceTransformers 与上游 FastEmbed ONNX 的编码结果等价。
 
 ## 入口与生命周期
 

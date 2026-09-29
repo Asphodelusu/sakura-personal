@@ -115,9 +115,16 @@ class OpenAICompatibleClient:
         agent_trace_recorder: AgentTraceRecorder | None = None,
         app_version: str | None = None,
         retry_requests: bool = True,
+        request_attempts: int | None = None,
     ) -> None:
         self.settings = settings
-        self._request_attempts = MAX_AUTO_RETRY_ATTEMPTS if retry_requests else 1
+        if request_attempts is not None:
+            self._request_attempts = max(1, int(request_attempts))
+        else:
+            self._request_attempts = MAX_AUTO_RETRY_ATTEMPTS if retry_requests else 1
+        self._compatibility_attempts = (
+            self._request_attempts if request_attempts is not None else MAX_AUTO_RETRY_ATTEMPTS
+        )
         resolved_version = app_version or read_app_version(Path(__file__).resolve().parents[2])
         self._app_version = resolved_version.strip().removeprefix("v")
         self._unsupported_chat_params: set[str] = set()
@@ -620,7 +627,7 @@ class OpenAICompatibleClient:
             fallback_payload.pop(param, None)
         fallback_kind = getattr(self._trace_local, "pending_fallback", None)
         self._trace_local.pending_fallback = None
-        for attempt in range(1, MAX_AUTO_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, self._compatibility_attempts + 1):
             self._trace_local.request_diagnostic = (
                 {"compatibilityFallback": fallback_kind} if fallback_kind else {}
             )
@@ -708,7 +715,7 @@ class OpenAICompatibleClient:
                         "结构化 response_format 不受支持，已回退普通请求",
                         {
                             "attempt": attempt,
-                            "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                            "max_attempts": self._request_attempts,
                             **diagnostic_attributes(
                                 exc,
                                 reason_code="MODEL_REQUEST_RETRYABLE",
@@ -726,7 +733,7 @@ class OpenAICompatibleClient:
                         "模型不支持自定义 temperature，已回退默认温度",
                         {
                             "attempt": attempt,
-                            "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                            "max_attempts": self._request_attempts,
                             **diagnostic_attributes(
                                 exc,
                                 reason_code="MODEL_REQUEST_FAILED",

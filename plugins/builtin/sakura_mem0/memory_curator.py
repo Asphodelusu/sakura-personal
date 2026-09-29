@@ -47,8 +47,6 @@ DEFAULT_AUTO_MEMORY_TRIGGER_TURNS = 8
 DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT = 200
 MAX_CURATION_CHUNK_MESSAGES = 32
 MAX_CURATION_CHUNK_CHARS = 12000
-# 整理时一次性注入给模型的现有记忆条数上限，远大于日常摘要，便于全量对照去重纠错。
-CURATION_MEMORY_SNAPSHOT_LIMIT = 500
 # 现有记忆清单注入的字符预算，超出后截断以保护 token 开销。
 CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET = 20000
 # 单次整理允许写回的操作数量上限，避免异常输出放大写入。
@@ -84,6 +82,7 @@ class MemoryCurationResult:
     returned: int = 0
     unclassified: int = 0
     event_counts: dict[str, int] | None = None
+    core_candidates: tuple = ()
 
     def summary(self) -> str:
         return (
@@ -200,11 +199,13 @@ class MemoryCurator:
         memory_store: MemoryStore,
         *,
         system_prompt: str = "",
+        accept_core_candidates: bool = False,
     ) -> None:
         self.api_client = api_client
         self.memory_store = memory_store
         # 人格卡文本，作为第一人称整理 prompt 的基底；缺省时只用整理任务说明。
         self.system_prompt = (system_prompt or "").strip()
+        self.accept_core_candidates = bool(accept_core_candidates)
 
     def set_api_client(self, api_client: Any) -> None:
         self.api_client = api_client
@@ -222,6 +223,7 @@ class MemoryCurator:
             self.api_client,
             memory_store or self.memory_store,
             system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+            accept_core_candidates=self.accept_core_candidates,
         )
 
     def curate_entries(
@@ -241,6 +243,7 @@ class MemoryCurator:
         archived = 0
         ignored = 0
         event_counts: dict[str, int] = {}
+        core_candidates: list[dict[str, Any]] = []
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -265,6 +268,9 @@ class MemoryCurator:
                 cancel_checker=cancel_checker,
             )
             check_cancelled(cancel_checker)
+            operations, accepted, dropped = self._split_core_candidates(operations, chunk, len(core_candidates))
+            core_candidates.extend(accepted)
+            ignored += dropped
             source_entry_ids = list(
                 dict.fromkeys(entry.entry_id for entry in chunk if entry.entry_id)
             )
@@ -272,6 +278,7 @@ class MemoryCurator:
                 operations,
                 existing,
                 source_entry_ids=source_entry_ids,
+                cancel_checker=cancel_checker,
             )
             created += counts["created"]
             updated += counts["updated"]
@@ -287,13 +294,16 @@ class MemoryCurator:
             returned=created + updated + archived,
             unclassified=0,
             event_counts=event_counts,
+            core_candidates=tuple(core_candidates),
         )
 
     def _load_existing_memories(self) -> list[dict[str, Any]]:
         """读取当前角色的长期记忆快照；失败时不得绕过来源幂等检查。"""
 
         try:
-            return self.memory_store.list_memories(limit=CURATION_MEMORY_SNAPSHOT_LIMIT)
+            # Source dedupe needs the complete scoped snapshot; only the model
+            # projection below is bounded by the prompt character budget.
+            return self.memory_store.list_memories(limit=None)
         except OperationCancelled:
             raise
         except Exception as exc:
@@ -308,9 +318,23 @@ class MemoryCurator:
             raise MemoryCurationError("MEMORY_CURATION_SNAPSHOT_FAILED") from exc
 
     def _build_self_curation_system_prompt(self) -> str:
+        descriptions = {"semantic": "长期事实", "episodic": "已经发生的事件总结",
+                        "procedural": "稳定的协作规则/偏好", "session": "当前任务短期状态",
+                        "core_profile": "高度稳定的常驻档案"}
+        layers = getattr(self.memory_store, "curation_layers", MEMORY_LAYERS)
+        guidance = "请为每条候选记忆选择本存储支持的 layer：" + "，".join(
+            f"{layer}={descriptions[layer]}" for layer in descriptions if layer in layers) + "。"
+        task_prompt = _SELF_CURATION_TASK_PROMPT.replace("{layer_guidance}", guidance)
+        if self.accept_core_candidates:
+            task_prompt += (
+                "\n若本次对话有双方原话支持的稳定认识，可在 operations 中额外加入最多 5 条 "
+                "op=core_candidate，字段仅限 kind、target_section、subject_key、claim、"
+                "user_excerpt、assistant_excerpt、confidence。"
+                "两段 excerpt 必须是本次对话原句，不要填写证据 id、批次或 scope。\n"
+            )
         if not self.system_prompt:
-            return _SELF_CURATION_TASK_PROMPT
-        return f"{self.system_prompt}\n\n{_SELF_CURATION_TASK_PROMPT}"
+            return task_prompt
+        return f"{self.system_prompt}\n\n{task_prompt}"
 
     def _extract_operations(
         self,
@@ -382,14 +406,43 @@ class MemoryCurator:
         )
         return operations
 
+    def _split_core_candidates(self, operations, entries, already):
+        if not self.accept_core_candidates:
+            return operations, [], 0
+        try:
+            from .personal_profile_maintenance import MAX_CORE_CANDIDATES_PER_JOB, bind_core_candidate
+        except ImportError:
+            from personal_profile_maintenance import MAX_CORE_CANDIDATES_PER_JOB, bind_core_candidate
+        scope = str(getattr(self.memory_store, "scope_id", "") or "")
+        vector = []
+        accepted = []
+        dropped = 0
+        for operation in operations:
+            action = ""
+            if isinstance(operation, dict):
+                action = str(operation.get("op") or operation.get("action") or "").strip().lower()
+            if action != "core_candidate":
+                vector.append(operation)
+                continue
+            if already + len(accepted) >= MAX_CORE_CANDIDATES_PER_JOB:
+                dropped += 1
+                continue
+            bound = bind_core_candidate(operation, entries, scope)
+            if bound is None:
+                dropped += 1
+                continue
+            accepted.append(bound)
+        return vector, accepted, dropped
+
     def _apply_operations(
         self,
         operations: list[dict[str, Any]],
         existing: list[dict[str, Any]],
         *,
         source_entry_ids: list[str],
+        cancel_checker: CancelChecker | None = None,
     ) -> dict[str, Any]:
-        """把整理操作写回记忆库；策略性忽略成功，backend 写失败则整批失败。"""
+        """逐条写回；失败或取消时立即停止，保留已提交操作供来源去重。"""
 
         existing_ids = {
             str(memory.get("id", "")).strip()
@@ -401,9 +454,9 @@ class MemoryCurator:
         updated = 0
         archived = 0
         ignored = 0
-        write_failure: Exception | None = None
         event_counts: dict[str, int] = {}
         for operation in operations[:MAX_CURATION_OPERATIONS]:
+            check_cancelled(cancel_checker)
             if not isinstance(operation, dict):
                 ignored += 1
                 continue
@@ -540,6 +593,8 @@ class MemoryCurator:
                     event_counts["DELETE"] = event_counts.get("DELETE", 0) + 1
                 else:
                     ignored += 1
+            except OperationCancelled:
+                raise
             except Exception as exc:
                 log_event(
                     "Memory",
@@ -553,12 +608,8 @@ class MemoryCurator:
                         "stage": "memory_write",
                     },
                 )
-                ignored += 1
-                if write_failure is None:
-                    write_failure = exc
-                continue
-        if write_failure is not None:
-            raise MemoryCurationError("MEMORY_CURATION_WRITE_FAILED") from write_failure
+                raise MemoryCurationError("MEMORY_CURATION_WRITE_FAILED") from exc
+        check_cancelled(cancel_checker)
         return {
             "created": created,
             "updated": updated,
@@ -659,8 +710,7 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 已有记忆已经明确失效、错误或不该再保留 → 删除对应那条记忆；\n"
     "- 没有值得整理的内容时，就不要产生任何操作。\n\n"
     "只保留对长期陪伴与协作真正有用、且能独立理解的事实；忽略寒暄、一次性的临时提醒、转瞬即逝的情绪和无长期价值的内容。\n"
-    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=已经发生的事件总结，procedural=稳定的协作规则/偏好，"
-    "session=当前任务短期状态，core_profile=高度稳定的常驻档案。"
+    "{layer_guidance}"
     "有双向证据的共同经历使用 episodic，并优先标记 category=shared_experience；"
     "长期反复形成的共同协作习惯可使用 procedural。\n"
     "不要记录密码、token、密钥、证件号、银行卡等敏感信息。\n"

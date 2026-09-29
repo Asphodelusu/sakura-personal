@@ -216,6 +216,21 @@ class AssistantAdapter:
             )
             owned.append(runtime)
             self._check_active(cancel)
+            from app.core_host.relationship_settings import load_relationship_turn_settings
+            from app.storage.paths import StoragePaths
+
+            drive_settings, in_turn_enabled = load_relationship_turn_settings(self._user_root)
+            runtime.configure_relationship_drive(
+                enabled=drive_settings.enabled,
+                in_turn_enabled=in_turn_enabled,
+                profile=profile.relationship_drive_profile,
+                state_path=StoragePaths(self._user_root).relational_drive_for(profile.id),
+                character_id=profile.id,
+            )
+            from app.core_host.inner_thought_settings import attach_inner_thought
+
+            attach_inner_thought(runtime, self._user_root)
+            self._check_active(cancel)
 
             pipeline = ChatPipeline(runtime, finalize_trace_operations=False)
             owned.append(pipeline)

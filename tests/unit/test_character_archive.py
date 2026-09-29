@@ -126,7 +126,8 @@ def test_character_archive_manifest_uses_sakura_format() -> None:
     assert manifest["version"] == ARCHIVE_VERSION
     assert manifest["character"]["card"] == "character/card.md"
     assert manifest["character"]["portrait"]["default"] == "character/portraits/default.png"
-    assert manifest["character"]["voice"]["tone_refs"] == "character/voice/refs/ref.txt"
+    assert "voice" not in manifest["character"]
+    assert manifest["character"]["extensions"]["sakura.tts.gpt-sovits"]["toneRefs"] == "voice/refs/ref.txt"
     assert "character/voice/models/gpt.ckpt" in names
     assert "character/voice/refs/tone_refs/neutral.wav" in names
 
@@ -162,8 +163,11 @@ def test_character_archive_roundtrips_opaque_plugin_extensions() -> None:
         public_manifest = json.loads(zf.read("manifest.json"))
         package_manifest = json.loads(zf.read("character/character.json"))
     resources = {key: value for key, value in expected.items() if key != "sakura.tts"}
-    assert public_manifest["character"]["extensions"] == resources
-    assert package_manifest["extensions"] == resources
+    for key, value in resources.items():
+        assert public_manifest["character"]["extensions"][key] == value
+        assert package_manifest["extensions"][key] == value
+    assert set(public_manifest["character"]["extensions"]) == set(resources) | {"sakura.tts.gpt-sovits"}
+    assert package_manifest["extensions"] == public_manifest["character"]["extensions"]
 
 
 def test_character_archive_roundtrips_runtime_fields_and_extension_voice_resources() -> None:
@@ -500,8 +504,9 @@ def test_character_voice_archive_imports_to_selected_character(existing_extensio
     assert imported.voice.gpt_model_path.read_bytes() == b"gpt-new"
     assert imported.voice.sovits_model_path.read_bytes() == b"sovits-new"
     assert imported.voice.tone_ref_path.read_text(encoding="utf-8").strip().endswith("|开心")
-    assert manifest["voice"]["tone_refs"] == "voice/refs/ref.txt"
-    assert manifest["voice"]["ref_lang"] == "ja"
+    assert "voice" not in manifest
+    assert manifest["extensions"]["sakura.tts.gpt-sovits"]["toneRefs"] == "voice/refs/ref.txt"
+    assert manifest["extensions"]["sakura.tts.gpt-sovits"]["refLang"] == "ja"
     assert "sakura.tts" not in manifest["extensions"]
     assert manifest["extensions"]["sakura.tts.gpt-sovits"]["sovitsModel"] == (
         "voice/models/sovits.pth"

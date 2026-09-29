@@ -264,6 +264,9 @@ class RealChatBoundary:
         runtime = None
         completed_fact: dict[str, Any] | None = None
         plugin_application: object | None = None
+        completed_reply = None
+        relationship_user_turn = False
+        relationship_character_id = ""
         try:
             from app.core.runtime_log import suppress_runtime_logs
             from app.agent.trace import traced_message
@@ -325,6 +328,7 @@ class RealChatBoundary:
                 event_payload = proactive_event.get("payload")
                 assert isinstance(event_payload, Mapping)
                 execution.cancel.throw_if_cancelled()
+                _invalidate_inner_thought(runtime)
                 with suppress_runtime_logs():
                     result = getattr(session, "pipeline").run_event(
                         AgentEvent(type="update_available", payload=dict(event_payload)),
@@ -470,6 +474,21 @@ class RealChatBoundary:
                     ) from exc
 
                 execution.cancel.throw_if_cancelled()
+                relationship_character_id = str(character.id)
+                relationship_user_turn = (
+                    screen_attachment is None
+                    or screen_attachment.source != "screen_awareness"
+                )
+                if relationship_user_turn:
+                    _begin_relationship_user_turn(runtime, operation_id)
+                    _start_inner_thought(
+                        runtime,
+                        operation_id,
+                        messages,
+                        execution.cancel.throw_if_cancelled,
+                    )
+                else:
+                    _invalidate_inner_thought(runtime)
                 with suppress_runtime_logs():
                     pipeline_kwargs: dict[str, Any] = {
                         "cancel_checker": execution.cancel.throw_if_cancelled,
@@ -480,6 +499,7 @@ class RealChatBoundary:
                         messages,
                         **pipeline_kwargs,
                     )
+            completed_reply = getattr(result, "reply", None)
             execution.cancel.throw_if_cancelled()
             allowed_action_types = {"tool_call", "event"} if is_update_event else {"tool_call"}
             unsupported = [
@@ -647,6 +667,15 @@ class RealChatBoundary:
                 "outcome": {"chat.completed": "success", "chat.cancelled": "cancelled"}.get(resolved_terminal, "failed"),
                 "elapsed_ms": int((monotonic() - started_at) * 1000),
             }, event="chat.finished", severity="info")
+        _settle_relationship_reply(
+            runtime,
+            operation_id,
+            resolved_terminal=resolved_terminal,
+            assistant_committed=assistant_committed,
+            user_turn=relationship_user_turn,
+            character_id=relationship_character_id,
+            reply=completed_reply,
+        )
         try:
             if resolved_terminal == "chat.completed":
                 if plugin_application is not None and completed_fact is not None:
@@ -1218,6 +1247,119 @@ class RealChatBoundary:
                 raise RealChatRejection(
                     "INVALID_CHAT_PAYLOAD", "update pubDate is invalid"
                 )
+
+
+def _relationship_interaction_id(operation_id: str) -> str:
+    from app.core.interaction import get_interaction_id
+
+    context_id = str(get_interaction_id() or "").strip()
+    bound = str(operation_id or "").strip()
+    if context_id and bound and context_id != bound:
+        return ""
+    return context_id or bound
+
+
+def _start_inner_thought(
+    runtime: object | None,
+    operation_id: str,
+    messages: list[Any],
+    cancel_checker: Any,
+) -> None:
+    start = getattr(runtime, "start_inner_thought", None)
+    if not callable(start):
+        return
+    try:
+        start(
+            _relationship_interaction_id(operation_id),
+            messages,
+            cancel_checker=cancel_checker,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional thought must not fail the turn
+        _log_inner_thought_failure(exc)
+
+
+def _invalidate_inner_thought(runtime: object | None) -> None:
+    invalidate = getattr(runtime, "invalidate_inner_thought", None)
+    if not callable(invalidate):
+        return
+    try:
+        invalidate()
+    except Exception as exc:  # noqa: BLE001
+        _log_inner_thought_failure(exc)
+
+
+def _log_inner_thought_failure(exc: BaseException) -> None:
+    from app.core.runtime_log import log_event
+
+    log_event(
+        "InnerThought",
+        "内心独白未启动",
+        {"code": "INNER_THOUGHT_START_FAILED", "error_type": type(exc).__name__},
+        severity="info",
+    )
+
+
+def _begin_relationship_user_turn(runtime: object | None, operation_id: str) -> None:
+    begin = getattr(runtime, "begin_relationship_user_turn", None)
+    if not callable(begin):
+        return
+    try:
+        begin(_relationship_interaction_id(operation_id))
+    except Exception as exc:  # noqa: BLE001 - contact bookkeeping must not fail the turn
+        from app.core.runtime_log import log_event
+
+        log_event(
+            "RelationalDrive",
+            "effect settlement failed",
+            {
+                "code": "RELATIONSHIP_DRIVE_CONTACT_FAILED",
+                "error_type": type(exc).__name__,
+            },
+            severity="info",
+        )
+
+
+def _settle_relationship_reply(
+    runtime: object | None,
+    operation_id: str,
+    *,
+    resolved_terminal: str | None,
+    assistant_committed: bool,
+    user_turn: bool,
+    character_id: str,
+    reply: object | None,
+) -> None:
+    if (
+        not assistant_committed
+        or resolved_terminal != "chat.completed"
+        or not user_turn
+    ):
+        return
+    from app.llm.chat_reply import ChatReply
+
+    if not isinstance(reply, ChatReply) or not reply.text.strip():
+        return
+    settle = getattr(runtime, "settle_relationship_reply", None)
+    if not callable(settle):
+        return
+    try:
+        settle(
+            _relationship_interaction_id(operation_id) or str(operation_id or "").strip(),
+            reply,
+            character_id=character_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - settlement must not fail a committed chat
+        from app.core.runtime_log import log_event
+
+        log_event(
+            "RelationalDrive",
+            "effect settlement failed",
+            {
+                "code": "RELATIONSHIP_DRIVE_SETTLEMENT_FAILED",
+                "error_type": type(exc).__name__,
+            },
+            severity="info",
+        )
 
 
 class _BoundaryFailure(RuntimeError):

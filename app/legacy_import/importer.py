@@ -29,10 +29,13 @@ from .files import (
     copy_tree_checked,
     copy_tree_fast_checked,
     is_link_or_junction,
+    sqlite_readonly_uri,
     tree_stats,
 )
 from .history import import_history
-from .incremental import _merge_memory, _merge_timeline
+from .history_sqlite import validate_sqlite_history_source
+from .incremental import _legacy_current_scope, _merge_memory, _merge_timeline
+from .memory_contract import require_importable_memory, require_importable_memory_roots
 from .inspector import (
     detect_legacy_source_platform,
     inspect_installation,
@@ -87,6 +90,8 @@ def run_legacy_import(
 ) -> tuple[ImportReport, PendingCommit | None]:
     source = Path(source).resolve(strict=True)
     target = Path(target).resolve(strict=True)
+    require_importable_memory_roots(source, target)
+    validate_sqlite_history_source(source)
     inspection = inspection or inspect_installation(source, target)
     if not inspection.compatible:
         first = inspection.blockers[0]
@@ -136,7 +141,6 @@ def run_legacy_import(
         # character identity comes from the legacy scope itself; a character
         # package is useful for case normalization but is not their owner.
         discovered_character_ids = _discover_character_ids(source)
-        _processed_counts, _current_character = _legacy_curation(source)
         _log_stage(
             import_id,
             "history",
@@ -206,7 +210,7 @@ def run_legacy_import(
                 converted,
                 payload,
                 overwrite_conflicts=True,
-                current_scope=_current_character,
+                current_scope=_legacy_current_scope(source),
                 quarantine=payload
                 / "data"
                 / "legacy-imports"
@@ -1489,6 +1493,7 @@ def _copy_memory(
     """
 
     source_root = source / "data" / "memory"
+    require_importable_memory(source_root)
     target_root = payload / "data" / "memory"
     source_files, source_bytes = tree_stats(source_root)
     _log_legacy_import(
@@ -1567,7 +1572,7 @@ def _snapshot_sqlite_database(
             },
         )
         step = "open_source"
-        source_uri = _sqlite_readonly_uri(source)
+        source_uri = sqlite_readonly_uri(source)
         with closing(sqlite3.connect(source_uri, uri=True, timeout=10)) as origin:
             row = origin.execute("PRAGMA journal_mode").fetchone()
             journal_mode = str(row[0]) if row else "unknown"
@@ -1644,24 +1649,6 @@ def _safe_file_size(path: Path) -> int:
         return path.stat().st_size if path.is_file() else 0
     except OSError:
         return -1
-
-
-def _sqlite_readonly_uri(path: Path) -> str:
-    r"""Build a SQLite URI from normal or Windows extended-length paths.
-
-    Tauri's directory picker canonicalizes Windows selections to ``\\?\D:\``.
-    ``Path.as_uri`` encodes that prefix as a URI authority named ``%3F``, which
-    SQLite rejects before reading the database.  Strip only the Win32 namespace
-    prefix while retaining the resolved path and read-only URI semantics.
-    """
-
-    resolved = str(path.resolve(strict=True))
-    if os.name == "nt":
-        if resolved.startswith("\\\\?\\UNC\\"):
-            resolved = "\\\\" + resolved[8:]
-        elif resolved.startswith("\\\\?\\"):
-            resolved = resolved[4:]
-    return f"{Path(resolved).as_uri()}?mode=ro"
 
 
 def _exception_log_attributes(
@@ -2201,6 +2188,7 @@ def _validate_screen_state(staged: Path) -> None:
 
 
 def _validate_memory(root: Path, *, quarantine: Path | None = None) -> None:
+    require_importable_memory(root)
     if not root.exists():
         return
     history = root / "mem0_history.db"
@@ -2328,41 +2316,6 @@ def _quarantine_invalid_memory_store(root: Path, quarantine: Path, domain: str) 
         if destination.exists():
             shutil.rmtree(destination)
         os.replace(source, destination)
-def _legacy_curation(source: Path) -> tuple[dict[str, int], str]:
-    current = ""
-    config = source / "data" / "config" / "characters.yaml"
-    if config.is_file():
-        try:
-            value = yaml.safe_load(config.read_text(encoding="utf-8"))
-            current = str(value.get("current_character_id") or "") if isinstance(value, dict) else ""
-        except (OSError, UnicodeError, yaml.YAMLError):
-            current = ""
-    current = current.strip()
-    counts: dict[str, int] = {}
-    global_path = source / "data" / "memory_curation_state.json"
-    if current:
-        counts[current] = _read_processed_count(global_path)
-    for path in sorted((source / "data").glob("memory_curation_state.*.json")):
-        scope = path.name.removeprefix("memory_curation_state.").removesuffix(".json").strip()
-        if scope:
-            counts[scope] = _read_processed_count(path)
-    return {scope: count for scope, count in counts.items() if count > 0}, current
-
-
-def _read_processed_count(path: Path) -> int:
-    if not path.is_file():
-        return 0
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise TypeError("curation state must be an object")
-        return max(0, int(value.get("processed_history_count", 0)))
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        # This cursor is rebuildable from authoritative Timeline and Memory.
-        # Dirty 0.9 state must not block importing either domain.
-        return 0
-
-
 def _write_report(payload: Path, report: ImportReport) -> None:
     target = payload / "data" / "legacy-imports" / report.import_id / "report.json"
     target.parent.mkdir(parents=True, exist_ok=True)

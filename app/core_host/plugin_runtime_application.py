@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping, Sequence
 
 from app.core_host.plugin_artifacts import PluginArtifactStore
@@ -545,7 +545,11 @@ class PluginRuntimeApplication:
 
 
 def _context_request_mapping(request: ContextRequest) -> dict[str, Any]:
-    value = asdict(request)
+    # Bound the plugin projection before serialization; imported history remains
+    # intact for Core's own context budget and the Timeline service.
+    recent = tuple(replace(item, content=item.content[:2000])
+                   for item in request.recent_messages[-32:])
+    value = asdict(replace(request, recent_messages=recent))
     value["recent_messages"] = [dict(item) for item in value.get("recent_messages", [])]
     return value
 

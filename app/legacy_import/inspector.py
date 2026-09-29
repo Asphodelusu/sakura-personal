@@ -10,6 +10,8 @@ from pathlib import Path
 import yaml
 
 from .errors import LegacyImportError
+from .history_sqlite import validate_sqlite_history_source
+from .memory_contract import require_importable_memory_roots
 from .files import is_link_or_junction, tree_stats
 from .models import DomainInspection, LegacyInspection
 
@@ -33,6 +35,14 @@ def inspect_installation(source: Path, target: Path) -> LegacyInspection:
     target = Path(target).resolve(strict=False)
     blockers: list[dict[str, object]] = []
     warnings: list[dict[str, object]] = []
+    try:
+        validate_sqlite_history_source(source)
+    except LegacyImportError as error:
+        blockers.append(error.to_public_dict())
+    try:
+        require_importable_memory_roots(source, target)
+    except LegacyImportError as error:
+        blockers.append(error.to_public_dict())
 
     if not source.is_dir():
         blockers.append({"code": "LEGACY_SOURCE_NOT_DIRECTORY", "stage": "inspect"})
@@ -119,7 +129,7 @@ def inspect_installation(source: Path, target: Path) -> LegacyInspection:
     )
     domains["history"] = _domain(
         source / "data" / "chat_history",
-        items=_count_lines(source / "data" / "chat_history", ("*.jsonl", "*.archive")),
+        items=_count_history(source),
     )
     domains["memory"] = _domain(source / "data" / "memory")
     domains["notes"] = _domain(source / "data" / "notes")
@@ -492,7 +502,7 @@ def _has_legacy_history_files(root: Path) -> bool:
         return False
     try:
         return any(
-            path.is_file() and ".jsonl" in path.name
+            path.is_file() and (".jsonl" in path.name or path.suffix.casefold() == ".db")
             for path in root.iterdir()
         )
     except OSError:
@@ -545,17 +555,26 @@ def _count_manifests(root: Path) -> int:
     return sum(1 for _ in root.glob("*/character.json")) if root.is_dir() else 0
 
 
-def _count_lines(root: Path, patterns: tuple[str, ...]) -> int:
-    if not root.is_dir():
-        return 0
+def _count_history(source: Path) -> int:
+    from .history import _history_groups
+    from .history_sqlite import read_sqlite_history
+
     count = 0
-    for pattern in patterns:
-        for path in root.glob(pattern):
-            try:
-                with path.open("rb") as handle:
-                    count += sum(1 for line in handle if line.strip())
-            except OSError:
-                continue
+    try:
+        groups = _history_groups(source / "data/chat_history", ())
+        for _, paths in groups:
+            for path in paths:
+                if path.suffix.casefold() == ".db":
+                    count += sum(1 for _ in read_sqlite_history(path))
+                    continue
+                try:
+                    with path.open("rb") as handle:
+                        count += sum(1 for line in handle if line.strip())
+                except OSError:
+                    continue
+    except LegacyImportError:
+        # The inspector already reports the source validation blocker.
+        return 0
     return count
 
 

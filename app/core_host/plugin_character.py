@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.config.character_loader import CharacterConfigError, CharacterRegistry
+from app.config.character_loader import CharacterConfigError, CharacterRegistry, load_character_system_prompt
 from app.config.settings_service import AppSettingsService
 from app.storage.atomic import atomic_write_text
 
@@ -52,8 +52,9 @@ class PluginCharacterStore:
             registry = CharacterRegistry(self._app_root)
             profile = registry.get(character_id)
             try:
-                prompt = profile.card_path.read_text(encoding="utf-8").strip()
-            except OSError as error:
+                prompt = (load_character_system_prompt(profile) if profile.system_guards_path is not None
+                          else profile.card_path.read_text(encoding="utf-8").strip())
+            except (OSError, CharacterConfigError) as error:
                 raise PluginCharacterError("CHARACTER_RESOURCE_INVALID") from error
             if not prompt:
                 raise PluginCharacterError("CHARACTER_RESOURCE_INVALID")

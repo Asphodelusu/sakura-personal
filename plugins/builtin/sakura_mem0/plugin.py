@@ -12,13 +12,13 @@ try:
     from .memory import MEMORY_LAYERS
     from .memory_recall import MemoryRecallService
     from .domain_types import ContextMessage, ContextRequest
-    from .support import bind_logger
+    from .support import bind_logger, log_event
 except ImportError:
     from boundary import MemoryBoundary, _project_memory
     from memory import MEMORY_LAYERS
     from memory_recall import MemoryRecallService
     from domain_types import ContextMessage, ContextRequest
-    from support import bind_logger
+    from support import bind_logger, log_event
 
 
 PLUGIN_ID = "sakura.memory.mem0"
@@ -82,8 +82,9 @@ class SakuraMem0Runtime:
         context_request = _context_request(request)
         if context_request.character_id != self._character_id:
             return []
+        profile = self._profile_fragment()
         recalled = self._recall.recall(context_request)
-        return [
+        fragments = [
             {
                 "id": fragment.fragment_id,
                 "content": fragment.content,
@@ -93,6 +94,46 @@ class SakuraMem0Runtime:
             }
             for fragment in recalled.fragments
         ]
+        if profile is None:
+            return fragments
+        return [profile, *_without_profile_duplicate(fragments, profile)]
+
+    def _profile_fragment(self) -> dict[str, object] | None:
+        reader = getattr(self._boundary, "core_profile_fragment", None)
+        if not callable(reader):
+            return None
+        try:
+            fragment = reader()
+        except Exception:
+            log_event(
+                "Memory",
+                "个人常驻档案不可读",
+                {"code": "CORE_PROFILE_UNREADABLE"},
+                event="memory.personal.core_profile_unreadable",
+                severity="warning",
+            )
+            return None
+        if not isinstance(fragment, dict):
+            return None
+        content = fragment.get("content")
+        fragment_id = fragment.get("id")
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > 1200
+            or fragment.get("sensitivity") != "private"
+            or fragment_id != f"core_profile:{self._character_id}"
+        ):
+            return None
+        priority = fragment.get("priority")
+        budget = fragment.get("budgetHint")
+        return {
+            "id": fragment_id,
+            "content": content,
+            "priority": priority if type(priority) is int else 90,
+            "budgetHint": budget if type(budget) is int else 1200,
+            "sensitivity": "private",
+        }
 
     def search_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
         return self._boundary.search_memory(dict(arguments), wait=False)
@@ -590,7 +631,14 @@ class SakuraMem0Plugin:
     def __init__(
         self,
         runtime_factory: Callable[[object], SakuraMem0Runtime] | None = None,
+        *, personal_snapshot: Path | None = None, personal_write_rehearsal: bool = False,
     ) -> None:
+        if runtime_factory is not None and personal_snapshot is not None:
+            raise ValueError("PERSONAL_RUNTIME_FACTORY_CONFLICT")
+        self._personal_snapshot = personal_snapshot
+        if personal_write_rehearsal and personal_snapshot is None:
+            raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        self._personal_write_rehearsal = personal_write_rehearsal
         self._runtime_factory = runtime_factory or _default_runtime
 
     def setup(self, context: object) -> None:
@@ -599,9 +647,35 @@ class SakuraMem0Plugin:
             getattr(context, "effect")(lambda: bind_logger(None))
         except Exception:
             bind_logger(None)
-        runtime = self._runtime_factory(context)
+        if self._personal_snapshot is not None:
+            if __package__:
+                from .personal_runtime import PersonalRecallBoundary
+            else:
+                from personal_runtime import PersonalRecallBoundary
+            storage = getattr(context, "get")("sakura.host.storage")
+            character = getattr(context, "get")("sakura.host.character").current()
+            character_id = str(character.get("id") or "")
+            curation_options = None
+            timeline = None
+            if self._personal_write_rehearsal:
+                slots = getattr(context, "get")("sakura.host.model_slots")
+                timeline = getattr(context, "get")("sakura.host.timeline")
+                curation_options = {
+                    "system_prompt": str(character.get("systemPrompt") or ""),
+                    "curation_config_getter": context.config.get,
+                    "model_catalog_getter": slots.catalog,
+                    "model_resolver": slots.resolve,
+                }
+            boundary = PersonalRecallBoundary(Path(storage.resolve("data", "memory")),
+                                              character_id, self._personal_snapshot,
+                                              curation_options=curation_options)
+            runtime = SakuraMem0Runtime(Path(getattr(context, "data_path")(".")),
+                                       character_id, boundary=boundary, timeline=timeline)
+        else:
+            runtime = self._runtime_factory(context)
         getattr(context, "effect")(runtime.close)
-        getattr(context, "on")(HOST_CHAT_COMPLETED_EVENT, runtime.note_completed_chat)
+        if self._personal_snapshot is None or self._personal_write_rehearsal:
+            getattr(context, "on")(HOST_CHAT_COMPLETED_EVENT, runtime.note_completed_chat)
         getattr(context, "get")("sakura.host.context").register(
             {
                 "providerId": MEMORY_CONTEXT_PROVIDER_ID,
@@ -612,7 +686,11 @@ class SakuraMem0Plugin:
         )
         tools = getattr(context, "get")("sakura.host.tools")
         for descriptor, callback in _tool_registrations(runtime):
+            if self._personal_snapshot is not None and descriptor["name"] != "memory_search":
+                continue
             tools.register(descriptor, callback)
+        if self._personal_snapshot is not None:
+            return
         settings = getattr(context, "get")("sakura.host.settings")
         settings.register(
             runtime.settings_descriptor(),
@@ -664,6 +742,24 @@ class SakuraMem0Plugin:
             name="sakura-mem0-initial-catch-up",
             daemon=True,
         ).start()
+
+
+class PersonalRecallPlugin:
+    """Explicit worker entry for a completed isolated copy; never the default."""
+    def setup(self, context):
+        snapshot = context.config.get().get("personalSnapshot")
+        if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
+            raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        SakuraMem0Plugin(personal_snapshot=Path(snapshot)).setup(context)
+
+
+class PersonalWriteRehearsalPlugin:
+    """Explicit internal entry; only path-admitted disposable copies can write."""
+    def setup(self, context):
+        snapshot = context.config.get().get("personalSnapshot")
+        if not isinstance(snapshot, str) or not snapshot or not Path(snapshot).is_absolute():
+            raise ValueError("PERSONAL_RUNTIME_SNAPSHOT_REQUIRED")
+        SakuraMem0Plugin(personal_snapshot=Path(snapshot), personal_write_rehearsal=True).setup(context)
 
 
 def _default_runtime(context: object) -> SakuraMem0Runtime:
@@ -813,6 +909,23 @@ def _collection_item(memory: Mapping[str, object]) -> dict[str, object]:
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _without_profile_duplicate(fragments, profile):
+    profile_id = str(profile.get("id") or "")
+    content = str(profile.get("content") or "")
+    label = "【常驻档案】\n"
+    body = content[len(label):] if content.startswith(label) else content
+    repeated = {content, f"与本轮相关的长期记忆：{body}"}
+    kept = []
+    for item in fragments:
+        item_id = str(item.get("id") or "")
+        if item_id in {profile_id, f"memory.{profile_id}"} or item_id.startswith("memory.core_profile:"):
+            continue
+        if str(item.get("content") or "") in repeated:
+            continue
+        kept.append(item)
+    return kept
 
 
 def _context_request(value: object) -> ContextRequest:

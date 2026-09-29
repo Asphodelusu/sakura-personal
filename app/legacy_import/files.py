@@ -584,6 +584,23 @@ def _copy_tree_stats_checked(
     return files, total
 
 
+def sqlite_uri_from_resolved(resolved: str) -> str:
+    """Build a read-only SQLite URI without treating ``\\\\?\\`` as an authority."""
+
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+    return f"{Path(resolved).as_uri()}?mode=ro"
+
+
+def sqlite_readonly_uri(path: Path) -> str:
+    """Resolve a database path, then keep SQLite's ``mode=ro`` URI semantics."""
+
+    return sqlite_uri_from_resolved(str(path.resolve(strict=True)))
+
+
 def _stop_copy_process(process: subprocess.Popen[bytes]) -> None:
     try:
         process.terminate()

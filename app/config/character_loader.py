@@ -56,6 +56,7 @@ class CharacterProfile:
     default_visual_id: str | None = None
     visual_providers: dict[str, str] = field(default_factory=dict)
     voice: CharacterVoice | None = None
+    system_guards_path: Path | None = None
     # 接话模板清单路径(可选,缺省即该角色 opt-out)。此处只解析路径不校验存在,
     # 文件缺失/非法由 manifest 加载方降级处理,不应让整个角色包加载失败。
     backchannel_manifest_path: Path | None = None
@@ -64,6 +65,8 @@ class CharacterProfile:
     theme_source: CharacterThemeSource = THEME_SOURCE_PACKAGE
     # 角色渲染后端配置（renderer 段原样保留；路径解析交由对应渲染插件处理）。
     renderer_config: dict[str, Any] | None = None
+    relationship_drive_profile: RelationalDriveProfile | None = None
+    relationship_drive_mapping: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.theme_settings is None:
@@ -133,7 +136,7 @@ class CharacterRegistry:
         return profiles
 
 
-def load_system_prompt(path: Path) -> str:
+def load_system_prompt(path: Path, *, system_guards_path: Path | None = None) -> str:
     if not path.exists():
         raise CharacterConfigError(f"角色卡不存在：{path}")
 
@@ -145,11 +148,20 @@ def load_system_prompt(path: Path) -> str:
     if not content:
         raise CharacterConfigError(f"角色卡为空：{path}")
 
+    if system_guards_path is not None:
+        from app.llm.prompts.personal_persona import with_desktop_pet_context as compose_personal_prompt
+        try:
+            guards = system_guards_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as error:
+            raise CharacterConfigError("角色演出约束无法读取。") from error
+        if not guards:
+            raise CharacterConfigError("角色演出约束为空。")
+        return compose_personal_prompt(content, system_guards=guards)
     return _append_desktop_context(content)
 
 
 def load_character_system_prompt(profile: CharacterProfile) -> str:
-    return load_system_prompt(profile.card_path)
+    return load_system_prompt(profile.card_path, system_guards_path=profile.system_guards_path)
 
 
 def _load_profile(manifest_path: Path) -> CharacterProfile:
@@ -166,6 +178,14 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
     initial_message = _optional_text(raw_data, "initial_message", "……起動した。用事があるなら、呼んで。")
     card_path = _resolve_required_file(package_dir, _required_text(raw_data, "card", manifest_path), "角色卡")
 
+    raw_guards = raw_data.get("system_guards")
+    if raw_guards is not None and not isinstance(raw_guards, str):
+        raise CharacterConfigError("system_guards 必须是包内相对路径。")
+    guards_name = str(raw_guards or "").strip()
+    if not guards_name and (package_dir / "system_guards.md").exists():
+        guards_name = "system_guards.md"
+    guards_path = _resolve_required_file(package_dir, guards_name, "角色演出约束") if guards_name else None
+
     from app.config.plugin_requirements import parse_requirements
     try:
         parse_requirements(raw_data.get("pluginRequirements", []))
@@ -179,7 +199,24 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
 
     reply_data = raw_data.get("reply")
     reply_tones = _load_reply_tones(reply_data)
-    voice = _load_voice(package_dir, raw_data.get("voice"), manifest_path)
+    from app.config.character_voice import voice_fields
+    try:
+        fields = voice_fields(raw_data)
+    except ValueError as exc:
+        raise CharacterConfigError(str(exc)) from exc
+    # Model inventory can exist before reference audio is configured.
+    # Keep the character editable; only the TTS provider decides playback readiness.
+    from app.config.character_voice import GPT_SOVITS_EXTENSION
+    if GPT_SOVITS_EXTENSION in raw_data.get("extensions", {}) and fields is not None and not fields.get("tone_refs"):
+        fields = None
+    try:
+        voice = _load_voice(package_dir, fields, manifest_path)
+    except CharacterConfigError:
+        if GPT_SOVITS_EXTENSION not in raw_data.get("extensions", {}):
+            raise
+        # Resource preparation and its errors belong to the plugin. Missing or
+        # unsafe voice resources must not hide the character from that plugin.
+        voice = None
     backchannel_text = _optional_text(raw_data, "backchannel", "")
     backchannel_manifest_path = (
         _resolve_package_path(package_dir, backchannel_text) if backchannel_text.strip() else None
@@ -196,11 +233,14 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         default_visual_id=default_visual_id,
         visual_providers=dict(raw_data.get("visuals", {}).get("providers", {})),
         voice=voice,
+        system_guards_path=guards_path,
         backchannel_manifest_path=backchannel_manifest_path,
         reply_tones=reply_tones,
         theme_settings=theme_settings,
         theme_source=theme_source,
         renderer_config=_load_renderer_config(raw_data),
+        relationship_drive_profile=_relationship_drive_profile(raw_data.get("relationship_drive")),
+        relationship_drive_mapping=_relationship_drive_mapping(raw_data.get("relationship_drive")),
     )
 
 
@@ -237,6 +277,18 @@ def save_character_theme(
     if not isinstance(raw_data, dict):
         raise CharacterConfigError(f"角色清单必须是 JSON 对象：{manifest_path}")
     _write_character_theme_manifest(manifest_path, raw_data, settings, source=source)
+
+
+def _relationship_drive_mapping(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return dict(raw)
+
+
+def _relationship_drive_profile(raw: Any):
+    from app.config.relationship_drive import profile_from_mapping
+
+    return profile_from_mapping(raw)
 
 
 def _load_reply_tones(reply_data: Any) -> list[str]:

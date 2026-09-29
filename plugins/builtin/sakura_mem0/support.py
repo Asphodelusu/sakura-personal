@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from contextvars import ContextVar
+from datetime import datetime
 import os
 import shutil
 import tempfile
@@ -244,6 +245,21 @@ class OperationCancelled(RuntimeError):
     pass
 
 
+def parse_iso_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.astimezone()
+    return parsed
+
+
 def check_cancelled(checker: Callable[[], object] | None) -> None:
     if checker is not None:
         checker()
@@ -263,6 +279,7 @@ __all__ = [
     "external_runtime_sink_active",
     "interaction_context",
     "log_event",
+    "parse_iso_datetime",
     "rename_with_retry",
     "replace_with_retry",
     "suppress_runtime_logs",

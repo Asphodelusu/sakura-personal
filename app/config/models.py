@@ -16,7 +16,9 @@ from app.config.visual_effect import VisualEffectMode
 
 
 MODEL_SLOT_CHAT = "chat"
+MODEL_SLOT_CHAT_FAST = "chat_fast"
 MODEL_SLOT_VISION_CHAT = "vision_chat"
+MODEL_SLOT_INNER_THOUGHT = "inner_thought"
 
 MODEL_SLOT_ORDER = (
     MODEL_SLOT_CHAT,
@@ -40,6 +42,8 @@ MODEL_SLOT_DESCRIPTIONS = {
 
 MODEL_SLOT_FALLBACKS = {
     MODEL_SLOT_VISION_CHAT: (MODEL_SLOT_CHAT,),
+    MODEL_SLOT_CHAT_FAST: (MODEL_SLOT_CHAT,),
+    MODEL_SLOT_INNER_THOUGHT: (MODEL_SLOT_CHAT_FAST, MODEL_SLOT_CHAT),
 }
 
 
@@ -237,12 +241,18 @@ class ModelSelectionSettings:
 
     chat: ModelSlotSelection = field(default_factory=ModelSlotSelection)
     vision_chat: ModelSlotSelection | None = None
+    chat_fast: ModelSlotSelection | None = None
+    inner_thought: ModelSlotSelection | None = None
 
     def get(self, slot: str) -> ModelSlotSelection | None:
         if slot == MODEL_SLOT_CHAT:
             return self.chat
         if slot == MODEL_SLOT_VISION_CHAT:
             return self.vision_chat
+        if slot == MODEL_SLOT_CHAT_FAST:
+            return self.chat_fast
+        if slot == MODEL_SLOT_INNER_THOUGHT:
+            return self.inner_thought
         return None
 
     @property

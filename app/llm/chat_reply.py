@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+
+from app.core.relational_drive import DriveEffect, parse_drive_effect
 from app.llm.visual_control import raw_visual_control
 
 
@@ -20,6 +22,7 @@ class ChatSegment:
     portrait: str = ""
     suppress_tts: bool = False
     control: Any = None
+    drive_effect: DriveEffect | None = None
 
     def __init__(
         self,
@@ -29,6 +32,7 @@ class ChatSegment:
         portrait: str = "",
         suppress_tts: bool = False,
         control: Any = None,
+        drive_effect: DriveEffect | None = None,
     ) -> None:
         object.__setattr__(self, "text", text)
         object.__setattr__(self, "tone", tone)
@@ -36,6 +40,7 @@ class ChatSegment:
         object.__setattr__(self, "portrait", portrait)
         object.__setattr__(self, "suppress_tts", suppress_tts)
         object.__setattr__(self, "control", raw_visual_control(control))
+        object.__setattr__(self, "drive_effect", drive_effect if isinstance(drive_effect, DriveEffect) else None)
 
     def display_text(self, subtitle_language: str) -> str:
         """按字幕语言返回气泡显示文本；缺少译文时回退日文原文。"""
@@ -47,6 +52,29 @@ class ChatSegment:
 @dataclass(frozen=True)
 class ChatReply:
     segments: list[ChatSegment]
+    drive_effect: DriveEffect | None = None
+
+    def __post_init__(self) -> None:
+        effect = self.drive_effect if isinstance(self.drive_effect, DriveEffect) else None
+        if effect is None:
+            for segment in self.segments:
+                carried = getattr(segment, "drive_effect", None)
+                if isinstance(carried, DriveEffect):
+                    effect = carried
+                    object.__setattr__(self, "drive_effect", carried)
+                    break
+            return
+        object.__setattr__(self, "drive_effect", effect)
+        stamped: list[ChatSegment] = []
+        changed = False
+        for segment in self.segments:
+            if getattr(segment, "drive_effect", None) == effect:
+                stamped.append(segment)
+            else:
+                stamped.append(replace(segment, drive_effect=effect))
+                changed = True
+        if changed:
+            object.__setattr__(self, "segments", stamped)
 
     @property
     def text(self) -> str:
@@ -117,7 +145,7 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
         segments, has_language_issue = _parse_segments(data)
         if segments:
             return ChatReplyParseResult(
-                ChatReply(segments),
+                ChatReply(segments, drive_effect=_optional_drive_effect(data)),
                 ok=not has_language_issue,
                 needs_retry=has_language_issue,
                 repaired=repaired,
@@ -161,7 +189,13 @@ def sanitize_reply_tones(reply: ChatReply, allowed_tones: list[str] | None) -> C
             changed = True
         else:
             new_segments.append(segment)
-    return ChatReply(new_segments) if changed else reply
+    return ChatReply(new_segments, drive_effect=reply.drive_effect) if changed else reply
+
+
+def _optional_drive_effect(data: dict[str, Any]) -> DriveEffect | None:
+    if "drive_effect" not in data:
+        return None
+    return parse_drive_effect(data.get("drive_effect"))
 
 
 def _parse_segments(data: dict[str, Any]) -> tuple[list[ChatSegment], bool]:

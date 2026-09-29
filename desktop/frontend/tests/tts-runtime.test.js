@@ -11,6 +11,32 @@ function deferred() {
   return { promise, reject, resolve };
 }
 
+test("late synthesis from a replaced reply cannot play or open its subtitle", async () => {
+  const pending = deferred();
+  const calls = [];
+  const controller = createTtsController({
+    listen: async () => () => {},
+    invoke: (name) => {
+      calls.push(name);
+      return name === "tts_prepare_segment" ? pending.promise : Promise.resolve();
+    },
+  });
+  await controller.start();
+  const old = { text: "old" };
+  controller.beginReply("old", [old]);
+  let opened = false;
+  const waiting = controller.beforeSegment(old, 0, { onStarted: () => { opened = true; } });
+  controller.beginReply("new", [{ text: "new", suppressTts: true }]);
+  pending.resolve({
+    opaqueId: "0123456789abcdef0123456789abcdef", recordingId: null,
+    mediaType: "audio/wav", byteLength: 128, expiresAt: "2099-01-01T00:00:00Z",
+  });
+  await waiting;
+  assert.equal(opened, false);
+  assert.equal(calls.includes("tts_play_prepared"), false);
+  controller.dispose();
+});
+
 test("voice capture stops queued TTS and skips new segments without replay after capture", async () => {
   const calls = [];
   const controller = createTtsController({

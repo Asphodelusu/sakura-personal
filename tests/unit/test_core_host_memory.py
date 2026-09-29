@@ -574,6 +574,19 @@ def test_plugin_config_is_independent_from_core_curation_documents(tmp_path: Pat
 
 
 
+def test_invalid_curation_configuration_emits_safe_diagnostic(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr("plugins.builtin.sakura_mem0.boundary.log_event",
+                        lambda *args, **kwargs: events.append((args, kwargs)))
+    boundary = _boundary(_root(tmp_path), FakeMemoryStore(), config={"triggerTurns": "invalid"})
+    try:
+        boundary.note_timeline_changed(_timeline(tmp_path))
+        assert any(kwargs.get("event") == "memory.curation.trigger_failed" for _, kwargs in events)
+        assert boundary._curation_state.curation_cursor() == ""
+    finally:
+        boundary.close()
+
+
 def test_completed_turn_curation_commits_cursor_only_after_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -599,8 +612,8 @@ def test_completed_turn_curation_commits_cursor_only_after_success(
             pass
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             if cancel_checker:
@@ -653,8 +666,8 @@ def test_scheduled_observation_counts_only_after_semantic_analysis_and_once_per_
             pass
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             calls.append([entry.entry_id for entry in entries])
@@ -777,8 +790,8 @@ def test_completion_arriving_during_curation_runs_one_followup_catchup(
             pass
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             calls.append([entry.entry_id for entry in entries])
@@ -837,8 +850,8 @@ def test_plugin_restart_catches_up_from_saved_curation_cursor(
             pass
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             calls.append([entry.entry_id for entry in entries])
@@ -883,8 +896,8 @@ def test_failed_curation_keeps_cursor_and_retry_does_not_duplicate_success(
             pass
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             nonlocal calls
@@ -972,8 +985,8 @@ def test_curation_cursor_state_survives_a_b_a_role_switch_beyond_backfill(
             curation_finished.set()
 
     class FakeCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, entries, *, cancel_checker=None):
             calls.append([entry.entry_id for entry in entries])
@@ -1342,8 +1355,8 @@ def test_wp_5_03_generation_close_cancels_active_memory_curation_without_advanci
             pass
 
     class BlockingCurator:
-        def __init__(self, _client, _store, *, system_prompt: str = "") -> None:
-            pass
+        def __init__(self, _client, _store, *, system_prompt: str = "", accept_core_candidates: bool = False) -> None:
+            assert accept_core_candidates is False
 
         def curate_entries(self, _entries, *, cancel_checker=None):
             started.set()

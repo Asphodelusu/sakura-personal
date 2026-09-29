@@ -1059,7 +1059,7 @@ def _effective_voice_extension(
     manifest: Mapping[str, Any],
     extension: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Explicit Genie fields > GPT-SoVITS fields > legacy voice, without writes."""
+    """Genie overrides shared fields; legacy is only for unconverted packs."""
     legacy = manifest.get("voice")
     extensions = manifest.get("extensions")
     shared = extensions.get("sakura.tts.gpt-sovits") if isinstance(extensions, Mapping) else None
@@ -1070,7 +1070,7 @@ def _effective_voice_extension(
         ("gpt_model", "gptModel"),
         ("sovits_model", "sovitsModel"),
     ):
-        if isinstance(legacy, Mapping) and legacy_key in legacy:
+        if (not isinstance(extensions, Mapping) or "sakura.tts.gpt-sovits" not in extensions) and isinstance(legacy, Mapping) and legacy_key in legacy:
             result[key] = legacy[legacy_key]
         if isinstance(shared, Mapping) and key in shared:
             result[key] = shared[key]

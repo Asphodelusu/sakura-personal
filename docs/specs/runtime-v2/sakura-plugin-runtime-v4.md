@@ -4,7 +4,7 @@ status: normative
 audience: maintainer
 source_of_truth: self
 status_source: ../../plans/runtime-v2/work-packages.md
-updated: 2026-09-11
+updated: 2026-09-20
 ---
 
 # Sakura Plugin Runtime v4
@@ -136,6 +136,11 @@ SDK 提供不依赖 Core 的 `sakura_http.urlopen_direct_for_loopback` 和 `prox
 `sakura.host.model_slots.catalog()/resolve()` 取得。三者对 bundled 与 user 插件使用同一合同，Generic
 Runtime 不检查插件 ID，也不解释 Memory、TTS 等领域内容。插件私有配置和其他普通持久数据仍只使用
 `config` 与 `data_path()`。
+
+`sakura.host.context` 的贡献者请求只投影最近32条 `recent_messages`，保持时间顺序，每条正文最多2000个
+Unicode字符。Core 在序列化到插件进程前完成投影，避免完整导入历史超过1 MiB传输帧上限。
+投影不修改 Timeline、Core原始历史或 `current_input`、角色及来源ID；插件可按用途继续缩小召回上下文。
+其他字段仍受现有传输校验约束，不因历史投影而提高帧上限。
 
 ### 4.1 统一宿主日志
 

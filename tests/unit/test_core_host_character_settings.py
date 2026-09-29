@@ -32,7 +32,9 @@ def test_import_failure_keeps_original_cause_in_response(tmp_path, monkeypatch, 
     assert expected in diagnostic["exception_chain"]
     assert " at " in diagnostic["exception_stack"]
     if failure in {"missing", "permission"}:
-        assert str(archive) in diagnostic["diagnostic"]
+        # OSError formats its filename with repr(), escaping Windows slashes.
+        expected_path = repr(str(archive))[1:-1] if failure == "permission" else str(archive)
+        assert expected_path in diagnostic["diagnostic"]
     assert CREDENTIAL not in json.dumps(diagnostic)
 
 
@@ -215,7 +217,8 @@ def test_voice_import_restarts_current_character_and_exports_all_package_kinds(
         card_manifest = json.loads(archive.read("manifest.json"))
     with zipfile.ZipFile(outputs["voice"]) as archive:
         voice_manifest = json.loads(archive.read("manifest.json"))
-    assert full_manifest["character"]["voice"]["gpt_model"]
+    assert "voice" not in full_manifest["character"]
+    assert full_manifest["character"]["extensions"]["sakura.tts.gpt-sovits"]["gptModel"]
     assert "voice" not in card_manifest["character"]
     assert voice_manifest["format"] == "sakura.character.voice"
 

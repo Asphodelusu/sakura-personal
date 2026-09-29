@@ -4,7 +4,9 @@ from dataclasses import dataclass
 
 from app.config.models import (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_CHAT_FAST,
     MODEL_SLOT_FALLBACKS,
+    MODEL_SLOT_INNER_THOUGHT,
     ApiConfigProfile,
     ModelSelectionSettings,
     ModelSlotSelection,
@@ -23,6 +25,20 @@ class ResolvedModelSlot:
     settings: ApiSettings
 
 
+@dataclass(frozen=True)
+class InnerThoughtModelChoice:
+    settings: ApiSettings | None
+    source_slot: str
+    reason: str
+
+
+_INNER_THOUGHT_SLOT_ORDER = (
+    MODEL_SLOT_INNER_THOUGHT,
+    MODEL_SLOT_CHAT_FAST,
+    MODEL_SLOT_CHAT,
+)
+
+
 def normalize_provider_models(models: object) -> tuple[str, ...]:
     names: list[str] = []
     if isinstance(models, list | tuple):
@@ -36,6 +52,56 @@ def normalize_provider_models(models: object) -> tuple[str, ...]:
             if name and name not in names:
                 names.append(name)
     return tuple(names)
+
+
+def resolve_inner_thought_model(
+    profiles: list[ApiConfigProfile],
+    selections: ModelSelectionSettings,
+    base_settings: ApiSettings,
+    *,
+    invalid_slots: frozenset[str] = frozenset(),
+) -> InnerThoughtModelChoice:
+    """Use the first explicit slot. A configured but unusable slot disables the call."""
+
+    for slot in _INNER_THOUGHT_SLOT_ORDER:
+        if slot in invalid_slots:
+            return InnerThoughtModelChoice(
+                settings=None,
+                source_slot=slot,
+                reason="INNER_THOUGHT_SELECTION_INVALID",
+            )
+        selection = selections.get(slot)
+        if selection is None or not selection.configured:
+            continue
+        settings = _explicit_slot_settings(profiles, selection, base_settings, slot)
+        if settings is None:
+            return InnerThoughtModelChoice(
+                settings=None,
+                source_slot=slot,
+                reason="INNER_THOUGHT_SELECTION_INVALID",
+            )
+        return InnerThoughtModelChoice(settings=settings, source_slot=slot, reason="")
+    return InnerThoughtModelChoice(settings=None, source_slot="", reason="INNER_THOUGHT_UNCONFIGURED")
+
+
+def _explicit_slot_settings(
+    profiles: list[ApiConfigProfile],
+    selection: ModelSlotSelection,
+    base_settings: ApiSettings,
+    slot: str,
+) -> ApiSettings | None:
+    profile = find_profile(profiles, selection.profile_id)
+    if profile is None or not profile.api_key.strip() or not profile.base_url.strip():
+        return None
+    if selection.model.strip() not in profile.models:
+        return None
+    return api_settings_from_selection(
+        profile,
+        selection.model,
+        base_settings,
+        include_dialogue_params=slot == MODEL_SLOT_CHAT,
+        context_window_tokens=selection.context_window_tokens,
+    )
 
 
 def resolve_model_slot(

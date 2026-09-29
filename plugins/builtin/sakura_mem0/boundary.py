@@ -133,6 +133,7 @@ class MemoryBoundary:
         self._message = "长期记忆系统正在初始化。"
         self._curation_cancel = threading.Event()
         self._curation_active = False
+        self._profile_maintenance = None
         self._curation_request_fuse_open = False
         self._pending_timeline: object | None = None
         self._model_task_active = False
@@ -669,7 +670,11 @@ class MemoryBoundary:
                     timeout_seconds=resolved["timeoutSeconds"],
                 )
                 self._curation_active = True
-            except Exception:
+            except Exception as exc:
+                log_event("Memory", "记忆整理触发失败", {
+                    "error_type": type(exc).__name__,
+                    "reason_code": getattr(exc, "code", "MEMORY_CURATION_TRIGGER_FAILED"),
+                }, event="memory.curation.trigger_failed", severity="warning")
                 return
 
         self._start_curation(
@@ -699,10 +704,12 @@ class MemoryBoundary:
                         severity="debug",
                     )
                     client = OpenAICompatibleClient(settings)
+                    maintenance_on = _profile_maintenance_enabled(self)
                     curator = MemoryCurator(
                         client,
                         self._store.scoped(self._character_id),
                         system_prompt=self._system_prompt,
+                        accept_core_candidates=maintenance_on,
                     )
 
                     def check_cancelled() -> None:
@@ -713,7 +720,41 @@ class MemoryBoundary:
                         result = curator.curate_entries(entries, cancel_checker=check_cancelled)
                     if self._curation_cancel.is_set():
                         return
-                    mark_success()
+                    if maintenance_on:
+                        try:
+                            from .personal_core_maintainer import core_maintainer_from_config
+                            from .personal_profile_maintenance import (
+                                ProfileMaintenance,
+                                commit_curation_then_maintain,
+                            )
+                        except ImportError:
+                            from personal_core_maintainer import core_maintainer_from_config
+                            from personal_profile_maintenance import (
+                                ProfileMaintenance,
+                                commit_curation_then_maintain,
+                            )
+                        maintenance = ProfileMaintenance(
+                            self._memory_dir,
+                            self._character_id,
+                            settings=core_maintainer_from_config(self._curation_config_getter()),
+                            cancel_event=self._curation_cancel,
+                        )
+                        with self._lock:
+                            self._profile_maintenance = maintenance
+                        try:
+                            commit_curation_then_maintain(
+                                maintenance,
+                                entries,
+                                tuple(getattr(result, "core_candidates", ()) or ()),
+                                mark_success=mark_success,
+                                completion=OpenAICompatibleClient(settings, request_limit=1),
+                            )
+                        finally:
+                            with self._lock:
+                                if self._profile_maintenance is maintenance:
+                                    self._profile_maintenance = None
+                    else:
+                        mark_success()
                     log_event(
                         "Memory",
                         "后台记忆整理完成",
@@ -729,8 +770,9 @@ class MemoryBoundary:
             except OperationCancelled:
                 return
             except Exception as exc:
-                # Cursor and existing memories remain untouched; the next
-                # generation can retry the same committed interval. If this job
+                # The cursor does not advance, but earlier operations may have
+                # committed. Retrying the interval relies on source-aware dedupe,
+                # not batch rollback. If this job
                 # exhausted its HTTP allowance, stop automatic curation for the
                 # current plugin generation so later chat events cannot replay it.
                 with interaction_context(operation_id):
@@ -834,6 +876,9 @@ class MemoryBoundary:
             self._message = "记忆能力已停止。"
             self._status_changed.notify_all()
         self._curation_cancel.set()
+        maintenance = self._profile_maintenance
+        if maintenance is not None:
+            maintenance.close()
         self._model_task_cancel.set()
         self._resources.stop_all(timeout_ms=10_000)
         self._store.remove_status_listener(self._on_store_status)
@@ -1045,6 +1090,17 @@ def _curation_evidence_turns(
             or (entry.role == "observation" and entry.evidence_ready)
         )
     return selected, eligible_turns
+
+
+def _profile_maintenance_enabled(boundary: MemoryBoundary) -> bool:
+    if not getattr(boundary._store, "allow_profile_candidates", False):
+        return False
+    try:
+        from .personal_core_maintainer import core_maintainer_from_config
+    except ImportError:
+        from personal_core_maintainer import core_maintainer_from_config
+    settings = core_maintainer_from_config(boundary._curation_config_getter())
+    return settings is not None and bool(settings.enabled)
 
 
 def _curation_values(

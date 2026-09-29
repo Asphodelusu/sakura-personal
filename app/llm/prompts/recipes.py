@@ -21,6 +21,16 @@ from app.llm.prompts.render import render_blocks
 from app.llm.prompts.types import PromptBlock
 
 
+_DRIVE_EFFECT_INSTRUCTION = (
+    "\n\n共同互动确实改变短期身体或亲近状态时，才可在 segments 同一顶层附加 drive_effect；"
+    "不确定则省略，不为填写而改变正文。"
+    "event 只可用 mutual_affection、mutual_escalation、fulfilled、aftercare、hesitation、stopped；"
+    "strength 只可用 subtle、mild、strong。"
+    '顶层示例：{"segments":[{"ja":"……好き。","zh":"……喜欢。","tone":"亲密"}],'
+    '"drive_effect":{"event":"mutual_affection","strength":"mild"}}。'
+)
+
+
 def build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_visual: Mapping[str, Any] | None = None,
@@ -29,6 +39,7 @@ def build_segmented_reply_instruction(
     default_segments: str = "3-4",
     include_translation_rules: bool = True,
     include_no_single_segment_rule: bool = False,
+    include_drive_effect: bool = False,
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     visual = reply_visual
@@ -45,18 +56,23 @@ def build_segmented_reply_instruction(
                 "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
             ]
         )
-    return build_segment_protocol(
+    protocol = build_segment_protocol(
         tones,
         visual,
         format_text=SEGMENTED_REPLY_FORMAT,
         segment_rules="\n".join(rules),
         include_translation_rules=include_translation_rules,
     )
+    if not include_drive_effect:
+        return protocol
+    return protocol + _DRIVE_EFFECT_INSTRUCTION
 
 
 def build_agent_reply_protocol(
     reply_tones: list[str] | None,
     reply_visual: Mapping[str, Any] | None = None,
+    *,
+    include_drive_effect: bool = False,
 ) -> str:
     tones = labels_or_default(reply_tones, DEFAULT_REPLY_TONES)
     visual = reply_visual
@@ -69,13 +85,16 @@ def build_agent_reply_protocol(
             "- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。",
         ]
     )
-    return build_segment_protocol(
+    protocol = build_segment_protocol(
         tones,
         visual,
         format_text=AGENT_REPLY_FORMAT,
         segment_rules=segment_rules,
         include_translation_rules=True,
     )
+    if not include_drive_effect:
+        return protocol
+    return protocol + _DRIVE_EFFECT_INSTRUCTION
 
 
 def build_event_reply_protocol(

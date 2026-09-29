@@ -19,7 +19,10 @@ import yaml
 from app.storage.timeline import TimelineDataError, TimelineStore
 
 from .errors import LegacyImportError
-from .files import copy_tree_checked
+from .history_sqlite import validate_sqlite_history_source
+from .history_sqlite import personal_rows_by_entry, write_personal_history_rows
+from .memory_contract import require_importable_memory, require_importable_memory_roots
+from .files import copy_tree_checked, sqlite_readonly_uri
 from .history import import_history, read_history_identities, write_history_identities
 from .inspector import detect_legacy_version, legacy_source_is_active
 from .transaction import PendingCommit, commit_payload
@@ -318,10 +321,12 @@ def run_character_data_import(
 
 
 def _validate_source(source: Path, target: Path) -> None:
+    validate_sqlite_history_source(source)
+    require_importable_memory_roots(source, target)
     history = source / "data" / "chat_history"
     try:
         has_legacy_history = history.is_dir() and any(
-            path.is_file() and ".jsonl" in path.name for path in history.iterdir()
+            path.is_file() and (".jsonl" in path.name or path.suffix.casefold() == ".db") for path in history.iterdir()
         )
     except OSError:
         has_legacy_history = False
@@ -455,6 +460,8 @@ def _timeline_rows(path: Path) -> dict[str, tuple[str, ...]]:
 
 def _inspect_timeline(converted: Path, target: Path, plan: _Plan) -> None:
     source_rows = _timeline_rows(converted / "data/chat_history/timeline.sqlite3")
+    source_metadata = personal_rows_by_entry(converted / "data/chat_history/timeline.sqlite3")
+    target_metadata = personal_rows_by_entry(target / "data/chat_history/timeline.sqlite3")
     try:
         target_rows = _timeline_rows(target / "data/chat_history/timeline.sqlite3")
     except (TimelineDataError, sqlite3.Error) as exc:
@@ -469,6 +476,8 @@ def _inspect_timeline(converted: Path, target: Path, plan: _Plan) -> None:
             row[1] in target_turns and target_turns[row[1]] != character_id
         )
         status = "new" if existing is None else ("identical" if existing == row else "conflicts")
+        if existing is not None and source_metadata.get(entry_id, []) != target_metadata.get(entry_id, []):
+            status = "conflicts"
         if hard:
             status = "conflicts"
         plan.classify(
@@ -476,7 +485,8 @@ def _inspect_timeline(converted: Path, target: Path, plan: _Plan) -> None:
             character_id=character_id,
             item_id=entry_id,
             status=status,
-            content=_canonical_content({"source": row, "target": existing}),
+            content=_canonical_content({"source": row, "target": existing,
+                "sourceMetadata": source_metadata.get(entry_id, []), "targetMetadata": target_metadata.get(entry_id, [])}),
             hard=hard,
         )
 
@@ -497,11 +507,15 @@ def _merge_timeline(converted: Path, payload: Path, *, overwrite_conflicts: bool
     store.initialize()
     source_rows = _timeline_rows(source_path)
     target_rows = _timeline_rows(target_path)
+    source_metadata = personal_rows_by_entry(source_path)
+    target_metadata = personal_rows_by_entry(target_path)
     target_turns = {row[1]: row[2] for row in target_rows.values()}
     with closing(sqlite3.connect(target_path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         for entry_id, row in source_rows.items():
             existing = target_rows.get(entry_id)
+            if existing is not None and source_metadata.get(entry_id, []) != target_metadata.get(entry_id, []) and not overwrite_conflicts:
+                raise LegacyImportError("LEGACY_DATA_IMPORT_CONFIRMATION_REQUIRED", "staging")
             if existing == row:
                 continue
             if (existing is not None and existing[2] != row[2]) or (
@@ -525,6 +539,11 @@ def _merge_timeline(converted: Path, payload: Path, *, overwrite_conflicts: bool
             )
             target_turns[row[1]] = row[2]
         write_history_identities(connection, read_history_identities(converted))
+        if source_metadata:
+            write_personal_history_rows(connection, [])
+            for entry_id, rows in source_metadata.items():
+                connection.execute("DELETE FROM personal_history_rows WHERE entry_id=?", (entry_id,))
+                write_personal_history_rows(connection, rows)
         connection.commit()
     store.assert_activated()
 
@@ -702,6 +721,7 @@ def _qdrant_client(path: Path):
 
 
 def _qdrant_points(memory: Path) -> tuple[dict[str, tuple[Any, Any]], Any | None]:
+    require_importable_memory(memory)
     root = memory / "qdrant"
     if not root.is_dir() or not any(path.is_file() for path in root.rglob("*")):
         return {}, None
@@ -998,7 +1018,7 @@ def _sqlite_snapshot(source: Path, destination: Path) -> bool:
     if not source.is_file():
         return False
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as original:
+    with closing(sqlite3.connect(sqlite_readonly_uri(source), uri=True)) as original:
         with closing(sqlite3.connect(destination)) as copied:
             original.backup(copied)
     from plugins.builtin.sakura_mem0.memory import normalize_existing_history_database

@@ -139,6 +139,11 @@ class AgentRuntime:
         self.model_vision_enabled = True
         self.autonomous_screen_observation_enabled = True
         self._native_tool_results_blocked_models: set[str] = set()
+        from app.agent.inner_thought_runtime import InnerThoughtCoordinator
+        from app.agent.relationship_runtime import RelationshipTurnAdapter
+
+        self._relationship = RelationshipTurnAdapter()
+        self._inner_thought = InnerThoughtCoordinator()
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -197,6 +202,7 @@ class AgentRuntime:
         character_name: str = "",
     ) -> None:
         """角色切换后同步系统提示词、可用语气并撤销旧表现绑定。"""
+        previous_character_id = self.character_id
         self.system_prompt = system_prompt
         if character_id:
             self.character_id = character_id.strip()
@@ -204,6 +210,109 @@ class AgentRuntime:
             self.character_name = character_name.strip()
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self._visual_binding = None
+        incoming = character_id.strip() if character_id else ""
+        replaced = bool(incoming and incoming != previous_character_id)
+        if replaced:
+            self._relationship.invalidate()
+        self._inner_thought.note_character(
+            character_id=self.character_id,
+            character_name=self.character_name,
+            system_prompt=self.system_prompt,
+            replaced=replaced,
+        )
+
+    def close(self) -> None:
+        self._inner_thought.close()
+        self._relationship.close()
+
+    def configure_relationship_drive(
+        self,
+        *,
+        enabled: bool,
+        in_turn_enabled: bool,
+        profile: object | None,
+        state_path: object | None,
+        character_id: str,
+    ) -> None:
+        from pathlib import Path
+
+        from app.core.relational_drive import RelationalDriveProfile
+
+        self._relationship.configure(
+            enabled=bool(enabled),
+            in_turn_enabled=bool(in_turn_enabled),
+            profile=profile if isinstance(profile, RelationalDriveProfile) else None,
+            state_path=Path(state_path) if state_path else None,
+            character_id=character_id,
+        )
+
+    def begin_relationship_user_turn(self, interaction_id: str) -> None:
+        self._relationship.begin_user_turn(interaction_id)
+
+    def configure_inner_thought(
+        self,
+        *,
+        settings: object,
+        client: object | None,
+        source_slot: str,
+    ) -> None:
+        from app.agent.inner_thought import InnerThoughtSettings
+
+        thought_settings = settings if isinstance(settings, InnerThoughtSettings) else InnerThoughtSettings()
+        self._inner_thought.configure(
+            settings=thought_settings,
+            client=client,
+            source_slot=source_slot,
+            character_id=self.character_id,
+            character_name=self.character_name,
+            system_prompt=self.system_prompt,
+            appraisal_sink=self._relationship.accept_appraisal,
+        )
+
+    def start_inner_thought(
+        self,
+        interaction_id: str,
+        messages: list[ChatMessage],
+        *,
+        cancel_checker: CancelChecker | None = None,
+        turn_tier: str = "standard",
+        proactive_mode: bool = False,
+    ) -> bool:
+        return self._inner_thought.start(
+            interaction_id,
+            messages,
+            cancel_checker=cancel_checker,
+            turn_tier=turn_tier,
+            proactive_mode=proactive_mode,
+        )
+
+    def join_inner_thought(
+        self,
+        turn_id: str,
+        *,
+        cancel_checker: CancelChecker | None = None,
+    ) -> None:
+        self._inner_thought.join(
+            turn_id,
+            character_id=self.character_id,
+            cancel_checker=cancel_checker,
+        )
+
+    def invalidate_inner_thought(self) -> None:
+        self._inner_thought.invalidate()
+
+    def settle_relationship_reply(
+        self,
+        interaction_id: str,
+        reply: ChatReply,
+        *,
+        character_id: str,
+    ) -> bool:
+        return self._relationship.settle(
+            interaction_id,
+            reply,
+            character_id=character_id,
+        )
 
     def set_prompt_patches(self, prompt_patches: list[PromptPatchContribution] | None) -> None:
         """同步插件提示词补丁。"""
@@ -244,6 +353,20 @@ class AgentRuntime:
         self.history_store = history_store
 
     def _session_state_fragments(
+        self,
+        request: ContextRequest,
+    ) -> tuple[ContextFragment, ...]:
+        fragments: list[ContextFragment] = []
+        thought = self._inner_thought.fragment()
+        if thought is not None:
+            fragments.append(thought)
+        drive = self._relationship.fragment()
+        if drive is not None:
+            fragments.append(drive)
+        fragments.extend(self._history_digest_fragments(request))
+        return tuple(fragments)
+
+    def _history_digest_fragments(
         self,
         request: ContextRequest,
     ) -> tuple[ContextFragment, ...]:
@@ -511,25 +634,26 @@ class AgentRuntime:
 
         check_cancelled(cancel_checker)
         repaired = parse_chat_reply_result(repaired_turn.content)
+        repair_invalid = repaired.needs_retry or not _reply_has_display_translation(repaired.reply)
         log_event(
             "AgentRuntime",
             "回复修复结果",
             {
                 "repair_reason": retry_reason,
-                "repair_outcome": "invalid" if repaired.needs_retry else "valid",
-                "outcome": "failed" if repaired.needs_retry else "completed",
+                "repair_outcome": "invalid" if repair_invalid else "valid",
+                "outcome": "failed" if repair_invalid else "completed",
             },
             event="reply.repair.finished",
-            severity="warning" if repaired.needs_retry else "info",
+            severity="warning" if repair_invalid else "info",
         )
-        if repaired.needs_retry:
+        if repair_invalid:
             if self.strict_provider_errors:
                 raise ApiRequestError("Provider reply remained invalid after repair")
             log_event(
                 "AgentRuntime",
                 "最终回复修复后仍不合格，使用安全兜底",
                 {
-                    "reason_code": repaired.reason,
+                    "reason_code": repaired.reason or "missing_translation",
                     "stage": "reply_repair_parse",
                     "error_type": "InvalidReplyStructure",
                     "raw_content": repaired_turn.content,
@@ -537,7 +661,10 @@ class AgentRuntime:
             )
             return parsed.reply
         log_event("AgentRuntime", "最终回复结构修复成功", {"repaired": repaired.repaired})
-        return repaired.reply
+        adopted = repaired.reply
+        if adopted.drive_effect is None and parsed.reply.drive_effect is not None:
+            adopted = ChatReply(adopted.segments, drive_effect=parsed.reply.drive_effect)
+        return adopted
 
     def _parse_reply_and_visual_observation(
         self,
@@ -644,6 +771,7 @@ class AgentRuntime:
         import app.agent.tool_routing as tool_routing
 
         check_cancelled(cancel_checker)
+        self.join_inner_thought(self._relationship.turn_id, cancel_checker=cancel_checker)
         turn_started_at = time.perf_counter()
         allow_screen_observation = (
             self.model_vision_enabled
@@ -1535,7 +1663,11 @@ class AgentRuntime:
         import app.agent.tool_routing as tool_routing
 
         reply_protocol = self._apply_reply_protocol_patches(
-            build_agent_reply_protocol(self.reply_tones, self.reply_visual)
+            build_agent_reply_protocol(
+                self.reply_tones,
+                self.reply_visual,
+                include_drive_effect=self._relationship.accepts_effect_instruction,
+            )
         )
         context_strategy = build_context_acquisition_strategy(
             allow_screen_observation=allow_screen_observation

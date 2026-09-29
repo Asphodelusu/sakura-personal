@@ -21,6 +21,9 @@ from app.storage.timeline import (
 )
 
 from .errors import LegacyImportError
+from .files import sqlite_readonly_uri
+from .history_sqlite import validate_sqlite_history_source
+from .history_sqlite import read_sqlite_history, sqlite_history_files, write_personal_history_rows
 
 
 _MANUAL_MARKER = re.compile(
@@ -38,19 +41,17 @@ class HistoryImportStats:
     timeline_entries: int
     errors_quarantined: int
     per_character_records: dict[str, int]
-    cutoff_entry_ids: dict[str, str]
 
 
 @dataclass(frozen=True)
 class _SourceRecord:
-    path: Path
     relative: str
     line: int
-    ordinal: int
     identity: str
     timestamp: str
     raw: bytes
     value: dict[str, Any]
+    sqlite_row_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ class _TimelineWriter:
         self.store = store
         self.count = 0
 
-    def append(self, entry: NewTimelineEntry, *, source: _SourceRecord) -> None:
+    def append(self, entry: NewTimelineEntry, *, source: _SourceRecord, sources=None) -> None:
         try:
             self.store.append(entry)
         except TimelineDataError as exc:
@@ -112,6 +113,16 @@ class _TimelineWriter:
                 str(exc), "staging", source.relative, source.line
             ) from exc
         self.count += 1
+        rows = []
+        for index, record in enumerate(sources or [source]):
+            if record.sqlite_row_id is not None:
+                rows.append((entry.character_id, record.relative, record.sqlite_row_id, entry.entry_id,
+                             index if entry.kind is TimelineKind.ASSISTANT else None,
+                             record.raw.decode("utf-8")))
+        if rows:
+            with closing(sqlite3.connect(self.store.path)) as connection:
+                write_personal_history_rows(connection, rows)
+                connection.commit()
 
 
 def import_history(
@@ -119,26 +130,27 @@ def import_history(
     staged_root: Path,
     *,
     character_ids: tuple[str, ...],
-    processed_counts: dict[str, int] | None = None,
     import_id: str = "history-import",
     identity_root: Path | None = None,
     identities: dict[tuple[str, str], str] | None = None,
 ) -> HistoryImportStats:
+    validate_sqlite_history_source(source_root)
     history_root = source_root / "data" / "chat_history"
-    timeline = TimelineStore(staged_root / "data" / "chat_history" / "timeline.sqlite3")
-    timeline.initialize()
     try:
         ids = _HistoryIdentities(identity_root or staged_root, identities)
+        groups = _history_groups(history_root, character_ids)
+        ids.require_compatible_sources(groups, source_root)
     except (sqlite3.Error, TimelineDataError) as exc:
         raise LegacyImportError("LEGACY_DATA_TARGET_TIMELINE_INVALID", "inspect") from exc
+    timeline = TimelineStore(staged_root / "data" / "chat_history" / "timeline.sqlite3")
+    timeline.initialize()
     writer = _TimelineWriter(timeline)
     visual = _load_visual_records(source_root / "data" / "visual_observations")
     source_records = 0
     quarantine = _HistoryQuarantineWriter(staged_root, import_id)
     per_character: dict[str, int] = {}
-    cutoffs: dict[str, str] = {}
     try:
-        for scope, paths in _history_groups(history_root, character_ids):
+        for scope, paths in groups:
             scan = {"ordinal": 0}
             records = _iter_records(
                 paths,
@@ -147,7 +159,6 @@ def import_history(
                 scan=scan,
                 quarantine=quarantine,
             )
-            processed = max(0, int((processed_counts or {}).get(scope, 0)))
             current_turn = ""
             current_has_human = False
             current_scheduled = False
@@ -159,7 +170,7 @@ def import_history(
                     return
                 # Keep only the current Runtime v2-sized reply chunk in memory.
                 chunk = assistant_buffer
-                first, last = chunk[0], chunk[-1]
+                first = chunk[0]
                 turn_id = current_turn or ids.get("turn", first)
                 entry_id = ids.get("assistant", first)
                 segments = [_segment(record, quarantine) for record in chunk]
@@ -174,13 +185,14 @@ def import_history(
                         payload={"segments": segments},
                     ),
                     source=first,
+                    sources=chunk,
                 )
-                if last.ordinal <= processed:
-                    cutoffs[scope] = entry_id
                 assistant_buffer = []
 
             for record in records:
                 role = record.value["role"]
+                if role == "error" and record.sqlite_row_id is not None:
+                    role = "system"
                 if role == "assistant":
                     assistant_buffer.append(record)
                     if len(assistant_buffer) == MAX_SEGMENTS:
@@ -215,8 +227,6 @@ def import_history(
                         ),
                         source=record,
                     )
-                    if record.ordinal <= processed:
-                        cutoffs[scope] = ids.get("human", record)
                     if cleaned != content:
                         observation_id = ids.get("observation", record)
                         writer.append(
@@ -231,8 +241,6 @@ def import_history(
                             ),
                             source=record,
                         )
-                        if record.ordinal <= processed:
-                            cutoffs[scope] = observation_id
                     continue
                 if role == "system":
                     scheduled_id, cleaned = _strip_marker(content, _SCHEDULED_MARKER)
@@ -264,12 +272,10 @@ def import_history(
                                 kind=TimelineKind.SYSTEM,
                                 origin="host",
                                 created_at=record.timestamp,
-                                payload={"text": content, "eventType": "legacy_system"},
+                                payload={"text": content, "eventType": "legacy_error" if record.value["role"] == "error" else "legacy_system"},
                             ),
                             source=record,
                         )
-                    if record.ordinal <= processed:
-                        cutoffs[scope] = entry_id
                     continue
                 quarantine.append(
                     HistoryIssue(
@@ -295,7 +301,6 @@ def import_history(
         timeline_entries=writer.count,
         errors_quarantined=quarantine.count,
         per_character_records=per_character,
-        cutoff_entry_ids=cutoffs,
     )
 
 
@@ -303,11 +308,16 @@ def _history_groups(root: Path, character_ids: tuple[str, ...]) -> list[tuple[st
     if not root.is_dir():
         return []
     bases: dict[str, list[Path]] = {}
+    databases = {path.stem.casefold(): path for path in sqlite_history_files(root.parent.parent)}
     for path in root.iterdir():
         if not path.is_file() or ".jsonl" not in path.name:
             continue
         raw_scope = path.name.split(".jsonl", 1)[0]
+        if raw_scope.casefold() in databases:
+            continue
         bases.setdefault(raw_scope, []).append(path)
+    for path in databases.values():
+        bases[path.stem] = [path]
     folded: dict[str, list[str]] = {}
     for character_id in character_ids:
         folded.setdefault(character_id.casefold(), []).append(character_id)
@@ -326,7 +336,8 @@ def _history_groups(root: Path, character_ids: tuple[str, ...]) -> list[tuple[st
             (path for path in paths if path.name.endswith(".jsonl")),
             key=lambda path: path.name,
         )
-        result.append((scope, [*archives, *active]))
+        sqlite = [path for path in paths if path.suffix.casefold() == ".db"]
+        result.append((scope, sqlite or [*archives, *active]))
     return result
 
 
@@ -341,6 +352,15 @@ def _iter_records(
     occurrences: dict[tuple[str, str], int] = {}
     for path in paths:
         relative = path.relative_to(source_root).as_posix()
+        if path.suffix.casefold() == ".db":
+            for value in read_sqlite_history(path):
+                scan["ordinal"] += 1
+                key = value["id"]
+                identity = json.dumps([scope, "sqlite", relative, key], ensure_ascii=True, separators=(",", ":"))
+                raw = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                yield _SourceRecord(relative, key, identity,
+                    _parse_timestamp(value["created_at"]), raw, value, key)
+            continue
         try:
             handle = path.open("rb")
         except OSError as exc:
@@ -389,10 +409,8 @@ def _iter_records(
                     [scope, role, timestamp, occurrence], ensure_ascii=True, separators=(",", ":")
                 )
                 yield _SourceRecord(
-                    path,
                     relative,
                     line_number,
-                    scan["ordinal"],
                     identity,
                     timestamp,
                     raw_bytes,
@@ -507,7 +525,7 @@ def read_history_identities(root: Path) -> dict[tuple[str, str], str]:
     path = root / "data/chat_history/timeline.sqlite3"
     if not path.is_file():
         return {}
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+    with closing(sqlite3.connect(sqlite_readonly_uri(path), uri=True)) as connection:
         exists = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_history_identities'"
         ).fetchone()
@@ -557,7 +575,7 @@ class _HistoryIdentities:
         path = root / "data/chat_history/timeline.sqlite3"
         if path.is_file():
             assigned = set(self.values.values())
-            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            with closing(sqlite3.connect(sqlite_readonly_uri(path), uri=True)) as connection:
                 for entry_id, turn_id, scope, kind, timestamp in connection.execute(
                     "SELECT entry_id, turn_id, character_id, kind, created_at "
                     "FROM timeline_entries ORDER BY seq"
@@ -567,7 +585,25 @@ class _HistoryIdentities:
                     ):
                         self.legacy[(scope, kind, timestamp)].append((entry_id, turn_id))
 
+    def require_compatible_sources(self, groups, source_root):
+        for scope, paths in groups:
+            databases = [path for path in paths if path.suffix.casefold() == ".db"]
+            if not databases:
+                continue
+            relative = databases[0].relative_to(source_root).as_posix()
+            conflict = any(key[0] == scope for key in self.legacy)
+            for identity, _ in self.values:
+                value = json.loads(identity)
+                if value[0] == scope and (value[1] != "sqlite" or value[2] != relative):
+                    conflict = True
+            if conflict:
+                raise LegacyImportError("LEGACY_PERSONAL_HISTORY_IDENTITY_CONFLICT", "inspect")
+
     def _existing(self, kind: str, record: _SourceRecord) -> tuple[str, str] | None:
+        if record.sqlite_row_id is not None:
+            # SQLite has a stable source ID. Never guess a match by timestamp
+            # against an earlier JSONL-only conversion.
+            return None
         key = (record.identity, kind)
         if key not in self.matched:
             scope = json.loads(record.identity)[0]

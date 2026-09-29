@@ -18,6 +18,7 @@ from app.config.character_loader import (
     character_theme_from_mapping,
     character_theme_to_mapping,
 )
+from app.config.character_voice import GPT_SOVITS_EXTENSION, write_voice_fields
 from app.config.character_packages import (
     allocate_character_installation,
     ensure_legacy_voice_extensions,
@@ -338,16 +339,23 @@ def export_character_archive(
             profile.backchannel_manifest_path,
             "backchannel",
         )
-    if include_voice and profile.voice is not None:
-        character_manifest["voice"] = {
-            "gpt_model": archive_path_for_resource(profile.voice.gpt_model_path, "voice/models"),
-            "sovits_model": archive_path_for_resource(profile.voice.sovits_model_path, "voice/models"),
-            "tone_refs": archive_path_for_resource(profile.voice.tone_ref_path, "voice/refs"),
+    if include_voice and profile.voice is not None and GPT_SOVITS_EXTENSION not in character_manifest.get("extensions", {}):
+        def package_voice_path(path, kind):
+            value = archive_path_for_resource(path, kind)
+            return _package_path_text(PurePosixPath(value)) if value else None
+        write_voice_fields(character_manifest, {
+            "gpt_model": package_voice_path(profile.voice.gpt_model_path, "voice/models"),
+            "sovits_model": package_voice_path(profile.voice.sovits_model_path, "voice/models"),
+            "tone_refs": package_voice_path(profile.voice.tone_ref_path, "voice/refs"),
             "ref_lang": profile.voice.ref_lang,
             "text_lang": profile.voice.text_lang,
-        }
-    elif not include_voice:
+        })
+    else:
         character_manifest.pop("voice", None)
+        if not include_voice:
+            extensions = character_manifest.get("extensions", {})
+            for plugin_id in (GPT_SOVITS_EXTENSION, "sakura.tts.genie"):
+                extensions.pop(plugin_id, None)
 
     from app.config.plugin_requirements import requirements_for_manifest
     character_manifest["pluginRequirements"] = requirements_for_manifest(character_manifest, include_tts=include_voice)
@@ -637,9 +645,10 @@ def _normalized_import_character_data(
     else:
         normalized.pop("reply", None)
 
-    voice_data = character_data.get("voice")
-    if voice_data is not None:
-        normalized["voice"] = _normalized_voice(voice_data)
+    if GPT_SOVITS_EXTENSION not in normalized.get("extensions", {}):
+        voice_data = character_data.get("voice")
+        if voice_data is not None:
+            normalized["voice"] = _normalized_voice(voice_data)
     backchannel = character_data.get("backchannel")
     if isinstance(backchannel, str) and backchannel.strip():
         normalized["backchannel"] = _package_path_text(
@@ -648,6 +657,8 @@ def _normalized_import_character_data(
     # The clone already preserved extensions and removed the package's local
     # voice choice. Do not restore it from the original archive before startup.
     ensure_legacy_voice_extensions(normalized, package_dir)
+    if GPT_SOVITS_EXTENSION in normalized.get("extensions", {}):
+        normalized.pop("voice", None)
 
     _validate_referenced_files(package_dir, normalized)
     return normalized
@@ -892,22 +903,7 @@ def _write_character_voice_manifest(package_dir: Path, voice_data: dict[str, str
         raise CharacterArchiveError(f"角色清单无法读取：{manifest_path}") from exc
     if not isinstance(character_data, dict):
         raise CharacterArchiveError(f"角色清单必须是 JSON 对象：{manifest_path}")
-    character_data["voice"] = voice_data
-    if isinstance(character_data.get("extensions"), dict):
-        character_data["extensions"].pop("sakura.tts", None)
-    ensure_legacy_voice_extensions(character_data, package_dir)
-    # Import replaces shared voice resources, including any previous Studio
-    # paths. Keep explicit Genie resource overrides intact.
-    provider = character_data["extensions"]["sakura.tts.gpt-sovits"]
-    for source_key, target_key in (
-        ("tone_refs", "toneRefs"), ("ref_lang", "refLang"),
-        ("text_lang", "textLang"), ("gpt_model", "gptModel"),
-        ("sovits_model", "sovitsModel"),
-    ):
-        if source_key in voice_data:
-            provider[target_key] = voice_data[source_key]
-        else:
-            provider.pop(target_key, None)
+    write_voice_fields(character_data, voice_data)
     from app.config.plugin_requirements import GPT_SOVITS_MODELS, requirements_for_manifest, parse_requirements
     preserved = [item for item in parse_requirements(character_data.get("pluginRequirements", []))
                  if (item["kind"], item["type"]) != ("tts", GPT_SOVITS_MODELS)]

@@ -152,6 +152,13 @@ class StoragePaths:
     def screen_awareness_state(self) -> Path:
         return self._data / "screen_awareness_state.json"
 
+    def relational_drive_for(self, character_id: str) -> Path:
+        return (
+            self._data
+            / "runtime_state"
+            / f"{sanitize_file_stem(character_id)}-relational-drive.json"
+        )
+
     # ---- 提醒 ----
     def reminders_store(self) -> Path:
         return self._data / "reminders.json"

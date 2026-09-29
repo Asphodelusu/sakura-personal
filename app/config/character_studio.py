@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.config.character_archive import export_character_archive
+from app.config.character_voice import voice_fields, write_voice_fields
 from app.config.character_loader import (
     THEME_SOURCE_PACKAGE,
     CharacterConfigError,
@@ -107,6 +108,7 @@ class CharacterStudioDoc:
     reference_audios: list[ReferenceAudioDraft] = field(default_factory=list)
     visuals: dict[str, Any] | None = None
     visual_data: dict[str, Any] = field(default_factory=dict)
+    relationship_drive: dict[str, Any] | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         manifest: dict[str, Any] = {
@@ -151,14 +153,16 @@ class CharacterStudioDoc:
                 voice["gpt_model"] = self.voice.gpt_model
             if self.voice.sovits_model:
                 voice["sovits_model"] = self.voice.sovits_model
-            manifest["voice"] = voice
+            write_voice_fields(manifest, voice)
+        if isinstance(self.relationship_drive, dict) and self.relationship_drive:
+            manifest["relationship_drive"] = dict(self.relationship_drive)
         return manifest
 
     def manifest_json(self) -> str:
         return json.dumps(self.to_manifest(), ensure_ascii=False, indent=2)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.id,
             "display_name": self.display_name,
             "initial_message": self.initial_message,
@@ -180,6 +184,9 @@ class CharacterStudioDoc:
                 "text_lang": self.voice.text_lang,
             },
         }
+        if isinstance(self.relationship_drive, dict) and self.relationship_drive:
+            payload["relationship_drive"] = dict(self.relationship_drive)
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CharacterStudioDoc":
@@ -189,7 +196,7 @@ class CharacterStudioDoc:
         voice = None
         if isinstance(raw_voice, dict):
             voice = VoiceDraft(
-                tone_refs=str(raw_voice.get("tone_refs") or DEFAULT_TONE_REFS),
+                tone_refs=str(raw_voice.get("tone_refs", DEFAULT_TONE_REFS)),
                 gpt_model=str(raw_voice.get("gpt_model") or "") or None,
                 sovits_model=str(raw_voice.get("sovits_model") or "") or None,
                 ref_lang=str(raw_voice.get("ref_lang") or "ja"),
@@ -201,6 +208,8 @@ class CharacterStudioDoc:
         reply_tones = raw_reply_tones if isinstance(raw_reply_tones, list) else []
         raw_reference_audios = payload.get("reference_audios")
         reference_audios = raw_reference_audios if isinstance(raw_reference_audios, list) else []
+        raw_drive = payload.get("relationship_drive")
+        relationship_drive = dict(raw_drive) if isinstance(raw_drive, dict) and raw_drive else None
         return cls(
             id=str(payload.get("id") or "").strip(),
             display_name=str(payload.get("display_name") or "").strip(),
@@ -218,6 +227,7 @@ class CharacterStudioDoc:
             reference_audios=[ReferenceAudioDraft.from_payload(item) for item in reference_audios],
             visuals=payload.get("visuals"),
             visual_data=payload.get("visual_data") or {},
+            relationship_drive=relationship_drive,
         )
 
     @classmethod
@@ -245,6 +255,8 @@ class CharacterStudioDoc:
         reply_tones = _reference_tones(reference_audios) if reference_audios else [
             str(tone) for tone in tones_raw if isinstance(tone, str) and tone.strip()
         ]
+        raw_drive = raw.get("relationship_drive")
+        relationship_drive = dict(raw_drive) if isinstance(raw_drive, dict) and raw_drive else None
 
         return cls(
             id=str(raw.get("id") or ""),
@@ -262,6 +274,7 @@ class CharacterStudioDoc:
             voice=voice,
             reference_audios=reference_audios,
             visuals=raw.get("visuals"),
+            relationship_drive=relationship_drive,
         )
 
 
@@ -423,7 +436,7 @@ class CharacterStudioService:
         if doc.id != workspace_id:
             raise ValueError("草稿角色 ID 与工作区不一致。")
         package_dir.mkdir(parents=True, exist_ok=True)
-        if doc.voice is not None and "reference_audios" in doc_payload:
+        if doc.voice is not None and "reference_audios" in doc_payload and (doc.reference_audios or doc.voice.tone_refs):
             _validate_reference_audios(package_dir, doc.reference_audios)
             doc.voice.tone_refs = DEFAULT_TONE_REFS
             doc.reply_tones = _reference_tones(doc.reference_audios)
@@ -1615,13 +1628,7 @@ def _merge_character_manifest(
         else:
             manifest.pop("reply", None)
 
-    if "voice" in generated:
-        voice = dict(manifest.get("voice")) if isinstance(manifest.get("voice"), dict) else {}
-        voice.update(generated["voice"])
-        for optional in ("gpt_model", "sovits_model"):
-            if optional not in generated["voice"]:
-                voice.pop(optional, None)
-        manifest["voice"] = voice
+    manifest.pop("voice", None)
     extensions = _sync_voice_extensions(manifest.get("extensions"), doc.voice)
     if extensions:
         manifest["extensions"] = extensions
@@ -1633,30 +1640,15 @@ def _merge_character_manifest(
 
 
 def _voice_draft_from_manifest(manifest: dict[str, Any]) -> VoiceDraft | None:
-    extensions = manifest.get("extensions")
-    extension_map = extensions if isinstance(extensions, dict) else {}
-    provider = extension_map.get(_GPT_SOVITS_EXTENSION)
-    legacy = manifest.get("voice")
-    legacy_map = legacy if isinstance(legacy, dict) else {}
-    if not isinstance(provider, dict) and not legacy_map:
+    fields = voice_fields(manifest)
+    if fields is None:
         return None
-    provider_map = provider if isinstance(provider, dict) else {}
     return VoiceDraft(
-        tone_refs=str(
-            provider_map.get("toneRefs")
-            or legacy_map.get("tone_refs")
-            or DEFAULT_TONE_REFS
-        ),
-        gpt_model=str(
-            provider_map.get("gptModel") or legacy_map.get("gpt_model") or ""
-        )
-        or None,
-        sovits_model=str(
-            provider_map.get("sovitsModel") or legacy_map.get("sovits_model") or ""
-        )
-        or None,
-        ref_lang=str(provider_map.get("refLang") or legacy_map.get("ref_lang") or "ja"),
-        text_lang=str(provider_map.get("textLang") or legacy_map.get("text_lang") or "ja"),
+        tone_refs=fields.get("tone_refs", ""),
+        gpt_model=fields.get("gpt_model") or None,
+        sovits_model=fields.get("sovits_model") or None,
+        ref_lang=fields.get("ref_lang") or "ja",
+        text_lang=fields.get("text_lang") or "ja",
     )
 
 
@@ -1664,34 +1656,20 @@ def _sync_voice_extensions(
     raw_extensions: object,
     voice: VoiceDraft | None,
 ) -> dict[str, Any]:
-    extensions = dict(raw_extensions) if isinstance(raw_extensions, dict) else {}
-    extensions.pop("sakura.tts", None)
-    existing_provider = extensions.get(_GPT_SOVITS_EXTENSION)
-    provider = dict(existing_provider) if isinstance(existing_provider, dict) else {}
-    if voice is None:
-        return extensions
-
-    provider.update(
-        {
-            "toneRefs": voice.tone_refs,
-            "refLang": voice.ref_lang,
-            "textLang": voice.text_lang,
-        }
-    )
-    for source_value, target_key in (
-        (voice.gpt_model, "gptModel"),
-        (voice.sovits_model, "sovitsModel"),
-    ):
-        if source_value:
-            provider[target_key] = source_value
-        else:
-            provider.pop(target_key, None)
-    extensions[_GPT_SOVITS_EXTENSION] = provider
-    return extensions
+    manifest = {"extensions": dict(raw_extensions) if isinstance(raw_extensions, dict) else {}}
+    fields = None if voice is None else {
+        "tone_refs": voice.tone_refs, "gpt_model": voice.gpt_model,
+        "sovits_model": voice.sovits_model, "ref_lang": voice.ref_lang,
+        "text_lang": voice.text_lang,
+    }
+    write_voice_fields(manifest, fields)
+    return manifest.get("extensions", {})
 
 
 def _read_reference_audios(package_dir: Path, relative_path: str) -> list[ReferenceAudioDraft]:
-    path = Path(package_dir) / str(relative_path or DEFAULT_TONE_REFS)
+    if not relative_path.strip():
+        return []
+    path = Path(package_dir) / relative_path
     if not path.is_file():
         return []
     result: list[ReferenceAudioDraft] = []
@@ -1801,7 +1779,7 @@ def _validate_package_local_paths(package_dir: Path) -> None:
         if isinstance(expressions, dict):
             for label, path_text in expressions.items():
                 _check_local_path(package_dir, path_text, f"{label} 表情立绘")
-    voice = raw.get("voice")
+    voice = voice_fields(raw)
     if isinstance(voice, dict):
         _check_local_path(package_dir, voice.get("tone_refs"), "语气参考表")
         _check_local_path(package_dir, voice.get("gpt_model"), "GPT 模型")

@@ -4,10 +4,18 @@ status: normative
 audience: maintainer
 source_of_truth: self
 status_source: ../../plans/runtime-v2/work-packages.md
-updated: 2026-09-12
+updated: 2026-09-14
 ---
 
 # Runtime v2 角色工坊
+
+## 个人候选：角色约束
+
+`system_guards` 指向角色包内 UTF-8 Markdown 文件；未指定时，使用存在的 `system_guards.md`。
+显式文件缺失、越界、内容为空或加载后无法读取时，角色提示词加载失败，不静默丢弃约束。
+配置此文件的角色沿用个人 Qt 提示词组合顺序：身份锚、人格、互动方式、尾部演出约束。
+主对话和插件角色读取使用相同组合；未配置文件的角色保留上游提示词行为。
+该契约只接入人格约束，不代表关系指引、关系驱动或关系效果结算已经接入。
 
 ## 产品范围
 
@@ -220,3 +228,25 @@ GPT-SoVITS、Genie extension 引用的模型、参考表和参考音频；导入
 发布前还要通过 `journey-character-switch`、`runtime-v2-shell` 和 `release-distribution`。Windows x64 与 macOS
 arm64 必须实机检查当前/非当前角色发布、跨重启草稿、带语音导出、取消大文件、多显示器取色和安装包入口。
 Linux 只要求编译通过。没有实机记录时，本能力最多标记为 `implemented` 或 `stabilizing`。
+
+## 个人 Windows 候选：语音配置唯一来源
+
+2026-09-14 用户确认：候选角色包以 `extensions["sakura.tts.gpt-sovits"]` 为语音配置权威来源。
+AI 修改角色时使用 `toneRefs`、`gptModel`、`sovitsModel`、`refLang` 和 `textLang`。
+字段中的路径相对于角色包目录；这项格式适配不更换 GPT-SoVITS、角色人格或模型资源。
+
+- 已有 GPT-SoVITS 扩展时，按整个扩展块读取，不用旧 `voice` 的值填补被删除或清空的字段。
+  扩展必须是对象，已知字段必须是字符串；空对象表示尚未配置共享语音。
+- 未转换的旧包仍通过上游 legacy 兼容入口读取，保留启动时 package repair。正常加载不写入文件；
+  工坊保存、角色归档、显式旧版导入与语音包导入写入扩展，并移除包内旧 `voice` 配置。
+- `CharacterProfile.voice` 是从权威字段派生的内存对象，不是第二份持久配置。
+  仅有模型而没有参考语音时，角色仍可编辑；文件缺失或路径不安全时，角色保持可见，
+  Profile 不宣称有可导出的有效语音，由插件报告资源准备失败。导出/发布仍验证资源边界。
+- 清空模型或参考配置不能恢复旧值；Studio 仅在显式加入参考音频时为此前空配置建立默认参考表。
+  普通保存不读取已清空配置对应的旧默认参考文件。
+- 删除语音仅移除已知配置字段，未知 provider 选项和其他插件字段保持；不把未知选项当语音资源。
+- `.char` 的角色清单使用扩展中的包相对路径；无语音导出剔除已知 GPT-SoVITS/Genie 语音扩展，
+  同时保留无关插件扩展。`.voice` 是独立传输格式，继续保留其既有 `voice` 元数据，导入时转换。
+- Genie 对共享资源的读取也遵循整个扩展块权威，显式 Genie 覆盖保持原优先级；不新增 Genie 功能。
+- AI 编辑后以重新加载/重启为本轮保证的生效边界。已打开的 Studio 草稿拥有自己的修改，
+  不承诺与外部 AI 同时编辑同一角色时自动合并，也不修改用户当前日常版本的角色包。
