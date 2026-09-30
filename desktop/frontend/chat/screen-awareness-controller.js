@@ -2,6 +2,11 @@ export const SCREEN_AWARENESS_POLL_INTERVAL_MS = 10_000;
 export const SCREEN_AWARENESS_PROMPT = "这是一次由 Sakura 定时截图触发的主动屏幕观察。以下截图按时间顺序展示我最近正在做的事情。请结合最近聊天历史和这些截图，以当前角色的语气自然接话：可以评论变化、接续任务、询问卡点或提供轻量帮助。不要逐张复述，也不要因为时间或久坐机械地提醒休息；如果没有明显变化，就简短说出你能确认的具体内容。";
 
 const RESOLUTIONS = new Set(["fullscreen", "720p", "1080p", "2160p"]);
+const QUIET_SKIP_CODES = new Set([
+  "SCREEN_OBSERVATION_PRIVACY_BLOCKED",
+  "SCREEN_OBSERVATION_SELF",
+  "SCREEN_OBSERVATION_UNCHANGED",
+]);
 
 export function normalizeScreenAwarenessSettings(value) {
   const settings = {
@@ -98,12 +103,19 @@ export function createScreenAwarenessController({
           if (batchCount === 0) batchStartedAt = timestamp;
           batchCount = result.count;
         } catch (error) {
+          const code = String(error instanceof Error ? error.message : error || "").split(/[|:]/)[0].trim();
+          if (QUIET_SKIP_CODES.has(code)) {
+            lastCaptureAt = timestamp;
+            onDiagnostic("screen_awareness.capture.skipped", { code });
+            return;
+          }
           await fail("capture", error);
           return;
         }
       }
       if (batchCount === 0 || batchStartedAt === null
-          || timestamp - batchStartedAt < settings.cooldownMinutes * 60_000
+          || (batchCount < settings.batchLimit
+            && timestamp - batchStartedAt < settings.cooldownMinutes * 60_000)
           || !isIdle()) return;
 
       let attachmentId = null;

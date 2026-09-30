@@ -1433,7 +1433,8 @@ const screenAwareness = createScreenAwarenessController({
       && stage.dataset.composing !== "true"
       && !screenAttachment.busy()
       && !asrController?.active()
-      && !updateAnnouncement.isPending();
+      && !updateAnnouncement.isPending()
+      && !initiative.isPending();
   },
   onDiagnostic: (event, details) => runtimeDiagnostics.record({
     level: event.endsWith("failed") ? "warn" : "info",

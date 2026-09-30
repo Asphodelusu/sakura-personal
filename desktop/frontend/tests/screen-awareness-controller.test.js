@@ -17,12 +17,13 @@ function settings(overrides = {}) {
   };
 }
 
-function harness({ enabled = true } = {}) {
+function harness({ enabled = true, overrides = {} } = {}) {
   let clock = 0;
   let idle = true;
   let generation = "generation-a";
   let captureCount = 0;
   let sendFailure = false;
+  const captureErrors = [];
   const calls = [];
   const sends = [];
   const controller = createScreenAwarenessController({
@@ -31,7 +32,11 @@ function harness({ enabled = true } = {}) {
     isIdle: () => idle,
     invoke: async (command, args) => {
       calls.push([command, args]);
-      if (command === "capture_screen_awareness_frame") return { count: ++captureCount, droppedCount: 0 };
+      if (command === "capture_screen_awareness_frame") {
+        const error = captureErrors.shift();
+        if (error) throw new Error(error);
+        return { count: ++captureCount, droppedCount: 0 };
+      }
       if (command === "attach_screen_awareness_batch") {
         return { attachmentId: `screen-${"a".repeat(32)}`, count: captureCount };
       }
@@ -45,11 +50,12 @@ function harness({ enabled = true } = {}) {
     setInterval: () => 1,
     clearInterval: () => {},
   });
-  controller.applySettings(settings({ enabled }));
+  controller.applySettings(settings({ enabled, ...overrides }));
   return {
     controller,
     calls,
     sends,
+    captureErrors,
     setClock: (value) => { clock = value; },
     setIdle: (value) => { idle = value; },
     setGeneration: (value) => { generation = value; },
@@ -130,4 +136,35 @@ test("failed automatic send releases the attachment and does not retry", async (
   assert.equal(commands(env, "release_screen_attachment").length, 1);
   await env.controller.tick();
   assert.equal(env.sends.length, 1);
+});
+
+test("a full batch is sent at once instead of waiting for the cooldown", async () => {
+  const env = harness({ overrides: { batchLimit: 1, cooldownMinutes: 10 } });
+  env.setClock(60_000);
+  await env.controller.tick();
+  assert.equal(commands(env, "capture_screen_awareness_frame").length, 1);
+  assert.equal(env.sends.length, 1);
+});
+
+test("private, own, or unchanged screens are skipped quietly until the next interval", async () => {
+  for (const code of [
+    "SCREEN_OBSERVATION_PRIVACY_BLOCKED",
+    "SCREEN_OBSERVATION_SELF",
+    "SCREEN_OBSERVATION_UNCHANGED",
+  ]) {
+    const env = harness({ overrides: { batchLimit: 1 } });
+    const clearsBefore = commands(env, "clear_screen_awareness_batch").length;
+    env.captureErrors.push(code);
+    env.setClock(60_000);
+    await env.controller.tick();
+    assert.equal(env.sends.length, 0, code);
+    assert.equal(commands(env, "clear_screen_awareness_batch").length, clearsBefore, code);
+    env.setClock(90_000);
+    await env.controller.tick();
+    assert.equal(commands(env, "capture_screen_awareness_frame").length, 1, code);
+    env.setClock(120_000);
+    await env.controller.tick();
+    assert.equal(commands(env, "capture_screen_awareness_frame").length, 2, code);
+    assert.equal(env.sends.length, 1, code);
+  }
 });

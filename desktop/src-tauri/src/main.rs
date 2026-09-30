@@ -3759,12 +3759,23 @@ async fn capture_screen_awareness_frame(
     let manager = captures.inner().clone();
     let task_generation_id = generation_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let response = handle
+            .settings_request(
+                None,
+                "screen_awareness.privacy.get",
+                json!({}),
+                std::time::Duration::from_secs(3),
+            )
+            .map_err(|_| "SCREEN_PRIVACY_UNAVAILABLE".to_string())?;
+        let privacy =
+            capture::ScreenPrivacy::from_core_payload(&settings_response_payload(response)?)?;
         manager.capture_screen_awareness_frame(
             &task_generation_id,
             cursor.x.round() as i32,
             cursor.y.round() as i32,
             &payload.resolution,
             payload.batch_limit,
+            &privacy,
         )
     })
     .await

@@ -20,6 +20,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 use xcap::Monitor;
 
+pub const SCREEN_OBSERVATION_SELF: &str = "SCREEN_OBSERVATION_SELF";
+pub const SCREEN_OBSERVATION_PRIVACY_BLOCKED: &str = "SCREEN_OBSERVATION_PRIVACY_BLOCKED";
+pub const SCREEN_OBSERVATION_UNCHANGED: &str = "SCREEN_OBSERVATION_UNCHANGED";
+const SCREEN_OBSERVATION_UNCHANGED_DISTANCE: u32 = 4;
+const MAX_PRIVACY_ENTRIES: usize = 64;
+const MAX_PRIVACY_ENTRY_CHARS: usize = 128;
 pub const ATTACHED_EVENT: &str = "sakura://screen-attachment";
 pub const CANCELLED_EVENT: &str = "sakura://screen-capture-cancelled";
 pub const ERROR_EVENT: &str = "sakura://screen-capture-error";
@@ -191,6 +197,160 @@ struct CaptureState {
     resources: HashMap<String, CaptureResource>,
     active_generation: Option<String>,
     awareness_frames: VecDeque<ScreenAwarenessFrame>,
+    last_awareness_dhash: Option<u64>,
+}
+
+/// Casefolded foreground-window blocklist owned by the Core screen-awareness settings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScreenPrivacy {
+    pub blocked_processes: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
+}
+
+impl ScreenPrivacy {
+    pub fn from_core_payload(value: &serde_json::Value) -> Result<Self, String> {
+        let invalid = || "SCREEN_PRIVACY_RESPONSE_INVALID".to_string();
+        let object = value
+            .as_object()
+            .filter(|object| {
+                object.len() == 3
+                    && object
+                        .get("schemaVersion")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(1)
+            })
+            .ok_or_else(invalid)?;
+        let list = |key: &str| -> Result<Vec<String>, String> {
+            let values = object
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .filter(|values| values.len() <= MAX_PRIVACY_ENTRIES)
+                .ok_or_else(invalid)?;
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|text| text.chars().count() <= MAX_PRIVACY_ENTRY_CHARS)
+                        .map(|text| text.trim().to_lowercase())
+                        .ok_or_else(invalid)
+                })
+                .filter(|entry| entry.as_ref().map_or(true, |text| !text.is_empty()))
+                .collect()
+        };
+        Ok(Self {
+            blocked_processes: list("blockedProcesses")?,
+            blocked_title_keywords: list("blockedTitleKeywords")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForegroundWindow {
+    pub process_id: u32,
+    pub process_name: String,
+    pub title: String,
+}
+
+/// Why a scheduled observation must not look at the screen right now.
+pub fn screen_observation_block(
+    privacy: &ScreenPrivacy,
+    foreground: Option<&ForegroundWindow>,
+    own_process_id: u32,
+) -> Option<&'static str> {
+    let foreground = foreground?;
+    if foreground.process_id == own_process_id {
+        return Some(SCREEN_OBSERVATION_SELF);
+    }
+    let process = foreground.process_name.to_lowercase();
+    if !process.is_empty()
+        && privacy
+            .blocked_processes
+            .iter()
+            .any(|blocked| *blocked == process)
+    {
+        return Some(SCREEN_OBSERVATION_PRIVACY_BLOCKED);
+    }
+    let title = foreground.title.to_lowercase();
+    if !title.is_empty()
+        && privacy
+            .blocked_title_keywords
+            .iter()
+            .any(|keyword| title.contains(keyword.as_str()))
+    {
+        return Some(SCREEN_OBSERVATION_PRIVACY_BLOCKED);
+    }
+    None
+}
+
+#[cfg(windows)]
+pub fn foreground_window() -> Option<ForegroundWindow> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    };
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let mut title = [0u16; 512];
+    let title_len = unsafe { GetWindowTextW(hwnd, &mut title) }.max(0) as usize;
+    let mut process_name = String::new();
+    if let Ok(process) =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+    {
+        let mut path = [0u16; 1024];
+        let mut size = path.len() as u32;
+        if unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &mut size,
+            )
+        }
+        .is_ok()
+        {
+            let full = String::from_utf16_lossy(&path[..size as usize]);
+            process_name = full
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+        }
+        let _ = unsafe { CloseHandle(process) };
+    }
+    Some(ForegroundWindow {
+        process_id,
+        process_name,
+        title: String::from_utf16_lossy(&title[..title_len.min(title.len())]),
+    })
+}
+
+#[cfg(not(windows))]
+pub fn foreground_window() -> Option<ForegroundWindow> {
+    None
+}
+
+fn awareness_dhash(image: &image::RgbaImage) -> u64 {
+    let gray = image::imageops::grayscale(image);
+    let small = image::imageops::resize(&gray, 9, 8, FilterType::Triangle);
+    let mut hash = 0u64;
+    for y in 0..8 {
+        for x in 0..8 {
+            let brighter = small.get_pixel(x, y)[0] > small.get_pixel(x + 1, y)[0];
+            hash = (hash << 1) | u64::from(brighter);
+        }
+    }
+    hash
 }
 
 impl CaptureManager {
@@ -414,6 +574,7 @@ impl CaptureManager {
         cursor_y: i32,
         resolution: &str,
         batch_limit: usize,
+        privacy: &ScreenPrivacy,
     ) -> Result<ScreenAwarenessCapturePublication, String> {
         if !self.available {
             return Err("SCREEN_RESOURCE_ROOT_UNAVAILABLE".to_string());
@@ -422,12 +583,18 @@ impl CaptureManager {
         if !(1..=20).contains(&batch_limit) || !valid_screen_awareness_resolution(resolution) {
             return Err("SCREEN_AWARENESS_SETTINGS_INVALID".to_string());
         }
+        if let Some(code) =
+            screen_observation_block(privacy, foreground_window().as_ref(), std::process::id())
+        {
+            return Err(code.to_string());
+        }
         let monitor = Monitor::from_point(cursor_x, cursor_y)
             .map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE".to_string())?;
         let image = monitor
             .capture_image()
             .map_err(|_| "SCREEN_CAPTURE_PLATFORM_DENIED".to_string())?;
         let image = resize_screen_awareness_capture(image, resolution);
+        self.note_awareness_dhash(generation_id, awareness_dhash(&image))?;
         if u64::from(image.width()) * u64::from(image.height()) > MAX_CAPTURE_PIXELS {
             return Err("SCREEN_CAPTURE_RESOURCE_LIMIT".to_string());
         }
@@ -461,6 +628,24 @@ impl CaptureManager {
                 .collect(),
         };
         self.push_screen_awareness_frame(generation_id, frame, batch_limit)
+    }
+
+    /// Remembers the latest frame hash; a near-identical frame is not worth another look.
+    fn note_awareness_dhash(&self, generation_id: &str, hash: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE".to_string())?;
+        if state.active_generation.as_deref() != Some(generation_id) {
+            state.last_awareness_dhash = None;
+        }
+        let previous = state.last_awareness_dhash.replace(hash);
+        if previous.is_some_and(|previous| {
+            (previous ^ hash).count_ones() <= SCREEN_OBSERVATION_UNCHANGED_DISTANCE
+        }) {
+            return Err(SCREEN_OBSERVATION_UNCHANGED.to_string());
+        }
+        Ok(())
     }
 
     fn push_screen_awareness_frame(
@@ -1149,6 +1334,102 @@ mod tests {
             screen_awareness_target_size(3840, 2160, "fullscreen"),
             (3840, 2160)
         );
+    }
+
+    #[test]
+    fn privacy_payload_is_exact_and_casefolded() {
+        let privacy = ScreenPrivacy::from_core_payload(&serde_json::json!({
+            "schemaVersion": 1,
+            "blockedProcesses": ["Vault.EXE", " "],
+            "blockedTitleKeywords": ["Online Banking"],
+        }))
+        .unwrap();
+        assert_eq!(privacy.blocked_processes, ["vault.exe"]);
+        assert_eq!(privacy.blocked_title_keywords, ["online banking"]);
+        for invalid in [
+            serde_json::json!({"schemaVersion": 2, "blockedProcesses": [], "blockedTitleKeywords": []}),
+            serde_json::json!({"schemaVersion": 1, "blockedProcesses": [7], "blockedTitleKeywords": []}),
+            serde_json::json!({"schemaVersion": 1, "blockedProcesses": []}),
+            serde_json::json!({
+                "schemaVersion": 1, "blockedProcesses": [], "blockedTitleKeywords": [], "extra": true
+            }),
+        ] {
+            assert!(
+                ScreenPrivacy::from_core_payload(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_observation_skips_our_window_and_private_windows() {
+        let privacy = ScreenPrivacy {
+            blocked_processes: vec!["vault.exe".to_string()],
+            blocked_title_keywords: vec!["online banking".to_string()],
+        };
+        let window = |pid: u32, process: &str, title: &str| ForegroundWindow {
+            process_id: pid,
+            process_name: process.to_string(),
+            title: title.to_string(),
+        };
+        assert_eq!(
+            screen_observation_block(&privacy, Some(&window(7, "sakura.exe", "Sakura")), 7),
+            Some(SCREEN_OBSERVATION_SELF)
+        );
+        assert_eq!(
+            screen_observation_block(&privacy, Some(&window(8, "Vault.exe", "")), 7),
+            Some(SCREEN_OBSERVATION_PRIVACY_BLOCKED)
+        );
+        assert_eq!(
+            screen_observation_block(
+                &privacy,
+                Some(&window(8, "browser.exe", "My Online Banking - Browser")),
+                7
+            ),
+            Some(SCREEN_OBSERVATION_PRIVACY_BLOCKED)
+        );
+        assert_eq!(
+            screen_observation_block(&privacy, Some(&window(8, "editor.exe", "notes.txt")), 7),
+            None
+        );
+        assert_eq!(screen_observation_block(&privacy, None, 7), None);
+    }
+
+    #[test]
+    fn an_unchanged_screen_is_not_observed_twice() {
+        let root =
+            std::env::temp_dir().join(format!("sakura-awareness-test-{}", Uuid::new_v4().simple()));
+        let manager = CaptureManager::with_base(root.clone()).unwrap();
+        let generation_id = "00000000-0000-4000-8000-000000004007";
+        let gradient =
+            image::RgbaImage::from_fn(90, 80, |x, _| image::Rgba([(x * 2) as u8, 0, 0, 255]));
+        let reversed =
+            image::RgbaImage::from_fn(90, 80, |x, _| image::Rgba([(250 - x * 2) as u8, 0, 0, 255]));
+        let first = awareness_dhash(&gradient);
+        assert_eq!(first, awareness_dhash(&gradient.clone()));
+        assert_ne!(first, awareness_dhash(&reversed));
+
+        manager
+            .push_screen_awareness_frame(generation_id, awareness_frame("first", 8), 2)
+            .unwrap();
+        assert!(manager.note_awareness_dhash(generation_id, first).is_ok());
+        assert_eq!(
+            manager
+                .note_awareness_dhash(generation_id, first ^ 0b1111)
+                .unwrap_err(),
+            SCREEN_OBSERVATION_UNCHANGED
+        );
+        assert!(manager
+            .note_awareness_dhash(generation_id, awareness_dhash(&reversed))
+            .is_ok());
+        assert!(manager
+            .note_awareness_dhash(
+                "00000000-0000-4000-8000-000000004008",
+                awareness_dhash(&reversed)
+            )
+            .is_ok());
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
