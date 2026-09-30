@@ -1230,6 +1230,11 @@ def _project_memory(raw: Mapping[str, object], scope: str) -> dict[str, object] 
         "lastAccessedAt": str(field("last_accessed_at")),
         "score": _safe_number(raw.get("score"), default=None),
     }
+    semantic = _safe_number(raw.get("semantic_score"), default=None)
+    if semantic is not None:
+        projected["semanticScore"] = semantic
+    if field("volatile") is True:
+        projected["volatile"] = True
     optional_fields = {
         "sourceTurnId": field("source_turn_id"),
         "sourceEntryIds": field("source_entry_ids", []),
@@ -1238,6 +1243,9 @@ def _project_memory(raw: Mapping[str, object], scope: str) -> dict[str, object] 
         "expiresAt": field("expires_at"),
         "validUntil": field("valid_until"),
         "status": field("status"),
+        "memoryKind": field("memory_kind"),
+        "eventTime": field("event_time"),
+        "emotion": field("emotion"),
     }
     for key, value in optional_fields.items():
         if key == "sourceEntryIds":

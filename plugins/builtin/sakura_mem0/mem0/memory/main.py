@@ -1422,6 +1422,8 @@ class Memory(MemoryBase):
                 updated_at=payload.get("updated_at"),
                 score=scored["score"],
             ).model_dump()
+            if "semantic_score" in scored:
+                memory_item_dict["semantic_score"] = scored["semantic_score"]
 
             for key in promoted_payload_keys:
                 if key in payload:
@@ -2840,6 +2842,8 @@ class AsyncMemory(MemoryBase):
                 updated_at=payload.get("updated_at"),
                 score=scored["score"],
             ).model_dump()
+            if "semantic_score" in scored:
+                memory_item_dict["semantic_score"] = scored["semantic_score"]
 
             for key in promoted_payload_keys:
                 if key in payload:

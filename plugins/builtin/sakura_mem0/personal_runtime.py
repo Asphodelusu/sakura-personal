@@ -19,6 +19,7 @@ if __package__:
         read_personal_core_profile,
     )
     from .personal_emotion import DEFAULT_EMOTION, EmotionScorer
+    from .personal_recall import CrossEncoderReranker, PersonalRecallPolicy
     from .personal_mood import (
         PersonalEmotionStore,
         PersonalMoodStore,
@@ -41,6 +42,7 @@ else:
         read_personal_core_profile,
     )
     from personal_emotion import DEFAULT_EMOTION, EmotionScorer
+    from personal_recall import CrossEncoderReranker, PersonalRecallPolicy
     from personal_mood import (
         PersonalEmotionStore,
         PersonalMoodStore,
@@ -81,7 +83,8 @@ class _CurationStore(PersonalCurationStore):
 
 
 class PersonalRecallBoundary:
-    def __init__(self, memory_dir, character_id, snapshot, *, curation_options=None, daily=False):
+    def __init__(self, memory_dir, character_id, snapshot, *, curation_options=None, daily=False,
+                 reranker_snapshot=None):
         memory_dir = Path(memory_dir).absolute()
         root = memory_dir.parent.parent
         # Plugin workers cannot import Core's migration modules. Check only the
@@ -109,6 +112,12 @@ class PersonalRecallBoundary:
         self._pending_timeline = None
         self._status = "loading"
         self._closed = False
+        self.recall_policy = PersonalRecallPolicy(
+            memory_dir,
+            reranker=CrossEncoderReranker(reranker_snapshot) if reranker_snapshot is not None else None,
+            list_memories=lambda: self.list_memories(limit=200),
+            record_access=daily,
+        )
         self._thread = threading.Thread(target=self._load, args=(memory_dir, snapshot),
                                         name="sakura-personal-memory-load", daemon=True)
         self._thread.start()
@@ -351,6 +360,7 @@ class PersonalRecallBoundary:
             self._status = "stopped"
             self._pending_timeline = None
         self._thread.join()
+        self.recall_policy.close()
         # Do not hold the recall lock while joining the curation worker.
         if self._curation is not None:
             self._curation.close()

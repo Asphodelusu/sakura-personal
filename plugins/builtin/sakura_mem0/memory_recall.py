@@ -58,9 +58,10 @@ class MemoryRecallService:
         if not query:
             _log_recall_finished(started_at, status="skipped", candidates=0, selected=0)
             return MemoryRecallResult(query="")
+        policy = getattr(self.memory, "recall_policy", None)
         try:
             response = self.memory.search_memory(
-                {"query": query, "limit": DEFAULT_MEMORY_RECALL_CANDIDATES},
+                {"query": query, "limit": getattr(policy, "candidates", DEFAULT_MEMORY_RECALL_CANDIDATES)},
                 wait=False,
             )
         except Exception as exc:  # noqa: BLE001 - 记忆故障不得阻断普通聊天
@@ -105,6 +106,8 @@ class MemoryRecallService:
             )
             return MemoryRecallResult(status="failed", query=query)
 
+        if policy is not None:
+            return self._recall_with_policy(policy, request, query, memories, started_at)
         selected = _select_memories(
             memories,
             self.threshold,
@@ -137,6 +140,35 @@ class MemoryRecallService:
             selected=len(fragments),
         )
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
+
+    def _recall_with_policy(self, policy, request, query, memories, started_at) -> MemoryRecallResult:
+        selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id)
+        fragments = tuple(
+            ContextFragment(
+                fragment_id=f"memory.{memory['id'] or index}",
+                source="memory",
+                content=policy.annotate(memory),
+                trust="trusted" if memory["source"] == "explicit" else "untrusted",
+                priority=_policy_value(policy, "priority", memory, 70),
+                freshness=memory["updated_at"],
+                token_budget=_policy_value(policy, "budget", memory, 512),
+                sensitivity="private",
+                cache_scope="turn",
+                metadata={
+                    "memory_id": memory["id"],
+                    "score": memory["relevance"],
+                    "source": memory["source"],
+                },
+            )
+            for index, memory in enumerate(selected)
+        )
+        _log_recall_finished(started_at, status="ready", candidates=len(memories), selected=len(fragments))
+        return MemoryRecallResult(fragments=fragments, status="ready", query=query)
+
+
+def _policy_value(policy: Any, name: str, memory: dict[str, Any], default: int) -> int:
+    reader = getattr(policy, name, None)
+    return int(reader(memory)) if callable(reader) else default
 
 
 def _log_recall_finished(

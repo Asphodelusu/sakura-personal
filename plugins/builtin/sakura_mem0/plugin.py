@@ -808,9 +808,13 @@ class SakuraMem0Plugin:
                     "model_catalog_getter": slots.catalog,
                     "model_resolver": slots.resolve,
                 }
+            config_reader = getattr(getattr(context, "config", None), "get", None)
+            reranker = _mapping(config_reader() if callable(config_reader) else None).get("personalReranker")
             boundary = PersonalRecallBoundary(Path(storage.resolve("data", "memory")),
                                               character_id, self._personal_snapshot,
-                                              curation_options=curation_options, daily=self._personal_daily)
+                                              curation_options=curation_options, daily=self._personal_daily,
+                                              reranker_snapshot=(Path(reranker) if isinstance(reranker, str)
+                                                                 and Path(reranker).is_absolute() else None))
             runtime = SakuraMem0Runtime(Path(getattr(context, "data_path")(".")),
                                        character_id, boundary=boundary, timeline=timeline)
         else:

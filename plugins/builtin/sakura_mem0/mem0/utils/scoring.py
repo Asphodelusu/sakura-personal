@@ -113,6 +113,7 @@ def score_and_rank(
             {
                 "id": mem_id_str,
                 "score": combined,
+                "semantic_score": semantic_score,
                 "payload": result.get("payload"),
             }
         )
