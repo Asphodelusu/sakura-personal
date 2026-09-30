@@ -153,6 +153,10 @@ class AgentRuntime:
 
         self._intimacy = IntimacyModeState()
         self._intimacy_guide = ""
+        from app.agent.initiative import InitiativeArbiter
+
+        self._initiative = InitiativeArbiter()
+        self._initiative_client: object | None = None
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -286,6 +290,94 @@ class AgentRuntime:
         action = apply_intimacy_user_utterance(text, self._intimacy, available=bool(self._intimacy_guide))
         if self._intimacy.active and action not in {"entered", "already_on"}:
             self._intimacy.refresh_user_reply()
+
+    def configure_initiative(
+        self,
+        settings: object,
+        *,
+        client: object | None,
+        clock: Any = None,
+        idle_seconds: Any = None,
+    ) -> None:
+        from app.agent.initiative import InitiativeArbiter
+        from app.config.relationship_initiative import RelationshipInitiativeSettings
+
+        options = {key: value for key, value in (("clock", clock), ("idle_seconds", idle_seconds)) if value is not None}
+        arbiter = InitiativeArbiter(**options)
+        if isinstance(settings, RelationshipInitiativeSettings):
+            arbiter.configure(settings)
+        self._initiative = arbiter
+        self._initiative_client = client
+
+    def note_initiative_user_turn(self) -> None:
+        self._initiative.note_user_spoke()
+
+    def initiative_gate_reason(self) -> str:
+        return self._initiative.gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+
+    def run_relationship_initiative(
+        self,
+        recent_messages: list[ChatMessage],
+        *,
+        relationship_facts: str,
+        cancel_checker: CancelChecker | None = None,
+    ) -> ChatReply | None:
+        """One gated decision; ``None`` means Sakura stays quiet this time."""
+        from datetime import datetime
+
+        from app.agent.initiative import (
+            DECISION_MAX_TOKENS,
+            DECISION_TEMPERATURE,
+            build_relationship_decision_messages,
+            decision_to_reply,
+            parse_relationship_decision,
+        )
+        from app.agent.inner_thought import format_recent_dialogue
+
+        arbiter = self._initiative
+        if self.initiative_gate_reason() != "eligible":
+            return None
+        complete = getattr(self._initiative_client, "complete_raw", None)
+        if not callable(complete):
+            return None
+        attempt = arbiter.begin_attempt()
+        try:
+            drive_summary = self._relationship.summary(fresh=True)
+        except Exception:  # noqa: BLE001 - a missing drive summary only narrows context
+            drive_summary = ""
+        system, messages = build_relationship_decision_messages(
+            system_prompt=self.system_prompt,
+            relationship_guide=self._relationship_guide,
+            expression_bias=self._expression_bias,
+            now_iso=datetime.now().astimezone().isoformat(timespec="seconds"),
+            since_user_seconds=arbiter.seconds_since_user(),
+            recent_dialogue=format_recent_dialogue(recent_messages),
+            relationship_facts=relationship_facts,
+            drive_summary=str(drive_summary or ""),
+        )
+        try:
+            check_cancelled(cancel_checker)
+            raw = complete(system, messages, temperature=DECISION_TEMPERATURE, max_tokens=DECISION_MAX_TOKENS)
+            check_cancelled(cancel_checker)
+            decision = parse_relationship_decision(raw)
+        except OperationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed decision is recorded as silence
+            log_event(
+                "RelationshipInitiative",
+                "关系主动判定失败",
+                {"code": "RELATIONSHIP_INITIATIVE_DECISION_FAILED", "error_type": type(exc).__name__},
+                severity="info",
+            )
+            decision = None
+        if not arbiter.is_current(attempt):
+            return None
+        reply = decision_to_reply(decision, allowed_tones=self._effective_reply_tones())
+        if reply is None:
+            arbiter.mark_silent()
+            return None
+        arbiter.mark_spoken()
+        return reply
 
     def _effective_reply_tones(self) -> list[str]:
         """Configured tones; the active intimacy layer adds its extra tones if missing."""

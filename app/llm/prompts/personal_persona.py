@@ -149,6 +149,96 @@ def _select_intimacy_persona_sections(markdown: str, max_chars: int) -> str:
     )
 
 
+_BEHAVIOR_CORE_HEADINGS = (
+    "她怎样存在",
+    "判断、选择与修复",
+    "语言与节奏",
+)
+
+
+def _markdown_leading_text(markdown: str) -> str:
+    match = re.search(r"(?m)^##\s+[^\n]+?\s*$", markdown)
+    return markdown[: match.start()].strip() if match else markdown.strip()
+
+
+def _trim_plain(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rstrip()
+    for sep in ("\n\n", "\n", "。", "；", "，"):
+        pos = cut.rfind(sep)
+        if pos >= max_chars // 2:
+            cut = cut[: pos + len(sep)].rstrip()
+            break
+    return cut
+
+
+def _desktop_identity_lines(desktop_body: str) -> str:
+    chosen: list[str] = []
+    for line in desktop_body.splitlines():
+        stripped = line.strip()
+        if stripped and ("数字生命" in stripped or "对等" in stripped):
+            chosen.append(stripped)
+        if len(chosen) >= 2:
+            break
+    return "\n".join(chosen)
+
+
+def extract_character_identity_anchor(system_prompt: str) -> str:
+    """Extract L0 identity/person/digital-life positioning from a merged prompt."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    explicit = labeled.get("身份锚", "").strip()
+    if explicit:
+        return explicit
+    parts: list[str] = []
+    identity = _heading_body(labeled.get("演出约束", "") or text, _IDENTITY_HEADING)
+    if identity:
+        parts.append(f"## {_IDENTITY_HEADING}\n{identity}")
+    desktop = _desktop_identity_lines(labeled.get("互动方式", ""))
+    if desktop:
+        parts.append(desktop)
+    return "\n\n".join(parts).strip()
+
+
+def _render_behavior_sections(selected: list[tuple[str, str]], max_chars: int) -> str:
+    if max_chars <= 0:
+        return "\n\n".join(f"## {title}\n{body.strip()}" for title, body in selected)
+    heading_cost = sum(len(f"## {title}\n") + (2 if index else 0) for index, (title, _body) in enumerate(selected))
+    body_budget = max(24 * len(selected), max_chars - heading_cost)
+    per_section = max(24, body_budget // len(selected))
+    text = "\n\n".join(
+        f"## {title}\n{compact}" for title, body in selected if (compact := _trim_plain(body, per_section))
+    )
+    return _trim_plain(text, max_chars) if len(text) > max_chars else text
+
+
+def select_character_behavior_core(system_prompt: str, *, max_chars: int = 800) -> str:
+    """Select L1 behavior headings from a merged prompt or raw card. Never head-clip guards."""
+    text = (system_prompt or "").strip()
+    if not text:
+        return ""
+    labeled = {title: body for title, body in _split_labeled_prompt_sections(text) if title}
+    card = labeled.get("人格设定", "")
+    source = card or text
+    exact = {title: body for title, body in _split_markdown_heading_sections(source)}
+    selected = [(title, exact[title]) for title in _BEHAVIOR_CORE_HEADINGS if title in exact]
+    focus = labeled.get("当下专注", "").strip()
+    extras = [labeled.get("互动方式", "").strip(), f"【当下专注】\n{focus}" if focus else ""]
+    if selected:
+        core = _render_behavior_sections(selected, max_chars)
+        leading = _markdown_leading_text(card) if max_chars <= 0 else ""
+        return "\n\n".join(part for part in (leading, core, *extras) if part).strip()
+    if card:
+        return "\n\n".join(part for part in (_trim_plain(card, max_chars), *extras) if part).strip()
+    if "演出约束" in labeled:
+        return ""
+    return _trim_plain(text, max_chars)
+
+
 def soften_character_card_for_intimacy(
     system_prompt: str,
     *,
