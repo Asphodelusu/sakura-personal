@@ -25,6 +25,12 @@ pub struct ChatSendRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChatInitiativeRequest {
+    pub kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatCancelRequest {
     pub operation_id: String,
     pub cancel_handle: String,
@@ -136,6 +142,21 @@ impl ChatBridge {
         version: String,
     ) -> Result<PendingChatSend, String> {
         self.send_payload(window_label, json!({"event": event}), Some(version))
+    }
+
+    pub fn send_initiative(
+        &self,
+        window_label: &str,
+        kind: &str,
+    ) -> Result<PendingChatSend, String> {
+        if !crate::core_host_gateway::INITIATED_EVENT_TYPES.contains(&kind) {
+            return Err("CHAT_INITIATIVE_KIND_INVALID".to_string());
+        }
+        self.send_payload(
+            window_label,
+            json!({"event": {"type": kind, "payload": {}}}),
+            None,
+        )
     }
 
     fn send_payload(
@@ -592,6 +613,44 @@ mod tests {
             .unwrap();
         assert_eq!(completed.update_version.as_deref(), Some("1.2.0"));
         assert!(!serde_json::to_string(&completed).unwrap().contains("1.2.0"));
+    }
+
+    #[test]
+    fn initiated_turns_accept_only_known_kinds_and_tolerate_a_silent_completion() {
+        let bridge = bridge();
+        assert_eq!(
+            bridge.send_initiative("main", "screen_peek").err().unwrap(),
+            "CHAT_INITIATIVE_KIND_INVALID"
+        );
+        assert!(bridge
+            .send_initiative("settings", "relationship_initiative")
+            .is_err());
+        let pending = bridge
+            .send_initiative("main", "relationship_initiative")
+            .unwrap();
+        let operation_id = pending.publication.operation_id.clone();
+        assert_eq!(
+            bridge
+                .send_initiative("main", "intimacy_continue")
+                .err()
+                .unwrap(),
+            "CHAT_INTERACTION_ACTIVE"
+        );
+        pending.wait().unwrap();
+        bridge
+            .observe_event(&event(&operation_id, "chat.started"))
+            .unwrap()
+            .unwrap();
+        let mut silent = event(&operation_id, "chat.completed");
+        silent["payload"]["reply"]["segments"] = json!([]);
+        let completed = bridge.observe_event(&silent).unwrap().unwrap();
+        assert_eq!(completed.event_type, "chat.completed");
+        assert!(bridge.send_initiative("main", "intimacy_continue").is_ok());
+        assert!(serde_json::from_value::<ChatInitiativeRequest>(json!({
+            "kind": "relationship_initiative",
+            "payload": {"message": "forged"}
+        }))
+        .is_err());
     }
 
     #[test]

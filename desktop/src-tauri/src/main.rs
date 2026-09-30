@@ -3393,6 +3393,27 @@ async fn chat_send(
 }
 
 #[tauri::command]
+async fn chat_initiative_send(
+    window: WebviewWindow,
+    payload: chat_bridge::ChatInitiativeRequest,
+    lifecycle: State<'_, ShellLifecycleState>,
+) -> Result<chat_bridge::ChatSendPublication, String> {
+    if window.label() != "main" {
+        return Err("PET_WINDOW_REQUIRED".to_string());
+    }
+    let handle = lifecycle
+        .handle
+        .as_ref()
+        .ok_or_else(|| "CHAT_BRIDGE_UNAVAILABLE".to_string())?;
+    let pending = handle
+        .chat_bridge()?
+        .send_initiative(window.label(), &payload.kind)?;
+    tauri::async_runtime::spawn_blocking(move || pending.wait())
+        .await
+        .map_err(|_| "CHAT_DISPATCH_ABORTED".to_string())?
+}
+
+#[tauri::command]
 async fn chat_cancel(
     window: WebviewWindow,
     payload: chat_bridge::ChatCancelRequest,
@@ -8401,6 +8422,7 @@ fn main() {
             collect_native_diagnostics,
             runtime_lifecycle_snapshot,
             chat_send,
+            chat_initiative_send,
             chat_cancel,
             start_screen_capture,
             capture_selected_region,

@@ -22,6 +22,8 @@ pub const CHAT_SEND_DEADLINE: Duration = Duration::from_secs(30);
 pub const CHAT_CANCEL_DEADLINE: Duration = Duration::from_secs(1);
 const ALLOWED_WINDOW: &str = "main";
 const CHAT_TERMINALS: [&str; 3] = ["chat.completed", "chat.failed", "chat.cancelled"];
+pub(crate) const INITIATED_EVENT_TYPES: [&str; 2] =
+    ["intimacy_continue", "relationship_initiative"];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) trait GatewayTransport: Send + Sync {
@@ -347,7 +349,15 @@ fn validate_chat_payload(payload: &Value) -> Result<(), String> {
         .as_object()
         .ok_or_else(|| "INVALID_CHAT_PAYLOAD: payload must be an object".to_string())?;
     if object.len() == 1 && object.contains_key("event") {
-        validate_update_available_event(object.get("event"))?;
+        let event = object.get("event");
+        let kind = event
+            .and_then(|event| event.get("type"))
+            .and_then(Value::as_str);
+        if kind.is_some_and(|kind| INITIATED_EVENT_TYPES.contains(&kind)) {
+            validate_initiated_event(event)?;
+        } else {
+            validate_update_available_event(event)?;
+        }
         if serde_json::to_vec(payload).map_or(true, |encoded| encoded.len() > CHAT_PAYLOAD_LIMIT) {
             return Err("CHAT_PAYLOAD_TOO_LARGE: payload exceeds its limit".to_string());
         }
@@ -378,6 +388,21 @@ fn validate_chat_payload(payload: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_initiated_event(event: Option<&Value>) -> Result<(), String> {
+    let valid = event.and_then(Value::as_object).is_some_and(|event| {
+        event.len() == 2
+            && event
+                .get("payload")
+                .and_then(Value::as_object)
+                .is_some_and(|payload| payload.is_empty())
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err("INVALID_CHAT_PAYLOAD: initiated event is invalid".to_string())
+    }
 }
 
 fn validate_update_available_event(event: Option<&Value>) -> Result<(), String> {
@@ -622,6 +647,26 @@ mod tests {
             }}}),
         ] {
             assert!(validate_chat_payload(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn initiated_send_carries_only_its_kind_and_an_empty_payload() {
+        for kind in INITIATED_EVENT_TYPES {
+            let valid = json!({"event": {"type": kind, "payload": {}}});
+            assert!(validate_chat_payload(&valid).is_ok(), "{kind}");
+            for invalid in [
+                json!({"event": {"type": kind, "payload": {"message": "forged"}}}),
+                json!({"event": {"type": kind, "payload": null}}),
+                json!({"event": {"type": kind}}),
+                json!({"event": {"type": kind, "payload": {}, "prompt": "forged"}}),
+                json!({"event": {"type": kind, "payload": {}}, "message": "forged"}),
+            ] {
+                assert!(
+                    validate_chat_payload(&invalid).is_err(),
+                    "{kind}: {invalid}"
+                );
+            }
         }
     }
 
