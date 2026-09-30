@@ -254,6 +254,21 @@ class MemoryCurator:
         event_counts: dict[str, int] = {}
         core_candidates: list[dict[str, Any]] = []
         mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
+        discipline = self._discipline()
+        review: list[dict[str, Any]] = []
+        review_injected = False
+        prior_writes: list[str] = []
+        if discipline is not None:
+            try:
+                initial = self._load_existing_memories()
+                closed = discipline.sweep_stale_commitments(self.memory_store, initial)
+                if closed:
+                    event_counts["COMMITMENT_SWEPT"] = closed
+                review = discipline.commitments_for_review(initial)
+            except OperationCancelled:
+                raise
+            except Exception:  # noqa: BLE001 - the sweep never blocks curation
+                review = []
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -262,6 +277,10 @@ class MemoryCurator:
             # 每个 chunk 整理前重新拉取全量记忆，确保前一段写入的记忆能被后一段对照，避免重复。
             existing = self._load_existing_memories()
             check_cancelled(cancel_checker)
+            review_block = ""
+            if discipline is not None and review and not review_injected:
+                review_block = discipline.format_review(review)
+                review_injected = bool(review_block)
             operations = self._extract_operations(
                 dialog_entries,
                 existing,
@@ -276,6 +295,8 @@ class MemoryCurator:
                     )
                 ),
                 cancel_checker=cancel_checker,
+                review_block=review_block,
+                prior_writes=prior_writes,
             )
             check_cancelled(cancel_checker)
             operations, accepted, dropped = self._split_core_candidates(operations, chunk, len(core_candidates))
@@ -290,12 +311,21 @@ class MemoryCurator:
                 source_entry_ids=source_entry_ids,
                 cancel_checker=cancel_checker,
                 mood_budget=mood_budget,
+                dialog_entries=dialog_entries,
             )
             created += counts["created"]
             updated += counts["updated"]
             archived += counts["archived"]
             ignored += counts["ignored"]
             _merge_event_counts(event_counts, counts["event_counts"])
+            prior_writes = [*prior_writes, *counts.get("written_contents", [])][-12:]
+        if discipline is not None and review_injected:
+            try:
+                event_counts["EXPIRY_REVIEWED"] = discipline.mark_reviewed(self.memory_store, review)
+            except OperationCancelled:
+                raise
+            except Exception:  # noqa: BLE001 - an unmarked review is simply offered again
+                pass
         return MemoryCurationResult(
             created=created,
             updated=updated,
@@ -328,6 +358,16 @@ class MemoryCurator:
             )
             raise MemoryCurationError("MEMORY_CURATION_SNAPSHOT_FAILED") from exc
 
+    def _discipline(self) -> Any:
+        """The personal Qt-era discipline module, or None for the upstream curator."""
+        if getattr(self.memory_store, "personal_discipline", False) is not True:
+            return None
+        try:
+            from . import personal_curation_discipline
+        except ImportError:
+            import personal_curation_discipline
+        return personal_curation_discipline
+
     def _build_self_curation_system_prompt(self) -> str:
         descriptions = {"semantic": "长期事实", "episodic": "已经发生的事件总结",
                         "procedural": "稳定的协作规则/偏好", "session": "当前任务短期状态",
@@ -335,7 +375,14 @@ class MemoryCurator:
         layers = getattr(self.memory_store, "curation_layers", MEMORY_LAYERS)
         guidance = "请为每条候选记忆选择本存储支持的 layer：" + "，".join(
             f"{layer}={descriptions[layer]}" for layer in descriptions if layer in layers) + "。"
-        task_prompt = _SELF_CURATION_TASK_PROMPT.replace("{layer_guidance}", guidance)
+        discipline = self._discipline()
+        if discipline is not None:
+            # A background JSON task: the discipline plus a minimal identity anchor, not the full card.
+            task_prompt = discipline.identity_anchor(getattr(self.memory_store, "character_name", "")) + (
+                discipline.PERSONAL_CURATION_TASK_PROMPT.replace("{layer_guidance}", guidance)
+            )
+        else:
+            task_prompt = _SELF_CURATION_TASK_PROMPT.replace("{layer_guidance}", guidance)
         if self.accept_core_candidates:
             task_prompt += (
                 "\n若本次对话有双方原话支持的稳定认识，可在 operations 中额外加入最多 5 条 "
@@ -343,9 +390,11 @@ class MemoryCurator:
                 "user_excerpt、assistant_excerpt、confidence。"
                 "两段 excerpt 必须是本次对话原句，不要填写证据 id、批次或 scope。\n"
             )
+            if discipline is not None:
+                task_prompt += discipline.CORE_CANDIDATE_RULES
         if getattr(self.memory_store, "mood_store", None) is not None:
             task_prompt += _MOOD_CURATION_GUIDANCE
-        if not self.system_prompt:
+        if not self.system_prompt or discipline is not None:
             return task_prompt
         return f"{self.system_prompt}\n\n{task_prompt}"
 
@@ -357,17 +406,34 @@ class MemoryCurator:
         curation_turn_ids: tuple[str, ...] = (),
         curation_evidence_kinds: tuple[str, ...] = (),
         cancel_checker: CancelChecker | None = None,
+        review_block: str = "",
+        prior_writes: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """让模型以第一人称对照已有记忆，产出整理操作；解析失败必须重试。"""
 
         system_prompt = self._build_self_curation_system_prompt()
-        user_prompt = _build_curation_user_prompt(
-            _format_existing_memories(existing),
-            dialog_entries,
-        )
+        discipline = self._discipline()
         trajectories = _format_mood_trajectories(self.memory_store)
-        if trajectories:
-            user_prompt = f"{user_prompt}\n\n{trajectories}"
+        if discipline is not None:
+            parts = ["【我目前的长期记忆】\n" + discipline.format_existing(
+                [memory for memory in existing if str(memory.get("status") or (memory.get("metadata") or {}).get("status") or "") != "released"]
+            )]
+            if trajectories:
+                parts.append(trajectories)
+            if review_block:
+                parts.append(f"【刚过期的约定（一次性回顾）】\n{review_block}")
+            written = [f"- {text}" for text in prior_writes or [] if text.strip()]
+            if written:
+                parts.append("【本轮整理前段已写入（勿再 add 同义内容；需要时 update）】\n" + "\n".join(written))
+            parts.append("【最近的新对话】\n" + discipline.format_dialog(dialog_entries))
+            user_prompt = "\n\n".join(parts)
+        else:
+            user_prompt = _build_curation_user_prompt(
+                _format_existing_memories(existing),
+                dialog_entries,
+            )
+            if trajectories:
+                user_prompt = f"{user_prompt}\n\n{trajectories}"
         raw = self.api_client.complete_raw(
             system_prompt,
             [{"role": "user", "content": user_prompt}],
@@ -458,6 +524,7 @@ class MemoryCurator:
         source_entry_ids: list[str],
         cancel_checker: CancelChecker | None = None,
         mood_budget: dict[str, int] | None = None,
+        dialog_entries: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """逐条写回；失败或取消时立即停止，保留已提交操作供来源去重。"""
         if mood_budget is None:
@@ -474,7 +541,24 @@ class MemoryCurator:
         archived = 0
         ignored = 0
         event_counts: dict[str, int] = {}
-        for operation in operations[:MAX_CURATION_OPERATIONS]:
+        written_contents: list[str] = []
+        discipline = self._discipline()
+        operations = operations[:MAX_CURATION_OPERATIONS]
+        if discipline is not None:
+            operations, rejected = self._discipline_gate(discipline, operations, existing, dialog_entries or [], event_counts)
+            ignored += rejected
+
+        def payload(operation: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+            return discipline.enriched_payload(operation, base) if discipline is not None else base
+
+        def supersede(operation: dict[str, Any], exclude_ids: set[str]) -> None:
+            if discipline is None:
+                return
+            expired = discipline.expire_superseded_volatile(self.memory_store, existing, operation, exclude_ids=exclude_ids)
+            if expired:
+                event_counts["SUPERSEDE_VOLATILE"] = event_counts.get("SUPERSEDE_VOLATILE", 0) + expired
+
+        for operation in operations:
             check_cancelled(cancel_checker)
             if not isinstance(operation, dict):
                 ignored += 1
@@ -542,7 +626,7 @@ class MemoryCurator:
                         matched_id = str(matched.get("id") or "").strip()
                         if matched_id in existing_ids:
                             self.memory_store.update_memory(
-                                {
+                                payload(operation, {
                                     "id": matched_id,
                                     "content": content,
                                     "layer": layer,
@@ -551,18 +635,20 @@ class MemoryCurator:
                                     "confidence": confidence,
                                     "source": "self_curation",
                                     "source_entry_ids": source_entry_ids,
-                                },
+                                }),
                                 allow_sensitive=True,
                             )
                             matched["content"] = content
                             matched["layer"] = layer
                             matched["category"] = category
                             updated += 1
+                            written_contents.append(content)
                             operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                             event_counts["MERGE_UPDATE"] = event_counts.get("MERGE_UPDATE", 0) + 1
+                            supersede(operation, {matched_id})
                             continue
                     self.memory_store.create_memory(
-                        {
+                        payload(operation, {
                             "content": content,
                             "layer": layer,
                             "category": category,
@@ -570,12 +656,14 @@ class MemoryCurator:
                             "confidence": confidence,
                             "source": "self_curation",
                             "source_entry_ids": source_entry_ids,
-                        },
+                        }),
                         allow_sensitive=True,
                     )
                     created += 1
+                    written_contents.append(content)
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["ADD"] = event_counts.get("ADD", 0) + 1
+                    supersede(operation, set())
                 elif action == "update":
                     if memory_id not in existing_ids or not content:
                         log_event(
@@ -586,7 +674,7 @@ class MemoryCurator:
                         ignored += 1
                         continue
                     self.memory_store.update_memory(
-                        {
+                        payload(operation, {
                             "id": memory_id,
                             "content": content,
                             "layer": layer,
@@ -595,12 +683,14 @@ class MemoryCurator:
                             "confidence": confidence,
                             "source": "self_curation",
                             "source_entry_ids": source_entry_ids,
-                        },
+                        }),
                         allow_sensitive=True,
                     )
                     updated += 1
+                    written_contents.append(content)
                     operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["UPDATE"] = event_counts.get("UPDATE", 0) + 1
+                    supersede(operation, {memory_id})
                 elif action == "delete":
                     if memory_id not in existing_ids:
                         log_event("Memory", "跳过无效的记忆删除操作", {"id": memory_id})
@@ -642,8 +732,64 @@ class MemoryCurator:
             "archived": archived,
             "ignored": ignored,
             "event_counts": event_counts,
+            "written_contents": written_contents,
         }
 
+    def _discipline_gate(
+        self,
+        discipline: Any,
+        operations: list[dict[str, Any]],
+        existing: list[dict[str, Any]],
+        dialog_entries: list[dict[str, str]],
+        event_counts: dict[str, int],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Qt-era checks in write order: updates and deletes before adds."""
+        corpus = discipline.dialog_corpus(dialog_entries)
+        prior = {str(memory.get("id") or "").strip(): str(memory.get("content") or "") for memory in existing}
+        name = str(getattr(self.memory_store, "character_name", "") or "")
+        kept: list[dict[str, Any]] = []
+        accepted_texts: list[str] = []
+        completed_texts: list[str] = []
+        rejected = 0
+
+        def skip(code: str) -> None:
+            nonlocal rejected
+            rejected += 1
+            event_counts[code] = event_counts.get(code, 0) + 1
+
+        for operation in discipline.ordered_operations(operations):
+            action = str(operation.get("op") or operation.get("action") or "").strip().lower()
+            if action not in {"add", "update"}:
+                kept.append(operation)
+                continue
+            memory_id = str(operation.get("id") or operation.get("memory_id") or "").strip()
+            content = str(operation.get("content") or operation.get("memory") or "").strip()
+            ground = f"{corpus}\n{prior.get(memory_id, '')}" if action == "update" and memory_id else corpus
+            grounded, reason = discipline.grounding(content, discipline.operation_evidence(operation), ground)
+            if not grounded:
+                skip("SKIP_TRANSIENT" if reason == "transient_local" else "SKIP_UNGROUNDED")
+                continue
+            if discipline.commitment_missing_event_time(operation, existing, action=action, memory_id=memory_id):
+                skip("SKIP_COMMITMENT_NO_EVENT_TIME")
+                continue
+            if discipline.looks_like_third_person_self(content, name):
+                skip("SKIP_SPEAKER")
+                continue
+            if discipline.looks_trivial(content):
+                skip("SKIP_TRIVIAL")
+                continue
+            if action == "add":
+                if discipline.batch_near_duplicate(content, accepted_texts):
+                    skip("SKIP_BATCH_DUP")
+                    continue
+                if discipline.conflicts_with_completed_commitment(content, completed_texts):
+                    skip("SKIP_STALE_COMMITMENT")
+                    continue
+            if discipline.looks_like_completed_commitment(content):
+                completed_texts.append(content)
+            accepted_texts.append(content)
+            kept.append(operation)
+        return kept, rejected
 
     def _apply_mood_update(self, content: str, mood_budget: dict[str, int]) -> str:
         """One qualitative mood change per curation; a mood write never fails the job."""

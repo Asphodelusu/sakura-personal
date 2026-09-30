@@ -48,7 +48,8 @@ def rehearsal(tmp_path, dependencies, monkeypatch):
             pass
         def complete_raw(self, *args, **kwargs):
             calls.append(1)
-            return json.dumps({'operations': [{'op': 'add', 'content': '用户喜欢樱花', 'layer': 'semantic'}]})
+            return json.dumps({'operations': [{'op': 'add', 'content': '他让我记住樱花', 'layer': 'semantic',
+                                               'evidence': '请记住樱花'}]})
         def close(self):
             pass
     monkeypatch.setattr('plugins.builtin.sakura_mem0.boundary.OpenAICompatibleClient', Client)
@@ -220,7 +221,8 @@ def test_enabled_core_maintainer_updates_profile_after_cursor(rehearsal, daily):
         text = messages[0]["content"] if messages else ""
         if "【候補】" not in text:
             return json.dumps({"operations": [
-                {"op": "add", "content": "用户喜欢樱花", "layer": "semantic", "confidence": 0.9},
+                {"op": "add", "content": "他让我记住樱花", "layer": "semantic", "confidence": 0.9,
+                 "evidence": "请记住樱花"},
                 {"op": "core_candidate", "kind": "explicit", "target_section": "今の関係",
                  "subject_key": "relationship.identity", "claim": "我们明确确认了恋人关系。",
                  "user_excerpt": "我们是恋人吧。", "assistant_excerpt": "嗯，是恋人。",

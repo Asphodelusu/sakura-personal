@@ -141,6 +141,8 @@ class PersonalRecallBoundary:
             if self._curation_options is not None:
                 store = _CurationStore(records, self.scope, profile_candidates=True)
                 store.personal_daily = self._daily
+                store.personal_discipline = True
+                store.character_name = self.scope
                 if self._daily:
                     store.mood_store = PersonalMoodStore(memory_dir, self.scope, admit=self._admit_state_write)
                     store.emotion_store = PersonalEmotionStore(memory_dir, self.scope)

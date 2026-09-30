@@ -2606,6 +2606,8 @@ def _memory_metadata(
         metadata["volatile"] = True
     elif str(arguments.get("volatile", "")).strip().lower() == "false":
         metadata["volatile"] = False
+    if arguments.get("expiry_reviewed") is True:
+        metadata["expiry_reviewed"] = True
     return metadata
 
 
