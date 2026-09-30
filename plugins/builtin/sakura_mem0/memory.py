@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -390,6 +391,9 @@ def _import_mem0_dependencies() -> tuple[Any, Any, Any, Any]:
     _install_disabled_mem0_telemetry_module()
     _install_disabled_qdrant_grpc_module()
     _install_synchronous_qdrant_client_facade()
+    # The dependency root ships without spaCy; mem0 then keeps BM25 text unlemmatized
+    # and would otherwise warn about it on every worker start.
+    logging.getLogger("mem0.utils.spacy_models").setLevel(logging.ERROR)
     from mem0 import Memory
     import mem0.memory.main as mem0_memory_main
     from mem0.utils.factory import EmbedderFactory, VectorStoreFactory

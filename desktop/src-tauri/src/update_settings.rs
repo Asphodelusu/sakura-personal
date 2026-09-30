@@ -296,6 +296,15 @@ pub fn is_portable(executable_directory: &Path) -> bool {
     )
 }
 
+/// Release builds inject the update channel (tools/release/tauri_release_config.py);
+/// source and personal builds ship without one.
+fn updater_endpoints_configured(config: Option<&Value>) -> bool {
+    config
+        .and_then(|config| config.get("endpoints"))
+        .and_then(Value::as_array)
+        .is_some_and(|endpoints| !endpoints.is_empty())
+}
+
 fn portable_mode(has_marker: bool, is_windows: bool) -> bool {
     has_marker && is_windows
 }
@@ -320,6 +329,23 @@ pub async fn check(
     let started = Instant::now();
     let portable = is_portable(executable_directory);
     let mode = update_mode(portable);
+    if !updater_endpoints_configured(app.config().plugins.0.get("updater")) {
+        submit_updater_event(
+            runtime_log,
+            Severity::Info,
+            "updater.check.completed",
+            "Updater check completed",
+            json!({
+                "stage": "configuration",
+                "trigger": trigger,
+                "mode": mode,
+                "status": "not_configured",
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "elapsed_ms": elapsed_ms(started),
+            }),
+        );
+        return Err("UPDATE_NOT_CONFIGURED".to_string());
+    }
     submit_updater_event(
         runtime_log,
         Severity::Info,
@@ -1238,6 +1264,18 @@ mod tests {
             pub_date: Some("2026-08-29T08:00:00Z".to_string()),
             download_url: None,
         }
+    }
+
+    #[test]
+    fn update_channel_requires_at_least_one_endpoint() {
+        assert!(!updater_endpoints_configured(None));
+        assert!(!updater_endpoints_configured(Some(
+            &json!({"endpoints": []})
+        )));
+        assert!(!updater_endpoints_configured(Some(&json!({"pubkey": ""}))));
+        assert!(updater_endpoints_configured(Some(
+            &json!({"endpoints": ["https://example.invalid/latest.json"]})
+        )));
     }
 
     #[test]

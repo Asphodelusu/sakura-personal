@@ -766,6 +766,7 @@ class AgentRuntime:
                 "error_type": "InvalidReplyStructure",
                 "raw_content": raw_content,
             },
+            severity="warning",
         )
         if self.agent_trace_recorder is not None:
             self.agent_trace_recorder.mark_repair_requested(trace_call, retry_reason)
