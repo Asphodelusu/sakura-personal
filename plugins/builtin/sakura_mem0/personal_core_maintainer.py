@@ -706,6 +706,13 @@ class CoreProfileMaintainer:
         try:
             if not decision.admitted:
                 return MaintainerRunResult(decision.reason, metrics)
+            upgrade = getattr(self.memory_store, "upgrade_legacy_core_profile", None)
+            if callable(upgrade):
+                try:
+                    upgrade()
+                except CoreProfileStorageError:
+                    self._reject(scope_id, metrics, "storage")
+                    return MaintainerRunResult("storage_error", metrics)
             repaired, profile = self._repair_partial(scope_id)
             repaired_set = set(repaired)
             selected = tuple(item for item in decision.selected if item.id not in repaired_set)
@@ -754,6 +761,7 @@ class CoreProfileMaintainer:
             try:
                 applied_ids, reviewed_ids, patched = self._apply(proposal.base_updated_at, operations)
             except CoreProfileStorageError:
+                self._reject(scope_id, metrics, "storage")
                 return MaintainerRunResult("storage_error", metrics)
             if patched is not None and applied_ids:
                 revision = _profile_updated_at(patched)
@@ -953,18 +961,11 @@ def _validate_proposal(
         raise MaintainerValidationError("operations")
     selected_by_id = {item.id: item for item in selected}
     current_sections = _profile_sections(profile)
-    has_legacy = bool(str(current_sections.get("legacy") or "").strip())
     migrate_ops = [item for item in proposal.operations if item.op == "migrate_legacy"]
     ordinary = [item for item in proposal.operations if item.op not in {"keep", "migrate_legacy"}]
-    if len(migrate_ops) > 1:
-        raise MaintainerValidationError("limits")
+    if migrate_ops:
+        raise MaintainerValidationError("legacy_read_only")
     if len(ordinary) > settings.max_sections_per_call:
-        raise MaintainerValidationError("limits")
-    if migrate_ops and len(ordinary) > 1:
-        raise MaintainerValidationError("limits")
-    if has_legacy and ordinary and not migrate_ops:
-        raise MaintainerValidationError("limits")
-    if ordinary and not has_legacy and migrate_ops:
         raise MaintainerValidationError("limits")
     ordinary_sections = [item.section for item in ordinary]
     if len(ordinary_sections) != len(set(ordinary_sections)):
@@ -1103,7 +1104,11 @@ def _build_prompts(
         if body:
             section_lines.append(f"＜{name}＞\n{body}")
     if str(sections.get("legacy") or "").strip():
-        section_lines.append(f"＜legacy＞\n{sections['legacy']}")
+        section_lines.append(
+            "＜これまでの記録（読み取り専用）＞\n"
+            f"{sections['legacy']}\n"
+            "（旧档案原文，只读参考：不要改写、不要逐句搬运；新认识只写进正式章节，旧档案已有的内容不必重复。）"
+        )
     candidate_blocks = []
     for item in selected:
         evidence_lines = []
@@ -1127,8 +1132,8 @@ def _build_prompts(
     user_prompt = "【現在の常駐档案】\n" + ("\n\n".join(section_lines) or "(empty)")
     user_prompt += "\n\n【候補】\n" + ("\n\n".join(candidate_blocks) or "(none)")
     user_prompt += (
-        "\n\nprotocol: keep/refine/replace/remove/migrate_legacy。"
-        "keep omits content; migrate_legacy uses sections map。"
+        "\n\nprotocol: keep/refine/replace/remove。"
+        "keep omits content。"
         "keys: base_updated_at, operations[].op|section|content|reason|candidate_ids|evidence_ids|sections。"
         f"base_updated_at={_profile_updated_at(profile)}"
     )

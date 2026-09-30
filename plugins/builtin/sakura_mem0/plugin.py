@@ -561,6 +561,11 @@ class SakuraMem0Runtime:
         )
         if current is None:
             raise ValueError("MEMORY_NOT_FOUND")
+        if self._is_profile_item(item_id):
+            edited = self._boundary.edit_core_profile_item(item_id, values.get("content", current.get("content")))
+            if edited is None:
+                raise ValueError("MEMORY_NOT_FOUND")
+            return _collection_item(edited)
         writable = {
             key: current.get(key)
             for key in ("content", "layer", "category", "source", "importance", "confidence")
@@ -570,6 +575,9 @@ class SakuraMem0Runtime:
         return _collection_item(_mapping(result.get("memory")))
 
     def delete_collection_item(self, item_id: str) -> dict[str, bool]:
+        if self._is_profile_item(item_id):
+            self._boundary.edit_core_profile_item(item_id, "")
+            return {"deleted": True}
         result = self._boundary.delete({"id": item_id})
         return {"deleted": not bool(result.get("alreadyMissing"))}
 
@@ -623,7 +631,18 @@ class SakuraMem0Runtime:
             if isinstance(raw, Mapping)
             and (item := _project_memory(raw, self._character_id)) is not None
         ]
+        profile_items = getattr(self._boundary, "core_profile_items", None)
+        if callable(profile_items):
+            try:
+                projected = [*profile_items(), *projected]
+            except Exception:
+                pass
         return projected
+
+    def _is_profile_item(self, item_id: str) -> bool:
+        return callable(getattr(self._boundary, "edit_core_profile_item", None)) and item_id.startswith(
+            f"core_profile:{self._character_id}#"
+        )
 
     def _record_model_progress(self, stage: str, progress: int) -> None:
         with self._task_lock:

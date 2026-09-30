@@ -27,6 +27,11 @@ CORE_PROFILE_FORMAL_SECTIONS = (
 )
 CORE_PROFILE_FORMAL_SECTION_SET = frozenset(CORE_PROFILE_FORMAL_SECTIONS)
 CORE_PROFILE_LEGACY_SECTION = "legacy"
+# The pre-sections archive stays verbatim and read-only beside the formal sections.
+CORE_PROFILE_LEGACY_HEADING = "これまでの記録"
+CORE_PROFILE_V1_BACKUP = "core_profiles.v1-backup.json"
+CORE_PROFILE_MANUAL_SOURCE = "manual"
+CORE_PROFILE_MAX_SECTION_CHARS = 4000
 CORE_PROFILE_MAX_ORDINARY_SECTION_PATCHES = 2
 CORE_PROFILE_MAINTAINER_SOURCE = "core_maintainer"
 _QUOTED_TOKEN = re.compile("「[^」]*」|『[^』]*』|\"[^\"]*\"|'[^']*'")
@@ -302,8 +307,6 @@ def _patch_locked(path, scope, base_updated_at, sections, *, candidate_ids, migr
         ordered = {name: incoming.get(name, "").strip() for name in CORE_PROFILE_FORMAL_SECTIONS}
         _validate_legacy_migration(legacy_text, ordered)
     else:
-        if legacy_text:
-            raise CoreProfileStorageError("常驻档案仍含 legacy，需要 migrate_legacy")
         if len(incoming) > CORE_PROFILE_MAX_ORDINARY_SECTION_PATCHES:
             raise CoreProfileStorageError("普通章节更新最多 2 个")
         ordered = {name: str(current_sections.get(name) or "").strip() for name in CORE_PROFILE_FORMAL_SECTIONS}
@@ -312,6 +315,8 @@ def _patch_locked(path, scope, base_updated_at, sections, *, candidate_ids, migr
             if _normalize_text(value) != _normalize_text(ordered[name]):
                 changed += 1
                 ordered[name] = value.strip()
+        if legacy_text:
+            ordered[CORE_PROFILE_LEGACY_SECTION] = legacy_text
         rendered = _render_sections(ordered)
         if changed == 0 and str(previous.get("content") or "") == rendered and str(previous.get("memory") or "") == rendered:
             return previous
@@ -376,20 +381,13 @@ def _parse_section_patch(sections):
 def _reject_invalid_sections(sections):
     if not isinstance(sections, dict):
         raise CoreProfileStorageError("常驻档案 sections 必须是对象")
-    has_legacy = False
-    has_formal = False
     for key in sections:
-        if not isinstance(key, str) or not key.strip():
+        if (
+            not isinstance(key, str)
+            or not key.strip()
+            or key not in CORE_PROFILE_FORMAL_SECTION_SET | {CORE_PROFILE_LEGACY_SECTION}
+        ):
             raise CoreProfileStorageError("常驻档案存在未知 section，拒绝写入")
-        if key == CORE_PROFILE_LEGACY_SECTION:
-            has_legacy = True
-            continue
-        if key in CORE_PROFILE_FORMAL_SECTION_SET:
-            has_formal = True
-            continue
-        raise CoreProfileStorageError("常驻档案存在未知 section，拒绝写入")
-    if has_legacy and has_formal:
-        raise CoreProfileStorageError("常驻档案 legacy 与正式章节混存，拒绝写入")
 
 
 def _render_sections(sections):
@@ -398,7 +396,155 @@ def _render_sections(sections):
         body = str(sections.get(name) or "").strip()
         if body:
             parts.append(f"＜{name}＞\n{body}")
+    legacy = str(sections.get(CORE_PROFILE_LEGACY_SECTION) or "").strip()
+    if legacy:
+        parts.append(f"＜{CORE_PROFILE_LEGACY_HEADING}＞\n{legacy}")
     return "\n\n".join(parts)
+
+
+def _v2_record(scope, sections, metadata, *, now, source):
+    rendered = _render_sections(sections)
+    return {
+        "id": f"core_profile:{scope}",
+        "schema_version": CORE_PROFILE_SCHEMA_VERSION,
+        "content": rendered,
+        "memory": rendered,
+        "sections": sections,
+        "metadata": {
+            **metadata,
+            "layer": "core_profile",
+            "scope": scope,
+            "updated_at": now,
+            "created_at": str(metadata.get("created_at") or "").strip() or now,
+            "source": source,
+        },
+    }
+
+
+def _upgraded_v1(previous, scope):
+    """Deterministic V1 → V2: the whole old text becomes the legacy section, unchanged."""
+    if _schema_version(previous) is not None:
+        return None
+    content = _stored_text(previous)
+    if not content:
+        return None
+    metadata = previous.get("metadata") if isinstance(previous.get("metadata"), dict) else {}
+    source = str(metadata.get("source") or "").strip() or CORE_PROFILE_MANUAL_SOURCE
+    return _v2_record(
+        scope,
+        {CORE_PROFILE_LEGACY_SECTION: content},
+        metadata,
+        now=_next_updated_at(_updated_at(previous)),
+        source=source,
+    )
+
+
+def _locked_profile_write(memory_dir, scope, *, daily, write):
+    memory_dir = Path(memory_dir).absolute()
+    scope = str(scope)
+    _admit_write(memory_dir, scope, daily=daily)
+    if any(_unsupported_link(path) for path in (memory_dir, *memory_dir.parents)):
+        raise CoreProfileStorageError("常驻档案路径不可写")
+    path = memory_dir / "core_profiles.json"
+    for candidate in (path, path.with_name(path.name + ".bak"), path.with_name(path.name + ".lock"),
+                      memory_dir / CORE_PROFILE_V1_BACKUP):
+        _require_plain_profile_file(candidate)
+    with _exclusive_profile_lock(path):
+        _admit_write(memory_dir, scope, daily=daily)
+        return write(path, _load_profiles(path, strict=True))
+
+
+def _keep_v1_backup(path):
+    """Byte-for-byte copy of the file as it was before its first upgrade; never overwritten."""
+    import os
+    import tempfile
+
+    if __package__:
+        from .support import replace_with_retry
+    else:
+        from support import replace_with_retry
+    backup = path.with_name(CORE_PROFILE_V1_BACKUP)
+    if backup.exists():
+        return
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{backup.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(path.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_with_retry(Path(temporary), backup)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise CoreProfileStorageError("常驻档案升级前备份失败，拒绝写入")
+
+
+def upgrade_personal_core_profile(memory_dir, scope, *, daily=False):
+    """Upgrade a V1 archive in place, keeping a one-time copy of the V1 file. Returns whether it changed."""
+
+    def write(path, profiles):
+        previous = profiles.get(str(scope))
+        if not isinstance(previous, dict) or _scope_conflict(previous, str(scope)):
+            return False
+        upgraded = _upgraded_v1(previous, str(scope))
+        if upgraded is None:
+            return False
+        _keep_v1_backup(path)
+        profiles[str(scope)] = upgraded
+        _save_profiles(path, profiles)
+        log_event("Memory", "个人常驻档案已升级为章节格式", {"code": "CORE_PROFILE_V1_UPGRADED"},
+                  event="memory.personal.core_profile_upgraded", severity="info")
+        return True
+
+    return _locked_profile_write(memory_dir, scope, daily=daily, write=write)
+
+
+def edit_personal_core_profile_section(memory_dir, scope, section, content, *, daily=False):
+    """Manual edit of one section; empty content clears it. The legacy archive is editable only here."""
+    if section not in CORE_PROFILE_FORMAL_SECTION_SET | {CORE_PROFILE_LEGACY_SECTION}:
+        raise CoreProfileStorageError("常驻档案未知 section，拒绝写入")
+    if not isinstance(content, str) or len(content) > CORE_PROFILE_MAX_SECTION_CHARS:
+        raise CoreProfileStorageError("常驻档案 section 必须是文本")
+    scope = str(scope)
+
+    def write(path, profiles):
+        previous = profiles.get(scope)
+        if isinstance(previous, dict):
+            if _scope_conflict(previous, scope):
+                raise CoreProfileStorageError("常驻档案 scope 不符，拒绝写入")
+            upgraded = _upgraded_v1(previous, scope)
+            if upgraded is not None:
+                _keep_v1_backup(path)
+                previous = upgraded
+            elif _schema_version(previous) != CORE_PROFILE_SCHEMA_VERSION:
+                raise CoreProfileStorageError("常驻档案未知 schema，拒绝写入")
+            current = previous.get("sections")
+            _reject_invalid_sections(current)
+            metadata = previous.get("metadata") if isinstance(previous.get("metadata"), dict) else {}
+            base = _updated_at(previous)
+        else:
+            current, metadata, base = {}, {}, ""
+        sections = {
+            name: str(current.get(name) or "").strip()
+            for name in (*CORE_PROFILE_FORMAL_SECTIONS, CORE_PROFILE_LEGACY_SECTION)
+            if str(current.get(name) or "").strip()
+        }
+        if content.strip():
+            sections[section] = content.strip()
+        else:
+            sections.pop(section, None)
+        if not sections:
+            profiles.pop(scope, None)
+            _save_profiles(path, profiles)
+            return None
+        record = _v2_record(scope, sections, metadata, now=_next_updated_at(base), source=CORE_PROFILE_MANUAL_SOURCE)
+        profiles[scope] = record
+        _save_profiles(path, profiles)
+        return record
+
+    return _locked_profile_write(memory_dir, scope, daily=daily, write=write)
 
 
 def _normalize_text(text):

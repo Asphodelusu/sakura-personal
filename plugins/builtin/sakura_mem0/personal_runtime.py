@@ -10,7 +10,14 @@ if __package__:
     from .memory import MEMORY_LAYERS
     from . import personal_records
     from .index_contract import COPY_STATE_FILE, require_complete_copy
-    from .personal_core_profile import read_personal_core_profile
+    from .personal_core_profile import (
+        CORE_PROFILE_FORMAL_SECTIONS,
+        CORE_PROFILE_LEGACY_HEADING,
+        CORE_PROFILE_LEGACY_SECTION,
+        edit_personal_core_profile_section,
+        load_personal_core_profile_record,
+        read_personal_core_profile,
+    )
     from .personal_emotion import DEFAULT_EMOTION, EmotionScorer
     from .personal_mood import (
         PersonalEmotionStore,
@@ -25,7 +32,14 @@ else:
     from memory import MEMORY_LAYERS
     import personal_records
     from index_contract import COPY_STATE_FILE, require_complete_copy
-    from personal_core_profile import read_personal_core_profile
+    from personal_core_profile import (
+        CORE_PROFILE_FORMAL_SECTIONS,
+        CORE_PROFILE_LEGACY_HEADING,
+        CORE_PROFILE_LEGACY_SECTION,
+        edit_personal_core_profile_section,
+        load_personal_core_profile_record,
+        read_personal_core_profile,
+    )
     from personal_emotion import DEFAULT_EMOTION, EmotionScorer
     from personal_mood import (
         PersonalEmotionStore,
@@ -33,6 +47,9 @@ else:
         build_mood_fragment,
         build_user_emotion_fragment,
     )
+
+
+CORE_PROFILE_ITEM_PREFIX = "core_profile:"
 
 
 class _CurationStore(PersonalCurationStore):
@@ -250,6 +267,48 @@ class PersonalRecallBoundary:
             if self._closed:
                 return None
         return fragment
+
+    def core_profile_items(self):
+        """Archive sections as management items; the verbatim V1 archive is one "legacy" item."""
+        with self._lock:
+            if self._closed:
+                return []
+            memory_dir, scope = self._memory_dir, self.scope
+        record = load_personal_core_profile_record(memory_dir, scope)
+        if not isinstance(record, dict):
+            return []
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        sections = record.get("sections")
+        if not isinstance(sections, dict) or not sections:
+            text = str(record.get("content") or record.get("memory") or "").strip()
+            sections = {CORE_PROFILE_LEGACY_SECTION: text} if text else {}
+        items = []
+        for name in (*CORE_PROFILE_FORMAL_SECTIONS, CORE_PROFILE_LEGACY_SECTION):
+            text = str(sections.get(name) or "").strip()
+            if not text:
+                continue
+            items.append({
+                "id": f"{CORE_PROFILE_ITEM_PREFIX}{scope}#{name}",
+                "content": text,
+                "layer": "core_profile",
+                "category": CORE_PROFILE_LEGACY_HEADING if name == CORE_PROFILE_LEGACY_SECTION else name,
+                "source": str(metadata.get("source") or ""),
+                "importance": 1.0,
+                "confidence": 1.0,
+                "updatedAt": str(metadata.get("updated_at") or ""),
+            })
+        return items
+
+    def edit_core_profile_item(self, item_id, content):
+        with self._lock:
+            memory_dir, scope = self._memory_dir, self.scope
+        prefix = f"{CORE_PROFILE_ITEM_PREFIX}{scope}#"
+        if not isinstance(item_id, str) or not item_id.startswith(prefix):
+            raise ValueError("MEMORY_NOT_FOUND")
+        if not self._daily:
+            raise ValueError("PERSONAL_MEMORY_READ_ONLY")
+        edit_personal_core_profile_section(memory_dir, scope, item_id[len(prefix):], str(content or ""), daily=True)
+        return next((item for item in self.core_profile_items() if item["id"] == item_id), None)
 
     def _admit_state_write(self):
         personal_records._require_write_mode(self._memory_dir, self.scope, daily=True, write_rehearsal=False)

@@ -14,6 +14,7 @@ try:
     from .personal_core_profile import (
         load_personal_core_profile_record,
         patch_personal_core_profile_sections,
+        upgrade_personal_core_profile,
     )
     from .personal_records import _require_write_mode
     from .support import OperationCancelled, log_event
@@ -29,6 +30,7 @@ except ImportError:
     from personal_core_profile import (
         load_personal_core_profile_record,
         patch_personal_core_profile_sections,
+        upgrade_personal_core_profile,
     )
     from personal_records import _require_write_mode
     from support import OperationCancelled, log_event
@@ -121,6 +123,10 @@ class _ProfileStore:
 
     def core_profile(self):
         return load_personal_core_profile_record(self._memory_dir, self._scope)
+
+    def upgrade_legacy_core_profile(self):
+        self._check_open()
+        return upgrade_personal_core_profile(self._memory_dir, self._scope, daily=self._daily)
 
     def patch_core_profile_sections(self, base_updated_at, sections, candidate_ids=None, migrate_legacy=False):
         self._check_open()
