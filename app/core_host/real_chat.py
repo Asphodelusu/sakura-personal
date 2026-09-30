@@ -33,6 +33,7 @@ RECENT_PROACTIVE_LIMIT = 3
 RECENT_PROACTIVE_TTL_SECONDS = 60 * 60
 RECENT_PROACTIVE_UTTERANCE_CHARS = 2000
 RECENT_OBSERVATION_TTL_SECONDS = 2 * 60 * 60
+INITIATED_EVENT_TYPES = frozenset({"intimacy_continue", "relationship_initiative"})
 
 
 class RealChatRejection(ValueError):
@@ -303,14 +304,20 @@ class RealChatBoundary:
                     False,
                 ) from self._timeline_error
             proactive_event = payload.get("event")
-            is_update_event = isinstance(proactive_event, Mapping)
-            message = "" if is_update_event else str(payload["message"])
+            is_event = isinstance(proactive_event, Mapping)
+            initiated_kind = (
+                str(proactive_event.get("type"))
+                if is_event and proactive_event.get("type") in INITIATED_EVENT_TYPES
+                else None
+            )
+            is_update_event = is_event and initiated_kind is None
+            message = "" if is_event else str(payload["message"])
             plugin_application = (
                 self._plugin_application_provider()
                 if self._plugin_application_provider is not None
                 else None
             )
-            if plugin_application is not None and not is_update_event:
+            if plugin_application is not None and not is_event:
                 try:
                     getattr(plugin_application, "emit_event")(
                         "message.user",
@@ -334,19 +341,28 @@ class RealChatBoundary:
                         AgentEvent(type="update_available", payload=dict(event_payload)),
                         cancel_checker=execution.cancel.throw_if_cancelled,
                     )
+            elif initiated_kind is not None:
+                try:
+                    recent_messages = _messages_from_turn_projection(
+                        _recent_history_projection(timeline, str(character.id))
+                    )
+                except Exception as exc:
+                    history_status = "degraded"
+                    raise _BoundaryFailure(
+                        "TIMELINE_READ_FAILED", "Chat history could not be read", False
+                    ) from exc
+                execution.cancel.throw_if_cancelled()
+                _invalidate_inner_thought(runtime)
+                result = self._run_initiated_turn(
+                    initiated_kind,
+                    session,
+                    runtime,
+                    recent_messages,
+                    execution.cancel.throw_if_cancelled,
+                )
             else:
                 try:
-                    history_now = datetime.now().astimezone()
-                    history_projection = assemble_recent_turns(
-                        timeline.read_context_candidates(
-                            str(character.id),
-                            observation_since=history_now
-                            - timedelta(seconds=RECENT_OBSERVATION_TTL_SECONDS),
-                            proactive_since=history_now
-                            - timedelta(seconds=RECENT_PROACTIVE_TTL_SECONDS),
-                        ),
-                        now=history_now,
-                    )
+                    history_projection = _recent_history_projection(timeline, str(character.id))
                     recent_messages = _messages_from_turn_projection(history_projection)
                 except Exception as exc:
                     history_status = "degraded"
@@ -480,6 +496,7 @@ class RealChatBoundary:
                     or screen_attachment.source != "screen_awareness"
                 )
                 if relationship_user_turn:
+                    _note_initiative_user_turn(runtime)
                     _note_intimacy_user_turn(runtime, message)
                     _begin_relationship_user_turn(runtime, operation_id)
                     _start_inner_thought(
@@ -592,7 +609,7 @@ class RealChatBoundary:
                         kind=TimelineKind.ASSISTANT,
                         origin=(
                             "proactive"
-                            if is_update_event
+                            if is_event
                             or (
                                 screen_attachment is not None
                                 and screen_attachment.source == "screen_awareness"
@@ -1155,6 +1172,45 @@ class RealChatBoundary:
                 )
             )
 
+    @staticmethod
+    def _run_initiated_turn(
+        kind: str,
+        session: object,
+        runtime: object | None,
+        recent_messages: list[dict[str, Any]],
+        cancel_checker: Callable[[], None],
+    ) -> object:
+        from types import SimpleNamespace
+
+        from app.core.runtime_log import suppress_runtime_logs
+        from app.llm.chat_reply import ChatReply
+
+        quiet = SimpleNamespace(reply=ChatReply([]), actions=[])
+        if kind == "intimacy_continue":
+            from app.agent.intimacy import INTIMACY_CONTINUE_SYSTEM_TEXT
+
+            begin = getattr(runtime, "begin_intimacy_continuation", None)
+            if not callable(begin) or not begin():
+                return quiet
+            signal = {"role": "system", "content": INTIMACY_CONTINUE_SYSTEM_TEXT}
+            with suppress_runtime_logs():
+                return getattr(session, "pipeline").run_user_message(
+                    [*recent_messages, signal],
+                    cancel_checker=cancel_checker,
+                )
+        decide = getattr(runtime, "run_relationship_initiative", None)
+        if not callable(decide):
+            return quiet
+        facts = ""
+        provider = getattr(runtime, "relationship_facts", None)
+        if callable(provider):
+            try:
+                facts = str(provider() or "")
+            except Exception:  # noqa: BLE001 - missing facts only narrow the decision
+                facts = ""
+        reply = decide(recent_messages, relationship_facts=facts, cancel_checker=cancel_checker)
+        return SimpleNamespace(reply=reply, actions=[]) if reply is not None else quiet
+
     def _validate_send(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         # The Router deliberately does not understand generation credentials;
         # the product boundary therefore repeats the transport checks before
@@ -1181,7 +1237,12 @@ class RealChatBoundary:
         if payload.get("operationId") != request.get("id"):
             raise RealChatRejection("INVALID_CHAT_PAYLOAD", "chat identity is invalid")
         if set(payload) == {"operationId", "event"}:
-            self._validate_update_event(payload.get("event"))
+            event = payload.get("event")
+            if isinstance(event, Mapping) and event.get("type") in INITIATED_EVENT_TYPES:
+                if set(event) != {"type", "payload"} or event.get("payload") != {}:
+                    raise RealChatRejection("INVALID_CHAT_PAYLOAD", "initiated event is invalid")
+            else:
+                self._validate_update_event(event)
             return payload
         if not {"message", "operationId"}.issubset(payload) or not set(payload).issubset(
             {"message", "operationId", "attachmentId"}
@@ -1298,6 +1359,27 @@ def _log_inner_thought_failure(exc: BaseException) -> None:
         {"code": "INNER_THOUGHT_START_FAILED", "error_type": type(exc).__name__},
         severity="info",
     )
+
+
+def _recent_history_projection(timeline: Any, character_id: str) -> _TurnProjection:
+    history_now = datetime.now().astimezone()
+    return assemble_recent_turns(
+        timeline.read_context_candidates(
+            character_id,
+            observation_since=history_now - timedelta(seconds=RECENT_OBSERVATION_TTL_SECONDS),
+            proactive_since=history_now - timedelta(seconds=RECENT_PROACTIVE_TTL_SECONDS),
+        ),
+        now=history_now,
+    )
+
+
+def _note_initiative_user_turn(runtime: object | None) -> None:
+    note = getattr(runtime, "note_initiative_user_turn", None)
+    if callable(note):
+        try:
+            note()
+        except Exception:  # noqa: BLE001 - timing bookkeeping must not fail the turn
+            pass
 
 
 def _note_intimacy_user_turn(runtime: object | None, message: str) -> None:

@@ -11,8 +11,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.agent.inner_thought import InnerThoughtSettings
-from app.config.model_slots import InnerThoughtModelChoice, resolve_inner_thought_model
-from app.config.models import ModelSelectionSettings, ModelSlotSelection
+from app.config.model_slots import (
+    InnerThoughtModelChoice,
+    resolve_inner_thought_model,
+    resolve_model_slot,
+)
+from app.config.models import MODEL_SLOT_CHAT_FAST, ApiSettings, ModelSelectionSettings, ModelSlotSelection
 from app.config.settings_service import AppSettingsService
 from app.config.yaml_config import load_yaml_mapping
 from app.core.runtime_log import log_event
@@ -54,6 +58,20 @@ def attach_inner_thought(runtime: object, user_root: Path) -> None:
     if not callable(configure):
         return
     configure(settings=settings, client=client, source_slot=choice.source_slot)
+
+
+def load_fast_slot_settings(user_root: Path) -> ApiSettings | None:
+    """The chat_fast slot, falling back to the chat slot; None when neither resolves."""
+    try:
+        service = AppSettingsService(Path(user_root))
+        profiles = service.load_api_profiles()
+        base = service.load_api_settings()
+        raw = load_yaml_mapping(service.api_config_path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    selections, _invalid = _selections(raw.get("model_slots"))
+    resolved = resolve_model_slot(profiles, selections, MODEL_SLOT_CHAT_FAST, base)
+    return resolved.settings if resolved is not None else None
 
 
 def _load_choice(user_root: Path) -> InnerThoughtModelChoice:

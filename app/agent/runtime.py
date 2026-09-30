@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from app.storage.chat_history import ChatHistoryStore
 
 
+RELATIONSHIP_FACT_FRAGMENT_PREFIXES = ("core_profile:",)
+
 _VISUAL_OBSERVATION_REPLY_INSTRUCTION = """
 本轮消息包含图片时，最终 JSON 除 segments 外，必须额外包含顶层 visual_observation。
 visual_observation 只给系统保存短期视觉记忆，不会展示给用户；请用事实摘要，不要用角色口吻。
@@ -291,6 +293,10 @@ class AgentRuntime:
         if self._intimacy.active and action not in {"entered", "already_on"}:
             self._intimacy.refresh_user_reply()
 
+    def begin_intimacy_continuation(self) -> bool:
+        """Spend one silent continuation; False means the continuation stays quiet."""
+        return bool(self._intimacy_guide) and self._intimacy.consume_turn()
+
     def configure_initiative(
         self,
         settings: object,
@@ -314,6 +320,36 @@ class AgentRuntime:
 
     def initiative_gate_reason(self) -> str:
         return self._initiative.gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+
+    def relationship_facts(self) -> str:
+        """Standing relationship facts from context providers; no memory search is run."""
+        from app.agent.context_orchestrator import build_context_request
+
+        request = build_context_request(
+            [],
+            source="event",
+            mode="normal",
+            event_type="relationship_initiative",
+            step_index=0,
+            remaining_steps=0,
+            available_tools=(),
+            character_id=self.character_id,
+            character_name=self.character_name,
+        )
+        parts: list[str] = []
+        for provider in self.context_providers:
+            if not provider.enabled:
+                continue
+            try:
+                fragments = provider.build_context(request)
+            except Exception:  # noqa: BLE001 - one unreadable provider only narrows the facts
+                continue
+            for fragment in fragments:
+                if str(fragment.fragment_id).startswith(RELATIONSHIP_FACT_FRAGMENT_PREFIXES):
+                    content = str(fragment.content or "").strip()
+                    if content:
+                        parts.append(content)
+        return "\n\n".join(parts)
 
     def run_relationship_initiative(
         self,

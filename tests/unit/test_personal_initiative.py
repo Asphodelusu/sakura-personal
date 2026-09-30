@@ -207,3 +207,59 @@ def test_user_turn_during_decision_discards_the_result() -> None:
     runtime._initiative_client = _Racing("")
 
     assert runtime.run_relationship_initiative([], relationship_facts="") is None
+
+
+def test_relationship_facts_keep_only_the_standing_profile() -> None:
+    from app.llm.prompts.types import ContextFragment
+    from app.plugins.models import ContextProviderContribution
+
+    runtime = AgentRuntime(object(), "system", character_id="sakura", character_name="Sakura")
+    requests = []
+
+    def _memory(request):
+        requests.append(request)
+        return [
+            ContextFragment("core_profile:sakura", "plugin", "profile"),
+            ContextFragment("memory.recall", "plugin", "recalled"),
+        ]
+
+    def _broken(_request):
+        raise RuntimeError("down")
+
+    runtime.set_context_providers(
+        [
+            ContextProviderContribution("broken", "", _broken),
+            ContextProviderContribution("memory", "", _memory),
+        ]
+    )
+
+    assert runtime.relationship_facts() == "profile"
+    assert requests[0].current_input == ""
+    assert requests[0].character_id == "sakura"
+
+
+def test_adapter_configures_the_arbiter_and_a_decision_client(tmp_path) -> None:
+    import shutil
+    from pathlib import Path
+    from threading import Event
+
+    from app.agent.tools import ToolRegistry
+    from app.core_host.assistant_adapter import AssistantAdapter
+
+    fixture = Path(__file__).parents[1] / "fixtures" / "runtime_v2" / "wp_3_01" / "ready"
+    root = tmp_path / "root"
+    shutil.copytree(fixture, root)
+    config = root / "config" / "system_config.yaml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "\nrelationship_initiative:\n  proactive_enabled: true\n  proactive_cooldown_seconds: 1800\n",
+        encoding="utf-8",
+    )
+    session = AssistantAdapter(root, tool_registry=ToolRegistry(), mcp_provider=None).initialize(Event()).session
+    runtime = session.runtime
+    try:
+        assert runtime._initiative.settings.proactive_enabled is True
+        assert runtime._initiative.settings.proactive_cooldown_seconds == 1800
+        assert callable(getattr(runtime._initiative_client, "complete_raw", None))
+    finally:
+        runtime.close()

@@ -256,9 +256,15 @@ class AssistantAdapter:
             runtime.configure_intimacy(_read_optional_text(StoragePaths(self._user_root).intimacy_guide()))
             if runtime.intimacy_available:
                 self._application_tools.register(create_set_intimacy_mode_tool(runtime.intimacy_state))
-            from app.core_host.inner_thought_settings import attach_inner_thought
+            from app.core_host.inner_thought_settings import attach_inner_thought, load_fast_slot_settings
 
             attach_inner_thought(runtime, self._user_root)
+            decision_settings = load_fast_slot_settings(self._user_root)
+            decision_client = provider
+            if decision_settings is not None:
+                decision_client = OpenAICompatibleClient(decision_settings, request_attempts=1)
+                owned.append(decision_client)
+            runtime.configure_initiative(initiative, client=decision_client)
             self._check_active(cancel)
 
             pipeline = ChatPipeline(runtime, finalize_trace_operations=False)
