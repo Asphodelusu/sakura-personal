@@ -40,6 +40,75 @@ def with_desktop_pet_context(character_prompt: str, *, system_guards: str = "") 
     return "\n\n".join(part for part in parts if part).strip()
 
 
+_RELATIONSHIP_GUIDE_SECTION_IDS = {
+    "A. 日常主动强度": "persona.relationship.initiative",
+    "B. 身体推进直接度": "persona.relationship.directness",
+    "关系未明": "persona.relationship.uncertain",
+    "稳定恋人日常": "persona.relationship.established",
+    "感情如何出口": "persona.relationship.expression",
+    "私下升温": "persona.relationship.private_warmth",
+    "嫉妒、冷落与冲突": "persona.relationship.conflict_repair",
+    "公私切换": "persona.relationship.public_private",
+    "高温后的生活": "persona.relationship.aftercare",
+}
+_RELATIONSHIP_GUIDE_CORE_IDS = frozenset(
+    {
+        "persona.relationship.preamble",
+        "persona.relationship.initiative",
+        "persona.relationship.directness",
+        "persona.relationship.expression",
+    }
+)
+
+
+def split_relationship_guide_sections(guide: str) -> list[tuple[str, str]]:
+    """Split a relationship guide into stable, title-addressable source sections.
+
+    A guide without ``##`` headings remains a single compatibility section. Unknown
+    headings in an otherwise structured guide are retained under ordered ``other``
+    IDs so character-pack additions never disappear silently.
+    """
+
+    text = (guide or "").strip()
+    if not text:
+        return []
+    pattern = re.compile(r"(?m)^##\s+([^\n]+?)\s*$")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return [("persona.relationship.custom", text)]
+
+    sections: list[tuple[str, str]] = []
+    leading = text[: matches[0].start()].strip()
+    if leading:
+        sections.append(("persona.relationship.preamble", leading))
+    unknown_index = 0
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.start() : end].strip()
+        if not body:
+            continue
+        heading = match.group(1).strip()
+        section_id = _RELATIONSHIP_GUIDE_SECTION_IDS.get(heading)
+        if section_id is None:
+            unknown_index += 1
+            section_id = f"persona.relationship.other.{unknown_index}"
+        sections.append((section_id, body))
+    return sections
+
+
+def select_relationship_guide_core_sections(guide: str) -> list[tuple[str, str]]:
+    """Return only ordinary-turn guidance with lossless custom-guide fallback."""
+
+    sections = split_relationship_guide_sections(guide)
+    return [
+        (section_id, body)
+        for section_id, body in sections
+        if section_id in _RELATIONSHIP_GUIDE_CORE_IDS
+        or section_id == "persona.relationship.custom"
+        or section_id.startswith("persona.relationship.other.")
+    ]
+
+
 def _split_markdown_heading_sections(text: str) -> list[tuple[str, str]]:
     pattern = re.compile(r"(?m)^##\s+([^\n]+?)\s*$")
     matches = list(pattern.finditer(text))

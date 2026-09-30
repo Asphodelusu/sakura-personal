@@ -145,6 +145,10 @@ class AgentRuntime:
         self._relationship = RelationshipTurnAdapter()
         self._inner_thought = InnerThoughtCoordinator()
         self._personal_style = False
+        self._relationship_guide = ""
+        self._relationship_guide_enabled = False
+        self._expression_bias = "natural"
+        self._lore_index = None
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -252,6 +256,14 @@ class AgentRuntime:
 
     def configure_personal_reply(self, *, personal_style: bool) -> None:
         self._personal_style = bool(personal_style)
+
+    def configure_relationship_guide(self, guide: str, *, in_turn_enabled: bool, expression_bias: str) -> None:
+        self._relationship_guide = str(guide or "").strip()
+        self._relationship_guide_enabled = bool(in_turn_enabled)
+        self._expression_bias = str(expression_bias or "natural")
+
+    def configure_lore(self, lore_index: object | None) -> None:
+        self._lore_index = lore_index
 
     def configure_inner_thought(
         self,
@@ -367,11 +379,27 @@ class AgentRuntime:
         verbosity = self._inner_thought.verbosity_fragment()
         if verbosity is not None:
             fragments.append(verbosity)
+        lore = self._lore_fragment(request)
+        if lore is not None:
+            fragments.append(lore)
         drive = self._relationship.fragment()
         if drive is not None:
             fragments.append(drive)
         fragments.extend(self._history_digest_fragments(request))
         return tuple(fragments)
+
+    def _lore_fragment(self, request: ContextRequest) -> ContextFragment | None:
+        current_input = str(getattr(request, "current_input", "") or "").strip()
+        if self._lore_index is None or not current_input:
+            return None
+        from app.agent.lore import build_lore_context_fragment
+
+        history = [
+            {"role": message.role, "content": message.content.strip()}
+            for message in tuple(getattr(request, "recent_messages", ()))[-8:]
+            if message.role in {"user", "assistant"} and message.content.strip()
+        ]
+        return build_lore_context_fragment(current_input, self._lore_index, history=history)
 
     def _history_digest_fragments(
         self,
@@ -1604,6 +1632,7 @@ class AgentRuntime:
                 sensitivity="private",
             )
         ]
+        sections.extend(self._relationship_guide_sections())
         sections.extend(
             PromptSection(
                 section_id=f"plugin_patch.{patch.patch_id}",
@@ -1621,6 +1650,36 @@ class AgentRuntime:
             for patch in getattr(self, "prompt_patches", [])
             if patch.system_prompt_append.strip()
         )
+        return sections
+
+    def _relationship_guide_sections(self) -> list[PromptSection]:
+        if not self._relationship_guide_enabled or not self._relationship_guide:
+            return []
+        from app.config.relationship_initiative import RELATIONSHIP_GUIDE_TOKEN_BUDGET, expression_bias_guidance
+        from app.llm.prompts.personal_persona import select_relationship_guide_core_sections
+        from app.llm.prompts.runtime import estimate_prompt_tokens, truncate_to_token_budget
+
+        candidates = [
+            *select_relationship_guide_core_sections(self._relationship_guide),
+            ("persona.relationship.expression_bias", expression_bias_guidance(self._expression_bias)),
+        ]
+        sections: list[PromptSection] = []
+        remaining = RELATIONSHIP_GUIDE_TOKEN_BUDGET
+        for section_id, candidate in candidates:
+            if remaining <= 0:
+                break
+            body, _truncated = truncate_to_token_budget(candidate, remaining)
+            if not body:
+                continue
+            sections.append(PromptSection(
+                section_id=section_id,
+                body=body,
+                source="character",
+                sensitivity="private",
+                cache_scope="static",
+                token_budget=remaining,
+            ))
+            remaining -= estimate_prompt_tokens(body)
         return sections
 
     def _static_persona_prompt(self) -> str:

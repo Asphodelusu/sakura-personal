@@ -67,6 +67,9 @@ class CharacterProfile:
     renderer_config: dict[str, Any] | None = None
     relationship_drive_profile: RelationalDriveProfile | None = None
     relationship_drive_mapping: dict[str, Any] | None = None
+    # 可选关系演出参考与原作 lore 索引；缺失不让角色包加载失败。
+    relationship_guide_path: Path | None = None
+    lore_index_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.theme_settings is None:
@@ -241,7 +244,35 @@ def _load_profile(manifest_path: Path) -> CharacterProfile:
         renderer_config=_load_renderer_config(raw_data),
         relationship_drive_profile=_relationship_drive_profile(raw_data.get("relationship_drive")),
         relationship_drive_mapping=_relationship_drive_mapping(raw_data.get("relationship_drive")),
+        relationship_guide_path=_resolve_optional_package_file(
+            package_dir, raw_data.get("relationship_guide"), "relationship_guide.md", "relationship_guide"
+        ),
+        lore_index_path=_resolve_optional_package_file(
+            package_dir, raw_data.get("lore"), "lore/index.json", "lore"
+        ),
     )
+
+
+def _resolve_optional_package_file(package_dir: Path, raw: Any, default: str, field_name: str) -> Path | None:
+    if raw is not None and not isinstance(raw, str):
+        raise CharacterConfigError(f"{field_name} 必须是包内相对路径。")
+    if isinstance(raw, str) and raw.strip():
+        path = _resolve_package_path(package_dir, raw)
+        if not path.is_file():
+            log_event("Character", "角色可选资源不存在，已忽略", {"field": field_name}, severity="warning")
+            return None
+        return path
+    candidate = package_dir / default
+    return candidate if candidate.is_file() else None
+
+
+def load_relationship_guide(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
 
 
 def character_theme_from_mapping(data: Any) -> tuple[ThemeSettings, CharacterThemeSource, bool]:

@@ -229,6 +229,17 @@ class AssistantAdapter:
             )
             # Personal characters (with a guards file) keep the Qt-era reply style and silent actions.
             runtime.configure_personal_reply(personal_style=profile.system_guards_path is not None)
+            from app.agent.lore import load_lore_index
+            from app.config.character_loader import load_relationship_guide
+            from app.core_host.relationship_settings import load_relationship_initiative_settings
+
+            initiative = load_relationship_initiative_settings(self._user_root)
+            runtime.configure_relationship_guide(
+                load_relationship_guide(profile.relationship_guide_path),
+                in_turn_enabled=initiative.in_turn_enabled,
+                expression_bias=initiative.expression_bias,
+            )
+            runtime.configure_lore(load_lore_index(profile.lore_index_path))
             from app.core_host.inner_thought_settings import attach_inner_thought
 
             attach_inner_thought(runtime, self._user_root)
