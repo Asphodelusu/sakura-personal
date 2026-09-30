@@ -206,7 +206,8 @@ class RealChatBoundary:
                 if not started.is_set():
                     kickoff_errors.append(error)
                 else:
-                    _safe_diagnostic(error)
+                    code, message, _retryable = _classify_error(error)
+                    _safe_diagnostic(error, code=code, message=message)
                 self._drop_execution(operation_id)
             finally:
                 started.set()
@@ -907,6 +908,7 @@ class RealChatBoundary:
                 assert execution is not None
                 execution.cancel_requested = True
                 execution.cancel.cancel()
+                self._revision += 1
         return accepted
 
     def _accepted_send_response(
@@ -942,6 +944,7 @@ class RealChatBoundary:
                 assert execution is not None
                 execution.cancel_requested = True
                 execution.cancel.cancel()
+                self._revision += 1
         return response(
             request,
             generation_id=self._generation_id,
@@ -1144,10 +1147,11 @@ class RealChatBoundary:
     def cancel_all(self) -> None:
         with self._lock:
             for execution in self._executions.values():
-                if execution.completion_claimed:
+                if execution.completion_claimed or execution.cancel_requested:
                     continue
                 execution.cancel_requested = True
                 execution.cancel.cancel()
+                self._revision += 1
 
     def close(self) -> None:
         deadline = monotonic() + CHAT_CLOSE_TIMEOUT_SECONDS
@@ -1155,6 +1159,7 @@ class RealChatBoundary:
             if not self._closed:
                 self._closed = True
                 self._pending_screen_attachment = None
+                self._revision += 1
                 for execution in self._executions.values():
                     if execution.completion_claimed:
                         continue

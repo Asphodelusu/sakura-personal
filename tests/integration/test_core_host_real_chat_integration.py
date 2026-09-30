@@ -732,6 +732,32 @@ def test_next_chat_waits_for_terminal_publication_and_execution_release(
     assert boundary.snapshot_fields("ready", None)["activeInteractionSummary"] is None
 
 
+def test_cancel_advances_snapshot_revision_with_interaction_state(tmp_path: Path) -> None:
+    session = SimpleNamespace(character=SimpleNamespace(id="sakura"))
+    boundary = RealChatBoundary(
+        GENERATION_ID,
+        GENERATION_CREDENTIAL,
+        tmp_path,
+        session_provider=lambda: session,
+        timeline_store=_activated_timeline(tmp_path / "timeline.sqlite3"),
+    )
+    send = _request("to-cancel", "chat.send", {"message": "hello", "operationId": "to-cancel"})
+    boundary.reserve_send(send)
+    before = boundary.snapshot_fields("ready", None)
+    assert before["activeInteractionSummary"]["state"] == "started"
+
+    cancelled = boundary.handle_cancel(
+        _request("cancel", "chat.cancel", {"operationId": "to-cancel"})
+    )
+
+    after = boundary.snapshot_fields("ready", None)
+    assert cancelled["payload"]["accepted"] is True
+    assert after["activeInteractionSummary"]["state"] == "cancelling"
+    assert after["revision"] > before["revision"]
+    boundary.abandon_send(send)
+    boundary.close()
+
+
 def test_assistant_history_failure_does_not_emit_completed_chat_fact(tmp_path: Path) -> None:
     plugin_events: list[str] = []
 
