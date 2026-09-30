@@ -10,13 +10,13 @@ from typing import Any
 
 try:
     from .boundary import MemoryBoundary, _project_memory
-    from .memory import MEMORY_LAYERS
+    from .memory import MEMORY_LAYERS, VECTOR_MEMORY_LAYERS
     from .memory_recall import MemoryRecallService
     from .domain_types import ContextMessage, ContextRequest
     from .support import bind_logger, log_event
 except ImportError:
     from boundary import MemoryBoundary, _project_memory
-    from memory import MEMORY_LAYERS
+    from memory import MEMORY_LAYERS, VECTOR_MEMORY_LAYERS
     from memory_recall import MemoryRecallService
     from domain_types import ContextMessage, ContextRequest
     from support import bind_logger, log_event
@@ -149,6 +149,30 @@ class SakuraMem0Runtime:
 
     def forget_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
         return self._boundary.delete({"id": arguments.get("memory_id")})
+
+    def _personal(self, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
+        return getattr(self._boundary, "memory_tool")(name, dict(arguments))
+
+    def personal_search_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("search", arguments)
+
+    def personal_detail_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("detail", arguments)
+
+    def personal_timeline_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("timeline", arguments)
+
+    def personal_remember_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("remember", arguments)
+
+    def personal_update_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("update", arguments)
+
+    def personal_forget_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("forget", arguments)
+
+    def personal_let_go_tool(self, arguments: Mapping[str, object]) -> dict[str, object]:
+        return self._personal("let_go", arguments)
 
     def _combined_settings_descriptor(self) -> dict[str, object]:
         return {
@@ -723,9 +747,12 @@ class SakuraMem0Plugin:
             runtime.context,
         )
         tools = getattr(context, "get")("sakura.host.tools")
-        for descriptor, callback in _tool_registrations(runtime):
-            if self._personal_snapshot is not None and descriptor["name"] != "memory_search":
-                continue
+        registrations = (
+            _personal_tool_registrations(runtime, daily=self._personal_daily)
+            if self._personal_snapshot is not None
+            else _tool_registrations(runtime)
+        )
+        for descriptor, callback in registrations:
             tools.register(descriptor, callback)
         if self._personal_snapshot is not None:
             return
@@ -920,6 +947,96 @@ def _tool_registrations(
             runtime.forget_tool,
         ),
     ]
+
+
+_SENSITIVE_NOTE = "不要写入密码、token、密钥、身份证、银行卡等敏感凭据。"
+
+
+def _personal_tool_registrations(
+    runtime: SakuraMem0Runtime, *, daily: bool,
+) -> list[tuple[dict[str, object], Callable[[Mapping[str, object]], object]]]:
+    """Qt-era personal memory tools; writes exist only on the admitted daily entry."""
+
+    def call(name: str) -> Callable[[Mapping[str, object]], object]:
+        return getattr(runtime, f"personal_{name}_tool")
+
+    memory_id = {"memory_id": {"type": "string"}}
+    write_fields = {
+        "content": {"type": "string"},
+        "layer": {"type": "string", "enum": list(VECTOR_MEMORY_LAYERS)},
+        "category": {"type": "string"},
+        "importance": {"type": "number"},
+        "confidence": {"type": "number"},
+    }
+
+    def descriptor(name: str, description: str, properties: dict, required: list[str], risk: str) -> dict:
+        return {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": required},
+            "group": "plugin",
+            "risk": risk,
+        }
+
+    search = descriptor(
+        "memory_search",
+        "搜索长期记忆。问「认不认识 / 旧事 / 偏好 / 是谁」时默认用本工具，不要先用 history_search 翻聊天记录。"
+        "仅当运行时已注入的记忆不够用时再调用；同轮优先一次，显式回忆最多两次，不要对同一意图换词连搜。"
+        "若结果为空或未写明某细节，回答时承认不知道/记不清，禁止编造。"
+        "mode='full'（默认）返回完整正文；mode='index' 只返回标题索引，token 消耗约 1/10。"
+        "已放手的记忆默认不返回；只有对方明确要回顾放下的事时才设 include_released=true。",
+        {
+            "query": {"type": "string"},
+            "limit": {"type": "integer"},
+            "layer": {"type": "string", "enum": list(MEMORY_LAYERS)},
+            "mode": {"type": "string", "enum": ["full", "index"]},
+            "include_released": {"type": "boolean"},
+        },
+        ["query"],
+        "low",
+    )
+    registrations = [(search, call("search"))]
+    if not daily:
+        return registrations
+    registrations += [
+        (descriptor(
+            "memory_detail",
+            "按 memory_id 列表批量取回完整记忆内容。先用 memory_search(mode='index') 获取标题索引，"
+            "再对感兴趣的条目调用本工具展开全文。ids 可以是逗号分隔的字符串或数组。",
+            {"ids": {"type": "array", "items": {"type": "string"}}}, ["ids"], "low",
+        ), call("detail")),
+        (descriptor(
+            "memory_timeline",
+            "以某条记忆为锚点，查看它在时间线上的前后上下文。给定 memory_id，返回该条记忆及其之前/之后的邻近记忆。"
+            "适合在 memory_search 找到感兴趣的条目后，了解「那段时间还发生了什么」。不支持常驻档案（core_profile）作为锚点。",
+            {**memory_id, "before": {"type": "integer"}, "after": {"type": "integer"}}, ["memory_id"], "low",
+        ), call("timeline")),
+        (descriptor(
+            "memory_remember",
+            "保存一条明确、长期有用的记忆。只在对方明确要求记住，或信息明显会长期帮助相处/协作时使用。"
+            "身体亲密上的第一次、关系推进、对方的亲密偏好/边界、事后仍想记住的话，也属于应长期记住的相处事实"
+            "（写记忆点与偏好，不要写过程流水账）。关于他的事实用简体中文写；日记主语「我」是你自己，「他」是对方；"
+            "用「我／他」写清谁说了什么/约了什么，再写感受；已知名字可用名字代替「他」。" + _SENSITIVE_NOTE,
+            write_fields, ["content"], "medium",
+        ), call("remember")),
+        (descriptor(
+            "memory_update",
+            "更新一条已存在的长期记忆。先用 memory_search 找到 memory_id；只在对方明确纠正、补充、合并旧记忆，"
+            "或已有记忆明显过时时使用。" + _SENSITIVE_NOTE,
+            {**memory_id, **write_fields}, ["memory_id", "content"], "medium",
+        ), call("update")),
+        (descriptor(
+            "memory_forget",
+            "在对方明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
+            memory_id, ["memory_id"], "high",
+        ), call("forget")),
+        (descriptor(
+            "memory_let_go",
+            "放手一条记忆——不再想起，但不删除。用于「这件事我已经不想再记着了」的场合。",
+            memory_id, ["memory_id"], "medium",
+        ), call("let_go")),
+    ]
+    return registrations
 
 
 def _layer_options() -> list[dict[str, str]]:

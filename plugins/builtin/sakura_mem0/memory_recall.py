@@ -194,6 +194,8 @@ def _select_memories(
             continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         dedupe_key = " ".join(content.lower().split())
+        if _is_released(raw, metadata):
+            continue
         if dedupe_key in seen or any(
             _is_expired(_memory_field(raw, metadata, name, camel), now)
             for name, camel in (("expires_at", "expiresAt"), ("valid_until", "validUntil"))
@@ -228,6 +230,11 @@ def _select_memories(
         )
     )
     return normalized[:limit]
+
+
+def _is_released(raw: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    # A memory the character chose to let go of stays stored but is never recalled.
+    return str(_memory_field(raw, metadata, "status", "status") or "").strip().lower() == "released"
 
 
 def _memory_field(raw: dict[str, Any], metadata: dict[str, Any], name: str, camel: str) -> Any:

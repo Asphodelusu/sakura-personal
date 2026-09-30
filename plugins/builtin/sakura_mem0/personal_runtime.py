@@ -161,6 +161,25 @@ class PersonalRecallBoundary:
                 self._status = "degraded"
                 return {"status": "degraded", "memories": []}
 
+    _READ_TOOLS = frozenset({"search", "detail", "timeline"})
+    _WRITE_TOOLS = frozenset({"remember", "update", "forget", "let_go"})
+
+    def memory_tool(self, name, arguments):
+        if name not in self._READ_TOOLS | self._WRITE_TOOLS:
+            raise ValueError("PERSONAL_MEMORY_TOOL_UNKNOWN")
+        with self._lock:
+            if self._status != "ready" or self._records is None:
+                if name in self._WRITE_TOOLS:
+                    return {"status": self._status, "ok": False}
+                return {"status": self._status, "memories": []}
+            if name in self._WRITE_TOOLS and not self._daily:
+                raise ValueError("PERSONAL_MEMORY_READ_ONLY")
+            if __package__:
+                from .personal_tools import PersonalMemoryTools
+            else:
+                from personal_tools import PersonalMemoryTools
+            return getattr(PersonalMemoryTools(self._records, self.scope), name)(dict(arguments))
+
     def core_profile_fragment(self):
         with self._lock:
             if self._closed:
