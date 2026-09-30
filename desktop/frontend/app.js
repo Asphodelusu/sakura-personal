@@ -6,6 +6,7 @@ import { createAsrPresentation } from "./audio/asr-presentation.js";
 import { createAsrAvailability } from "./audio/asr-availability.js";
 import { createComposerActionIndicator } from "./chat/composer-action-indicator.js";
 import { createComposerToolRegistry } from "./chat/composer-tool-dock.js";
+import { createInitiativeController } from "./chat/initiative-controller.js";
 import { createRealChatClient } from "./chat/real-chat-client.js";
 import { createScreenAttachmentController } from "./chat/screen-attachment-controller.js";
 import { createScreenAwarenessController } from "./chat/screen-awareness-controller.js";
@@ -1323,6 +1324,7 @@ function render(state, bubbleUpdate = {}) {
 
 function handleCoreEvent(event) {
   updateAnnouncement.handleChatEvent(event);
+  initiative.handleChatEvent(event);
   if (["chat.completed", "chat.failed", "chat.cancelled"].includes(event.type)) {
     runtimeDiagnostics.record({
       level: event.type === "chat.failed" ? "warn" : "info",
@@ -1343,6 +1345,7 @@ function handleCoreEvent(event) {
     screenAttachment.invalidate();
     screenAwareness.generationChanged(event.generationId);
     updateAnnouncement.generationChanged();
+    initiative.generationChanged();
     composerToolRegistry.invalidate();
     ++portraitHitRevision;
     rendererHost.freeze("generation_changed");
@@ -1440,8 +1443,34 @@ const screenAwareness = createScreenAwarenessController({
   }),
 });
 
+const initiative = createInitiativeController({
+  send: (kind) => chatClient.sendInitiative(kind),
+  cancel: (operationId) => chatClient.cancel(operationId),
+  isIdle: () => {
+    const state = presentation.current();
+    return !presentationUnavailable
+      && isChatReadyLifecycle(state.lifecycle)
+      && !chatClient.isBusy()
+      && !state.canCancel
+      && !waitingIndicator.active()
+      && !typewriter.isActive()
+      && input.value === ""
+      && stage.dataset.composing !== "true"
+      && !screenAttachment.busy()
+      && !asrController?.active()
+      && !updateAnnouncement.isPending();
+  },
+  onDiagnostic: (event, details) => runtimeDiagnostics.record({
+    level: event.endsWith("failed") ? "warn" : "info",
+    event,
+    outcome: event.endsWith("failed") ? "failed" : "completed",
+    ...details,
+  }),
+});
+
 async function submitMessage({ text }) {
   if (asrController?.active()) return;
+  initiative.noteActivity();
   const state = presentation.current();
   if (presentationUnavailable || chatClient.isBusy() || state.canCancel || !isChatReadyLifecycle(state.lifecycle)) return;
   updateAnnouncement.noteActivity();
@@ -2070,6 +2099,7 @@ await listenAppEvent("sakura://update-preferences-changed", (event) => {
 });
 input.addEventListener("compositionstart", (event) => {
   updateAnnouncement.noteActivity();
+  initiative.noteActivity();
   inputFocus.handleCompositionStart(event.data);
   stage.dataset.composing = "true";
   adaptiveSurface.setComposing(true);
@@ -2084,6 +2114,7 @@ input.addEventListener("input", () => {
   draftVersion += 1;
   updateAnnouncement.noteActivity();
   screenAwareness.noteActivity();
+  initiative.noteActivity();
   input.lang = inferTextLanguage(input.value);
   adaptiveSurface.schedule();
   surfaceVisibilityController?.setInputPinned(inputIsPinned());
@@ -2106,6 +2137,7 @@ document.addEventListener("pointerdown", (event) => {
 input.addEventListener("keydown", (event) => {
   updateAnnouncement.noteActivity();
   screenAwareness.noteActivity();
+  initiative.noteActivity();
   if (event.key === "Escape" && screenAttachment.isOpen()) {
     event.preventDefault();
     screenAttachment.close({ focus: true });
@@ -2193,6 +2225,7 @@ function dispose() {
   composerToolRegistry.dispose();
   screenAwareness.dispose();
   updateAnnouncement.dispose();
+  initiative.dispose();
   runtimeDiagnostics.dispose();
 }
 
@@ -2228,3 +2261,4 @@ if (!presentationUnavailable) {
   }
 }
 updateAnnouncement.start();
+initiative.start();

@@ -219,6 +219,30 @@ test("failed or cancelled silent proactive requests leave the current UI untouch
   }
 });
 
+test("a silent request that chooses to say nothing releases the composer without touching the UI", () => {
+  const reducer = readyReducer();
+  const before = reducer.current();
+  reducer.reduce({
+    type: "chat.started",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "quiet",
+    presentation: "silent",
+  });
+  const completed = reducer.reduce({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "quiet",
+    presentation: "silent",
+    reply: { segments: [] },
+  });
+  assert.equal(completed.state.phase, before.phase);
+  assert.equal(completed.state.bubbleText, before.bubbleText);
+  assert.equal(completed.state.operationId, null);
+  assert.equal(completed.state.silentInteraction, false);
+});
+
 
 
 test("old operations, generations, and revisions cannot replace current presentation", () => {

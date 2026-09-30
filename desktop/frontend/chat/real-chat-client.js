@@ -2,6 +2,7 @@ import { isChatReadyLifecycle, projectLifecycle } from "../lifecycle.js";
 
 const TERMINALS = new Set(["chat.completed", "chat.failed", "chat.cancelled"]);
 const STABLE_LIFECYCLE = new Set(["ready", "setup_required", "degraded", "failed"]);
+const INITIATIVE_KINDS = new Set(["intimacy_continue", "relationship_initiative"]);
 
 function validateChatEvent(value) {
   if (
@@ -279,6 +280,10 @@ export function createRealChatClient({
     },
     async announceUpdate() {
       return sendCommand("chat_update_announce", undefined, "silent");
+    },
+    async sendInitiative(kind) {
+      if (!INITIATIVE_KINDS.has(kind)) throw new Error("CHAT_INITIATIVE_KIND_INVALID");
+      return sendCommand("chat_initiative_send", { payload: { kind } }, "silent");
     },
     async cancel(operationId) {
       if (disposed) return false;

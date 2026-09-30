@@ -227,6 +227,15 @@ export function createChatPresentationReducer({ initialMessage } = {}) {
       if (!event.operationId || event.operationId !== state.operationId) return result(false);
       if (event.type === "chat.completed" && (state.phase === "thinking" || state.silentInteraction)) {
         const segments = normalizedSegments(event.reply);
+        if (!segments.length && state.silentInteraction) {
+          state = freezeState({
+            ...state,
+            operationId: null,
+            silentInteraction: false,
+            canCancel: false,
+          });
+          return result(true);
+        }
         if (!segments.length) return result(false);
         const currentReplyHistoryStart = state.replyHistorySegments.length;
         const replyHistorySegments = Object.freeze([...state.replyHistorySegments, ...segments]);

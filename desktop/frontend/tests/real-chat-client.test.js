@@ -43,7 +43,7 @@ function harness(sendResponses = []) {
   const invoke = async (name, payload) => {
     calls.push([name, payload]);
     if (name === "runtime_lifecycle_snapshot") return publication;
-    if (["chat_send", "chat_update_announce"].includes(name)) return sendResponses.shift();
+    if (["chat_send", "chat_update_announce", "chat_initiative_send"].includes(name)) return sendResponses.shift();
     if (name === "chat_cancel") return { accepted: true, operationId: payload.payload.operationId };
     throw new Error(name);
   };
@@ -306,6 +306,40 @@ test("silent sends tag their started and terminal events without changing the na
   assert.deepEqual(env.calls.find(([name]) => name === "chat_send"), [
     "chat_send",
     { payload: { message: "主动观察" } },
+  ]);
+  assert.equal(client.isBusy(), false);
+  client.dispose();
+});
+
+test("initiated turns name only their kind and stay silent until Sakura speaks", async () => {
+  const events = [];
+  const env = harness([{
+    accepted: true,
+    operationId: "op-initiative",
+    cancelHandle: "cancel-initiative",
+    generationId: "generation-1",
+    generationNumber: 1,
+  }]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+
+  await assert.rejects(client.sendInitiative("screen_peek"), /CHAT_INITIATIVE_KIND_INVALID/);
+  await client.sendInitiative("relationship_initiative");
+  env.emit({ type: "chat.started", generationId: "generation-1", generationNumber: 1, operationId: "op-initiative" });
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-initiative",
+    reply: { segments: [] },
+  });
+
+  assert.deepEqual(env.calls.filter(([name]) => name === "chat_initiative_send"), [
+    ["chat_initiative_send", { payload: { kind: "relationship_initiative" } }],
+  ]);
+  assert.deepEqual(events.slice(1).map(({ type, presentation }) => [type, presentation]), [
+    ["chat.started", "silent"],
+    ["chat.completed", "silent"],
   ]);
   assert.equal(client.isBusy(), false);
   client.dispose();
