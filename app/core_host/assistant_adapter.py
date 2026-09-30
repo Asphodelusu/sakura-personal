@@ -108,6 +108,13 @@ def _safe_close_issue() -> None:
         pass
 
 
+def _read_optional_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except (OSError, UnicodeError):
+        return ""
+
+
 def _close_owned(values: list[object]) -> None:
     for value in reversed(values):
         close = getattr(value, "close", None)
@@ -244,6 +251,11 @@ class AssistantAdapter:
 
             for tool in create_history_tools(self._user_root, profile.id):
                 self._application_tools.register(tool)
+            from app.agent.intimacy import create_set_intimacy_mode_tool
+
+            runtime.configure_intimacy(_read_optional_text(StoragePaths(self._user_root).intimacy_guide()))
+            if runtime.intimacy_available:
+                self._application_tools.register(create_set_intimacy_mode_tool(runtime.intimacy_state))
             from app.core_host.inner_thought_settings import attach_inner_thought
 
             attach_inner_thought(runtime, self._user_root)

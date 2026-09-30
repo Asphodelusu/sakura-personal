@@ -480,6 +480,7 @@ class RealChatBoundary:
                     or screen_attachment.source != "screen_awareness"
                 )
                 if relationship_user_turn:
+                    _note_intimacy_user_turn(runtime, message)
                     _begin_relationship_user_turn(runtime, operation_id)
                     _start_inner_thought(
                         runtime,
@@ -1297,6 +1298,23 @@ def _log_inner_thought_failure(exc: BaseException) -> None:
         {"code": "INNER_THOUGHT_START_FAILED", "error_type": type(exc).__name__},
         severity="info",
     )
+
+
+def _note_intimacy_user_turn(runtime: object | None, message: str) -> None:
+    note = getattr(runtime, "note_intimacy_user_turn", None)
+    if not callable(note):
+        return
+    try:
+        note(str(message or ""))
+    except Exception as exc:  # noqa: BLE001 - the optional layer must not fail the turn
+        from app.core.runtime_log import log_event
+
+        log_event(
+            "Intimacy",
+            "亲密导演层状态未更新",
+            {"code": "INTIMACY_STATE_UPDATE_FAILED", "error_type": type(exc).__name__},
+            severity="info",
+        )
 
 
 def _begin_relationship_user_turn(runtime: object | None, operation_id: str) -> None:

@@ -167,6 +167,10 @@ class StoragePaths:
     def tasks_store(self) -> Path:
         return self._data / "tasks.json"
 
+    # ---- 可选亲密导演层（私有，不进版本库） ----
+    def intimacy_guide(self) -> Path:
+        return self._data / "intimacy_guide.txt"
+
     # ---- 笔记 ----
     @property
     def notes_dir(self) -> Path:

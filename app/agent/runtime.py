@@ -149,6 +149,10 @@ class AgentRuntime:
         self._relationship_guide_enabled = False
         self._expression_bias = "natural"
         self._lore_index = None
+        from app.agent.intimacy import IntimacyModeState
+
+        self._intimacy = IntimacyModeState()
+        self._intimacy_guide = ""
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -264,6 +268,33 @@ class AgentRuntime:
 
     def configure_lore(self, lore_index: object | None) -> None:
         self._lore_index = lore_index
+
+    def configure_intimacy(self, guide: str) -> None:
+        self._intimacy_guide = str(guide or "").strip()
+
+    @property
+    def intimacy_state(self):
+        return self._intimacy
+
+    @property
+    def intimacy_available(self) -> bool:
+        return bool(self._intimacy_guide)
+
+    def note_intimacy_user_turn(self, text: str) -> None:
+        from app.agent.intimacy import apply_intimacy_user_utterance
+
+        action = apply_intimacy_user_utterance(text, self._intimacy, available=bool(self._intimacy_guide))
+        if self._intimacy.active and action not in {"entered", "already_on"}:
+            self._intimacy.refresh_user_reply()
+
+    def _effective_reply_tones(self) -> list[str]:
+        """Configured tones; the active intimacy layer adds its extra tones if missing."""
+        from app.agent.intimacy import INTIMACY_EXTRA_TONES
+
+        tones = [str(tone).strip() for tone in self.reply_tones if str(tone).strip()]
+        if self._intimacy.active and self._intimacy_guide:
+            tones.extend(extra for extra in INTIMACY_EXTRA_TONES if extra not in tones)
+        return tones
 
     def configure_inner_thought(
         self,
@@ -725,7 +756,7 @@ class AgentRuntime:
                 trace_call=trace_call,
                 cancel_checker=cancel_checker,
             )
-        sanitized = sanitize_reply_tones(reply, self.reply_tones)
+        sanitized = sanitize_reply_tones(reply, self._effective_reply_tones())
         changes: list[str] = []
         if original.needs_retry and _reply_trace_mapping(original.reply) != _reply_trace_mapping(reply):
             changes.append("reply_repair")
@@ -753,7 +784,7 @@ class AgentRuntime:
         prompt = _final_provider_system_prompt(
             system_prompt,
             working_messages,
-            self.reply_tones,
+            self._effective_reply_tones(),
             self.reply_visual,
         )
         turn = self._client_for_messages(working_messages).complete_with_tools(
@@ -789,7 +820,7 @@ class AgentRuntime:
         reply = self._client_for_messages(working_messages).chat(
             system_prompt,
             working_messages,
-            self.reply_tones,
+            self._effective_reply_tones(),
             self.reply_visual,
             runtime_context=runtime_context,
             cancel_checker=cancel_checker,
@@ -1376,14 +1407,14 @@ class AgentRuntime:
                 static_prompt=(
                     _chat_provider_system_prompt(
                         base_final_prompt_build.system_prompt,
-                        self.reply_tones,
+                        self._effective_reply_tones(),
                         self.reply_visual,
                     )
                     if use_text_tool_summary
                     else _final_provider_system_prompt(
                         base_final_prompt_build.system_prompt,
                         working_messages,
-                        self.reply_tones,
+                        self._effective_reply_tones(),
                         self.reply_visual,
                     )
                 ),
@@ -1461,7 +1492,7 @@ class AgentRuntime:
                         messages=fallback_messages,
                         static_prompt=_chat_provider_system_prompt(
                             base_fallback_prompt.system_prompt,
-                            self.reply_tones,
+                            self._effective_reply_tones(),
                             self.reply_visual,
                         ),
                         tools=(),
@@ -1578,7 +1609,7 @@ class AgentRuntime:
             event_messages,
             static_prompt=_chat_provider_system_prompt(
                 base_prompt_build.system_prompt,
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_visual,
             ),
             source="event",
@@ -1593,7 +1624,7 @@ class AgentRuntime:
             reply = self._client_for_messages(event_messages).chat(
                 prompt_build.system_prompt,
                 event_messages,
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_visual,
                 runtime_context=prompt_build.runtime_context,
                 trace_metadata=PromptTraceMetadata(
@@ -1624,15 +1655,29 @@ class AgentRuntime:
         )
 
     def _persona_sections(self) -> list[PromptSection]:
+        from app.agent.intimacy import build_intimacy_section
+
+        intimacy_focus = self._intimacy.active and bool(self._intimacy_guide)
+        persona_body = self.system_prompt.strip()
+        if intimacy_focus and persona_body:
+            from app.llm.prompts.personal_persona import soften_character_card_for_intimacy
+
+            persona_body = soften_character_card_for_intimacy(persona_body)
         sections = [
             PromptSection(
                 section_id="persona.character",
-                body=self.system_prompt.strip(),
+                body=persona_body,
                 source="character",
                 sensitivity="private",
             )
         ]
         sections.extend(self._relationship_guide_sections())
+        intimacy = build_intimacy_section(self._intimacy, self._intimacy_guide)
+        if intimacy is not None:
+            sections.append(intimacy)
+        if intimacy_focus:
+            # 亲密专注当下：跳过插件往人格前缀塞的长补充，避免再把注意力拉回日常设定。
+            return sections
         sections.extend(
             PromptSection(
                 section_id=f"plugin_patch.{patch.patch_id}",
@@ -1730,7 +1775,7 @@ class AgentRuntime:
 
         reply_protocol = self._apply_reply_protocol_patches(
             build_agent_reply_protocol(
-                self.reply_tones,
+                self._effective_reply_tones(),
                 self.reply_visual,
                 include_drive_effect=self._relationship.accepts_effect_instruction,
                 personal_style=self._personal_style,
@@ -1823,7 +1868,7 @@ class AgentRuntime:
     ):
         screen_awareness_rules = build_screen_awareness_check_tool_system_prefix(
             "",
-            self.reply_tones,
+            self._effective_reply_tones(),
             self.reply_visual,
             max_tool_calls_per_step=self.runtime_loop_settings.max_tool_calls_per_step,
             max_tool_calls_per_turn=self.runtime_loop_settings.max_tool_calls_per_turn,
@@ -1869,7 +1914,7 @@ class AgentRuntime:
         snapshot: ContextSnapshot | None = None,
     ):
         event_rules = build_event_system_prompt(
-            "", self.reply_tones, self.reply_visual, event_type=event_type
+            "", self._effective_reply_tones(), self.reply_visual, event_type=event_type
         )
         sections = [
             *self._persona_sections(),
