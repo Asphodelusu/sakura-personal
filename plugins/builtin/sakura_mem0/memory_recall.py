@@ -143,7 +143,9 @@ class MemoryRecallService:
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
 
     def _recall_with_policy(self, policy, request, query, memories, started_at) -> MemoryRecallResult:
-        selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id)
+        budget = getattr(policy, "budget_seconds", None)
+        deadline = {} if budget is None else {"deadline": started_at + float(budget)}
+        selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id, **deadline)
         fragments = tuple(
             ContextFragment(
                 fragment_id=f"memory.{memory['id'] or index}",

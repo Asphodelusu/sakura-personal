@@ -197,3 +197,136 @@ def test_the_policy_plans_with_the_rewrite_client_and_survives_its_failure(tmp_p
 
     policy = _policy(tmp_path, rewrite_client=broken_factory)
     assert policy.plan_query(ContextRequest(current_input="在吗")) == "在吗"
+
+
+class _ColdReranker(_Reranker):
+    def __init__(self, scores):
+        super().__init__(scores)
+        self.warmed = 0
+
+    def ready(self):
+        return False
+
+    def warm(self):
+        self.warmed += 1
+
+    def score(self, query, texts):
+        raise AssertionError("a cold reranker must not block recall")
+
+
+def test_a_cold_reranker_is_warmed_and_recall_keeps_semantic_order(tmp_path: Path) -> None:
+    reranker = _ColdReranker({})
+    policy = _policy(tmp_path, reranker=reranker)
+    selected = policy.select("q", [
+        _memory("low", "low", semanticScore=0.4),
+        _memory("high", "high", semanticScore=0.8),
+    ], 5)
+    assert [item["id"] for item in selected] == ["high", "low"]
+    assert reranker.warmed == 1
+
+
+def test_only_the_semantic_head_is_reranked(tmp_path: Path) -> None:
+    from plugins.builtin.sakura_mem0.personal_recall import RERANK_TOP_N
+
+    scored = []
+
+    class Recording(_Reranker):
+        def score(self, query, texts):
+            scored.extend(texts)
+            return [0.9 for _ in texts]
+
+    memories = [_memory(f"m{index}", f"text {index}", semanticScore=0.9 - index * 0.01)
+                for index in range(RERANK_TOP_N + 3)]
+    selected = _policy(tmp_path, reranker=Recording({})).select("q", list(reversed(memories)), 50)
+    assert scored == [f"text {index}" for index in range(RERANK_TOP_N)]
+    assert {item["id"] for item in selected} == {f"m{index}" for index in range(RERANK_TOP_N)}
+
+
+def test_rerank_is_skipped_when_the_recall_deadline_is_near(tmp_path: Path) -> None:
+    from time import monotonic
+
+    class Unused(_Reranker):
+        def score(self, query, texts):
+            raise AssertionError("no time left to rerank")
+
+    selected = _policy(tmp_path, reranker=Unused({})).select("q", [
+        _memory("a", "a", semanticScore=0.5),
+        _memory("b", "b", semanticScore=0.7),
+    ], 5, deadline=monotonic() + 0.05)
+    assert [item["id"] for item in selected] == ["b", "a"]
+
+
+def test_a_slow_rewrite_falls_back_to_the_heuristic_within_its_budget(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    from time import monotonic
+
+    from plugins.builtin.sakura_mem0 import personal_recall
+
+    release = threading.Event()
+
+    class Slow:
+        def complete_raw(self, *_args, **_kwargs):
+            release.wait(5)
+            return '{"query": "late"}'
+
+    monkeypatch.setattr(personal_recall, "REWRITE_BUDGET_SECONDS", 0.1)
+    policy = _policy(tmp_path, rewrite_client=Slow)
+    started = monotonic()
+    try:
+        assert policy.plan_query(ContextRequest(current_input="在吗")) == "在吗"
+        assert monotonic() - started < 1.0
+    finally:
+        release.set()
+
+
+def test_recall_service_hands_the_policy_its_deadline(tmp_path: Path) -> None:
+    from time import monotonic
+
+    seen = []
+
+    class Policy:
+        budget_seconds = 4.0
+        candidates = 30
+
+        def plan_query(self, request):
+            return request.current_input
+
+        def select(self, query, memories, limit, *, excluded_turn_id="", deadline=None):
+            seen.append(deadline)
+            return []
+
+    class Memory:
+        recall_policy = Policy()
+
+        def search_memory(self, arguments, *, wait=False):
+            return {"status": "ready", "memories": []}
+
+    before = monotonic()
+    MemoryRecallService(Memory()).recall(ContextRequest(current_input="x", character_id="alice"))
+    assert before + 3.9 <= seen[0] <= monotonic() + 4.0
+
+
+def test_the_cross_encoder_loads_in_the_background_and_never_blocks_scoring(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    from plugins.builtin.sakura_mem0 import personal_recall
+
+    gate = threading.Event()
+
+    class Encoder:
+        def predict(self, pairs, **_kwargs):
+            return [0.5 for _ in pairs]
+
+    def slow_load(self):
+        gate.wait(5)
+        return Encoder()
+
+    monkeypatch.setattr(personal_recall.CrossEncoderReranker, "_load_encoder", slow_load)
+    reranker = personal_recall.CrossEncoderReranker(tmp_path)
+    assert reranker.score("q", ["a"]) is None
+    assert not reranker.ready()
+    gate.set()
+    reranker.warm()
+    reranker.wait_ready(2)
+    assert reranker.ready()
+    assert reranker.score("q", ["a", "b"]) == [0.5, 0.5]

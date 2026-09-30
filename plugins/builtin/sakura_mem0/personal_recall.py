@@ -9,13 +9,16 @@ import sqlite3
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 
 if __package__:
     from .personal_emotion import active_emotion, emotion_congruence_factor
+    from .personal_model import quiet_model_loading
     from .personal_query_rewrite import plan_query
     from .support import log_event
 else:
     from personal_emotion import active_emotion, emotion_congruence_factor
+    from personal_model import quiet_model_loading
     from personal_query_rewrite import plan_query
     from support import log_event
 
@@ -48,6 +51,14 @@ _PAST_LOOKING = re.compile(
 )
 ACCESS_TRACKER_FILE = "access_tracker.db"
 RERANK_MAX_LENGTH = 512
+# The plugin runs on CPU torch: one pair costs ~60 ms, so only the semantic head
+# is reranked and the step is skipped when the recall budget is nearly spent.
+RERANK_TOP_N = 12
+RERANK_RESERVE_SECONDS = 1.2
+# Recall runs inside the memory context call (MEMORY_CONTEXT_TIMEOUT_SECONDS in plugin.py);
+# it must degrade before that deadline rather than lose the profile and mood fragments too.
+RECALL_BUDGET_SECONDS = 4.5
+REWRITE_BUDGET_SECONDS = 1.8
 
 
 class AccessTracker:
@@ -94,45 +105,73 @@ class AccessTracker:
 
 
 class CrossEncoderReranker:
-    """bge-reranker from a local snapshot directory; loads lazily, never downloads."""
+    """bge-reranker from a local snapshot directory; never downloads.
+
+    Loading takes seconds, longer than a recall may wait, so it happens on a
+    background thread and scoring returns None until the model is resident.
+    """
 
     def __init__(self, snapshot):
         self._snapshot = Path(snapshot)
         self._lock = threading.Lock()
+        self._loaded = threading.Event()
         self._model = None
         self._failed = False
+        self._closed = False
+        self._loader = None
 
     def available(self):
         return not self._failed and self._snapshot.is_dir()
 
-    def _encoder(self):
-        with self._lock:
-            if self._model is not None or self._failed:
-                return self._model
-            try:
-                from sentence_transformers import CrossEncoder
+    def ready(self):
+        return self._loaded.is_set() and self._model is not None
 
-                self._model = CrossEncoder(
-                    str(self._snapshot), device=_prefer_device(), max_length=RERANK_MAX_LENGTH,
-                    local_files_only=True, trust_remote_code=False,
-                )
-            except Exception as exc:
+    def warm(self):
+        with self._lock:
+            if self._loader is not None or self._failed or self._closed:
+                return
+            self._loader = threading.Thread(target=self._load, name="sakura-memory-rerank-load", daemon=True)
+            self._loader.start()
+
+    def wait_ready(self, timeout):
+        self._loaded.wait(timeout)
+        return self.ready()
+
+    def _load_encoder(self):
+        quiet_model_loading()
+        from sentence_transformers import CrossEncoder
+
+        return CrossEncoder(
+            str(self._snapshot), device=_prefer_device(), max_length=RERANK_MAX_LENGTH,
+            local_files_only=True, trust_remote_code=False,
+        )
+
+    def _load(self):
+        try:
+            model = self._load_encoder()
+        except Exception as exc:
+            model = None
+            log_event("Memory", "记忆精排模型加载失败，改用语义分",
+                      {"code": "MEMORY_RERANK_LOAD_FAILED", "error_type": type(exc).__name__},
+                      event="memory.rerank.load_failed", severity="warning")
+        with self._lock:
+            if model is None:
                 self._failed = True
-                log_event("Memory", "记忆精排模型加载失败，改用语义分",
-                          {"code": "MEMORY_RERANK_LOAD_FAILED", "error_type": type(exc).__name__},
-                          event="memory.rerank.load_failed", severity="warning")
-            return self._model
+            elif not self._closed:
+                self._model = model
+        self._loaded.set()
 
     def score(self, query, texts):
-        encoder = self._encoder()
-        if encoder is None:
+        if not self.ready():
+            self.warm()
             return None
-        predicted = encoder.predict([[query, text] for text in texts],
-                                    batch_size=min(32, len(texts)), show_progress_bar=False)
+        predicted = self._model.predict([[query, text] for text in texts],
+                                        batch_size=min(32, len(texts)), show_progress_bar=False)
         return [min(1.0, max(0.0, float(value))) for value in predicted]
 
     def close(self):
         with self._lock:
+            self._closed = True
             self._model = None
 
 
@@ -309,6 +348,12 @@ def _combine_soft(*pairs):
     return max(0.0, 1.0 + sum(weight * (factor - 1.0) for factor, weight in pairs))
 
 
+def _semantic_rank(raw):
+    semantic = _score(raw.get("semanticScore"))
+    value = semantic if semantic is not None else _score(raw.get("score"))
+    return (value is None, -(value or 0.0))
+
+
 def _score(value):
     if isinstance(value, bool) or value is None:
         return None
@@ -370,6 +415,7 @@ class PersonalRecallPolicy:
     """Candidate selection for one character; stateless apart from the access table."""
 
     candidates = RECALL_CANDIDATES
+    budget_seconds = RECALL_BUDGET_SECONDS
 
     def __init__(self, memory_dir, *, reranker=None, list_memories=None, record_access=False,
                  threshold=RELEVANCE_THRESHOLD, clock=None, rewrite_client=None, mood_reader=None):
@@ -397,6 +443,11 @@ class PersonalRecallPolicy:
                     self._tracker_failed = True
             return self._tracker
 
+    def warm(self):
+        warm = getattr(self._reranker, "warm", None)
+        if callable(warm) and self._reranker.available():
+            warm()
+
     def plan_query(self, request):
         client = None
         if self._rewrite_client is not None:
@@ -404,7 +455,15 @@ class PersonalRecallPolicy:
                 client = self._rewrite_client()
             except Exception:
                 client = None
-        return plan_query(request, client)
+        if client is None:
+            return plan_query(request, None)
+        # The client's socket timeout bounds each read, not the whole request.
+        planned = []
+        worker = threading.Thread(target=lambda: planned.append(plan_query(request, client)),
+                                  name="sakura-memory-query-rewrite", daemon=True)
+        worker.start()
+        worker.join(REWRITE_BUDGET_SECONDS)
+        return planned[0] if planned else plan_query(request, None)
 
     def _active_emotion(self, query):
         mood = ""
@@ -424,10 +483,20 @@ class PersonalRecallPolicy:
     def budget(self, memory):
         return fragment_budget(memory)
 
-    def rerank(self, query, memories):
+    def rerank(self, query, memories, *, deadline=None):
         reranker = self._reranker
-        texts = [_text(item, "content", "memory") for item in memories]
-        if reranker is None or len(memories) < 2 or not all(texts) or not reranker.available():
+        if reranker is None or len(memories) < 2 or not reranker.available():
+            return memories
+        ready = getattr(reranker, "ready", None)
+        if callable(ready) and not ready():
+            self.warm()
+            return memories
+        if deadline is not None and deadline - monotonic() < RERANK_RESERVE_SECONDS:
+            return memories
+        # Rerank and semantic scores are on different scales, so the unscored tail is dropped.
+        head = sorted(memories, key=_semantic_rank)[:RERANK_TOP_N]
+        texts = [_text(item, "content", "memory") for item in head]
+        if not all(texts):
             return memories
         try:
             scores = reranker.score(query, texts)
@@ -435,16 +504,16 @@ class PersonalRecallPolicy:
             log_event("Memory", "记忆精排失败，改用语义分", {"code": "MEMORY_RERANK_FAILED", "error_type": type(exc).__name__},
                       event="memory.rerank.failed", severity="warning")
             return memories
-        if scores is None or len(scores) != len(memories):
+        if scores is None or len(scores) != len(head):
             return memories
-        rescored = [dict(item, rerankScore=score) for item, score in zip(memories, scores)]
+        rescored = [dict(item, rerankScore=score) for item, score in zip(head, scores)]
         rescored.sort(key=lambda item: item["rerankScore"], reverse=True)
         return rescored
 
-    def select(self, query, memories, limit, *, excluded_turn_id=""):
+    def select(self, query, memories, limit, *, excluded_turn_id="", deadline=None):
         now = self._clock()
         include_expired = query_looks_past(query)
-        memories = self.rerank(query, [item for item in memories if isinstance(item, dict)])
+        memories = self.rerank(query, [item for item in memories if isinstance(item, dict)], deadline=deadline)
         tracker = self._access()
         try:
             accessed = tracker.last_accessed([_text(item, "id") for item in memories]) if tracker else {}

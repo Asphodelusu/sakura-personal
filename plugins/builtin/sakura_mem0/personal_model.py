@@ -4,6 +4,16 @@ import json
 from pathlib import Path
 
 
+def quiet_model_loading():
+    """Weight-loading progress bars reach the host as plugin stderr warnings."""
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.disable_progress_bar()
+    except Exception:
+        pass
+
+
 def fingerprint_snapshot(snapshot):
     # Preserve app/config/memory_models.py's path/content framing exactly.
     # HF cache file symlinks identify blobs by their bytes, not their link names.
@@ -39,11 +49,13 @@ class LocalPersonalEncoder:
             raise ValueError("PERSONAL_MODEL_IDENTITY_INVALID")
         if not snapshot.is_dir() or (expected is not None and fingerprint_snapshot(snapshot) != expected):
             raise ValueError("PERSONAL_MODEL_ARTIFACT_MISMATCH")
+        quiet_model_loading()
         from sentence_transformers import SentenceTransformer
         try:
             self.model = SentenceTransformer(str(snapshot), local_files_only=True, trust_remote_code=False)
             self.model.max_seq_length = identity["max_seq_length"]
-            if self.model.get_sentence_embedding_dimension() != identity["dimensions"]:
+            dimension = getattr(self.model, "get_embedding_dimension", None) or self.model.get_sentence_embedding_dimension
+            if dimension() != identity["dimensions"]:
                 raise ValueError("PERSONAL_MODEL_DIMENSIONS_MISMATCH")
             if expected is not None and fingerprint_snapshot(snapshot) != expected:
                 raise ValueError("PERSONAL_MODEL_SNAPSHOT_CHANGED")

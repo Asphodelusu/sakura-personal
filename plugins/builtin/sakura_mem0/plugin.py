@@ -24,6 +24,8 @@ except ImportError:
 
 PLUGIN_ID = "sakura.memory.mem0"
 MEMORY_CONTEXT_PROVIDER_ID = "sakura.memory.mem0.recall"
+# Covers the recall budget (RECALL_BUDGET_SECONDS) plus the profile and mood reads.
+MEMORY_CONTEXT_TIMEOUT_SECONDS = 6
 MEMORY_SETTINGS_SECTION_ID = "memory"
 MEMORY_COMPONENT_SECTION_ID = "memory_embedding_component"
 MEMORY_MANAGEMENT_SECTION_ID = "memory_management"
@@ -827,6 +829,7 @@ class SakuraMem0Plugin:
                 "providerId": MEMORY_CONTEXT_PROVIDER_ID,
                 "description": "从当前角色的本地长期记忆中选择与本轮相关的少量事实。",
                 "order": 60,
+                "timeoutSeconds": MEMORY_CONTEXT_TIMEOUT_SECONDS,
             },
             runtime.context,
         )

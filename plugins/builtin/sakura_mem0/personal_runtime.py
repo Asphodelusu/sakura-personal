@@ -162,6 +162,7 @@ class PersonalRecallBoundary:
                     pending = None
             log_event("Memory", "个人记忆加载完成", {"curation_enabled": self._curation_options is not None},
                       event="memory.personal.loaded", severity="info")
+            self.recall_policy.warm()
             if pending is not None:
                 self.note_timeline_changed(pending)
         except Exception as exc:
@@ -340,7 +341,7 @@ class PersonalRecallBoundary:
             return None
         with self._lock:
             curation = self._curation if self._status == "ready" else None
-        return curation.fast_completion_client() if curation is not None else None
+        return curation.fast_completion_client(timeout_seconds=2) if curation is not None else None
 
     def _reflection_client(self):
         with self._lock:

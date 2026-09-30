@@ -33,6 +33,8 @@ HOST_COMPOSER_TOOLS_V0_SERVICE = "sakura.host.ui.composer-tools-v0"
 HOST_TIMELINE_SERVICE = "sakura.host.timeline"
 _TIMELINE_RESPONSE_ENTRY_BYTES = 700 * 1024
 _TOOL_CALLBACK_TIMEOUT_SECONDS = 15.0
+# Context runs before every reply, so a provider may only extend the default call deadline this far.
+_CONTEXT_CALLBACK_MAX_TIMEOUT_SECONDS = 10.0
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$")
 _COMPOSER_TOOL_PUBLIC_ID = re.compile(
@@ -624,6 +626,7 @@ class _ContextHostService:
         description = descriptor.get("description", "")
         order = descriptor.get("order", 100.0)
         enabled = descriptor.get("enabled", True)
+        timeout = descriptor.get("timeoutSeconds")
         if (
             not isinstance(provider_id, str)
             or not _IDENTIFIER.fullmatch(provider_id)
@@ -632,8 +635,14 @@ class _ContextHostService:
             or not isinstance(order, (int, float))
             or isinstance(order, bool)
             or not isinstance(enabled, bool)
+            or timeout is not None and (
+                isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or not 0 < timeout <= _CONTEXT_CALLBACK_MAX_TIMEOUT_SECONDS
+            )
         ):
             raise HostServiceError("CONTEXT_DESCRIPTOR_INVALID")
+        deadline = {} if timeout is None else {"timeout": float(timeout)}
         if any(
             item.contribution.provider_id == provider_id
             for item in self._registrations.values()
@@ -645,6 +654,7 @@ class _ContextHostService:
                 handle,
                 "context.contributor",
                 self._encode_request(request),
+                **deadline,
             )
             if not isinstance(payload, list):
                 raise HostServiceError("CONTEXT_RESULT_INVALID")
