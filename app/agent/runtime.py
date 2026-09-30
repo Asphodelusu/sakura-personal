@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import replace
 from threading import Lock
@@ -29,7 +30,13 @@ from app.llm.api_client import (
     is_vision_unsupported_error,
     messages_contain_image,
 )
-from app.llm.chat_reply import ChatReply, parse_chat_reply, parse_chat_reply_result, sanitize_reply_tones
+from app.llm.chat_reply import (
+    ChatReply,
+    parse_chat_reply,
+    parse_chat_reply_result,
+    reply_requests_silence,
+    sanitize_reply_tones,
+)
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.runtime_log import (
     diagnostic_attributes,
@@ -159,6 +166,7 @@ class AgentRuntime:
 
         self._initiative = InitiativeArbiter()
         self._initiative_client: object | None = None
+        self._silent_reply_allowed = False
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -317,6 +325,46 @@ class AgentRuntime:
 
     def note_initiative_user_turn(self) -> None:
         self._initiative.note_user_spoke()
+
+    def configure_screen_initiative(
+        self,
+        *,
+        enabled: bool = False,
+        cooldown_seconds: float = 0.0,
+        loader: Callable[[], tuple[bool, float]] | None = None,
+    ) -> None:
+        """``loader`` re-reads the user's settings before every gate check."""
+        self._screen_initiative_loader = loader
+        self._initiative.configure_screen(enabled=enabled, cooldown_seconds=cooldown_seconds)
+
+    @property
+    def screen_initiative_gated(self) -> bool:
+        return self._initiative.screen_gated
+
+    def screen_gate_reason(self) -> str:
+        loader = getattr(self, "_screen_initiative_loader", None)
+        if loader is not None:
+            try:
+                enabled, cooldown_seconds = loader()
+            except Exception:  # noqa: BLE001 - unreadable settings keep the screen quiet
+                enabled, cooldown_seconds = False, 0.0
+            self._initiative.configure_screen(enabled=enabled, cooldown_seconds=cooldown_seconds)
+        return self._initiative.screen_gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+
+    def settle_screen_observation(self, *, spoke: bool, relationship_motive: bool) -> None:
+        if spoke:
+            self._initiative.mark_screen_spoken(relationship_motive=relationship_motive)
+        else:
+            self._initiative.mark_screen_silent()
+
+    @contextmanager
+    def allow_silent_reply(self):
+        """Within this block a ``{"silent": true}`` reply is adopted as saying nothing."""
+        self._silent_reply_allowed = True
+        try:
+            yield
+        finally:
+            self._silent_reply_allowed = False
 
     def initiative_gate_reason(self) -> str:
         return self._initiative.gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
@@ -875,6 +923,8 @@ class AgentRuntime:
             from app.storage.visual_observation import extract_visual_observation_summary
 
             visual_observation = extract_visual_observation_summary(raw_content)
+        if self._silent_reply_allowed and reply_requests_silence(raw_content):
+            return ChatReply([]), visual_observation
         original = parse_chat_reply_result(raw_content)
         reply = self._parse_final_reply_with_retry(
                 system_prompt,

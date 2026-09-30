@@ -55,6 +55,42 @@ _LEGACY_ENV_TO_LLM_FIELD = {
 }
 
 
+def _map_proactive_observation(proactive: object, current_system: dict[str, object]) -> None:
+    """The Qt ProactiveObserver was the screen observation actually in use; it owns the source."""
+    if not isinstance(proactive, Mapping) or "enabled" not in proactive:
+        return
+    existing = current_system.get("screen_awareness")
+    screen = dict(existing) if isinstance(existing, Mapping) else {}
+    if proactive.get("enabled") is True:
+
+        def minutes(key: str, default: int) -> int:
+            value = proactive.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return default
+            return min(120, max(1, round(float(value) / 60)))
+
+        screen.update(
+            {
+                "enabled": True,
+                "check_interval_minutes": minutes("timer_seconds", 8),
+                "cooldown_minutes": minutes("cooldown_seconds", 10),
+                "screen_context_batch_limit": 1,
+            }
+        )
+    else:
+        screen["enabled"] = False
+    privacy = proactive.get("privacy")
+    if isinstance(privacy, Mapping):
+        mapped = {
+            key: [value for value in privacy[key] if isinstance(value, str)]
+            for key in ("blocked_processes", "blocked_title_keywords")
+            if isinstance(privacy.get(key), list)
+        }
+        if mapped:
+            screen["privacy"] = mapped
+    current_system["screen_awareness"] = screen
+
+
 def migrate_configuration(
     source: Path, staged: Path, *, new_tts_root: Path, existing_user_root: Path | None = None,
 ) -> dict[str, int]:
@@ -97,6 +133,7 @@ def migrate_configuration(
         if isinstance(legacy_context_enabled, bool):
             current_enabled = screen_awareness.get("enabled", True)
             screen_awareness["enabled"] = bool(current_enabled) and legacy_context_enabled
+    _map_proactive_observation(system.get("proactive"), current_system)
     _write_yaml(target_config / "system_config.yaml", current_system)
 
     characters = _load_yaml(legacy_config / "characters.yaml", required=False)

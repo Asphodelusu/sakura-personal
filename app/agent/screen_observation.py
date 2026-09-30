@@ -14,6 +14,24 @@ SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已自主观察屏幕]"
 MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已附加手动框选截图]"
 SCREEN_OBSERVATION_MAX_EDGE = 1280
 SCREEN_OBSERVATION_JPEG_QUALITY = 70
+SCHEDULED_SCREEN_PROMPT = (
+    "这是一次定时屏幕观察，不是他发来的消息。以下截图按时间顺序展示他最近在做的事情。"
+    "结合最近聊天历史判断此刻有没有自然、值得说的话：可以评论变化、接续任务、询问卡点或提供轻量帮助；"
+    "不要逐张复述，也不要机械提醒休息。"
+    "如果此刻没有值得说的，或者开口会打扰他，就保持安静：输出 "
+    '{"silent": true, "segments": []}，visual_observation 照常给出。保持安静是正常的选择。'
+)
+SCHEDULED_SCREEN_RELATIONSHIP_MOTIVE = (
+    "[关系动机]\n"
+    "屏幕事件优先。关系与心情可以作为附加动机，但不要把屏幕内容硬拗成亲密理由，"
+    "也不要连续再开一轮关系主动。"
+)
+
+
+def build_scheduled_screen_prompt(*, relationship_motive: bool) -> str:
+    if relationship_motive:
+        return f"{SCHEDULED_SCREEN_PROMPT}\n\n{SCHEDULED_SCREEN_RELATIONSHIP_MOTIVE}"
+    return SCHEDULED_SCREEN_PROMPT
 
 
 @dataclass(frozen=True)

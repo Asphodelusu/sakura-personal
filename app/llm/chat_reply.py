@@ -164,6 +164,15 @@ def parse_chat_reply_result(content: str) -> ChatReplyParseResult:
     )
 
 
+def reply_requests_silence(content: str) -> bool:
+    """``{"silent": true}`` with nothing to say. Callers decide whether silence is allowed."""
+    data, _repaired = _try_load_json(str(content or "").strip())
+    if not isinstance(data, dict) or data.get("silent") is not True:
+        return False
+    segments, _issue = _parse_segments(data)
+    return not segments
+
+
 def sanitize_reply_tones(reply: ChatReply, allowed_tones: list[str] | None) -> ChatReply:
     """把模型偶发越界的 tone（如 en、坚定）归一到 DEFAULT_TONE，避免脏标签流入下游。
 

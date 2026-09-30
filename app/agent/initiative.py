@@ -22,6 +22,13 @@ from app.llm.chat_reply import ChatReply, ChatSegment
 
 DECISION_TEMPERATURE = 0.7
 DECISION_MAX_TOKENS = 512
+# Qt-era proactive defaults for scheduled screen observation.
+SCREEN_MIN_SILENCE_AFTER_USER_SECONDS = 15
+SCREEN_SILENT_COOLDOWN_SECONDS = 300
+SCREEN_AWAY_IDLE_SECONDS = 600
+SCREEN_MIN_SILENCE_AFTER_USER_SECONDS = 15
+SCREEN_SILENT_COOLDOWN_SECONDS = 300
+SCREEN_AWAY_IDLE_SECONDS = 600
 
 
 def get_idle_seconds() -> float:
@@ -60,9 +67,55 @@ class InitiativeArbiter:
         self._last_silent_at = 0.0
         self._silence_streak = 0
         self._generation = 0
+        # None: screen turns keep the ungated CAP-016 behaviour.
+        self.screen_cooldown_seconds: float | None = None
+        self.screen_enabled = False
+        self._last_proactive_at = 0.0
+        self._last_screen_silent_at = 0.0
 
     def configure(self, settings: RelationshipInitiativeSettings) -> None:
         self.settings = settings.normalized()
+
+    def configure_screen(self, *, enabled: bool, cooldown_seconds: float) -> None:
+        self.screen_enabled = bool(enabled)
+        self.screen_cooldown_seconds = max(0.0, float(cooldown_seconds))
+
+    @property
+    def screen_gated(self) -> bool:
+        return self.screen_cooldown_seconds is not None
+
+    def screen_gate_reason(self, *, busy: bool = False, continuation: bool = False) -> str:
+        if not self.screen_enabled:
+            return "disabled"
+        if continuation:
+            return "continuation"
+        if busy:
+            return "busy"
+        now = self._clock()
+        if now - self._last_user_at < SCREEN_MIN_SILENCE_AFTER_USER_SECONDS:
+            return "silence"
+        cooldown = float(self.screen_cooldown_seconds or 0.0)
+        if self._last_proactive_at and now - self._last_proactive_at < cooldown:
+            return "cooldown"
+        if self._last_screen_silent_at and now - self._last_screen_silent_at < SCREEN_SILENT_COOLDOWN_SECONDS:
+            return "cooldown"
+        try:
+            idle = float(self._idle_seconds())
+        except Exception:  # noqa: BLE001 - an unreadable idle clock never blocks the gate
+            idle = 0.0
+        if idle >= SCREEN_AWAY_IDLE_SECONDS:
+            return "desktop_idle"
+        return "eligible"
+
+    def mark_screen_silent(self) -> None:
+        self._last_screen_silent_at = self._clock()
+
+    def mark_screen_spoken(self, *, relationship_motive: bool) -> None:
+        self._last_screen_silent_at = 0.0
+        if relationship_motive:
+            self.mark_spoken()
+        else:
+            self._last_proactive_at = self._clock()
 
     def note_user_spoke(self) -> None:
         self._last_user_at = self._clock()
@@ -117,6 +170,7 @@ class InitiativeArbiter:
     def mark_spoken(self) -> None:
         self._reset_backoff()
         self._last_spoken_at = self._clock()
+        self._last_proactive_at = self._last_spoken_at
 
 
 def build_relationship_decision_messages(

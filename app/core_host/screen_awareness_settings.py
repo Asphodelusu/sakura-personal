@@ -19,12 +19,75 @@ from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
 )
 from app.config.settings_service import AppSettingsService
+from app.config.yaml_config import load_yaml_mapping
 from app.core_host.protocol import response
 
 
 SCREEN_AWARENESS_SETTINGS_REQUEST_NAMES = frozenset(
-    {"screen_awareness.settings.get", "screen_awareness.settings.save"}
+    {
+        "screen_awareness.settings.get",
+        "screen_awareness.settings.save",
+        "screen_awareness.privacy.get",
+    }
 )
+DEFAULT_BLOCKED_PROCESSES = (
+    "1password.exe",
+    "bitwarden.exe",
+    "keepass.exe",
+    "keepassxc.exe",
+    "lastpass.exe",
+    "dashlane.exe",
+    "authy.exe",
+)
+DEFAULT_BLOCKED_TITLE_KEYWORDS = (
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "keepass",
+    "online banking",
+    "网上银行",
+)
+MAX_PRIVACY_ENTRIES = 64
+MAX_PRIVACY_ENTRY_CHARS = 128
+
+
+def load_screen_privacy(app_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Blocked foreground processes and title keywords, casefolded.
+
+    ``screen_awareness.privacy`` wins over the Qt-era ``proactive.privacy``; an
+    explicit empty list clears the defaults. Unreadable config keeps the defaults.
+    """
+    root = Path(app_root)
+    for path, section_name in (
+        (root / "config" / "system_config.yaml", "screen_awareness"),
+        (root / "data" / "config" / "system_config.yaml", "proactive"),
+    ):
+        try:
+            section = load_yaml_mapping(path).get(section_name)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        privacy = section.get("privacy") if isinstance(section, Mapping) else None
+        if isinstance(privacy, Mapping):
+            return (
+                _privacy_entries(privacy.get("blocked_processes"), DEFAULT_BLOCKED_PROCESSES),
+                _privacy_entries(privacy.get("blocked_title_keywords"), DEFAULT_BLOCKED_TITLE_KEYWORDS),
+            )
+    return (
+        _privacy_entries(None, DEFAULT_BLOCKED_PROCESSES),
+        _privacy_entries(None, DEFAULT_BLOCKED_TITLE_KEYWORDS),
+    )
+
+
+def _privacy_entries(raw: object, default: tuple[str, ...]) -> tuple[str, ...]:
+    values = raw if isinstance(raw, list) else list(default)
+    entries: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        entry = value.strip().casefold()[:MAX_PRIVACY_ENTRY_CHARS]
+        if entry and entry not in entries:
+            entries.append(entry)
+    return tuple(entries[:MAX_PRIVACY_ENTRIES])
 
 
 class ScreenAwarenessSettingsError(ValueError):
@@ -47,6 +110,7 @@ class ScreenAwarenessSettingsBoundary:
     def __init__(self, generation_id: str, generation_credential: str, app_root: Path) -> None:
         self._generation_id = generation_id
         self._generation_credential = generation_credential
+        self._app_root = Path(app_root)
         self._service = AppSettingsService(app_root)
         self._save_lock = threading.Lock()
 
@@ -71,6 +135,15 @@ class ScreenAwarenessSettingsBoundary:
                 if set(payload) != {"settings"}:
                     raise ScreenAwarenessSettingsError("INVALID_REQUEST", "设置保存请求格式无效。")
                 result = self.save(payload["settings"])
+            elif name == "screen_awareness.privacy.get":
+                if payload:
+                    raise ScreenAwarenessSettingsError("INVALID_REQUEST", "隐私名单读取请求必须为空。")
+                processes, keywords = load_screen_privacy(self._app_root)
+                result = {
+                    "schemaVersion": 1,
+                    "blockedProcesses": list(processes),
+                    "blockedTitleKeywords": list(keywords),
+                }
             else:
                 raise ScreenAwarenessSettingsError("UNKNOWN_COMMAND", "不支持的主动屏幕感知设置命令。")
             return response(

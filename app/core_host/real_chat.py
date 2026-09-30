@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import re
+from contextlib import nullcontext
 import secrets
 import sys
 import threading
@@ -268,6 +269,8 @@ class RealChatBoundary:
         completed_reply = None
         relationship_user_turn = False
         relationship_character_id = ""
+        screen_attempted = False
+        screen_motive = False
         try:
             from app.core.runtime_log import suppress_runtime_logs
             from app.agent.trace import traced_message
@@ -312,6 +315,11 @@ class RealChatBoundary:
             )
             is_update_event = is_event and initiated_kind is None
             message = "" if is_event else str(payload["message"])
+            screen_gated = (
+                screen_attachment is not None
+                and screen_attachment.source == "screen_awareness"
+                and bool(getattr(runtime, "screen_initiative_gated", False))
+            )
             plugin_application = (
                 self._plugin_application_provider()
                 if self._plugin_application_provider is not None
@@ -360,7 +368,20 @@ class RealChatBoundary:
                     recent_messages,
                     execution.cancel.throw_if_cancelled,
                 )
+            elif screen_gated and _screen_gate_reason(runtime) != "eligible":
+                from types import SimpleNamespace
+
+                from app.llm.chat_reply import ChatReply
+
+                _invalidate_inner_thought(runtime)
+                result = SimpleNamespace(reply=ChatReply([]), actions=[])
             else:
+                if screen_gated:
+                    from app.agent.screen_observation import build_scheduled_screen_prompt
+
+                    screen_motive = _relationship_gate_open(runtime)
+                    screen_attempted = True
+                    message = build_scheduled_screen_prompt(relationship_motive=screen_motive)
                 try:
                     history_projection = _recent_history_projection(timeline, str(character.id))
                     recent_messages = _messages_from_turn_projection(history_projection)
@@ -507,7 +528,12 @@ class RealChatBoundary:
                     )
                 else:
                     _invalidate_inner_thought(runtime)
-                with suppress_runtime_logs():
+                silence = (
+                    runtime.allow_silent_reply()
+                    if screen_attempted and callable(getattr(runtime, "allow_silent_reply", None))
+                    else nullcontext()
+                )
+                with suppress_runtime_logs(), silence:
                     pipeline_kwargs: dict[str, Any] = {
                         "cancel_checker": execution.cancel.throw_if_cancelled,
                     }
@@ -639,6 +665,11 @@ class RealChatBoundary:
                     raise _BoundaryFailure(
                         "TIMELINE_WRITE_FAILED", "Assistant reply could not be saved", False
                     ) from exc
+            elif screen_attempted and semantic_observation_entry is not None:
+                try:
+                    timeline.append(semantic_observation_entry)
+                except Exception:  # noqa: BLE001 - a quiet observation is optional context
+                    history_status = "degraded"
             terminal = "chat.completed"
             terminal_payload = {
                 "operationId": operation_id,
@@ -694,6 +725,12 @@ class RealChatBoundary:
             character_id=relationship_character_id,
             reply=completed_reply,
         )
+        if screen_attempted:
+            _settle_screen_observation(
+                runtime,
+                spoke=assistant_committed and resolved_terminal == "chat.completed",
+                relationship_motive=screen_motive,
+            )
         try:
             if resolved_terminal == "chat.completed":
                 if plugin_application is not None and completed_fact is not None:
@@ -1371,6 +1408,33 @@ def _recent_history_projection(timeline: Any, character_id: str) -> _TurnProject
         ),
         now=history_now,
     )
+
+
+def _screen_gate_reason(runtime: object | None) -> str:
+    gate = getattr(runtime, "screen_gate_reason", None)
+    if not callable(gate):
+        return "eligible"
+    try:
+        return str(gate())
+    except Exception:  # noqa: BLE001 - an unreadable gate keeps the screen quiet
+        return "unavailable"
+
+
+def _relationship_gate_open(runtime: object | None) -> bool:
+    gate = getattr(runtime, "initiative_gate_reason", None)
+    try:
+        return callable(gate) and gate() == "eligible"
+    except Exception:  # noqa: BLE001 - the motive is only a hint
+        return False
+
+
+def _settle_screen_observation(runtime: object | None, *, spoke: bool, relationship_motive: bool) -> None:
+    settle = getattr(runtime, "settle_screen_observation", None)
+    if callable(settle):
+        try:
+            settle(spoke=spoke, relationship_motive=relationship_motive)
+        except Exception:  # noqa: BLE001 - timing bookkeeping must not fail the turn
+            pass
 
 
 def _note_initiative_user_turn(runtime: object | None) -> None:
