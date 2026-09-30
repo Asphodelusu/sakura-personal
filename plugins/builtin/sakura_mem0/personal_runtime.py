@@ -117,6 +117,8 @@ class PersonalRecallBoundary:
             reranker=CrossEncoderReranker(reranker_snapshot) if reranker_snapshot is not None else None,
             list_memories=lambda: self.list_memories(limit=200),
             record_access=daily,
+            rewrite_client=self._rewrite_client,
+            mood_reader=lambda: PersonalMoodStore(self._memory_dir, self.scope).current(),
         )
         self._thread = threading.Thread(target=self._load, args=(memory_dir, snapshot),
                                         name="sakura-personal-memory-load", daemon=True)
@@ -318,6 +320,16 @@ class PersonalRecallBoundary:
             raise ValueError("PERSONAL_MEMORY_READ_ONLY")
         edit_personal_core_profile_section(memory_dir, scope, item_id[len(prefix):], str(content or ""), daily=True)
         return next((item for item in self.core_profile_items() if item["id"] == item_id), None)
+
+    def _rewrite_client(self):
+        """The curation model rewrites recall queries unless ``queryRewrite`` is false."""
+        options = self._curation_options or {}
+        getter = options.get("curation_config_getter")
+        if callable(getter) and getter().get("queryRewrite", True) is False:
+            return None
+        with self._lock:
+            curation = self._curation if self._status == "ready" else None
+        return curation.fast_completion_client() if curation is not None else None
 
     def _admit_state_write(self):
         personal_records._require_write_mode(self._memory_dir, self.scope, daily=True, write_rehearsal=False)

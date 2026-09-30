@@ -54,11 +54,12 @@ class MemoryRecallService:
 
     def recall(self, request: ContextRequest) -> MemoryRecallResult:
         started_at = monotonic()
-        query = _build_memory_query(request)
+        policy = getattr(self.memory, "recall_policy", None)
+        planner = getattr(policy, "plan_query", None)
+        query = planner(request) if callable(planner) else _build_memory_query(request)
         if not query:
             _log_recall_finished(started_at, status="skipped", candidates=0, selected=0)
             return MemoryRecallResult(query="")
-        policy = getattr(self.memory, "recall_policy", None)
         try:
             response = self.memory.search_memory(
                 {"query": query, "limit": getattr(policy, "candidates", DEFAULT_MEMORY_RECALL_CANDIDATES)},

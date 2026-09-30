@@ -153,3 +153,47 @@ def test_recall_service_uses_the_policy_when_the_memory_offers_one(tmp_path: Pat
     result = MemoryRecallService(memory).recall(ContextRequest(current_input="thing?", character_id="alice"))
     assert memory.limits == [30]
     assert result.fragments[0].content == "（昨天）thing"
+
+
+def test_heuristic_query_keeps_the_intent_and_resolves_a_reference() -> None:
+    from plugins.builtin.sakura_mem0.domain_types import ContextMessage
+    from plugins.builtin.sakura_mem0.personal_query_rewrite import plan_query
+
+    request = ContextRequest(
+        current_input="那个后来呢",
+        recent_messages=(ContextMessage("user", "我在看《葬送的芙莉莲》"), ContextMessage("user", "今天好累")),
+        visual_summaries=("屏幕上是代码编辑器",),
+    )
+    query = plan_query(request)
+    assert query.startswith("那个后来呢\n今天好累")
+    assert "屏幕" not in query
+
+    class Client:
+        def complete_raw(self, *_args, **_kwargs):
+            return '{"query": "芙莉莲的后续", "entities": ["葬送的芙莉莲"]}'
+
+    assert plan_query(request, Client()) == "芙莉莲的后续\n关键实体：葬送的芙莉莲"
+
+    class Broken:
+        def complete_raw(self, *_args, **_kwargs):
+            raise TimeoutError()
+
+    assert plan_query(request, Broken()) == query
+
+
+def test_memories_that_match_the_current_emotion_rank_a_little_higher(tmp_path: Path) -> None:
+    policy = _policy(tmp_path, mood_reader=lambda: None)
+    older = (NOW - timedelta(days=10)).isoformat()
+    selected = policy.select("今天好开心", [
+        _memory("sad", "sad day", semanticScore=0.6, emotion="sad", updatedAt=older),
+        _memory("glad", "happy day", semanticScore=0.6, emotion="happy", updatedAt=older),
+    ], 5)
+    assert [item["id"] for item in selected] == ["glad", "sad"]
+
+
+def test_the_policy_plans_with_the_rewrite_client_and_survives_its_failure(tmp_path: Path) -> None:
+    def broken_factory():
+        raise RuntimeError("no model")
+
+    policy = _policy(tmp_path, rewrite_client=broken_factory)
+    assert policy.plan_query(ContextRequest(current_input="在吗")) == "在吗"

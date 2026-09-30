@@ -11,8 +11,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 if __package__:
+    from .personal_emotion import active_emotion, emotion_congruence_factor
+    from .personal_query_rewrite import plan_query
     from .support import log_event
 else:
+    from personal_emotion import active_emotion, emotion_congruence_factor
+    from personal_query_rewrite import plan_query
     from support import log_event
 
 RECALL_CANDIDATES = 30
@@ -36,6 +40,7 @@ MAX_REFLECTIONS = 1
 MAX_META_REFLECTIONS = 1
 VOLATILE_FACTOR = 1.12
 _COLD_ARCHIVE_WEIGHT = 0.55
+_EMOTION_WEIGHT = 0.35
 _VOLATILE_WEIGHT = 0.55
 _PAST_LOOKING = re.compile(
     r"(上次|昨天|前天|之前|早些时候|刚才我们|还记得|记不记得|记得吗|"
@@ -313,7 +318,7 @@ def _score(value):
         return None
 
 
-def _normalized(raw, now, *, include_expired, last_accessed, excluded_turn_id):
+def _normalized(raw, now, *, include_expired, last_accessed, excluded_turn_id, emotion=""):
     content = _text(raw, "content", "memory")
     memory_id = _text(raw, "id", "memory_id")
     if not content or not memory_id or is_released(raw):
@@ -329,8 +334,10 @@ def _normalized(raw, now, *, include_expired, last_accessed, excluded_turn_id):
     updated_at = _text(raw, "updatedAt", "updated_at")
     created_at = _text(raw, "createdAt", "created_at")
     days = _days_since(last_accessed.get(memory_id) or updated_at or created_at, now)
+    memory_emotion = _text(raw, "emotion")
     soft = _combine_soft(
         (_cold_archive_factor(importance, days, kind), _COLD_ARCHIVE_WEIGHT),
+        (emotion_congruence_factor(emotion, memory_emotion) if emotion and memory_emotion else 1.0, _EMOTION_WEIGHT),
         (VOLATILE_FACTOR if _field(raw, "volatile") is True else 1.0, _VOLATILE_WEIGHT),
     )
     weight = min(1.0, max(0.0, _decay_weight(importance, days) * soft))
@@ -365,10 +372,12 @@ class PersonalRecallPolicy:
     candidates = RECALL_CANDIDATES
 
     def __init__(self, memory_dir, *, reranker=None, list_memories=None, record_access=False,
-                 threshold=RELEVANCE_THRESHOLD, clock=None):
+                 threshold=RELEVANCE_THRESHOLD, clock=None, rewrite_client=None, mood_reader=None):
         self._memory_dir = Path(memory_dir)
         self._reranker = reranker
         self._list_memories = list_memories
+        self._rewrite_client = rewrite_client
+        self._mood_reader = mood_reader
         self._record_access = bool(record_access)
         self._threshold = threshold
         self._clock = clock or (lambda: datetime.now().astimezone())
@@ -387,6 +396,24 @@ class PersonalRecallPolicy:
                 except Exception:
                     self._tracker_failed = True
             return self._tracker
+
+    def plan_query(self, request):
+        client = None
+        if self._rewrite_client is not None:
+            try:
+                client = self._rewrite_client()
+            except Exception:
+                client = None
+        return plan_query(request, client)
+
+    def _active_emotion(self, query):
+        mood = ""
+        if self._mood_reader is not None:
+            try:
+                mood = str((self._mood_reader() or {}).get("content") or "")
+            except Exception:
+                mood = ""
+        return active_emotion(query, mood)
 
     def annotate(self, memory):
         return annotate(memory, self._clock())
@@ -425,9 +452,10 @@ class PersonalRecallPolicy:
             accessed = {}
         seen = set()
         normalized = []
+        emotion = self._active_emotion(query)
         for raw in memories:
             item = _normalized(raw, now, include_expired=include_expired, last_accessed=accessed,
-                               excluded_turn_id=excluded_turn_id)
+                               excluded_turn_id=excluded_turn_id, emotion=emotion)
             if item is None:
                 continue
             key = " ".join(item["content"].lower().split())
