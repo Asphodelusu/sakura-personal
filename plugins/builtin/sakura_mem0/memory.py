@@ -2591,7 +2591,30 @@ def _memory_metadata(
         if evidence_kind not in {"human", "observation", "mixed"}:
             raise ValueError("evidence_kind is invalid")
         metadata["evidence_kind"] = evidence_kind
+    for key in ("memory_kind", "valid_until", "expires_at", "event_time", "evidence"):
+        value = _optional_text(arguments, key) or str(metadata.get(key) or "").strip()
+        if value:
+            metadata[key] = value[:240] if key == "evidence" else value
+    emotion_value = _optional_text(arguments, "emotion") or str(metadata.get("emotion") or "").strip()
+    if emotion_value:
+        metadata["emotion"] = _normalize_emotion_label(emotion_value)
+    # A released memory stays stored; recall skips it by this status.
+    status_value = _optional_text(arguments, "status") or str(metadata.get("status") or "").strip()
+    if status_value:
+        metadata["status"] = status_value.lower()
+    if arguments.get("volatile") is True:
+        metadata["volatile"] = True
+    elif str(arguments.get("volatile", "")).strip().lower() == "false":
+        metadata["volatile"] = False
     return metadata
+
+
+def _normalize_emotion_label(value: str) -> str:
+    try:
+        from .personal_emotion import normalize_emotion
+    except ImportError:
+        from personal_emotion import normalize_emotion
+    return normalize_emotion(value)
 
 
 def _merged_source_entry_ids(existing: object, added: object) -> list[str]:

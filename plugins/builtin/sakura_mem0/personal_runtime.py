@@ -20,6 +20,7 @@ if __package__:
     )
     from .personal_emotion import DEFAULT_EMOTION, EmotionScorer
     from .personal_recall import CrossEncoderReranker, PersonalRecallPolicy
+    from .personal_reflection import REFLECTION_REQUEST_LIMIT, ReflectionScheduler
     from .personal_mood import (
         PersonalEmotionStore,
         PersonalMoodStore,
@@ -43,6 +44,7 @@ else:
     )
     from personal_emotion import DEFAULT_EMOTION, EmotionScorer
     from personal_recall import CrossEncoderReranker, PersonalRecallPolicy
+    from personal_reflection import REFLECTION_REQUEST_LIMIT, ReflectionScheduler
     from personal_mood import (
         PersonalEmotionStore,
         PersonalMoodStore,
@@ -120,6 +122,11 @@ class PersonalRecallBoundary:
             rewrite_client=self._rewrite_client,
             mood_reader=lambda: PersonalMoodStore(self._memory_dir, self.scope).current(),
         )
+        self._reflection = ReflectionScheduler(
+            memory_dir,
+            store_factory=lambda: PersonalCurationStore(self._records, self.scope),
+            client_factory=self._reflection_client,
+        ) if daily and curation_options is not None else None
         self._thread = threading.Thread(target=self._load, args=(memory_dir, snapshot),
                                         name="sakura-personal-memory-load", daemon=True)
         self._thread.start()
@@ -179,6 +186,8 @@ class PersonalRecallBoundary:
             curation = self._curation if self._status == "ready" else None
         if curation is not None:
             curation.note_timeline_changed(timeline)
+            if self._reflection is not None:
+                self._reflection.maybe_start()
 
     def search_memory(self, arguments, *, wait=False):
         if set(arguments) - {"query", "limit", "layer"}:
@@ -331,6 +340,14 @@ class PersonalRecallBoundary:
             curation = self._curation if self._status == "ready" else None
         return curation.fast_completion_client() if curation is not None else None
 
+    def _reflection_client(self):
+        with self._lock:
+            curation = self._curation if self._status == "ready" and not self._closed else None
+        if curation is None:
+            return None
+        self._admit_state_write()
+        return curation.fast_completion_client(timeout_seconds=60, request_limit=REFLECTION_REQUEST_LIMIT)
+
     def _admit_state_write(self):
         personal_records._require_write_mode(self._memory_dir, self.scope, daily=True, write_rehearsal=False)
 
@@ -372,6 +389,8 @@ class PersonalRecallBoundary:
             self._status = "stopped"
             self._pending_timeline = None
         self._thread.join()
+        if self._reflection is not None:
+            self._reflection.join(timeout=5)
         self.recall_policy.close()
         # Do not hold the recall lock while joining the curation worker.
         if self._curation is not None:

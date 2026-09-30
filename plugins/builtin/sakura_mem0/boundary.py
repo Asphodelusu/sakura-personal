@@ -683,8 +683,10 @@ class MemoryBoundary:
             lambda: self._curation_state.mark_timeline_processed(next_cursor),
         )
 
-    def fast_completion_client(self, *, timeout_seconds: int = 4) -> OpenAICompatibleClient | None:
-        """One short request on the curation model, for recall query rewriting."""
+    def fast_completion_client(
+        self, *, timeout_seconds: int = 4, request_limit: int = 1
+    ) -> OpenAICompatibleClient | None:
+        """A bounded client on the curation model, for query rewriting or reflection."""
         catalog = _provider_choices(self._model_catalog_getter())
         _trigger, _backfill, configured_slot = _curation_values(self._curation_config_getter(), catalog)
         resolved = _resolved_model(self._model_resolver(configured_slot))
@@ -697,7 +699,7 @@ class MemoryBoundary:
                 model=resolved["model"],
                 timeout_seconds=min(int(resolved["timeoutSeconds"] or timeout_seconds), timeout_seconds),
             ),
-            request_limit=1,
+            request_limit=request_limit,
         )
 
     def _start_curation(
