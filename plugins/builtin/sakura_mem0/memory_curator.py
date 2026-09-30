@@ -55,6 +55,15 @@ MIN_AUTO_WRITE_CONFIDENCE = 0.55
 CURATION_DUPLICATE_SIMILARITY = 0.92
 CURATION_MERGE_SIMILARITY = 0.78
 MAX_CURATION_OPERATIONS_PER_LAYER = 20
+MAX_MOOD_UPDATES_PER_CURATION = 1
+_MOOD_CURATION_GUIDANCE = (
+    "\n心の記録用 mood_update：{\"op\":\"mood_update\",\"content\":\"今の自分への一言（日本語）\"}。"
+    "一次整理最多一条；只在心情相对上次有质的变化时写。短、有本段钩子，可留刺；不必和解；无质变不做 mood_update。"
+    "「最近的心情轨迹」只供对照是否重复，禁止抄写或换皮重写；"
+    "「对方的情绪轨迹」可留意，但不要据此编造对话里没有的事。"
+    "若触发心情的那件事还没有对应记忆，再用一条 add/update 补上即可；不必因为写了心情再堆一条重复事件。"
+    "mood_update 不需要 evidence。\n"
+)
 
 
 class MemoryCurationError(RuntimeError):
@@ -244,6 +253,7 @@ class MemoryCurator:
         ignored = 0
         event_counts: dict[str, int] = {}
         core_candidates: list[dict[str, Any]] = []
+        mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
         for chunk in _chunk_entries_for_curation(entries):
             check_cancelled(cancel_checker)
             dialog_entries = _entries_for_model(chunk)
@@ -279,6 +289,7 @@ class MemoryCurator:
                 existing,
                 source_entry_ids=source_entry_ids,
                 cancel_checker=cancel_checker,
+                mood_budget=mood_budget,
             )
             created += counts["created"]
             updated += counts["updated"]
@@ -332,6 +343,8 @@ class MemoryCurator:
                 "user_excerpt、assistant_excerpt、confidence。"
                 "两段 excerpt 必须是本次对话原句，不要填写证据 id、批次或 scope。\n"
             )
+        if getattr(self.memory_store, "mood_store", None) is not None:
+            task_prompt += _MOOD_CURATION_GUIDANCE
         if not self.system_prompt:
             return task_prompt
         return f"{self.system_prompt}\n\n{task_prompt}"
@@ -352,6 +365,9 @@ class MemoryCurator:
             _format_existing_memories(existing),
             dialog_entries,
         )
+        trajectories = _format_mood_trajectories(self.memory_store)
+        if trajectories:
+            user_prompt = f"{user_prompt}\n\n{trajectories}"
         raw = self.api_client.complete_raw(
             system_prompt,
             [{"role": "user", "content": user_prompt}],
@@ -441,8 +457,11 @@ class MemoryCurator:
         *,
         source_entry_ids: list[str],
         cancel_checker: CancelChecker | None = None,
+        mood_budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """逐条写回；失败或取消时立即停止，保留已提交操作供来源去重。"""
+        if mood_budget is None:
+            mood_budget = {"left": MAX_MOOD_UPDATES_PER_CURATION}
 
         existing_ids = {
             str(memory.get("id", "")).strip()
@@ -591,6 +610,13 @@ class MemoryCurator:
                     existing_ids.discard(memory_id)
                     archived += 1
                     event_counts["DELETE"] = event_counts.get("DELETE", 0) + 1
+                elif action == "mood_update":
+                    outcome = self._apply_mood_update(content, mood_budget)
+                    if outcome == "MOOD_UPDATE":
+                        updated += 1
+                    else:
+                        ignored += 1
+                    event_counts[outcome] = event_counts.get(outcome, 0) + 1
                 else:
                     ignored += 1
             except OperationCancelled:
@@ -617,6 +643,61 @@ class MemoryCurator:
             "ignored": ignored,
             "event_counts": event_counts,
         }
+
+
+    def _apply_mood_update(self, content: str, mood_budget: dict[str, int]) -> str:
+        """One qualitative mood change per curation; a mood write never fails the job."""
+        mood_store = getattr(self.memory_store, "mood_store", None)
+        if mood_store is None or not content:
+            return "MOOD_IGNORED"
+        if int(mood_budget.get("left", 0)) <= 0:
+            return "MOOD_BUDGET"
+        if looks_like_sensitive_memory(content):
+            return "MOOD_SENSITIVE"
+        try:
+            if mood_store.is_duplicate(content):
+                return "MOOD_DEDUP"
+            mood_store.set(content)
+        except OperationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the mood note is optional
+            log_event(
+                "Memory",
+                "心情笔记写入失败",
+                {"error_type": type(exc).__name__, "reason_code": "MEMORY_MOOD_WRITE_FAILED"},
+            )
+            return "MOOD_FAILED"
+        mood_budget["left"] = int(mood_budget.get("left", 0)) - 1
+        return "MOOD_UPDATE"
+
+
+def _format_mood_trajectories(memory_store: Any) -> str:
+    """Current mood plus history, and the user's emotion trail; only compared against, never copied."""
+    mood_store = getattr(memory_store, "mood_store", None)
+    if mood_store is None:
+        return ""
+    parts: list[str] = []
+    try:
+        mood = mood_store.current()
+    except Exception:  # noqa: BLE001 - trajectories only narrow duplicate checks
+        mood = None
+    if mood:
+        items = [{"content": mood["content"], "timestamp": mood.get("updated_at", "")}, *mood.get("history", [])]
+        lines = [
+            f"{index}. [{str(item.get('timestamp') or '')[:16]}] {item['content']}"
+            for index, item in enumerate(items[:6], 1)
+        ]
+        parts.append("【最近的心情轨迹】\n以下是你的心情变化记录，最近的在上面：\n" + "\n".join(lines))
+    emotion_store = getattr(memory_store, "emotion_store", None)
+    try:
+        emotion = emotion_store.current() if emotion_store is not None else None
+    except Exception:  # noqa: BLE001
+        emotion = None
+    if emotion:
+        items = [{"content": emotion["content"], "timestamp": emotion.get("updated_at", "")}, *emotion.get("history", [])]
+        lines = [f"· [{str(item.get('timestamp') or '')[:16]}] {item['content']}" for item in items[:4]]
+        parts.append("【对方的情绪轨迹】\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def _merge_event_counts(target: dict[str, int], source: dict[str, int]) -> None:

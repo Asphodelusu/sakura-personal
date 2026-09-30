@@ -83,7 +83,9 @@ class SakuraMem0Runtime:
         context_request = _context_request(request)
         if context_request.character_id != self._character_id:
             return []
+        self._note_user_input(context_request)
         profile = self._profile_fragment()
+        continuity = self._continuity_fragments()
         recalled = self._recall.recall(context_request)
         fragments = [
             {
@@ -96,8 +98,51 @@ class SakuraMem0Runtime:
             for fragment in recalled.fragments
         ]
         if profile is None:
-            return fragments
-        return [profile, *_without_profile_duplicate(fragments, profile)]
+            return [*continuity, *fragments]
+        return [profile, *continuity, *_without_profile_duplicate(fragments, profile)]
+
+    def _note_user_input(self, request: ContextRequest) -> None:
+        note = getattr(self._boundary, "note_user_input", None)
+        turn_id = request.current_turn_id
+        if (
+            not callable(note)
+            or request.source != "chat"
+            or not request.human_entry_id
+            or not request.current_input.strip()
+            or not turn_id
+            or turn_id == getattr(self, "_emotion_turn_id", "")
+        ):
+            return
+        self._emotion_turn_id = turn_id
+        try:
+            note(request.current_input)
+        except Exception:
+            pass
+
+    def _continuity_fragments(self) -> list[dict[str, object]]:
+        reader = getattr(self._boundary, "continuity_fragments", None)
+        if not callable(reader):
+            return []
+        try:
+            raw = reader()
+        except Exception:
+            return []
+        allowed = (f"mood:{self._character_id}", f"user_emotion:{self._character_id}")
+        return [
+            {
+                "id": item["id"],
+                "content": item["content"],
+                "priority": item["priority"] if type(item.get("priority")) is int else 85,
+                "budgetHint": item["budgetHint"] if type(item.get("budgetHint")) is int else 400,
+                "sensitivity": "private",
+            }
+            for item in (raw if isinstance(raw, list) else [])
+            if isinstance(item, dict)
+            and item.get("id") in allowed
+            and isinstance(item.get("content"), str)
+            and item["content"].strip()
+            and len(item["content"]) <= 1200
+        ]
 
     def _profile_fragment(self) -> dict[str, object] | None:
         reader = getattr(self._boundary, "core_profile_fragment", None)

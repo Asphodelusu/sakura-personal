@@ -58,6 +58,7 @@ class InnerThoughtCoordinator:
         self._appraisal_sink: AppraisalSink | None = None
         self._incomplete_logged = False
         self._turn_interest: str | None = None
+        self._mood_provider: Callable[[], str] | None = None
 
     def configure(
         self,
@@ -69,12 +70,14 @@ class InnerThoughtCoordinator:
         character_name: str,
         system_prompt: str,
         appraisal_sink: AppraisalSink | None,
+        mood_provider: Callable[[], str] | None = None,
     ) -> None:
         with self._lock:
             if self._closed:
                 return
             self._settings = settings
             self._client = client
+            self._mood_provider = mood_provider
             self._source_slot = str(source_slot or "")
             self._character_name = str(character_name or "")
             self._system_prompt = str(system_prompt or "")
@@ -91,7 +94,7 @@ class InnerThoughtCoordinator:
                     "内心独白上下文不完整",
                     {
                         "code": "INNER_THOUGHT_CONTEXT_INCOMPLETE",
-                        "missing": ["sensory_impression", "mood", "intimacy"],
+                        "missing": ["sensory_impression"],
                     },
                     severity="info",
                 )
@@ -154,6 +157,7 @@ class InnerThoughtCoordinator:
                 "character_excerpt": character_excerpt_from_prompt(self._system_prompt),
                 "recent_dialogue": format_recent_dialogue(messages),
                 "previous": self._window.items(),
+                "mood_provider": self._mood_provider,
             }
             client = self._client
             worker = Thread(
@@ -273,11 +277,19 @@ class InnerThoughtCoordinator:
                 if cancel_checker is not None:
                     cancel_checker()
 
+            mood_summary = ""
+            mood_provider = snapshot.get("mood_provider")
+            if callable(mood_provider):
+                try:
+                    mood_summary = str(mood_provider() or "")
+                except Exception:  # noqa: BLE001 - an unreadable mood leaves the default line
+                    mood_summary = ""
+            _cancel()
             work.result = generate_inner_thought(
                 client,
                 character_name=str(snapshot["character_name"]),
                 character_excerpt=str(snapshot["character_excerpt"]),
-                mood_summary="",
+                mood_summary=mood_summary,
                 recent_dialogue=str(snapshot["recent_dialogue"]),
                 sensory_impression="",
                 previous_thoughts=tuple(snapshot["previous"]),

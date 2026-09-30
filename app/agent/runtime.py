@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     from app.storage.chat_history import ChatHistoryStore
 
 
-RELATIONSHIP_FACT_FRAGMENT_PREFIXES = ("core_profile:",)
+RELATIONSHIP_FACT_FRAGMENT_PREFIXES = ("core_profile:", "mood:")
 
 _VISUAL_OBSERVATION_REPLY_INSTRUCTION = """
 本轮消息包含图片时，最终 JSON 除 segments 外，必须额外包含顶层 visual_observation。
@@ -371,13 +371,19 @@ class AgentRuntime:
 
     def relationship_facts(self) -> str:
         """Standing relationship facts from context providers; no memory search is run."""
+        return "\n\n".join(self._standing_fragments(RELATIONSHIP_FACT_FRAGMENT_PREFIXES, "relationship_initiative"))
+
+    def continuity_mood(self) -> str:
+        return "\n\n".join(self._standing_fragments(("mood:",), "inner_thought"))
+
+    def _standing_fragments(self, prefixes: tuple[str, ...], event_type: str) -> list[str]:
         from app.agent.context_orchestrator import build_context_request
 
         request = build_context_request(
             [],
             source="event",
             mode="normal",
-            event_type="relationship_initiative",
+            event_type=event_type,
             step_index=0,
             remaining_steps=0,
             available_tools=(),
@@ -393,11 +399,11 @@ class AgentRuntime:
             except Exception:  # noqa: BLE001 - one unreadable provider only narrows the facts
                 continue
             for fragment in fragments:
-                if str(fragment.fragment_id).startswith(RELATIONSHIP_FACT_FRAGMENT_PREFIXES):
+                if str(fragment.fragment_id).startswith(prefixes):
                     content = str(fragment.content or "").strip()
                     if content:
                         parts.append(content)
-        return "\n\n".join(parts)
+        return parts
 
     def run_relationship_initiative(
         self,
@@ -490,6 +496,7 @@ class AgentRuntime:
             character_name=self.character_name,
             system_prompt=self.system_prompt,
             appraisal_sink=self._relationship.accept_appraisal,
+            mood_provider=self.continuity_mood,
         )
 
     def start_inner_thought(

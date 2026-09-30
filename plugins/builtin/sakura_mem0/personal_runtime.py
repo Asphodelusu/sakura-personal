@@ -11,6 +11,13 @@ if __package__:
     from . import personal_records
     from .index_contract import COPY_STATE_FILE, require_complete_copy
     from .personal_core_profile import read_personal_core_profile
+    from .personal_emotion import DEFAULT_EMOTION, EmotionScorer
+    from .personal_mood import (
+        PersonalEmotionStore,
+        PersonalMoodStore,
+        build_mood_fragment,
+        build_user_emotion_fragment,
+    )
 else:
     from boundary import MemoryBoundary, _project_memory
     from personal_curation import PersonalCurationStore
@@ -19,6 +26,13 @@ else:
     import personal_records
     from index_contract import COPY_STATE_FILE, require_complete_copy
     from personal_core_profile import read_personal_core_profile
+    from personal_emotion import DEFAULT_EMOTION, EmotionScorer
+    from personal_mood import (
+        PersonalEmotionStore,
+        PersonalMoodStore,
+        build_mood_fragment,
+        build_user_emotion_fragment,
+    )
 
 
 class _CurationStore(PersonalCurationStore):
@@ -92,6 +106,9 @@ class PersonalRecallBoundary:
             if self._curation_options is not None:
                 store = _CurationStore(records, self.scope, profile_candidates=True)
                 store.personal_daily = self._daily
+                if self._daily:
+                    store.mood_store = PersonalMoodStore(memory_dir, self.scope, admit=self._admit_state_write)
+                    store.emotion_store = PersonalEmotionStore(memory_dir, self.scope)
                 curation = MemoryBoundary(memory_dir.parent.parent, self.scope,
                     memory_dir=memory_dir,
                     memory_store=store,
@@ -233,6 +250,41 @@ class PersonalRecallBoundary:
             if self._closed:
                 return None
         return fragment
+
+    def _admit_state_write(self):
+        personal_records._require_write_mode(self._memory_dir, self.scope, daily=True, write_rehearsal=False)
+
+    def continuity_fragments(self):
+        """Sakura's mood and the user's emotion trajectory; read-only, no memory search."""
+        with self._lock:
+            if self._closed:
+                return []
+            memory_dir, scope = self._memory_dir, self.scope
+        try:
+            mood = PersonalMoodStore(memory_dir, scope).current()
+            emotion = PersonalEmotionStore(memory_dir, scope).current()
+        except Exception as exc:
+            log_event("Memory", "心情状态不可读", {"code": "PERSONAL_STATE_UNREADABLE", "error_type": type(exc).__name__},
+                      event="memory.personal.state_unreadable", severity="warning")
+            return []
+        fragments = (build_mood_fragment(scope, mood), build_user_emotion_fragment(scope, emotion))
+        return [fragment for fragment in fragments if fragment is not None]
+
+    def note_user_input(self, text):
+        """Daily entry only: record the user's emotion when the scorer is confident."""
+        with self._lock:
+            if self._closed or not self._daily:
+                return
+            memory_dir, scope = self._memory_dir, self.scope
+        emotion = EmotionScorer().best(text)
+        if emotion is None or emotion == DEFAULT_EMOTION:
+            return
+        try:
+            self._admit_state_write()
+            PersonalEmotionStore(memory_dir, scope).record(emotion)
+        except Exception as exc:
+            log_event("Memory", "用户情绪未记录", {"code": "PERSONAL_EMOTION_WRITE_FAILED", "error_type": type(exc).__name__},
+                      event="memory.personal.emotion_write_failed", severity="info")
 
     def close(self):
         with self._lock:
