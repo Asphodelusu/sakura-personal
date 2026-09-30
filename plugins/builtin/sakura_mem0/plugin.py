@@ -701,6 +701,22 @@ class SakuraMem0Plugin:
         self._personal_daily = personal_daily
         self._runtime_factory = runtime_factory or _default_runtime
 
+    @staticmethod
+    def _register_memory_management(context: object, runtime: SakuraMem0Runtime) -> None:
+        getattr(context, "get")("sakura.host.settings").register(runtime.memory_management_descriptor())
+        getattr(context, "get")("sakura.host.settings.surface-v0").register(
+            MEMORY_MANAGEMENT_SECTION_ID,
+            "memory",
+        )
+        getattr(context, "get")("sakura.host.settings.collection-v0").register(
+            MEMORY_MANAGEMENT_SECTION_ID,
+            runtime.memory_collection_descriptor(),
+            query=runtime.query_collection,
+            create=runtime.create_collection_item,
+            update=runtime.update_collection_item,
+            delete=runtime.delete_collection_item,
+        )
+
     def setup(self, context: object) -> None:
         try:
             bind_logger(getattr(context, "get")("sakura.host.logging"))
@@ -755,6 +771,8 @@ class SakuraMem0Plugin:
         for descriptor, callback in registrations:
             tools.register(descriptor, callback)
         if self._personal_snapshot is not None:
+            if self._personal_daily:
+                self._register_memory_management(context, runtime)
             return
         settings = getattr(context, "get")("sakura.host.settings")
         settings.register(
@@ -775,19 +793,7 @@ class SakuraMem0Plugin:
             MEMORY_COMPONENT_SECTION_ID,
             "about",
         )
-        settings.register(runtime.memory_management_descriptor())
-        getattr(context, "get")("sakura.host.settings.surface-v0").register(
-            MEMORY_MANAGEMENT_SECTION_ID,
-            "memory",
-        )
-        getattr(context, "get")("sakura.host.settings.collection-v0").register(
-            MEMORY_MANAGEMENT_SECTION_ID,
-            runtime.memory_collection_descriptor(),
-            query=runtime.query_collection,
-            create=runtime.create_collection_item,
-            update=runtime.update_collection_item,
-            delete=runtime.delete_collection_item,
-        )
+        self._register_memory_management(context, runtime)
         getattr(context, "get")("sakura.host.model_slots").register(
             {
                 "slotId": "curation",

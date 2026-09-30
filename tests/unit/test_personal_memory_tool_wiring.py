@@ -83,12 +83,7 @@ def test_daily_plugin_writes_searches_and_lets_go_through_registered_tools(rehea
     from test_personal_completed_curation import start
 
     context, _timeline, _calls, _client = rehearsal
-    memory = context.root / "data/memory"
-    (memory / ".personal-write-rehearsal.json").unlink()
-    (memory / ".personal-daily.json").write_text(json.dumps({
-        "schemaVersion": 1, "purpose": "personal-memory-daily",
-        "root": str(memory.resolve()), "scopes": ["sakura"],
-    }), encoding="utf-8")
+    _enable_daily(context)
     start(context, daily=True)
     tools = {descriptor["name"]: callback for descriptor, callback in context.tools}
 
@@ -107,6 +102,37 @@ def test_rehearsal_plugin_keeps_memory_read_only(rehearsal) -> None:
     start(context, daily=False)
 
     assert [descriptor["name"] for descriptor, _ in context.tools] == ["memory_search"]
+    assert context.collections == []
+
+
+def _enable_daily(context) -> None:
+    import json
+
+    memory = context.root / "data/memory"
+    (memory / ".personal-write-rehearsal.json").unlink()
+    (memory / ".personal-daily.json").write_text(json.dumps({
+        "schemaVersion": 1, "purpose": "personal-memory-daily",
+        "root": str(memory.resolve()), "scopes": ["sakura"],
+    }), encoding="utf-8")
+
+
+def test_daily_plugin_registers_a_working_memory_management_collection(rehearsal) -> None:
+    from test_personal_completed_curation import start
+
+    context, _timeline, _calls, _client = rehearsal
+    _enable_daily(context)
+    start(context, daily=True)
+
+    assert len(context.collections) == 1
+    _args, callbacks = context.collections[0]
+    created = callbacks["create"]({"content": "synthetic: typed in settings", "layer": "semantic"})
+    assert created["values"]["content"] == "synthetic: typed in settings"
+    page = callbacks["query"]({"search": "typed in settings", "limit": 10})
+    assert [item["itemId"] for item in page["items"]] == [created["itemId"]]
+    updated = callbacks["update"](created["itemId"], {"content": "synthetic: edited in settings"})
+    assert updated["values"]["content"] == "synthetic: edited in settings"
+    assert callbacks["delete"](created["itemId"]) == {"deleted": True}
+    assert callbacks["query"]({"search": "in settings"})["items"] == []
 
 
 def test_boundary_rejects_unknown_tool_names() -> None:

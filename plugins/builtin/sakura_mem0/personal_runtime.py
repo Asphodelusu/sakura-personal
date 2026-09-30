@@ -180,6 +180,44 @@ class PersonalRecallBoundary:
                 from personal_tools import PersonalMemoryTools
             return getattr(PersonalMemoryTools(self._records, self.scope), name)(dict(arguments))
 
+    # --- memory management collection (daily entry only) --------------------
+
+    def status(self):
+        with self._lock:
+            return {"status": self._status, "message": ""}
+
+    def list_memories(self, *, limit=None):
+        with self._lock:
+            if self._status != "ready" or self._records is None:
+                return []
+            return self._records.list(self.scope, limit=limit)
+
+    def _management_store(self):
+        if self._status != "ready" or self._records is None:
+            raise RuntimeError("PERSONAL_MEMORY_NOT_READY")
+        if not self._daily:
+            raise ValueError("PERSONAL_MEMORY_READ_ONLY")
+        return PersonalCurationStore(self._records, self.scope)
+
+    def upsert(self, values):
+        with self._lock:
+            store = self._management_store()
+            arguments = {key: value for key, value in dict(values).items()
+                         if key in {"id", "content", "layer", "category", "source", "importance", "confidence"}}
+            saved = (store.update_memory(arguments) if arguments.get("id")
+                     else store.create_memory({key: value for key, value in arguments.items() if key != "id"}))
+            raw = self._records.get(self.scope, saved["memory"]["id"])
+            return {"memory": _project_memory(raw, self.scope)}
+
+    def delete(self, values):
+        with self._lock:
+            store = self._management_store()
+            key = str(dict(values).get("id") or "").strip()
+            if not key or self._records.get(self.scope, key) is None:
+                return {"alreadyMissing": True}
+            store.delete_memory({"id": key})
+            return {"alreadyMissing": False}
+
     def core_profile_fragment(self):
         with self._lock:
             if self._closed:

@@ -14,6 +14,7 @@ from test_personal_model_loading import model_fixture
 class Context:
     def __init__(self, root):
         self.root, self.effects, self.providers, self.tools = root, [], [], []
+        self.settings, self.surfaces, self.collections = [], [], []
     def data_path(self, relative):
         return self.root / "data/plugins/mem0" / relative
     def effect(self, callback):
@@ -27,6 +28,12 @@ class Context:
             return SimpleNamespace(register=lambda *args: self.providers.append(args))
         if name == "sakura.host.tools":
             return SimpleNamespace(register=lambda *args: self.tools.append(args))
+        if name == "sakura.host.settings":
+            return SimpleNamespace(register=lambda *args, **kwargs: self.settings.append((args, kwargs)))
+        if name == "sakura.host.settings.surface-v0":
+            return SimpleNamespace(register=lambda *args: self.surfaces.append(args))
+        if name == "sakura.host.settings.collection-v0":
+            return SimpleNamespace(register=lambda *args, **kwargs: self.collections.append((args, kwargs)))
         raise KeyError(name)
 
 
