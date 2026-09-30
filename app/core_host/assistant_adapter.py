@@ -240,6 +240,10 @@ class AssistantAdapter:
                 expression_bias=initiative.expression_bias,
             )
             runtime.configure_lore(load_lore_index(profile.lore_index_path))
+            from app.core_host.history_tools import create_history_tools
+
+            for tool in create_history_tools(self._user_root, profile.id):
+                self._application_tools.register(tool)
             from app.core_host.inner_thought_settings import attach_inner_thought
 
             attach_inner_thought(runtime, self._user_root)
