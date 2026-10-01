@@ -3,8 +3,7 @@
 The state machine follows the Qt-era ProactiveObserver: app focus is process plus
 window handle, fast switches reset the settle clock, a title change inside the same
 app does not, and a busy UI holds a ready trigger instead of consuming it. This
-module does not capture the screen or speak. Content-change, UIA, OCR and media
-triggers are not represented here.
+module consumes bounded visible text but does not collect it, capture or speak.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import json
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +22,7 @@ WINDOW_SWITCH_COOLDOWN_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 5.0
 IDLE_TRIGGER_SECONDS = 600.0
 AWAY_MAX_SECONDS = 12 * 3600.0
-_QUIET_OUTCOMES = frozenset({"privacy", "unchanged", "self"})
+_QUIET_OUTCOMES = frozenset({"privacy", "self"})
 _COMMIT_OUTCOMES = frozenset({"failed", "submitted", *_QUIET_OUTCOMES})
 DIAGNOSTIC_BYTE_LIMIT = 256 * 1024
 _DIAGNOSTIC_MEMORY = 200
@@ -37,6 +36,7 @@ class FocusSnapshot:
     changed_at: float
     pid: int = 0
     own_process: bool = False
+    visible_text: str | None = None
 
     @property
     def app_key(self) -> str:
@@ -69,6 +69,8 @@ class FocusObserver:
     away_max_seconds: float = AWAY_MAX_SECONDS
     enabled: bool = True
     diagnostics_path: Path | None = None
+    content_check_interval: float = 30.0
+    content_min_chars: int = 30
     _scope: str = ""
     _current: FocusSnapshot | None = None
     _previous: FocusSnapshot | None = None
@@ -93,6 +95,10 @@ class FocusObserver:
     _perception_hold: bool = False
     _perception_settled: bool = False
     _held_triggers: list[str] = field(default_factory=list)
+    _content_baseline: str = ""
+    _content_pending: bool = False
+    _last_content_check_at: float | None = None
+    _last_visual: tuple[str, str, str, str] | None = None
 
     def configure(
         self,
@@ -105,6 +111,8 @@ class FocusObserver:
         poll_interval: float | None = None,
         idle_threshold_seconds: float | None = None,
         away_max_seconds: float | None = None,
+        content_check_interval: float | None = None,
+        content_min_chars: int | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.timer_seconds = max(1.0, float(timer_seconds))
@@ -125,6 +133,10 @@ class FocusObserver:
             self.idle_threshold_seconds = max(0.0, float(idle_threshold_seconds))
         if away_max_seconds is not None:
             self.away_max_seconds = max(0.0, float(away_max_seconds))
+        if content_check_interval is not None:
+            self.content_check_interval = max(0.2, float(content_check_interval))
+        if content_min_chars is not None:
+            self.content_min_chars = max(1, int(content_min_chars))
 
     def set_diagnostics_path(self, path: Path | None) -> None:
         self.diagnostics_path = path
@@ -151,6 +163,8 @@ class FocusObserver:
         self._perception_hold = False
         self._perception_settled = False
         self._held_triggers = []
+        self._clear_content()
+        self._last_visual = None
 
     def advance(
         self,
@@ -170,16 +184,22 @@ class FocusObserver:
                 self._away_set_at = away_at
         now = float(self.clock())
         if snapshot is not None and snapshot.changed_at <= 0:
-            snapshot = FocusSnapshot(
-                hwnd=snapshot.hwnd,
-                process=snapshot.process,
-                title=snapshot.title,
-                changed_at=now,
-                pid=snapshot.pid,
-                own_process=snapshot.own_process,
-            )
+            snapshot = replace(snapshot, changed_at=now)
+        restricted = (
+            not gate.enabled or gate.busy or gate.continuation or gate.silence
+            or self._away or (snapshot is not None and snapshot.own_process)
+            or bool(_privacy_reason(snapshot, blocked_processes, blocked_titles))
+        )
+        if restricted:
+            if not gate.enabled or self._away or (snapshot is not None and snapshot.own_process) or _privacy_reason(snapshot, blocked_processes, blocked_titles):
+                self._last_visual = None
+                self._clear_content()
+            if snapshot is not None:
+                snapshot = replace(snapshot, visible_text=None)
         if snapshot is not None:
             self._sync(snapshot, now)
+            if snapshot.visible_text is not None:
+                self._read_content(snapshot.visible_text, now)
         self.configure(enabled=gate.enabled, timer_seconds=self.timer_seconds)
         if not gate.enabled:
             return self._decision("wait", "", "disabled")
@@ -219,6 +239,11 @@ class FocusObserver:
         self._away = bool(enabled)
         self._away_set_at = now if enabled else 0.0
         if enabled:
+            self._clear_content()
+            self._last_visual = None
+            self.release_perception_hold()
+            self._offered = []
+            self._held_triggers = []
             self._idle_armed = True
             self._emit("away", process=self._current.label if self._current else "", trigger="", reason="away_on")
         else:
@@ -267,11 +292,11 @@ class FocusObserver:
     def content_quiet_until(self) -> float:
         return self._content_quiet_until
 
-    def focus_identity(self) -> tuple[str, str, str, bool]:
+    def focus_identity(self) -> tuple[str, str, str, bool, int, str]:
         current = self._current
         if current is None:
-            return self._scope, "", "", False
-        return self._scope, current.app_key, current.process, bool(current.own_process)
+            return self._scope, "", "", False, 0, ""
+        return self._scope, current.app_key, current.process, bool(current.own_process), current.pid, current.title
 
     def offer_trigger(self) -> str:
         raw = ""
@@ -290,11 +315,17 @@ class FocusObserver:
         app_key: str,
         interval: float,
         content_quiet: float,
+        visible_text: str | None = None,
     ) -> bool:
         """Arm adaptive timing only after validated perception for the same focus."""
         current_key = self._current.app_key if self._current is not None else ""
         if scope != self._scope or current_key != app_key:
             return False
+        text = visible_text if visible_text is not None else (self._current.visible_text if self._current else None)
+        if text is not None and len(text.strip()) >= self.content_min_chars:
+            self._content_baseline = text.strip()[:2000]
+            latest = self._current.visible_text if self._current else None
+            self._content_pending = bool(latest and latest.strip() != self._content_baseline)
         now = float(self.clock())
         self._next_timer_at = now + float(interval)
         if app_key:
@@ -310,6 +341,51 @@ class FocusObserver:
     def release_perception_hold(self) -> None:
         self._perception_hold = False
         self._perception_settled = True
+
+    def content_read_allowed(
+        self, gate: FocusGate, *, blocked_processes: tuple[str, ...] = (),
+        blocked_titles: tuple[str, ...] = (),
+    ) -> bool:
+        current = self._current
+        if (
+            not gate.enabled or gate.busy or gate.continuation or gate.silence or gate.cooldown
+            or self._away or self._perception_hold or current is None or current.own_process
+            or _privacy_reason(current, blocked_processes, blocked_titles)
+        ):
+            return False
+        now = float(self.clock())
+        return bool(self._offered) or self._last_content_check_at is None or (
+            now - self._last_content_check_at >= self.content_check_interval
+        )
+
+    def _clear_content(self) -> None:
+        self._content_baseline = ""
+        self._content_pending = False
+        self._last_content_check_at = None
+        for name in ("_current", "_previous", "_pending", "_deferred"):
+            snapshot = getattr(self, name)
+            if snapshot is not None:
+                setattr(self, name, replace(snapshot, visible_text=None))
+
+    def skip_repeated_summary(self, summary: str, trigger: str) -> bool:
+        current = self._current
+        if current is None or not current.title.strip() or not summary.strip():
+            return False
+        value = (self._scope, current.app_key, current.title.strip(), summary.strip())
+        repeated = value == self._last_visual and trigger not in {"window", "content"}
+        self._last_visual = value
+        return repeated
+
+    def _read_content(self, text: str, now: float) -> None:
+        if self._last_content_check_at is not None and now - self._last_content_check_at < self.content_check_interval:
+            return
+        self._last_content_check_at = now
+        text = text.strip()[:2000]
+        if len(text) < self.content_min_chars:
+            return
+        if not self._content_baseline:
+            self._content_baseline = text
+        self._content_pending = text != self._content_baseline
 
     def note_personal_evaluation(
         self,
@@ -372,20 +448,17 @@ class FocusObserver:
             self._current = snap
             return
         current = self._current
-        if snap.app_key == current.app_key:
+        if snap.app_key == current.app_key and snap.pid == current.pid:
             if snap.title != current.title or snap.process != current.process or snap.pid != current.pid:
-                self._current = FocusSnapshot(
-                    hwnd=current.hwnd,
-                    process=snap.process or current.process,
-                    title=snap.title or current.title,
-                    changed_at=current.changed_at,
-                    pid=snap.pid or current.pid,
-                    own_process=snap.own_process,
-                )
                 self._emit("focus_title", process=self._current.label, trigger="", reason="same_app")
+            self._current = replace(
+                snap, changed_at=current.changed_at,
+                visible_text=snap.visible_text if snap.visible_text is not None else current.visible_text,
+            )
             self._promote_deferred(now)
             self._finalize(now)
             return
+        self._clear_content()
         if snap.own_process and current.own_process:
             self._current = snap
             self._pending = None
@@ -492,6 +565,8 @@ class FocusObserver:
         if throttle and triggers:
             return triggers
         if not cooldown and self._settled_at == 0 and not self._ready_trigger:
+            if self._content_pending and now >= self._content_quiet_until:
+                triggers.append("content")
             if self._next_timer_at > 0:
                 due = now >= self._next_timer_at
             else:
@@ -553,6 +628,7 @@ def snapshot_from_mapping(value: Mapping[str, Any] | None) -> FocusSnapshot | No
         changed_at=float(value.get("changedAt") or 0.0),
         pid=int(value.get("pid") or 0),
         own_process=bool(value.get("ownProcess")),
+        visible_text=value.get("visibleText") if isinstance(value.get("visibleText"), str) else None,
     )
 
 

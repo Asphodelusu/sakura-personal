@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from app.agent.actions import AgentEvent, AgentProgress, AgentResult
@@ -42,6 +42,7 @@ class ChatPipeline:
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
         screen_awareness_mode: bool = False,
+        observer_context: Mapping[str, str] | None = None,
     ) -> AgentResult:
         binding = getattr(self.agent_runtime, "visual_binding", None)
         log_event(
@@ -53,12 +54,14 @@ class ChatPipeline:
                 "messages": summarize_messages(messages),
             },
         )
+        observer_kwargs = {"observer_context": observer_context} if observer_context is not None else {}
         result = self._run_traced(
             lambda: self.agent_runtime.handle_user_message(
                 messages,
                 progress_callback=_visual_progress(progress_callback, binding),
                 cancel_checker=cancel_checker,
                 screen_awareness_mode=screen_awareness_mode,
+                **observer_kwargs,
             ),
             operation_id=_messages_trace_operation_id(messages),
         )

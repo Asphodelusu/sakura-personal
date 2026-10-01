@@ -6,7 +6,8 @@ const RESOLUTIONS = new Set(["fullscreen", "720p", "1080p", "2160p"]);
 const QUIET_SKIP_CODES = new Set([
   "SCREEN_OBSERVATION_PRIVACY_BLOCKED",
   "SCREEN_OBSERVATION_SELF",
-  "SCREEN_OBSERVATION_UNCHANGED",
+  "SCREEN_OBSERVATION_TARGET_STALE",
+  "SCREEN_OBSERVATION_TARGET_UNAVAILABLE",
 ]);
 
 export function createFocusAdvanceCaller({ invoke, generationId } = {}) {
@@ -181,7 +182,7 @@ export function createScreenAwarenessController({
   function quietOutcome(code) {
     if (code === "SCREEN_OBSERVATION_PRIVACY_BLOCKED") return "privacy";
     if (code === "SCREEN_OBSERVATION_SELF") return "self";
-    if (code === "SCREEN_OBSERVATION_UNCHANGED") return "unchanged";
+    if (code === "SCREEN_OBSERVATION_TARGET_STALE" || code === "SCREEN_OBSERVATION_TARGET_UNAVAILABLE") return "aborted";
     return "";
   }
 
@@ -208,6 +209,7 @@ export function createScreenAwarenessController({
     try {
       const timestamp = now();
       let immediate = false;
+      let captureTicket = null;
       if (typeof advanceFocus === "function") {
         let decision;
         try {
@@ -219,6 +221,14 @@ export function createScreenAwarenessController({
           return;
         }
         if (!decision || decision.action !== "capture") return;
+        if (personalMode()) {
+          if (!/^[0-9a-f]{32}$/.test(String(decision.captureTicket || ""))) {
+            onDiagnostic("screen_awareness.focus.failed", { code: "FOCUS_CAPTURE_TICKET_INVALID" });
+            await report("aborted");
+            return;
+          }
+          captureTicket = decision.captureTicket;
+        }
         if (!isCurrent(token, startedGeneration) || !isIdle()) {
           await report("aborted");
           return;
@@ -240,6 +250,7 @@ export function createScreenAwarenessController({
           const result = await invoke("capture_screen_awareness_frame", { payload: {
             resolution,
             batchLimit,
+            ...(personalMode() ? { scope: startedGeneration, captureTicket } : {}),
           } });
           if (!isCurrent(token, startedGeneration)) {
             discardOwnedWork(startedGeneration, null);
@@ -279,7 +290,8 @@ export function createScreenAwarenessController({
 
       let attachmentId = null;
       try {
-        const attached = await invoke("attach_screen_awareness_batch");
+        const attached = await invoke("attach_screen_awareness_batch", personalMode()
+          ? { payload: { scope: startedGeneration, captureTicket } } : undefined);
         attachmentId = String(attached?.attachmentId || "");
         if (!isCurrent(token, startedGeneration) || !isIdle()) {
           discardOwnedWork(startedGeneration, attachmentId);

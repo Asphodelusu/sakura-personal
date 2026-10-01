@@ -262,11 +262,11 @@ test("a late settlement still names the generation that started the attempt", as
   assert.equal(payloads.at(-1).outcome, "aborted");
 });
 
-test("private, own, or unchanged screens are skipped quietly until the next interval", async () => {
+test("private, own, or stale target screens are skipped quietly until the next interval", async () => {
   for (const code of [
     "SCREEN_OBSERVATION_PRIVACY_BLOCKED",
     "SCREEN_OBSERVATION_SELF",
-    "SCREEN_OBSERVATION_UNCHANGED",
+    "SCREEN_OBSERVATION_TARGET_STALE",
   ]) {
     const env = harness({ overrides: { batchLimit: 1 } });
     const clearsBefore = commands(env, "clear_screen_awareness_batch").length;
@@ -335,7 +335,7 @@ test("personal polling keeps fractional seconds and does not use the minute sche
       return 2;
     },
     clearInterval: () => {},
-    advanceFocus: async () => ({ action: "capture", trigger: "timer", reason: "ready" }),
+    advanceFocus: async () => ({ action: "capture", trigger: "timer", reason: "ready", captureTicket: "b".repeat(32) }),
   });
   controller.applySettings(personal);
   controller.start();
@@ -344,4 +344,18 @@ test("personal polling keeps fractional seconds and does not use the minute sche
   const capture = focused.find(([command]) => command === "capture_screen_awareness_frame");
   assert.equal(capture[1].payload.batchLimit, 1);
   assert.equal(capture[1].payload.resolution, "fullscreen");
+  assert.equal(capture[1].payload.scope, "generation-a");
+  assert.equal(capture[1].payload.captureTicket, "b".repeat(32));
+  assert.deepEqual(focused.find(([command]) => command === "attach_screen_awareness_batch")[1], {
+    payload: { scope: "generation-a", captureTicket: "b".repeat(32) },
+  });
+});
+
+test("personal observation refuses a capture without its window offer ticket", async () => {
+  const env = harness({ advanceFocus: async () => ({ action: "capture", trigger: "window", reason: "ready" }) });
+  env.controller.applySettings({ enabled: true, timerSeconds: 480, cooldownSeconds: 600,
+    focusSettleDelay: 15, windowSwitchCooldown: 60, pollIntervalSeconds: 5 });
+  await env.controller.tick();
+  assert.equal(commands(env, "capture_screen_awareness_frame").length, 0);
+  assert.equal(env.sends.length, 0);
 });

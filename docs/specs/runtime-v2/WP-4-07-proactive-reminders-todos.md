@@ -33,7 +33,7 @@ updated: 2026-10-01
 - 个人 `window_switch_enabled=false` 关闭切窗触发，补充计时和空闲触发仍可用。已发布的个人会话不会因尚未生效的角色选择降为上游计时。
 - 非个人角色未接上焦点观察时，仍使用 10 秒普通轮询：只有 Core ready，距最近输入或手动发送、距上一张截图都达到截图间隔，
   且聊天、等待动画、打字机/TTS、手动截图或附件均空闲时才截图；忙时跳过，休眠后不补跑。
-- 每次捕获鼠标所在显示器，按设置等比缩小且不放大，JPEG quality 70。焦点观察在 Core 请求 `capture` 时捕获一张并立即送出。未接上焦点观察时，第一张截图开始冷却；冷却到期后将最新最多 N 张按时间顺序作为一次普通聊天请求发送，然后清空批次。
+- Windows 个人观察只捕获本次触发窗口的物理矩形，用 HWND、PID、进程、标题和矩形绑定短期 `captureTicket`；捕获前后、资源生成和附件发布时重新校验。无有效窗口、已最小化、隐藏、隐私名单或目标已变时跳过，不扩大为整屏。跨显示器时按各显示器的交集捕获并拼接，支持负坐标，不重复换算 DPI。手动截图选择器不变。非个人观察仍捕获鼠标所在显示器，按设置等比缩小且不放大，JPEG quality 70。焦点观察在 Core 请求 `capture` 时捕获一张并立即送出。未接上焦点观察时，第一张截图开始冷却；冷却到期后将最新最多 N 张按时间顺序作为一次普通聊天请求发送，然后清空批次。
 - 主动请求生成期间主界面保持原有画面，不显示思考占位符或等待动画；完整回复到达后才直接进入现有的
   分段打字、角色表现和 TTS 流程。手动聊天仍显示正常思考状态。
 - 手动发送、设置变化、generation 变化、禁用或退出立即清空批次。截图或发送失败不自动重试；清理后
@@ -64,16 +64,20 @@ updated: 2026-10-01
 
 - Core：`screen_awareness.settings.get`、`screen_awareness.settings.save`、
   `screen_awareness.focus.advance`、
-  `screen.attachBatch { resources: ScreenResourceDescriptor[1..20] }`。
-- `screen_awareness.focus.advance` 接收 `{ busy, scope, snapshot?, outcome? }`。`scope` 固定为本次尝试开始时的 Core generation id；不属于当前代次的请求返回 `wait/stale_scope`，不改变 runtime。`snapshot` 含 hwnd、pid、process、title、ownProcess。响应只有 `{ action, trigger, reason }`，不回传标题。`action` 为 `capture`、`hold` 或 `wait`。
-- `outcome` 只接受 `aborted | failed | privacy | unchanged | self | submitted`。结算请求只结束已提出的捕获尝试，不再读取前台窗口或提出新捕获。`submitted` 表示请求已送出。非个人角色仍在此时推进补充计时和同应用再看。个人角色的 `submitted` 只消费这一次触发，不提前推进补充计时、同应用再看或内容安静；这些成功计时只在视觉感知通过校验、且焦点与代次仍是送出时的那一个之后写入。失败、取消或焦点已变不写入。`aborted` 保留触发，捕获失败不计为成功评估。
+  `screen.attachBatch { resources: ScreenResourceDescriptor[1..20], observerContext? }`。descriptor 保持原来的八字段；可选 `observerContext` 只接受 `{ process, visibleText, visibleTextSource: "uia" }`，分别最多 260、2000 字符，必须在读取图像之前校验。它只在主动附件存活期间保留，不进入原始聊天历史。
+- `screen_awareness.focus.advance` 接收 `{ busy, scope, snapshot?, outcome? }`。`scope` 固定为本次尝试开始时的 Core generation id；不属于当前代次的请求返回 `wait/stale_scope`，不改变 runtime。`snapshot` 含 hwnd、pid、process、title、ownProcess，可带最多 2000 字符的 `visibleText`。响应为 `{ action, trigger, reason }`；个人会话另带布尔 `contentReadAllowed`，不回传标题或正文。`action` 为 `capture`、`hold` 或 `wait`。Shell 先上报薄快照，只有 Core 允许且窗口再次通过隐私校验时才读取 UIA，再上报有界正文；离开、禁用、忙碌或自身窗口均不读取。
+- Windows UIA 由 Shell 的单个 MTA 线程串行读取，COM 对象在同线程创建和释放。连接和交易期限均为 200 ms；遍历软期限 200 ms，最多 500 控件、20 层、2000 字符。先检查 password、offscreen 和可见矩形，再取文字；TextPattern 只用可见范围，不读取完整 DocumentRange。原生 provider 可能不遵守期限；调用方按时返回，保持至多一个在途任务，忙碌时静默，迟到、退休或已取消的结果丢弃，退出不无限 join。
+- 正文按个人 `content_check_interval`（默认 30 秒）检查，少于 `content_min_chars`（默认 30 字）不计变化。直接比较正文，内容安静期间保留尚未评估的变化；有效感知后才推进基线与安静期。切换窗口、离开和会话退休清除临时正文。UIA 足够时选其最多 1200 字的摘录，标记 `uia`；否则使用 VLM 的 `on_screen_text`，标记 `vlm`。
+- `outcome` 只接受 `aborted | failed | privacy | self | submitted`。结算请求只结束已提出的捕获尝试，不再读取前台窗口或提出新捕获。`submitted` 表示请求已送出。非个人角色仍在此时推进补充计时和同应用再看。个人角色的 `submitted` 只消费这一次触发，不提前推进补充计时、同应用再看或内容安静；这些成功计时只在视觉感知通过校验、且焦点与代次仍是送出时的那一个之后写入。失败、取消或焦点已变不写入。`aborted` 保留触发，捕获失败不计为成功评估。离开会解除旧评估的等待，迟到回复不得恢复发言或旧印象。
 - 个人定时观察不走普通工具循环。视觉请求只带截图和进程、触发、空闲、短印象这些薄元数据，使用 proactive 的评估温度、max_tokens 和 request_timeout，并关闭思考；不把 UIA 正文放进视觉请求。感知无效或为空时保持沉默，不再调用快模型。快模型不接收图片，上下文是本轮观测包、最多 1200 字可见摘录、最近六轮真实对话、最多三条主动交流、仍有效的短印象，以及角色身份和行为。屏幕文字不能写成用户发言。关系主动仍用自己的温度和长度；观察决策固定 0.5 / 1024，并关闭思考。除既有译文修复外，不再发起第三次普通对话。`should_speak` 为假、未配置、无法解析，或开口文本为空、不是短对白时，都不显示、不播 TTS、不写 ASSISTANT。沉默可以另写一条有界的语义 OBSERVATION。
 - 短时屏幕印象属于当前 runtime，不落盘。保存 1200 秒、最多 400 字；普通对话只注入截断到 160 字的投影。离开、会话退休和关闭时清除。此后的真实用户发言会让更早的印象退出后续观察决策，并在决策上下文里写明两边的时间。自动观察不因此去读本机媒体。
-- 诊断只记 outcome、stage、耗时、trigger 和 process。不记窗口标题、UIA 正文、base64 或决策评论。游戏 OCR 保持硬停用。
+- 同窗同标题且视觉摘要完全相同时跳过快模型；切窗和正文变化仍进入决策。直接比较摘要，不计算截图内容哈希。
+- 诊断只记 outcome、stage、耗时、trigger、process 及来源状态和字符数。不记窗口标题、UIA 正文、base64 或决策评论；视觉和发言评估请求不写入原始模型 Trace，补译只带待修复对白，不再传正文，普通对话 Trace 不变。游戏 OCR 保持硬停用。
 - 可选诊断：在用户根创建 `logs/observer-diagnostics.enabled`，或设置 `SAKURA_OBSERVER_DIAGNOSTICS=1`。Core 追加 `logs/observer-diagnostics.jsonl`。`python tools/observer_diagnostics.py --file <path>` 跟随该文件。默认不打开窗口，也不写入标题或画面正文。
 - `screen.attachBatch` 返回 `{ attached: true, attachmentId, count }`。
 - Tauri：`settings_screen_awareness_get`、`settings_screen_awareness_save`、
   `capture_screen_awareness_frame`、`observer_focus_advance`、`attach_screen_awareness_batch`、`clear_screen_awareness_batch`。
+- 个人 `observer_focus_advance` 的 capture 响应另带随机 `captureTicket`。个人捕获请求必须携带 `{ resolution: "fullscreen", batchLimit: 1, scope, captureTicket }`，附加批次携带 `{ scope, captureTicket }`；不能把旧请求改绑到最新窗口。WebView 仅传递凭证，不接收窗口正文。
 - 设置保存成功后发布一次 `sakura://screen-awareness-settings`。事件载荷就是 `settings` 对象。非个人角色保持
   `enabled`、`checkIntervalMinutes`、`cooldownMinutes`、`batchLimit`、`resolution`。个人角色改为
   `enabled`、`timerSeconds`、`cooldownSeconds`、`focusSettleDelay`、`windowSwitchCooldown`、`pollIntervalSeconds`。

@@ -69,6 +69,7 @@ class _ScreenAttachment:
     item_ids: tuple[str, ...]
     source: str
     visual_id: str | None = None
+    observer_context: Mapping[str, str] | None = None
 
 
 class RealChatBoundary:
@@ -540,6 +541,8 @@ class RealChatBoundary:
                     }
                     if visual_observation_jobs:
                         pipeline_kwargs["visual_observation_jobs"] = visual_observation_jobs
+                    if screen_attachment is not None and screen_attachment.observer_context is not None:
+                        pipeline_kwargs["observer_context"] = screen_attachment.observer_context
                     result = getattr(session, "pipeline").run_user_message(
                         messages,
                         screen_awareness_mode=screen_attempted,
@@ -1006,8 +1009,25 @@ class RealChatBoundary:
 
     def handle_screen_attach_batch(self, request: dict[str, Any]) -> dict[str, Any]:
         payload = request.get("payload")
-        if not isinstance(payload, Mapping) or set(payload) != {"resources"}:
+        if (
+            not isinstance(payload, Mapping)
+            or "resources" not in payload
+            or set(payload) - {"resources", "observerContext"}
+        ):
             raise ValueError("screen.attachBatch payload is invalid")
+        context = payload.get("observerContext")
+        if "observerContext" in payload:
+            if (
+                not isinstance(context, Mapping)
+                or set(context) != {"process", "visibleText", "visibleTextSource"}
+                or not isinstance(context.get("process"), str)
+                or len(context["process"]) > 260
+                or not isinstance(context.get("visibleText"), str)
+                or len(context["visibleText"]) > 2000
+                or context.get("visibleTextSource") != "uia"
+            ):
+                raise ValueError("screen.attachBatch observerContext is invalid")
+            context = dict(context)
         resources = payload.get("resources")
         if not isinstance(resources, list) or not 1 <= len(resources) <= 20:
             raise ValueError("screen.attachBatch resources count is invalid")
@@ -1024,6 +1044,7 @@ class RealChatBoundary:
             observations=observations,
             item_ids=(),
             source="screen_awareness",
+            observer_context=context,
         )
         with self._lock:
             if self._closed:

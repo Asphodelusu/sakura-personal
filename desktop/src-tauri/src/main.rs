@@ -26,6 +26,7 @@ mod macos_open_help;
 mod macos_surface_viewport;
 #[cfg(windows)]
 mod managed_process_tree;
+mod observer_sources;
 mod platform;
 mod plugin_settings;
 mod product_shell;
@@ -3758,26 +3759,41 @@ async fn capture_screen_awareness_frame(
         .map_err(|_| "SCREEN_CAPTURE_CURSOR_UNAVAILABLE".to_string())?;
     let manager = captures.inner().clone();
     let task_generation_id = generation_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let response = handle
-            .settings_request(
-                None,
-                "screen_awareness.privacy.get",
-                json!({}),
-                std::time::Duration::from_secs(3),
-            )
-            .map_err(|_| "SCREEN_PRIVACY_UNAVAILABLE".to_string())?;
-        let privacy =
-            capture::ScreenPrivacy::from_core_payload(&settings_response_payload(response)?)?;
-        manager.capture_screen_awareness_frame(
-            &task_generation_id,
-            cursor.x.round() as i32,
-            cursor.y.round() as i32,
-            &payload.resolution,
-            payload.batch_limit,
-            &privacy,
-        )
-    })
+    let offer = payload.offer()?;
+    let result = tauri::async_runtime::spawn_blocking(
+        move || -> Result<capture::ScreenAwarenessCapturePublication, String> {
+            if handle.available_generation_id().ok().flatten().as_deref()
+                != Some(task_generation_id.as_str())
+            {
+                return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+            }
+            let response = handle
+                .settings_request(
+                    None,
+                    "screen_awareness.privacy.get",
+                    json!({}),
+                    std::time::Duration::from_secs(3),
+                )
+                .map_err(|_| "SCREEN_PRIVACY_UNAVAILABLE".to_string())?;
+            let privacy =
+                capture::ScreenPrivacy::from_core_payload(&settings_response_payload(response)?)?;
+            let result = manager.capture_screen_awareness_frame(
+                &task_generation_id,
+                cursor.x.round() as i32,
+                cursor.y.round() as i32,
+                &payload.resolution,
+                payload.batch_limit,
+                &privacy,
+                offer.as_ref(),
+            )?;
+            if handle.available_generation_id().ok().flatten().as_deref()
+                != Some(task_generation_id.as_str())
+            {
+                return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+            }
+            Ok(result)
+        },
+    )
     .await
     .map_err(|_| "SCREEN_CAPTURE_TASK_ABORTED".to_string())??;
     record_screen_capture(
@@ -3809,6 +3825,7 @@ async fn observer_focus_advance(
     window: WebviewWindow,
     payload: FocusAdvanceRequest,
     lifecycle: State<'_, ShellLifecycleState>,
+    captures: State<'_, Arc<capture::CaptureManager>>,
 ) -> Result<Value, String> {
     if window.label() != "main" {
         return Err("PET_WINDOW_REQUIRED".to_string());
@@ -3828,46 +3845,136 @@ async fn observer_focus_advance(
             "reason": "stale_scope",
         }));
     }
-    let mut request = serde_json::json!({
-        "busy": payload.busy,
-        "scope": payload.scope,
-    });
-    let mut logged_process = Value::String(String::new());
-    if payload.outcome.is_empty() {
-        let foreground = capture::foreground_window();
-        if let Some(snapshot) = capture::focus_advance_snapshot(foreground.as_ref(), std::process::id())
+    let manager = captures.inner().clone();
+    let task_generation = generation_id.clone();
+    let revision = manager.focus_revision();
+    let body = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let current = || {
+            handle.available_generation_id().ok().flatten().as_deref()
+                == Some(task_generation.as_str())
+                && manager.focus_revision() == revision
+        };
+        let wait = |reason| json!({"action": "wait", "trigger": "", "reason": reason});
+        let mut request = json!({"busy": payload.busy, "scope": payload.scope});
+        let target = if payload.outcome.is_empty() {
+            observer_sources::foreground_target()
+        } else {
+            None
+        };
+        let foreground = target
+            .as_ref()
+            .map(|target| target.window.clone())
+            .or_else(|| {
+                if payload.outcome.is_empty() {
+                    capture::foreground_window()
+                } else {
+                    None
+                }
+            });
+        if let Some(snapshot) =
+            capture::focus_advance_snapshot(foreground.as_ref(), std::process::id())
         {
-            if let Some(process) = snapshot.get("process").cloned() {
-                logged_process = process;
-            }
             request["snapshot"] = snapshot;
         }
-    } else {
-        request["outcome"] = serde_json::Value::String(payload.outcome);
-    }
-    let response = dispatch_settings_request(
-        handle,
-        None,
-        "screen_awareness.focus.advance",
-        request,
-        std::time::Duration::from_secs(3),
-    )
-    .await?;
-    let body = settings_response_payload(response)?;
+        if !payload.outcome.is_empty() {
+            request["outcome"] = json!(payload.outcome);
+        }
+        let mut body = settings_response_payload(handle.settings_request(
+            None,
+            "screen_awareness.focus.advance",
+            request.clone(),
+            std::time::Duration::from_secs(3),
+        )?)?;
+        if !current() {
+            return Ok(wait("stale_scope"));
+        }
+        if !payload.outcome.is_empty() {
+            return Ok(body);
+        }
+        let personal = body.get("contentReadAllowed").is_some();
+        manager.set_awareness_mode(&task_generation, personal, revision)?;
+        let mut visible_text = String::new();
+        if personal
+            && body.get("contentReadAllowed").and_then(Value::as_bool) == Some(true)
+            && !payload.busy
+        {
+            if let Some(target) = target.as_ref() {
+                let privacy = capture::ScreenPrivacy::from_core_payload(
+                    &settings_response_payload(handle.settings_request(
+                        None,
+                        "screen_awareness.privacy.get",
+                        json!({}),
+                        std::time::Duration::from_secs(3),
+                    )?)?,
+                )?;
+                if capture::screen_observation_block(
+                    &privacy,
+                    Some(&target.window),
+                    std::process::id(),
+                )
+                .is_none()
+                    && current()
+                    && observer_sources::foreground_target().as_ref() == Some(target)
+                {
+                    let source = manager.observer_sources.collect(target.clone());
+                    if !current() || observer_sources::foreground_target().as_ref() != Some(target)
+                    {
+                        return Ok(wait("stale_target"));
+                    }
+                    visible_text = source.text;
+                    request["snapshot"]["visibleText"] = json!(visible_text);
+                    body = settings_response_payload(handle.settings_request(
+                        None,
+                        "screen_awareness.focus.advance",
+                        request,
+                        std::time::Duration::from_secs(3),
+                    )?)?;
+                    // Status and length are safe; never log titles or the body.
+                    body["sourceStatus"] = json!(source.status);
+                    body["sourceLength"] = json!(visible_text.chars().count());
+                }
+            }
+        }
+        if !current() {
+            return Ok(wait("stale_scope"));
+        }
+        if personal && body.get("action").and_then(Value::as_str) == Some("capture") {
+            let Some(target) = target else {
+                return Ok(wait("target_unavailable"));
+            };
+            if observer_sources::foreground_target().as_ref() != Some(&target) {
+                return Ok(wait("stale_target"));
+            }
+            body["captureTicket"] = json!(manager.offer_foreground(
+                &task_generation,
+                target,
+                visible_text,
+                revision
+            )?);
+        } else if personal
+            && matches!(
+                body.get("reason").and_then(Value::as_str),
+                Some("away" | "privacy" | "disabled" | "self_window")
+            )
+        {
+            manager.clear_screen_awareness_batch();
+        }
+        body["process"] = json!(foreground
+            .as_ref()
+            .map(|window| window.process_name.as_str())
+            .unwrap_or(""));
+        Ok(body)
+    })
+    .await
+    .map_err(|_| "FOCUS_ADVANCE_TASK_ABORTED".to_string())??;
     let action = body
         .get("action")
         .and_then(Value::as_str)
         .filter(|value| matches!(*value, "capture" | "hold" | "wait"))
         .ok_or_else(|| "FOCUS_ADVANCE_RESPONSE_INVALID".to_string())?;
-    let trigger = body
-        .get("trigger")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let reason = body
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if action != "wait" {
+    let trigger = body.get("trigger").and_then(Value::as_str).unwrap_or("");
+    let reason = body.get("reason").and_then(Value::as_str).unwrap_or("");
+    if action != "wait" || body.get("sourceStatus").is_some() {
         record_screen_capture(
             &lifecycle.runtime_log,
             &generation_id,
@@ -3877,20 +3984,27 @@ async fn observer_focus_advance(
                 "action": action,
                 "trigger": trigger,
                 "reason": reason,
-                "process": logged_process,
+                "process": body.get("process"),
+                "source_status": body.get("sourceStatus"),
+                "source_length": body.get("sourceLength"),
             }),
         );
     }
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "action": action,
         "trigger": trigger,
         "reason": reason,
-    }))
+    });
+    if let Some(ticket) = body.get("captureTicket") {
+        result["captureTicket"] = ticket.clone();
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 async fn attach_screen_awareness_batch(
     window: WebviewWindow,
+    payload: Option<capture::ScreenAwarenessOfferRequest>,
     lifecycle: State<'_, ShellLifecycleState>,
     captures: State<'_, Arc<capture::CaptureManager>>,
 ) -> Result<capture::ScreenAwarenessAttachmentPublication, String> {
@@ -3904,12 +4018,30 @@ async fn attach_screen_awareness_batch(
         .ok_or_else(|| "SCREEN_CAPTURE_CORE_NOT_READY".to_string())?;
     let manager = captures.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let requested_offer = payload;
+        manager.require_foreground_offer(requested_offer.as_ref())?;
+        let privacy = if requested_offer.is_some() { capture::ScreenPrivacy::from_core_payload(&settings_response_payload(handle.settings_request(
+            None, "screen_awareness.privacy.get", json!({}), std::time::Duration::from_secs(3))?)?)? } else { capture::ScreenPrivacy::default() };
+        let offer = match requested_offer.as_ref() {
+            Some(request) => Some(manager.check_foreground_offer(&generation_id, request, observer_sources::foreground_target().as_ref(), &privacy)?),
+            None => None,
+        };
         let descriptors = manager.materialize_screen_awareness_batch(&generation_id)?;
         let count = descriptors.len();
+        if let Some(request) = requested_offer.as_ref() {
+            if let Err(error) = manager.check_foreground_offer(&generation_id, request, observer_sources::foreground_target().as_ref(), &privacy) {
+                manager.release_descriptors(&descriptors, &generation_id);
+                return Err(error);
+            }
+        }
+        let mut attach_payload = json!({"resources": descriptors});
+        if let Some(offer) = offer { attach_payload["observerContext"] = json!({
+            "process": offer.target.window.process_name, "visibleText": offer.visible_text, "visibleTextSource": "uia",
+        }); }
         let response = handle.settings_request(
             None,
             "screen.attachBatch",
-            json!({"resources": descriptors}),
+            attach_payload,
             std::time::Duration::from_secs(15),
         );
         manager.release_descriptors(&descriptors, &generation_id);
@@ -3925,6 +4057,14 @@ async fn attach_screen_awareness_batch(
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value == count)
             .ok_or_else(|| "SCREEN_ATTACHMENT_RESPONSE_INVALID".to_string())?;
+        if let Some(request) = requested_offer.as_ref() {
+            let current = handle.available_generation_id().ok().flatten().as_deref() == Some(generation_id.as_str());
+            if !current || manager.check_foreground_offer(&generation_id, request, observer_sources::foreground_target().as_ref(), &privacy).is_err() {
+                let _ = handle.settings_request(None, "screen.release", json!({"attachmentId": attachment_id}), std::time::Duration::from_secs(3));
+                return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+            }
+            manager.clear_screen_awareness_batch();
+        }
         Ok(capture::ScreenAwarenessAttachmentPublication {
             attachment_id: attachment_id.to_string(),
             count: attached_count,
@@ -7758,6 +7898,7 @@ fn finish_app_exit(
         app_handle.state::<asr::AsrState>().shutdown();
         handle.request_shutdown().map_err(str::to_string)?;
     }
+    app_handle.state::<Arc<capture::CaptureManager>>().observer_sources.shutdown();
     app_handle.exit(0);
     Ok(())
 }

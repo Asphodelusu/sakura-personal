@@ -5,10 +5,14 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 
+use crate::observer_sources::{self, ForegroundTarget, ObserverSources};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -22,8 +26,6 @@ use xcap::Monitor;
 
 pub const SCREEN_OBSERVATION_SELF: &str = "SCREEN_OBSERVATION_SELF";
 pub const SCREEN_OBSERVATION_PRIVACY_BLOCKED: &str = "SCREEN_OBSERVATION_PRIVACY_BLOCKED";
-pub const SCREEN_OBSERVATION_UNCHANGED: &str = "SCREEN_OBSERVATION_UNCHANGED";
-const SCREEN_OBSERVATION_UNCHANGED_DISTANCE: u32 = 4;
 const MAX_PRIVACY_ENTRIES: usize = 64;
 const MAX_PRIVACY_ENTRY_CHARS: usize = 128;
 pub const ATTACHED_EVENT: &str = "sakura://screen-attachment";
@@ -165,12 +167,49 @@ pub struct AttachmentItemRemoveRequest {
 pub struct ScreenAwarenessCaptureRequest {
     pub resolution: String,
     pub batch_limit: usize,
+    pub scope: Option<String>,
+    pub capture_ticket: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScreenAwarenessOfferRequest {
+    pub scope: String,
+    pub capture_ticket: String,
+}
+
+impl ScreenAwarenessCaptureRequest {
+    pub fn offer(&self) -> Result<Option<ScreenAwarenessOfferRequest>, String> {
+        match (&self.scope, &self.capture_ticket) {
+            (None, None) => Ok(None),
+            (Some(scope), Some(ticket))
+                if self.batch_limit == 1 && self.resolution == "fullscreen" =>
+            {
+                Ok(Some(ScreenAwarenessOfferRequest {
+                    scope: scope.clone(),
+                    capture_ticket: ticket.clone(),
+                }))
+            }
+            _ => Err("SCREEN_AWARENESS_SETTINGS_INVALID".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ForegroundOffer {
+    generation_id: String,
+    ticket: String,
+    pub target: ForegroundTarget,
+    pub visible_text: String,
+    created_at: Instant,
 }
 
 pub struct CaptureManager {
     base_root: PathBuf,
     available: bool,
     state: Mutex<CaptureState>,
+    focus_revision: AtomicU64,
+    pub observer_sources: ObserverSources,
 }
 
 pub fn valid_attachment_id(value: &str) -> bool {
@@ -197,7 +236,8 @@ struct CaptureState {
     resources: HashMap<String, CaptureResource>,
     active_generation: Option<String>,
     awareness_frames: VecDeque<ScreenAwarenessFrame>,
-    last_awareness_dhash: Option<u64>,
+    foreground_only: bool,
+    foreground_offer: Option<ForegroundOffer>,
 }
 
 /// Casefolded foreground-window blocklist owned by the Core screen-awareness settings.
@@ -358,19 +398,6 @@ pub fn foreground_window() -> Option<ForegroundWindow> {
     None
 }
 
-fn awareness_dhash(image: &image::RgbaImage) -> u64 {
-    let gray = image::imageops::grayscale(image);
-    let small = image::imageops::resize(&gray, 9, 8, FilterType::Triangle);
-    let mut hash = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            let brighter = small.get_pixel(x, y)[0] > small.get_pixel(x + 1, y)[0];
-            hash = (hash << 1) | u64::from(brighter);
-        }
-    }
-    hash
-}
-
 impl CaptureManager {
     pub fn new() -> Self {
         let base_root = std::env::temp_dir().join(RESOURCE_DIRECTORY);
@@ -378,6 +405,8 @@ impl CaptureManager {
             base_root,
             available: false,
             state: Mutex::new(CaptureState::default()),
+            focus_revision: AtomicU64::new(0),
+            observer_sources: ObserverSources::default(),
         })
     }
 
@@ -391,7 +420,111 @@ impl CaptureManager {
             base_root,
             available: true,
             state: Mutex::new(CaptureState::default()),
+            focus_revision: AtomicU64::new(0),
+            observer_sources: ObserverSources::default(),
         })
+    }
+
+    pub fn focus_revision(&self) -> u64 {
+        self.focus_revision.load(Ordering::SeqCst)
+    }
+
+    pub fn set_awareness_mode(
+        &self,
+        generation_id: &str,
+        personal: bool,
+        revision: u64,
+    ) -> Result<(), String> {
+        validate_generation(generation_id)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE")?;
+        if revision != self.focus_revision() {
+            return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+        }
+        if state.active_generation.as_deref() != Some(generation_id) {
+            cleanup_resources(&mut state.resources);
+            state.awareness_frames.clear();
+            state.foreground_offer = None;
+            state.active_generation = Some(generation_id.into());
+        }
+        state.foreground_only = personal;
+        Ok(())
+    }
+
+    pub fn offer_foreground(
+        &self,
+        generation_id: &str,
+        target: ForegroundTarget,
+        visible_text: String,
+        revision: u64,
+    ) -> Result<String, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE")?;
+        if revision != self.focus_revision()
+            || state.active_generation.as_deref() != Some(generation_id)
+            || !state.foreground_only
+        {
+            return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+        }
+        let ticket = Uuid::new_v4().simple().to_string();
+        state.awareness_frames.clear();
+        state.foreground_offer = Some(ForegroundOffer {
+            generation_id: generation_id.into(),
+            ticket: ticket.clone(),
+            target,
+            visible_text: visible_text.chars().take(2000).collect(),
+            created_at: Instant::now(),
+        });
+        Ok(ticket)
+    }
+
+    pub fn check_foreground_offer(
+        &self,
+        generation_id: &str,
+        request: &ScreenAwarenessOfferRequest,
+        current: Option<&ForegroundTarget>,
+        privacy: &ScreenPrivacy,
+    ) -> Result<ForegroundOffer, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE")?;
+        let offer = state
+            .foreground_offer
+            .as_ref()
+            .filter(|offer| {
+                state.active_generation.as_deref() == Some(generation_id)
+                    && request.scope == generation_id
+                    && offer.generation_id == generation_id
+                    && request.capture_ticket == offer.ticket
+                    && offer.created_at.elapsed() < RESOURCE_TTL
+                    && current == Some(&offer.target)
+            })
+            .ok_or("SCREEN_OBSERVATION_TARGET_STALE")?;
+        if let Some(code) =
+            screen_observation_block(privacy, Some(&offer.target.window), std::process::id())
+        {
+            return Err(code.into());
+        }
+        Ok(offer.clone())
+    }
+
+    pub fn require_foreground_offer(
+        &self,
+        request: Option<&ScreenAwarenessOfferRequest>,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE")?;
+        if state.foreground_only && request.is_none() {
+            return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+        }
+        Ok(())
     }
 
     pub fn begin_session(
@@ -419,6 +552,7 @@ impl CaptureManager {
         if state.active_generation.as_deref() != Some(generation_id) {
             cleanup_resources(&mut state.resources);
             state.awareness_frames.clear();
+            state.foreground_offer = None;
             state.active_generation = Some(generation_id.to_string());
         }
         let session_id = Uuid::new_v4().simple().to_string();
@@ -593,6 +727,7 @@ impl CaptureManager {
         resolution: &str,
         batch_limit: usize,
         privacy: &ScreenPrivacy,
+        offer_request: Option<&ScreenAwarenessOfferRequest>,
     ) -> Result<ScreenAwarenessCapturePublication, String> {
         if !self.available {
             return Err("SCREEN_RESOURCE_ROOT_UNAVAILABLE".to_string());
@@ -601,18 +736,68 @@ impl CaptureManager {
         if !(1..=20).contains(&batch_limit) || !valid_screen_awareness_resolution(resolution) {
             return Err("SCREEN_AWARENESS_SETTINGS_INVALID".to_string());
         }
+        self.require_foreground_offer(offer_request)?;
         if let Some(code) =
             screen_observation_block(privacy, foreground_window().as_ref(), std::process::id())
         {
             return Err(code.to_string());
         }
-        let monitor = Monitor::from_point(cursor_x, cursor_y)
-            .map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE".to_string())?;
-        let image = monitor
-            .capture_image()
-            .map_err(|_| "SCREEN_CAPTURE_PLATFORM_DENIED".to_string())?;
+        let (image, screen_name) = if let Some(request) = offer_request {
+            let offer = self.check_foreground_offer(
+                generation_id,
+                request,
+                observer_sources::foreground_target().as_ref(),
+                privacy,
+            )?;
+            let monitors = Monitor::all().map_err(|_| "SCREEN_CAPTURE_NO_MONITORS")?;
+            let bounds: Vec<_> = monitors
+                .iter()
+                .map(|monitor| {
+                    Ok(PhysicalRect {
+                        x: monitor.x().map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE")?,
+                        y: monitor.y().map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE")?,
+                        width: monitor.width().map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE")?,
+                        height: monitor
+                            .height()
+                            .map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE")?,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let image = observer_sources::compose_foreground(
+                offer.target.bounds,
+                &bounds,
+                |index, rect| {
+                    monitors[index]
+                        .capture_region(rect.x as u32, rect.y as u32, rect.width, rect.height)
+                        .map_err(|_| "SCREEN_CAPTURE_PLATFORM_DENIED".into())
+                },
+            )?;
+            self.check_foreground_offer(
+                generation_id,
+                request,
+                observer_sources::foreground_target().as_ref(),
+                privacy,
+            )?;
+            (image, "foreground".into())
+        } else {
+            let monitor = Monitor::from_point(cursor_x, cursor_y)
+                .map_err(|_| "SCREEN_CAPTURE_MONITOR_GONE")?;
+            let image = monitor
+                .capture_image()
+                .map_err(|_| "SCREEN_CAPTURE_PLATFORM_DENIED")?;
+            (
+                image,
+                monitor
+                    .name()
+                    .ok()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "monitor".into())
+                    .chars()
+                    .take(128)
+                    .collect(),
+            )
+        };
         let image = resize_screen_awareness_capture(image, resolution);
-        self.note_awareness_dhash(generation_id, awareness_dhash(&image))?;
         if u64::from(image.width()) * u64::from(image.height()) > MAX_CAPTURE_PIXELS {
             return Err("SCREEN_CAPTURE_RESOURCE_LIMIT".to_string());
         }
@@ -636,34 +821,18 @@ impl CaptureManager {
             captured_at: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-            screen_name: monitor
-                .name()
-                .ok()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| "monitor".to_string())
-                .chars()
-                .take(128)
-                .collect(),
+            screen_name,
         };
-        self.push_screen_awareness_frame(generation_id, frame, batch_limit)
-    }
-
-    /// Remembers the latest frame hash; a near-identical frame is not worth another look.
-    fn note_awareness_dhash(&self, generation_id: &str, hash: u64) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE".to_string())?;
-        if state.active_generation.as_deref() != Some(generation_id) {
-            state.last_awareness_dhash = None;
+        if offer_request.is_some() {
+            self.push_screen_awareness_frame_checked(
+                generation_id,
+                frame,
+                batch_limit,
+                offer_request,
+            )
+        } else {
+            self.push_screen_awareness_frame(generation_id, frame, batch_limit)
         }
-        let previous = state.last_awareness_dhash.replace(hash);
-        if previous.is_some_and(|previous| {
-            (previous ^ hash).count_ones() <= SCREEN_OBSERVATION_UNCHANGED_DISTANCE
-        }) {
-            return Err(SCREEN_OBSERVATION_UNCHANGED.to_string());
-        }
-        Ok(())
     }
 
     fn push_screen_awareness_frame(
@@ -672,10 +841,30 @@ impl CaptureManager {
         frame: ScreenAwarenessFrame,
         batch_limit: usize,
     ) -> Result<ScreenAwarenessCapturePublication, String> {
+        self.push_screen_awareness_frame_checked(generation_id, frame, batch_limit, None)
+    }
+
+    fn push_screen_awareness_frame_checked(
+        &self,
+        generation_id: &str,
+        frame: ScreenAwarenessFrame,
+        batch_limit: usize,
+        offer: Option<&ScreenAwarenessOfferRequest>,
+    ) -> Result<ScreenAwarenessCapturePublication, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "SCREEN_CAPTURE_STATE_UNAVAILABLE".to_string())?;
+        if let Some(request) = offer {
+            if !state.foreground_offer.as_ref().is_some_and(|offer| {
+                offer.generation_id == generation_id
+                    && request.scope == generation_id
+                    && request.capture_ticket == offer.ticket
+                    && offer.created_at.elapsed() < RESOURCE_TTL
+            }) {
+                return Err("SCREEN_OBSERVATION_TARGET_STALE".into());
+            }
+        }
         if state.active_generation.as_deref() != Some(generation_id) {
             cleanup_resources(&mut state.resources);
             state.awareness_frames.clear();
@@ -783,6 +972,9 @@ impl CaptureManager {
             .map(|mut state| {
                 let count = state.awareness_frames.len();
                 state.awareness_frames.clear();
+                state.foreground_offer = None;
+                self.focus_revision.fetch_add(1, Ordering::SeqCst);
+                self.observer_sources.invalidate();
                 count
             })
             .unwrap_or(0)
@@ -837,6 +1029,7 @@ impl CaptureManager {
 
 impl Drop for CaptureManager {
     fn drop(&mut self) {
+        self.observer_sources.shutdown();
         if let Ok(state) = self.state.get_mut() {
             cleanup_resources(&mut state.resources);
         }
@@ -1420,38 +1613,85 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_screen_is_not_observed_twice() {
+    fn personal_capture_offer_cannot_be_reused_for_a_new_window_or_scope() {
         let root =
             std::env::temp_dir().join(format!("sakura-awareness-test-{}", Uuid::new_v4().simple()));
         let manager = CaptureManager::with_base(root.clone()).unwrap();
         let generation_id = "00000000-0000-4000-8000-000000004007";
-        let gradient =
-            image::RgbaImage::from_fn(90, 80, |x, _| image::Rgba([(x * 2) as u8, 0, 0, 255]));
-        let reversed =
-            image::RgbaImage::from_fn(90, 80, |x, _| image::Rgba([(250 - x * 2) as u8, 0, 0, 255]));
-        let first = awareness_dhash(&gradient);
-        assert_eq!(first, awareness_dhash(&gradient.clone()));
-        assert_ne!(first, awareness_dhash(&reversed));
-
+        let target = crate::observer_sources::ForegroundTarget {
+            window: ForegroundWindow {
+                hwnd: 8,
+                process_id: 8,
+                process_name: "editor.exe".into(),
+                title: "notes".into(),
+            },
+            bounds: PhysicalRect {
+                x: -100,
+                y: 0,
+                width: 200,
+                height: 100,
+            },
+        };
+        let revision = manager.focus_revision();
         manager
-            .push_screen_awareness_frame(generation_id, awareness_frame("first", 8), 2)
+            .set_awareness_mode(generation_id, true, revision)
             .unwrap();
-        assert!(manager.note_awareness_dhash(generation_id, first).is_ok());
-        assert_eq!(
-            manager
-                .note_awareness_dhash(generation_id, first ^ 0b1111)
-                .unwrap_err(),
-            SCREEN_OBSERVATION_UNCHANGED
-        );
+        assert!(manager.require_foreground_offer(None).is_err());
+        let first = manager
+            .offer_foreground(generation_id, target.clone(), "body".into(), revision)
+            .unwrap();
+        let request = ScreenAwarenessOfferRequest {
+            scope: generation_id.into(),
+            capture_ticket: first,
+        };
+        let privacy = ScreenPrivacy::default();
         assert!(manager
-            .note_awareness_dhash(generation_id, awareness_dhash(&reversed))
+            .check_foreground_offer(generation_id, &request, Some(&target), &privacy)
             .is_ok());
+        let mut changed = target.clone();
+        changed.window.hwnd = 9;
         assert!(manager
-            .note_awareness_dhash(
-                "00000000-0000-4000-8000-000000004008",
-                awareness_dhash(&reversed)
+            .check_foreground_offer(generation_id, &request, Some(&changed), &privacy)
+            .is_err());
+        let mut changed = target.clone();
+        changed.window.process_id = 9;
+        assert!(manager
+            .check_foreground_offer(generation_id, &request, Some(&changed), &privacy)
+            .is_err());
+        let mut changed = target.clone();
+        changed.bounds.width += 1;
+        assert!(manager
+            .check_foreground_offer(generation_id, &request, Some(&changed), &privacy)
+            .is_err());
+        assert!(manager
+            .check_foreground_offer(
+                generation_id,
+                &request,
+                Some(&target),
+                &ScreenPrivacy {
+                    blocked_processes: vec!["editor.exe".into()],
+                    blocked_title_keywords: vec![],
+                }
             )
-            .is_ok());
+            .is_err());
+        assert!(manager
+            .check_foreground_offer(generation_id, &request, None, &privacy)
+            .is_err());
+        let mut wrong_scope = request.clone();
+        wrong_scope.scope = "00000000-0000-4000-8000-000000004008".into();
+        assert!(manager
+            .check_foreground_offer(generation_id, &wrong_scope, Some(&target), &privacy)
+            .is_err());
+        manager
+            .offer_foreground(generation_id, target.clone(), "new".into(), revision)
+            .unwrap();
+        assert!(manager
+            .check_foreground_offer(generation_id, &request, Some(&target), &privacy)
+            .is_err());
+        manager.clear_screen_awareness_batch();
+        assert!(manager
+            .offer_foreground(generation_id, target, "late".into(), revision)
+            .is_err());
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

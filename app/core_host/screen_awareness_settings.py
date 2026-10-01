@@ -181,7 +181,7 @@ class ScreenAwarenessSettingsBoundary:
             raise ScreenAwarenessSettingsError("FIELD_INVALID", "焦点观察字段无效。", field="busy")
         if not isinstance(outcome, str) or len(outcome) > 32:
             raise ScreenAwarenessSettingsError("FIELD_INVALID", "焦点观察结果无效。", field="outcome")
-        if outcome and outcome not in {"aborted", "failed", "privacy", "unchanged", "self", "submitted"}:
+        if outcome and outcome not in {"aborted", "failed", "privacy", "self", "submitted"}:
             raise ScreenAwarenessSettingsError("FIELD_INVALID", "焦点观察结果无效。", field="outcome")
         snapshot = payload.get("snapshot")
         if snapshot is not None and not _valid_focus_snapshot(snapshot):
@@ -227,6 +227,8 @@ class ScreenAwarenessSettingsBoundary:
                 "screen_enabled": bool(timing["enabled"]),
                 "cooldown_seconds": float(timing["cooldown_seconds"]),
                 "min_silence_after_user": float(timing["min_silence_after_user"]),
+                "content_check_interval": float(timing["content_check_interval"]),
+                "content_min_chars": int(timing["content_min_chars"]),
             }
         decision = runtime.advance_focus(
             snapshot,
@@ -237,13 +239,20 @@ class ScreenAwarenessSettingsBoundary:
             blocked_titles=keywords,
             **focus_kwargs,
         )
-        if set(decision) != {"action", "trigger", "reason"}:
+        if (
+            not {"action", "trigger", "reason"}.issubset(decision)
+            or set(decision) - {"action", "trigger", "reason", "contentReadAllowed"}
+            or ("contentReadAllowed" in decision and not isinstance(decision["contentReadAllowed"], bool))
+        ):
             raise ScreenAwarenessSettingsError("INVALID_REQUEST", "焦点观察结果无效。")
-        return {
+        result = {
             "action": str(decision["action"]),
             "trigger": str(decision["trigger"]),
             "reason": str(decision["reason"]),
         }
+        if personal and "contentReadAllowed" in decision:
+            result["contentReadAllowed"] = decision["contentReadAllowed"]
+        return result
 
     def snapshot(self) -> dict[str, object]:
         try:
@@ -439,7 +448,12 @@ def _session_runtime(provider: object | None) -> object | None:
 
 
 def _valid_focus_snapshot(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {"hwnd", "pid", "process", "title", "ownProcess"}:
+    if (
+        not isinstance(value, Mapping)
+        or not {"hwnd", "pid", "process", "title", "ownProcess"}.issubset(value)
+        or set(value) - {"hwnd", "pid", "process", "title", "ownProcess", "visibleText"}
+        or ("visibleText" in value and (not isinstance(value["visibleText"], str) or len(value["visibleText"]) > 2000))
+    ):
         return False
     hwnd = value.get("hwnd")
     pid = value.get("pid")

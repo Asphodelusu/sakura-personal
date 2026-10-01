@@ -67,6 +67,7 @@ class ObservationPacket:
     reaction_hint: str = ""
     on_screen_text: str = ""
     visible_text_excerpt: str = ""
+    visible_text_source: str = "vlm"
     suggested_interval: float | None = None
 
     @property
@@ -185,7 +186,7 @@ def decision_user_text(
         part
         for part in (
             f"[画面摘要]\n{packet.visual_summary or '（无）'}",
-            f"[可见文字摘录]\n{(packet.visible_text_excerpt or '（无）')[:VISIBLE_EXCERPT_LIMIT]}",
+            f"[可见文字摘录 · {packet.visible_text_source}]\n{(packet.visible_text_excerpt or '（无）')[:VISIBLE_EXCERPT_LIMIT]}",
             f"[反应提示]\n{packet.reaction_hint or '（无）'}",
             _meta(packet),
         )

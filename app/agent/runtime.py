@@ -427,7 +427,9 @@ class AgentRuntime:
         screen_enabled: bool | None = None,
         cooldown_seconds: float | None = None,
         min_silence_after_user: float | None = None,
-    ) -> dict[str, str]:
+        content_check_interval: float | None = None,
+        content_min_chars: int | None = None,
+    ) -> dict[str, Any]:
         from app.agent.focus_observer import snapshot_from_mapping
 
         if screen_enabled is not None or cooldown_seconds is not None or min_silence_after_user is not None:
@@ -449,6 +451,8 @@ class AgentRuntime:
             poll_interval=poll_interval,
             idle_threshold_seconds=idle_threshold_seconds,
             away_max_seconds=away_max_seconds,
+            content_check_interval=content_check_interval,
+            content_min_chars=content_min_chars,
         )
         reason = self.screen_gate_reason()
         from app.agent.focus_observer import FocusGate
@@ -472,13 +476,18 @@ class AgentRuntime:
             away_max_seconds=away_max_seconds,
         )
         self._focus_observer.set_diagnostics_path(self._focus_diagnostics_path)
-        return self._focus_observer.advance(
+        decision = self._focus_observer.advance(
             snapshot_from_mapping(snapshot),
             scope=str(scope or ""),
             gate=gate,
             blocked_processes=blocked_processes,
             blocked_titles=blocked_titles,
         )
+        if self._personal_style:
+            decision["contentReadAllowed"] = self._focus_observer.content_read_allowed(
+                gate, blocked_processes=blocked_processes, blocked_titles=blocked_titles
+            )
+        return decision
 
     def settle_focus_attempt(self, outcome: str) -> None:
         self._focus_observer.settle_attempt(outcome, personal=bool(self._personal_style))
@@ -1191,6 +1200,7 @@ class AgentRuntime:
         cancel_checker: CancelChecker | None = None,
         *,
         screen_awareness_mode: bool = False,
+        observer_context: Mapping[str, str] | None = None,
     ) -> AgentResult:
         import app.agent.tool_routing as tool_routing
 
@@ -1216,7 +1226,9 @@ class AgentRuntime:
         )
         personal_screen = bool(screen_awareness_mode and self._personal_style)
         if personal_screen:
-            return self._run_personal_screen(messages, cancel_checker=cancel_checker)
+            return self._run_personal_screen(
+                messages, cancel_checker=cancel_checker, observer_context=observer_context
+            )
         return self._run_tool_loop(
             _annotate_initial_trace_messages(messages),
             allow_screen_observation=allow_screen_observation,
@@ -1236,6 +1248,7 @@ class AgentRuntime:
         messages: list[ChatMessage],
         *,
         cancel_checker: CancelChecker | None,
+        observer_context: Mapping[str, str] | None = None,
     ) -> AgentResult:
         """Vision packet, then one text-only fast decision. Repair is the only extra call."""
         from app.agent.personal_observer import (
@@ -1254,8 +1267,8 @@ class AgentRuntime:
         from app.llm.chat_reply import ChatReply
 
         started = time.perf_counter()
-        scope, app_key, process, _own = self._focus_observer.focus_identity()
-        frozen = (scope, app_key)
+        scope, app_key, process, _own, pid, title = self._focus_observer.focus_identity()
+        frozen = (scope, app_key, pid, title)
         trigger = self._focus_observer.offer_trigger()
         attempt = self._initiative.begin_attempt()
         published = False
@@ -1268,8 +1281,10 @@ class AgentRuntime:
                 return "cancelled"
             if not self._initiative.is_current(attempt):
                 return "stale"
-            current_scope, current_key, _process, own_process = self._focus_observer.focus_identity()
-            if own_process or (current_scope, current_key) != frozen:
+            if self._focus_observer.away_mode:
+                return "stale"
+            current_scope, current_key, _process, own_process, current_pid, current_title = self._focus_observer.focus_identity()
+            if own_process or (current_scope, current_key, current_pid, current_title) != frozen:
                 return "stale"
             return "ok"
 
@@ -1333,7 +1348,7 @@ class AgentRuntime:
                 timeout_seconds=timeout_seconds,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                trace_recorder=self.agent_trace_recorder,
+                trace_recorder=None,  # Observer diagnostics exclude captured contents.
             )
             vision_messages: list[ChatMessage] = [
                 {
@@ -1381,10 +1396,13 @@ class AgentRuntime:
                 return finish("silent")
             packet = replace(
                 packet,
-                process_name=process,
+                process_name=process or (observer_context or {}).get("process", ""),
                 triggers=(trigger,) if trigger else (),
                 idle_s=idle_s,
             )
+            visible_text = (observer_context or {}).get("visibleText", "").strip()
+            if len(visible_text) >= int(config.get("content_min_chars", 30)):
+                packet = replace(packet, visible_text_excerpt=visible_text[:1200], visible_text_source="uia")
             stage = "perception"
             state = owned()
             if state == "cancelled":
@@ -1396,10 +1414,13 @@ class AgentRuntime:
                 app_key=app_key,
                 interval=float(packet.suggested_interval),
                 content_quiet=content_quiet_for(float(packet.suggested_interval), config),
+                visible_text=visible_text or None,
             )
             visual = {"summary": packet.visual_summary, "confidence": "medium"} if packet.visual_summary else None
             if not published:
                 return finish("stale", visual=visual)
+            if self._focus_observer.skip_repeated_summary(packet.visual_summary, trigger):
+                return finish("silent", visual=visual)
             fast_source = self._initiative_client
             if not isinstance(fast_source, OpenAICompatibleClient):
                 stage = "decision"
@@ -1415,7 +1436,7 @@ class AgentRuntime:
                 timeout_seconds=timeout_seconds,
                 temperature=FAST_DECISION_TEMPERATURE,
                 max_tokens=FAST_DECISION_MAX_TOKENS,
-                trace_recorder=self.agent_trace_recorder,
+                trace_recorder=None,  # Do not persist raw UIA excerpts as request traces.
             )
             user_text = decision_user_text(
                 packet,
@@ -1475,7 +1496,7 @@ class AgentRuntime:
             try:
                 reply = self._parse_final_reply_with_retry(
                     decision_prompt,
-                    [traced_message({"role": "user", "content": user_text}, "observation_input")],
+                    [traced_message({"role": "user", "content": "保留本次屏幕观察的短对白，只修复回复格式和中文译文，不新增事实。"}, "observation_input")],
                     raw_reply,
                     cancel_checker=cancel_checker,
                 )
