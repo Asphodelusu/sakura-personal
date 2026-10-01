@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   SCREEN_AWARENESS_PROMPT,
+  createFocusAdvanceCaller,
   createScreenAwarenessController,
 } from "../chat/screen-awareness-controller.js";
 
@@ -17,7 +18,7 @@ function settings(overrides = {}) {
   };
 }
 
-function harness({ enabled = true, overrides = {} } = {}) {
+function harness({ enabled = true, overrides = {}, advanceFocus = null, beforeCapture = null } = {}) {
   let clock = 0;
   let idle = true;
   let generation = "generation-a";
@@ -33,6 +34,7 @@ function harness({ enabled = true, overrides = {} } = {}) {
     invoke: async (command, args) => {
       calls.push([command, args]);
       if (command === "capture_screen_awareness_frame") {
+        if (beforeCapture) await beforeCapture;
         const error = captureErrors.shift();
         if (error) throw new Error(error);
         return { count: ++captureCount, droppedCount: 0 };
@@ -49,6 +51,7 @@ function harness({ enabled = true, overrides = {} } = {}) {
     },
     setInterval: () => 1,
     clearInterval: () => {},
+    advanceFocus,
   });
   controller.applySettings(settings({ enabled, ...overrides }));
   return {
@@ -144,6 +147,119 @@ test("a full batch is sent at once instead of waiting for the cooldown", async (
   await env.controller.tick();
   assert.equal(commands(env, "capture_screen_awareness_frame").length, 1);
   assert.equal(env.sends.length, 1);
+});
+
+test("focus advance captures one frame when core asks and does not capture while held", async () => {
+  const decisions = [
+    { action: "hold", trigger: "window", reason: "busy" },
+    { action: "capture", trigger: "window", reason: "ready" },
+  ];
+  const seen = [];
+  const env = harness({
+    advanceFocus: async ({ busy }) => {
+      seen.push(busy);
+      return decisions.shift();
+    },
+  });
+  env.setIdle(false);
+  await env.controller.tick();
+  assert.deepEqual(seen, [true]);
+  assert.equal(env.sends.length, 0);
+  env.setIdle(true);
+  await env.controller.tick();
+  assert.equal(env.sends.length, 1);
+  assert.equal(commands(env, "capture_screen_awareness_frame").length, 1);
+});
+
+test("a deferred focus decision does not capture after invalidation", async () => {
+  for (const invalidate of ["disable", "dispose", "generation", "manual"]) {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const outcomes = [];
+    const env = harness({
+      advanceFocus: async ({ outcome }) => {
+        if (outcome) {
+          outcomes.push(outcome);
+          return { action: "wait", trigger: "", reason: outcome };
+        }
+        return gate;
+      },
+    });
+    const pending = env.controller.tick();
+    if (invalidate === "disable") env.controller.applySettings(settings({ enabled: false }));
+    if (invalidate === "dispose") env.controller.dispose();
+    if (invalidate === "generation") env.controller.generationChanged("generation-b");
+    if (invalidate === "manual") env.controller.noteManualSend();
+    release({ action: "capture", trigger: "window", reason: "ready" });
+    await pending;
+    assert.equal(commands(env, "capture_screen_awareness_frame").length, 0, invalidate);
+    assert.equal(env.sends.length, 0, invalidate);
+    assert.deepEqual(outcomes, ["aborted"], invalidate);
+  }
+});
+
+test("a deferred capture is not sent and does not clear the next generation", async () => {
+  let releaseCapture;
+  const captureGate = new Promise((resolve) => { releaseCapture = resolve; });
+  const env = harness({
+    beforeCapture: captureGate,
+    advanceFocus: ({ outcome }) => (
+      outcome
+        ? { action: "wait", trigger: "", reason: outcome }
+        : { action: "capture", trigger: "window", reason: "ready" }
+    ),
+  });
+  const pending = env.controller.tick();
+  await Promise.resolve();
+  env.controller.generationChanged("generation-b");
+  const clearsAfterSwitch = commands(env, "clear_screen_awareness_batch").length;
+  releaseCapture();
+  await pending;
+  assert.equal(env.sends.length, 0);
+  assert.equal(commands(env, "clear_screen_awareness_batch").length, clearsAfterSwitch);
+  env.setGeneration("generation-b");
+  env.controller.generationChanged("generation-b");
+  const clearsBeforeNext = commands(env, "clear_screen_awareness_batch").length;
+  await env.controller.tick();
+  assert.equal(commands(env, "capture_screen_awareness_frame").length, 2);
+  assert.equal(commands(env, "clear_screen_awareness_batch").length, clearsBeforeNext);
+});
+
+test("production focus caller keeps the supplied scope and outcome", async () => {
+  const calls = [];
+  let current = "generation-new";
+  const advanceFocus = createFocusAdvanceCaller({
+    invoke: async (command, args) => {
+      calls.push([command, args]);
+      return { action: "wait", trigger: "", reason: "aborted" };
+    },
+    generationId: () => current,
+  });
+  await advanceFocus({ busy: false, scope: "generation-old", outcome: "aborted" });
+  assert.deepEqual(calls, [[
+    "observer_focus_advance",
+    { payload: { busy: false, scope: "generation-old", outcome: "aborted" } },
+  ]]);
+});
+
+test("a late settlement still names the generation that started the attempt", async () => {
+  const payloads = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const env = harness({
+    advanceFocus: (request) => {
+      payloads.push({ ...request });
+      if (request.outcome) return { action: "wait", trigger: "", reason: request.outcome };
+      return gate;
+    },
+  });
+  const pending = env.controller.tick();
+  env.setGeneration("generation-b");
+  env.controller.generationChanged("generation-b");
+  release({ action: "capture", trigger: "window", reason: "ready" });
+  await pending;
+  assert.equal(payloads.at(-1).scope, "generation-a");
+  assert.equal(payloads.at(-1).outcome, "aborted");
 });
 
 test("private, own, or unchanged screens are skipped quietly until the next interval", async () => {

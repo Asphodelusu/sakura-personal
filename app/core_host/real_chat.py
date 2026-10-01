@@ -542,6 +542,7 @@ class RealChatBoundary:
                         pipeline_kwargs["visual_observation_jobs"] = visual_observation_jobs
                     result = getattr(session, "pipeline").run_user_message(
                         messages,
+                        screen_awareness_mode=screen_attempted,
                         **pipeline_kwargs,
                     )
             completed_reply = getattr(result, "reply", None)

@@ -1409,6 +1409,7 @@ def run_host(
             config.generation_id,
             config.generation_credential,
             config.user_root,
+            session_provider=dispatcher.published_session,
         )
         character_settings = CharacterSettingsBoundary(
             config.generation_id,

@@ -217,6 +217,7 @@ def build_screen_awareness_check_tool_system_prefix(
     max_tool_calls_per_step: int,
     max_tool_calls_per_turn: int,
     extra_instructions: str = "",
+    allow_silence: bool = False,
 ) -> str:
     """构建主动屏幕感知 tool-loop 的【静态系统提示前缀】。
 
@@ -233,7 +234,11 @@ def build_screen_awareness_check_tool_system_prefix(
                 "\n\n".join(
                     [
                         "你现在正在处理【主动屏幕感知事件】。这不是用户直接发来的请求，而是系统定时截图后触发的低打扰找话题。",
-                        "请用角色语气基于屏幕内容找话题：评论变化、接续任务、询问卡点、轻量协助或保持安静感。",
+                        (
+                            "请用角色语气基于屏幕内容找话题：评论变化、接续任务、询问卡点、轻量协助或保持安静。"
+                            if allow_silence
+                            else "请用角色语气基于屏幕内容找话题：评论变化、接续任务、询问卡点、轻量协助或保持安静感。"
+                        ),
                         "请把 screen_contexts/visual_contexts 当作当前画面，把 recent_conversation 当作最近完整对话历史；必须结合两者判断用户正在延续什么任务、发生了什么变化、哪些话题已经聊过，再自然接话。",
                     ]
                 ),
@@ -245,13 +250,17 @@ def build_screen_awareness_check_tool_system_prefix(
                         "- 结合图片和最近对话历史理解用户这段时间在做什么，并基于屏幕内容寻找自然话题，而不是逐张描述截图。",
                         "- recent_conversation 包含用户和 Sakura 的最近对话；它用于判断上下文、进展、已给建议和已重复话题，不只是用来避免 Sakura 自己复读。",
                         "- 优先使用 visual_contexts 中的 summary、visible_texts、notable_elements。",
-                        "- 最终回复必须至少点到一个具体可见对象，除非视觉上下文为空或明确不可识别。",
+                        (
+                            "- 开口时点到一个能确认的可见对象；没有值得说的，或开口会打扰对方，就保持安静。"
+                            if allow_silence
+                            else "- 最终回复必须至少点到一个具体可见对象，除非视觉上下文为空或明确不可识别。"
+                        ),
                         "- 如果只能部分识别，也要先说出能确认的部分，再轻轻询问。",
                         "- 不要机械套用休息、喝水、深呼吸、累不累等通用提醒；深夜和停留时长只能作为弱信号。",
                     ]
                 ),
             ),
-            screen_awareness_reply_decision_flow_block(),
+            screen_awareness_reply_decision_flow_block(allow_silence=allow_silence),
             screen_awareness_scene_strategy_block(),
             screen_awareness_web_research_rules_block(),
             screen_awareness_rules_block(include_tool_rules=True),

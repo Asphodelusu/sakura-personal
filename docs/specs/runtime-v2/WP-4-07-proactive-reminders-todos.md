@@ -4,7 +4,7 @@ status: normative
 audience: maintainer
 source_of_truth: self
 status_source: ../../plans/runtime-v2/work-packages.md
-updated: 2026-08-29
+updated: 2026-10-01
 ---
 
 # WP-4-07 定时截图与主动请求规范
@@ -18,10 +18,10 @@ updated: 2026-08-29
   分辨率。读取时 `enabled && screen_context_enabled` 合并为一个开关，保存时两个旧字段写成同一值。
 - 缺失配置默认启用、20 分钟截图、10 分钟冷却、最多 6 张、全屏分辨率。范围分别为 1–120 分钟、
   1–120 分钟、1–20 张；分辨率只接受 `fullscreen | 720p | 1080p | 2160p`。
-- 主窗口使用 10 秒普通轮询。只有 Core ready，距最近输入或手动发送、距上一张截图都达到截图间隔，
+- 主窗口在接上焦点观察后每 5 秒向 Core 上报前台窗口。Core 以前台应用（进程加窗口句柄）稳定约 15 秒作为主触发；快切重新计时，同一应用只改标题不计为新的停留。检查间隔只在没有切窗触发时补充。忙碌或亲密续写未结束时不消耗已就绪的触发。60 秒内的再次切窗先记下，冷却结束后补评。前台是 Sakura 自己或命中隐私名单时不截图。
+- 未接上焦点观察时，仍使用 10 秒普通轮询：只有 Core ready，距最近输入或手动发送、距上一张截图都达到截图间隔，
   且聊天、等待动画、打字机/TTS、手动截图或附件均空闲时才截图；忙时跳过，休眠后不补跑。
-- 每次捕获鼠标所在显示器，按设置等比缩小且不放大，JPEG quality 70。第一张截图开始冷却；冷却到期
-  后将最新最多 N 张按时间顺序作为一次普通聊天请求发送，然后清空批次。
+- 每次捕获鼠标所在显示器，按设置等比缩小且不放大，JPEG quality 70。焦点观察在 Core 请求 `capture` 时捕获一张并立即送出。未接上焦点观察时，第一张截图开始冷却；冷却到期后将最新最多 N 张按时间顺序作为一次普通聊天请求发送，然后清空批次。
 - 主动请求生成期间主界面保持原有画面，不显示思考占位符或等待动画；完整回复到达后才直接进入现有的
   分段打字、角色表现和 TTS 流程。手动聊天仍显示正常思考状态。
 - 手动发送、设置变化、generation 变化、禁用或退出立即清空批次。截图或发送失败不自动重试；清理后
@@ -45,16 +45,21 @@ updated: 2026-08-29
 
 > 这是一次由 Sakura 定时截图触发的主动屏幕观察。以下截图按时间顺序展示我最近正在做的事情。请结合最近聊天历史和这些截图，以当前角色的语气自然接话：可以评论变化、接续任务、询问卡点或提供轻量帮助。不要逐张复述，也不要因为时间或久坐机械地提醒休息；如果没有明显变化，就简短说出你能确认的具体内容。
 
-历史保存该全文并追加 `[已附加 N 张定时屏幕截图]`。历史不得保存图片、base64、路径或 resource token。
+个人角色且屏幕门控生效时，Core 用可沉默的观察说明替换上面这段固定请求，历史只记“刚才留意了一下屏幕状态。”未接上该门控时，历史保存该全文并追加 `[已附加 N 张定时屏幕截图]`。历史不得保存图片、base64、路径或 resource token。
 请求继续复用 `chat.send`、现有回复事件、角色表现、TTS 和历史链。
 
 ## 接口
 
 - Core：`screen_awareness.settings.get`、`screen_awareness.settings.save`、
+  `screen_awareness.focus.advance`、
   `screen.attachBatch { resources: ScreenResourceDescriptor[1..20] }`。
+- `screen_awareness.focus.advance` 接收 `{ busy, scope, snapshot?, outcome? }`。`scope` 固定为本次尝试开始时的 Core generation id；不属于当前代次的请求返回 `wait/stale_scope`，不改变 runtime。`snapshot` 含 hwnd、pid、process、title、ownProcess。响应只有 `{ action, trigger, reason }`，不回传标题。`action` 为 `capture`、`hold` 或 `wait`。
+- `outcome` 只接受 `aborted | failed | privacy | unchanged | self | submitted`。结算请求只结束已提出的捕获尝试，不再读取前台窗口或提出新捕获。`submitted` 表示请求已送出，模型实际开口或沉默由 Core 回复链结算；`aborted` 保留触发，捕获失败不计为成功评估。
+- 个人角色的定时观察使用可沉默的屏幕提示。模型可以返回 `{"silent": true, "segments": []}`。
+- 可选诊断：在用户根创建 `logs/observer-diagnostics.enabled`，或设置 `SAKURA_OBSERVER_DIAGNOSTICS=1`。Core 追加 `logs/observer-diagnostics.jsonl`。`python tools/observer_diagnostics.py --file <path>` 跟随该文件。默认不打开窗口，也不写入标题或画面正文。
 - `screen.attachBatch` 返回 `{ attached: true, attachmentId, count }`。
 - Tauri：`settings_screen_awareness_get`、`settings_screen_awareness_save`、
-  `capture_screen_awareness_frame`、`attach_screen_awareness_batch`、`clear_screen_awareness_batch`。
+  `capture_screen_awareness_frame`、`observer_focus_advance`、`attach_screen_awareness_batch`、`clear_screen_awareness_batch`。
 - 设置保存成功后发布一次 `sakura://screen-awareness-settings`。事件失败不重试；持久化值在下次启动生效。
 - 主动屏幕感知设置归入“交互”页，不再单列“隐私”导航；设置 capability 在 `interaction` section
   暴露 `privacy.screen_awareness = available`。不修改既有配置键、`chat.send`、聊天事件、TTS 或手动截图公开结构。

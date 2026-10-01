@@ -1,4 +1,5 @@
 export const SCREEN_AWARENESS_POLL_INTERVAL_MS = 10_000;
+export const FOCUS_OBSERVER_POLL_INTERVAL_MS = 5_000;
 export const SCREEN_AWARENESS_PROMPT = "这是一次由 Sakura 定时截图触发的主动屏幕观察。以下截图按时间顺序展示我最近正在做的事情。请结合最近聊天历史和这些截图，以当前角色的语气自然接话：可以评论变化、接续任务、询问卡点或提供轻量帮助。不要逐张复述，也不要因为时间或久坐机械地提醒休息；如果没有明显变化，就简短说出你能确认的具体内容。";
 
 const RESOLUTIONS = new Set(["fullscreen", "720p", "1080p", "2160p"]);
@@ -7,6 +8,20 @@ const QUIET_SKIP_CODES = new Set([
   "SCREEN_OBSERVATION_SELF",
   "SCREEN_OBSERVATION_UNCHANGED",
 ]);
+
+export function createFocusAdvanceCaller({ invoke, generationId } = {}) {
+  if (typeof invoke !== "function") {
+    throw new Error("SCREEN_AWARENESS_DEPENDENCY_INVALID");
+  }
+  return ({ busy = false, outcome, scope } = {}) => {
+    const fixedScope = scope === undefined || scope === null
+      ? String(typeof generationId === "function" ? generationId() : "")
+      : String(scope);
+    const payload = { busy: busy === true, scope: fixedScope };
+    if (outcome) payload.outcome = String(outcome);
+    return invoke("observer_focus_advance", { payload });
+  };
+}
 
 export function normalizeScreenAwarenessSettings(value) {
   const settings = {
@@ -37,6 +52,7 @@ export function createScreenAwarenessController({
   setInterval = (callback, delay) => globalThis.setInterval(callback, delay),
   clearInterval = (timer) => globalThis.clearInterval(timer),
   onDiagnostic = () => {},
+  advanceFocus = null,
 } = {}) {
   if ([invoke, send, isIdle, generationId].some((value) => typeof value !== "function")) {
     throw new Error("SCREEN_AWARENESS_DEPENDENCY_INVALID");
@@ -46,6 +62,7 @@ export function createScreenAwarenessController({
   let disposed = false;
   let ticking = false;
   let generation = "";
+  let epoch = 0;
   let lastActivityAt = now();
   let lastCaptureAt = now();
   let batchStartedAt = null;
@@ -69,6 +86,35 @@ export function createScreenAwarenessController({
     onDiagnostic("screen_awareness.batch.cleared", { reason });
   }
 
+  function invalidate(reason, timestamp = now()) {
+    epoch += 1;
+    clearBatch(reason, timestamp);
+  }
+
+  function isCurrent(token, startedGeneration) {
+    return token === epoch
+      && !disposed
+      && Boolean(settings?.enabled)
+      && String(generationId() || "") === generation
+      && generation === startedGeneration;
+  }
+
+  let attemptScope = "";
+
+  async function report(outcome) {
+    if (typeof advanceFocus !== "function" || !outcome) return;
+    try { await advanceFocus({ busy: !isIdle(), outcome, scope: attemptScope }); }
+    catch { /* The capture attempt is already over. */ }
+  }
+
+  function discardOwnedWork(startedGeneration, attachmentId) {
+    if (String(generationId() || "") !== startedGeneration || generation !== startedGeneration) return;
+    if (attachmentId) {
+      invokeBestEffort("release_screen_attachment", { payload: { attachmentId } });
+    }
+    clearBatch("stale_attempt");
+  }
+
   async function fail(stage, error, attachmentId = null) {
     if (attachmentId) {
       invokeBestEffort("release_screen_attachment", { payload: { attachmentId } });
@@ -77,58 +123,118 @@ export function createScreenAwarenessController({
     onDiagnostic("screen_awareness.failed", { stage, code: String(error || stage).split("|")[0] });
   }
 
+  function quietOutcome(code) {
+    if (code === "SCREEN_OBSERVATION_PRIVACY_BLOCKED") return "privacy";
+    if (code === "SCREEN_OBSERVATION_SELF") return "self";
+    if (code === "SCREEN_OBSERVATION_UNCHANGED") return "unchanged";
+    return "";
+  }
+
   async function tick() {
     if (disposed || ticking || !settings) return;
     const currentGeneration = String(generationId() || "");
     if (currentGeneration !== generation) {
       generation = currentGeneration;
-      clearBatch("generation_changed");
+      invalidate("generation_changed");
       return;
     }
-    if (!settings.enabled || !currentGeneration || !isIdle()) return;
+    if (!settings.enabled || !currentGeneration) return;
+    const token = epoch;
+    const startedGeneration = generation;
+    attemptScope = startedGeneration;
     ticking = true;
+    let captured = false;
     try {
       const timestamp = now();
+      let immediate = false;
+      if (typeof advanceFocus === "function") {
+        let decision;
+        try {
+          decision = await advanceFocus({ busy: !isIdle(), scope: startedGeneration });
+        } catch (error) {
+          onDiagnostic("screen_awareness.focus.failed", {
+            code: String(error instanceof Error ? error.message : error || "focus").split(/[|:]/)[0].trim(),
+          });
+          return;
+        }
+        if (!decision || decision.action !== "capture") return;
+        if (!isCurrent(token, startedGeneration) || !isIdle()) {
+          await report("aborted");
+          return;
+        }
+        immediate = true;
+      } else if (!isIdle()) return;
+      if (!isCurrent(token, startedGeneration)) {
+        await report("aborted");
+        return;
+      }
       const intervalMs = settings.checkIntervalMinutes * 60_000;
-      if (timestamp - lastActivityAt >= intervalMs && timestamp - lastCaptureAt >= intervalMs) {
+      if (immediate || (timestamp - lastActivityAt >= intervalMs && timestamp - lastCaptureAt >= intervalMs)) {
         try {
           const result = await invoke("capture_screen_awareness_frame", { payload: {
             resolution: settings.resolution,
             batchLimit: settings.batchLimit,
           } });
+          if (!isCurrent(token, startedGeneration)) {
+            discardOwnedWork(startedGeneration, null);
+            await report("aborted");
+            return;
+          }
           if (!Number.isSafeInteger(result?.count) || result.count < 1 || result.count > settings.batchLimit) {
             throw new Error("SCREEN_AWARENESS_CAPTURE_RESPONSE_INVALID");
           }
+          captured = true;
           lastCaptureAt = timestamp;
           if (batchCount === 0) batchStartedAt = timestamp;
           batchCount = result.count;
         } catch (error) {
           const code = String(error instanceof Error ? error.message : error || "").split(/[|:]/)[0].trim();
-          if (QUIET_SKIP_CODES.has(code)) {
+          const quiet = quietOutcome(code);
+          if (quiet) {
             lastCaptureAt = timestamp;
             onDiagnostic("screen_awareness.capture.skipped", { code });
+            await report(quiet);
             return;
           }
-          await fail("capture", error);
+          await report("failed");
+          if (isCurrent(token, startedGeneration)) await fail("capture", error);
           return;
         }
       }
-      if (batchCount === 0 || batchStartedAt === null
+      if (!isCurrent(token, startedGeneration) || !isIdle()) {
+        if (captured) discardOwnedWork(startedGeneration, null);
+        await report("aborted");
+        return;
+      }
+      if (!immediate && (batchCount === 0 || batchStartedAt === null
           || (batchCount < settings.batchLimit
-            && timestamp - batchStartedAt < settings.cooldownMinutes * 60_000)
-          || !isIdle()) return;
+            && timestamp - batchStartedAt < settings.cooldownMinutes * 60_000))) return;
+      if (immediate && batchCount === 0) return;
 
       let attachmentId = null;
       try {
         const attached = await invoke("attach_screen_awareness_batch");
         attachmentId = String(attached?.attachmentId || "");
+        if (!isCurrent(token, startedGeneration) || !isIdle()) {
+          discardOwnedWork(startedGeneration, attachmentId);
+          await report("aborted");
+          return;
+        }
         if (!/^screen-[0-9a-f]{32}$/.test(attachmentId) || attached?.count !== batchCount) {
           throw new Error("SCREEN_AWARENESS_ATTACHMENT_RESPONSE_INVALID");
         }
         await send({ message: SCREEN_AWARENESS_PROMPT, attachmentId });
+        if (!isCurrent(token, startedGeneration)) {
+          discardOwnedWork(startedGeneration, attachmentId);
+          await report("aborted");
+          return;
+        }
         resetClock(timestamp);
+        await report("submitted");
       } catch (error) {
-        await fail("send", error, attachmentId);
+        await report("failed");
+        if (isCurrent(token, startedGeneration)) await fail("send", error, attachmentId);
+        else discardOwnedWork(startedGeneration, attachmentId);
       }
     } finally {
       ticking = false;
@@ -139,22 +245,25 @@ export function createScreenAwarenessController({
     applySettings(value) {
       settings = normalizeScreenAwarenessSettings(value);
       generation = String(generationId() || "");
-      clearBatch(settings.enabled ? "settings_changed" : "disabled");
+      invalidate(settings.enabled ? "settings_changed" : "disabled");
     },
     start() {
       if (disposed || timer !== null) return;
-      timer = setInterval(() => { void tick(); }, SCREEN_AWARENESS_POLL_INTERVAL_MS);
+      const delay = typeof advanceFocus === "function"
+        ? FOCUS_OBSERVER_POLL_INTERVAL_MS
+        : SCREEN_AWARENESS_POLL_INTERVAL_MS;
+      timer = setInterval(() => { void tick(); }, delay);
     },
     tick,
     noteActivity() {
       lastActivityAt = now();
     },
     noteManualSend() {
-      clearBatch("manual_send");
+      invalidate("manual_send");
     },
     generationChanged(value = generationId()) {
       generation = String(value || "");
-      clearBatch("generation_changed");
+      invalidate("generation_changed");
     },
     snapshot() {
       return Object.freeze({ settings, generation, lastActivityAt, lastCaptureAt, batchStartedAt, batchCount });
@@ -164,7 +273,7 @@ export function createScreenAwarenessController({
       disposed = true;
       if (timer !== null) clearInterval(timer);
       timer = null;
-      clearBatch("dispose");
+      invalidate("dispose");
     },
   });
 }

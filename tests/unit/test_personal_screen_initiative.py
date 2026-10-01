@@ -163,10 +163,10 @@ def test_relationship_speech_also_cools_the_screen_down() -> None:
     assert arbiter.screen_gate_reason() == "cooldown"
 
 
-def test_away_user_is_not_observed() -> None:
+def test_input_idle_does_not_block_screen_observation() -> None:
     arbiter, clock = _screen_arbiter(idle=600)
     clock.now += 10_000
-    assert arbiter.screen_gate_reason() == "desktop_idle"
+    assert arbiter.screen_gate_reason() == "eligible"
 
 
 class _Pipeline:

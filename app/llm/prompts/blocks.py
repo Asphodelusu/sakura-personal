@@ -139,7 +139,18 @@ def context_acquisition_strategy_block(*, allow_screen_observation: bool) -> Pro
     return PromptBlock(None, "主动获取上下文策略：\n" + "\n".join(rules))
 
 
-def screen_awareness_reply_decision_flow_block() -> PromptBlock:
+def screen_awareness_reply_decision_flow_block(*, allow_silence: bool = False) -> PromptBlock:
+    closing = (
+        "5. 如果没有自然、值得说的话，或者开口会打扰对方，就保持安静："
+        '输出 {"silent": true, "segments": []}，visual_observation 照常给出。保持安静是正常的选择。'
+        if allow_silence
+        else "5. 最终回复至少包含一个来自图片或历史的具体依据；如果二者都不足，才退回普通问候。"
+    )
+    choice = (
+        "4. 根据“历史 + 可见对象 + 变化趋势”选择：延续对话、指出进展、轻问题、轻量协助、克制评论或保持安静。"
+        if allow_silence
+        else "4. 根据“历史 + 可见对象 + 变化趋势”选择：延续对话、指出进展、轻问题、轻量协助、克制评论或保持安静感。"
+    )
     return PromptBlock(
         "主动屏幕感知回复决策流程",
         "\n".join(
@@ -147,8 +158,8 @@ def screen_awareness_reply_decision_flow_block() -> PromptBlock:
                 "1. 先阅读 recent_conversation，确认用户目标、当前阶段、已给建议和刚聊过的话题。",
                 "2. 再找画面里最确定的对象：窗口、文件、网页标题、错误、代码、图片、视频、游戏或按钮。",
                 "3. 把 screen_contexts/visual_contexts 和 recent_conversation 交叉对照，判断是在延续任务、出现新变化、卡住、完成还是只是停留。",
-                "4. 根据“历史 + 可见对象 + 变化趋势”选择：延续对话、指出进展、轻问题、轻量协助、克制评论或保持安静感。",
-                "5. 最终回复至少包含一个来自图片或历史的具体依据；如果二者都不足，才退回普通问候。",
+                choice,
+                closing,
             ]
         ),
     )

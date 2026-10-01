@@ -3794,6 +3794,100 @@ async fn capture_screen_awareness_frame(
     Ok(result)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusAdvanceRequest {
+    busy: bool,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    outcome: String,
+}
+
+#[tauri::command]
+async fn observer_focus_advance(
+    window: WebviewWindow,
+    payload: FocusAdvanceRequest,
+    lifecycle: State<'_, ShellLifecycleState>,
+) -> Result<Value, String> {
+    if window.label() != "main" {
+        return Err("PET_WINDOW_REQUIRED".to_string());
+    }
+    if payload.scope.chars().count() > 128 || payload.outcome.chars().count() > 32 {
+        return Err("FOCUS_SCOPE_INVALID".to_string());
+    }
+    let handle = settings_core_handle(&lifecycle)?;
+    let generation_id = handle
+        .available_generation_id()
+        .map_err(str::to_string)?
+        .ok_or_else(|| "SCREEN_CAPTURE_CORE_NOT_READY".to_string())?;
+    if payload.scope != generation_id {
+        return Ok(serde_json::json!({
+            "action": "wait",
+            "trigger": "",
+            "reason": "stale_scope",
+        }));
+    }
+    let mut request = serde_json::json!({
+        "busy": payload.busy,
+        "scope": payload.scope,
+    });
+    let mut logged_process = Value::String(String::new());
+    if payload.outcome.is_empty() {
+        let foreground = capture::foreground_window();
+        if let Some(snapshot) = capture::focus_advance_snapshot(foreground.as_ref(), std::process::id())
+        {
+            if let Some(process) = snapshot.get("process").cloned() {
+                logged_process = process;
+            }
+            request["snapshot"] = snapshot;
+        }
+    } else {
+        request["outcome"] = serde_json::Value::String(payload.outcome);
+    }
+    let response = dispatch_settings_request(
+        handle,
+        None,
+        "screen_awareness.focus.advance",
+        request,
+        std::time::Duration::from_secs(3),
+    )
+    .await?;
+    let body = settings_response_payload(response)?;
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "capture" | "hold" | "wait"))
+        .ok_or_else(|| "FOCUS_ADVANCE_RESPONSE_INVALID".to_string())?;
+    let trigger = body
+        .get("trigger")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if action != "wait" {
+        record_screen_capture(
+            &lifecycle.runtime_log,
+            &generation_id,
+            "screen.focus.advance",
+            Severity::Info,
+            serde_json::json!({
+                "action": action,
+                "trigger": trigger,
+                "reason": reason,
+                "process": logged_process,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "action": action,
+        "trigger": trigger,
+        "reason": reason,
+    }))
+}
+
 #[tauri::command]
 async fn attach_screen_awareness_batch(
     window: WebviewWindow,
@@ -8441,6 +8535,7 @@ fn main() {
             release_screen_attachment,
             remove_screen_attachment_item,
             capture_screen_awareness_frame,
+            observer_focus_advance,
             attach_screen_awareness_batch,
             clear_screen_awareness_batch,
             composer_tools_get,

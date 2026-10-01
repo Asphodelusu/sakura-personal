@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -141,3 +142,39 @@ def test_screen_awareness_save_rejects_invalid_or_extra_fields(tmp_path: Path) -
         _request("extra", "screen_awareness.settings.save", {"settings": settings})
     )
     assert extra["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_stale_focus_scope_does_not_touch_runtime_and_same_scope_only_settles(tmp_path: Path) -> None:
+    calls: list[object] = []
+
+    class Runtime:
+        def advance_focus(self, *_args, **_kwargs):
+            calls.append("advance")
+            return {"action": "capture", "trigger": "window", "reason": "ready"}
+
+        def settle_focus_attempt(self, outcome):
+            calls.append(("settle", outcome))
+
+        def set_focus_diagnostics_path(self, _path):
+            calls.append("diagnostics")
+
+    boundary = ScreenAwarenessSettingsBoundary(
+        GENERATION_ID,
+        GENERATION_CREDENTIAL,
+        tmp_path,
+        session_provider=lambda: SimpleNamespace(runtime=Runtime()),
+    )
+    stale = boundary.handle(_request(
+        "stale-scope",
+        "screen_awareness.focus.advance",
+        {"busy": False, "scope": "generation-old", "outcome": "aborted"},
+    ))
+    assert stale["payload"] == {"action": "wait", "trigger": "", "reason": "stale_scope"}
+    assert calls == []
+    settled = boundary.handle(_request(
+        "same-scope",
+        "screen_awareness.focus.advance",
+        {"busy": False, "scope": GENERATION_ID, "outcome": "submitted"},
+    ))
+    assert settled["payload"] == {"action": "wait", "trigger": "", "reason": "submitted"}
+    assert calls == [("settle", "submitted")]

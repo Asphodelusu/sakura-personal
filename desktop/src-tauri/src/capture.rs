@@ -247,6 +247,7 @@ impl ScreenPrivacy {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForegroundWindow {
+    pub hwnd: u64,
     pub process_id: u32,
     pub process_name: String,
     pub title: String,
@@ -281,6 +282,22 @@ pub fn screen_observation_block(
         return Some(SCREEN_OBSERVATION_PRIVACY_BLOCKED);
     }
     None
+}
+
+/// Snapshot sent to Core. The title stays on this hop so same-app renames do not
+/// reset dwell; diagnostic output must not copy it.
+pub fn focus_advance_snapshot(
+    foreground: Option<&ForegroundWindow>,
+    own_process_id: u32,
+) -> Option<serde_json::Value> {
+    let foreground = foreground?;
+    Some(serde_json::json!({
+        "hwnd": foreground.hwnd,
+        "pid": foreground.process_id,
+        "process": foreground.process_name,
+        "title": foreground.title,
+        "ownProcess": foreground.process_id == own_process_id,
+    }))
 }
 
 #[cfg(windows)]
@@ -329,6 +346,7 @@ pub fn foreground_window() -> Option<ForegroundWindow> {
         let _ = unsafe { CloseHandle(process) };
     }
     Some(ForegroundWindow {
+        hwnd: hwnd.0 as usize as u64,
         process_id,
         process_name,
         title: String::from_utf16_lossy(&title[..title_len.min(title.len())]),
@@ -1368,6 +1386,7 @@ mod tests {
             blocked_title_keywords: vec!["online banking".to_string()],
         };
         let window = |pid: u32, process: &str, title: &str| ForegroundWindow {
+            hwnd: u64::from(pid),
             process_id: pid,
             process_name: process.to_string(),
             title: title.to_string(),
@@ -1393,6 +1412,11 @@ mod tests {
             None
         );
         assert_eq!(screen_observation_block(&privacy, None, 7), None);
+        let snapshot = focus_advance_snapshot(Some(&window(8, "editor.exe", "notes.txt")), 7)
+            .expect("snapshot");
+        assert_eq!(snapshot.get("title").and_then(|value| value.as_str()), Some("notes.txt"));
+        assert_eq!(snapshot.get("ownProcess").and_then(|value| value.as_bool()), Some(false));
+        assert!(focus_advance_snapshot(None, 7).is_none());
     }
 
     #[test]

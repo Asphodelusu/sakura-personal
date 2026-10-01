@@ -386,3 +386,82 @@ def _heading_body(markdown: str, heading: str) -> str:
         if title == heading:
             return body
     return ""
+
+
+def uses_personal_prompt_layers(system_prompt: str) -> bool:
+    text = system_prompt or ""
+    return any(marker in text for marker in ("【人格设定】", "【演出约束】", "【身份锚】"))
+
+
+_LABEL_SECTION_IDS = {
+    "身份锚": "persona.identity_anchor",
+    "人格设定": "persona.behavior_core",
+    "互动方式": "persona.interaction",
+    "当下专注": "persona.focus",
+    "演出约束": "persona.guards_tail",
+}
+
+
+def labeled_personal_prompt_sections(system_prompt: str) -> list[tuple[str, str]]:
+    """Keep source 【labels】 and the full block text.
+
+    A guards heading that still carries identity is also copied to the front as
+    【身份锚】. The original尾部 stays, so a composed prompt that already split
+    identity out is not duplicated.
+    """
+
+    text = (system_prompt or "").strip()
+    if not text:
+        return []
+    pieces = _split_labeled_prompt_sections(text)
+    titles = {title for title, _body in pieces if title}
+    rendered: list[tuple[str, str]] = []
+    if "身份锚" not in titles:
+        anchor = extract_character_identity_anchor(text)
+        if anchor:
+            rendered.append(("persona.identity_anchor", f"【身份锚】\n{anchor}"))
+    for title, body in pieces:
+        chunk = (body or "").strip()
+        if title is None:
+            if chunk:
+                rendered.append(("persona.character", chunk))
+            continue
+        if not chunk:
+            continue
+        section_id = _LABEL_SECTION_IDS.get(title, "persona.narrative")
+        rendered.append((section_id, f"【{title}】\n{chunk}"))
+    return rendered
+
+
+def personal_prompt_layer_rank(section_id: str) -> int:
+    """Old static order: identity, behavior, narrative/relationship, reply, tools, guards last."""
+    if section_id == "persona.guards_tail":
+        return 5
+    if section_id in {"persona.identity_anchor", "persona.character"}:
+        return 0
+    if section_id == "persona.behavior_core":
+        return 1
+    if section_id in {"persona.narrative", "persona.interaction", "persona.focus"} or section_id.startswith(
+        ("persona.relationship", "persona.intimacy", "plugin_patch.")
+    ):
+        return 2
+    if section_id.startswith("reply."):
+        return 3
+    return 4
+
+
+def order_personal_prompt_sections(sections: list) -> list:
+    layered = any(
+        getattr(section, "section_id", "")
+        in {"persona.guards_tail", "persona.identity_anchor", "persona.behavior_core", "persona.narrative"}
+        for section in sections
+    )
+    if not layered:
+        return list(sections)
+    return [
+        section
+        for _index, section in sorted(
+            enumerate(sections),
+            key=lambda item: (personal_prompt_layer_rank(item[1].section_id), item[0]),
+        )
+    ]

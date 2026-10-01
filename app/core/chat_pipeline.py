@@ -41,6 +41,7 @@ class ChatPipeline:
         visual_observation_jobs: list[VisualObservationJob] | None = None,
         progress_callback: ProgressCallback | None = None,
         cancel_checker: CancelChecker | None = None,
+        screen_awareness_mode: bool = False,
     ) -> AgentResult:
         binding = getattr(self.agent_runtime, "visual_binding", None)
         log_event(
@@ -57,6 +58,7 @@ class ChatPipeline:
                 messages,
                 progress_callback=_visual_progress(progress_callback, binding),
                 cancel_checker=cancel_checker,
+                screen_awareness_mode=screen_awareness_mode,
             ),
             operation_id=_messages_trace_operation_id(messages),
         )

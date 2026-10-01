@@ -22,13 +22,10 @@ from app.llm.chat_reply import ChatReply, ChatSegment
 
 DECISION_TEMPERATURE = 0.7
 DECISION_MAX_TOKENS = 512
-# Qt-era proactive defaults for scheduled screen observation.
+# Qt-era screen observation gates. Long input idle is not one of them:
+# that clock arms a one-shot observer trigger, and explicit away is separate.
 SCREEN_MIN_SILENCE_AFTER_USER_SECONDS = 15
 SCREEN_SILENT_COOLDOWN_SECONDS = 300
-SCREEN_AWAY_IDLE_SECONDS = 600
-SCREEN_MIN_SILENCE_AFTER_USER_SECONDS = 15
-SCREEN_SILENT_COOLDOWN_SECONDS = 300
-SCREEN_AWAY_IDLE_SECONDS = 600
 
 
 def get_idle_seconds() -> float:
@@ -99,13 +96,13 @@ class InitiativeArbiter:
             return "cooldown"
         if self._last_screen_silent_at and now - self._last_screen_silent_at < SCREEN_SILENT_COOLDOWN_SECONDS:
             return "cooldown"
-        try:
-            idle = float(self._idle_seconds())
-        except Exception:  # noqa: BLE001 - an unreadable idle clock never blocks the gate
-            idle = 0.0
-        if idle >= SCREEN_AWAY_IDLE_SECONDS:
-            return "desktop_idle"
         return "eligible"
+
+    def current_idle_seconds(self) -> float:
+        try:
+            return max(0.0, float(self._idle_seconds()))
+        except Exception:  # noqa: BLE001 - an unreadable idle clock is not an away switch
+            return 0.0
 
     def mark_screen_silent(self) -> None:
         self._last_screen_silent_at = self._clock()

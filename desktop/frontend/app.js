@@ -9,7 +9,7 @@ import { createComposerToolRegistry } from "./chat/composer-tool-dock.js";
 import { createInitiativeController } from "./chat/initiative-controller.js";
 import { createRealChatClient } from "./chat/real-chat-client.js";
 import { createScreenAttachmentController } from "./chat/screen-attachment-controller.js";
-import { createScreenAwarenessController } from "./chat/screen-awareness-controller.js";
+import { createFocusAdvanceCaller, createScreenAwarenessController } from "./chat/screen-awareness-controller.js";
 import { createUpdateAnnouncementController } from "./chat/update-announcement-controller.js";
 import { createWaitingIndicator } from "./chat/waiting-indicator.js";
 import { waitForRuntimeFonts } from "./core/font-loader.js";
@@ -1420,6 +1420,10 @@ const updateAnnouncement = createUpdateAnnouncementController({
 const screenAwareness = createScreenAwarenessController({
   invoke,
   send: (payload) => chatClient.send({ ...payload, presentation: "silent" }),
+  advanceFocus: createFocusAdvanceCaller({
+    invoke,
+    generationId: () => presentation.current().generationId,
+  }),
   generationId: () => presentation.current().generationId,
   isIdle: () => {
     const state = presentation.current();
