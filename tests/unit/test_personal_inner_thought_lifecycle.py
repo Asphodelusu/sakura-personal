@@ -468,3 +468,74 @@ def _stage_screen(boundary: RealChatBoundary, attachment_id: str, *, source: str
         source=source,
         visual_id=None,
     )
+
+
+def test_recall_overlaps_thought_and_current_thought_reaches_main_prompt(tmp_path: Path) -> None:
+    from app.plugins.models import ContextProviderContribution
+
+    entered, release = Event(), Event()
+    contexts = []
+    runtime, boundary, events, _ = _core(tmp_path, _BlockingClient([], entered, release), _MainClient(contexts))
+    def recall(_request):
+        assert entered.wait(1)
+        release.set()
+        return []
+    runtime.set_context_providers([ContextProviderContribution("memory", "memory", recall)])
+    try:
+        request = _request("overlap")
+        boundary.reserve_send(request)
+        boundary.handle_send(request)
+        assert events[-1]["name"] == "chat.completed"
+        assert THOUGHT in contexts[0]
+    finally:
+        release.set()
+        runtime._inner_thought.wait_until_idle(2)
+        boundary.close()
+
+
+def test_reopened_history_gap_reaches_actual_main_request(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta
+    from app.storage.timeline import NewTimelineEntry, TimelineKind
+
+    now = datetime.now().astimezone()
+    store = TimelineStore(tmp_path / "timeline.sqlite3")
+    store.initialize()
+    store.append_many([
+        NewTimelineEntry("human-gap", "previous", "sakura", TimelineKind.HUMAN, "chat",
+                         (now - timedelta(hours=24)).isoformat(), {"text": "hello"}),
+        NewTimelineEntry("assistant-gap", "previous", "sakura", TimelineKind.ASSISTANT, "chat",
+                         (now - timedelta(hours=23)).isoformat(), {"segments": [{"text": "hi", "translation": "你好", "tone": "中性", "portrait": "neutral", "suppressTts": False}]}),
+    ])
+    contexts = []
+    runtime, boundary, events, _ = _core(tmp_path, _ReadyClient(APPRAISAL), _MainClient(contexts))
+    try:
+        request = _request("back-after-reopen")
+        boundary.reserve_send(request)
+        boundary.handle_send(request)
+        assert events[-1]["name"] == "chat.completed"
+        assert "23 小时" in contexts[0]
+    finally:
+        boundary.close()
+
+
+def test_intimacy_user_turn_preserves_old_main_model_and_skips_thought(tmp_path: Path) -> None:
+    calls, params = [], []
+    class Main(_MainClient):
+        def complete_with_tools(self, *args, **kwargs):
+            params.append(kwargs)
+            return super().complete_with_tools(*args, **kwargs)
+    main = Main([])
+    runtime, boundary, events, _ = _core(tmp_path, _ReadyClient(APPRAISAL, calls), main)
+    runtime.configure_intimacy("Synthetic director instructions")
+    try:
+        request = _request("intimacy-entry")
+        request["payload"]["message"] = "贴紧"
+        boundary.reserve_send(request)
+        boundary.handle_send(request)
+        assert events[-1]["name"] == "chat.completed"
+        assert runtime.intimacy_state.active
+        assert calls == []
+        assert params[0]["thinking"] == {"type": "disabled"}
+        assert runtime.api_client is main
+    finally:
+        boundary.close()

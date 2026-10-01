@@ -90,7 +90,7 @@ def test_get_never_returns_saved_secret(tmp_path: Path) -> None:
     assert SECRET not in repr(result)
 
 
-def test_snapshot_without_plugin_application_has_only_two_core_model_slots(
+def test_snapshot_without_plugin_application_has_personal_core_model_slots(
     tmp_path: Path,
 ) -> None:
     boundary = ProviderSettingsBoundary(GENERATION, CREDENTIAL, _root(tmp_path))
@@ -101,6 +101,8 @@ def test_snapshot_without_plugin_application_has_only_two_core_model_slots(
     assert [slot["identity"] for slot in result["payload"]["model_slots"]] == [
         "core:chat",
         "core:vision_chat",
+        "core:chat_fast",
+        "core:inner_thought",
     ]
 
 
@@ -149,6 +151,8 @@ def test_dynamic_plugin_slots_are_sorted_validated_and_saved_by_owner(tmp_path: 
         "plugin:com.example.summary:summary",
         "core:chat",
         "core:vision_chat",
+        "core:chat_fast",
+        "core:inner_thought",
     ]
     assert SECRET not in repr(current)
 
@@ -185,6 +189,8 @@ def test_dynamic_plugin_slots_are_sorted_validated_and_saved_by_owner(tmp_path: 
     assert [slot["identity"] for slot in hidden["payload"]["model_slots"]] == [
         "core:chat",
         "core:vision_chat",
+        "core:chat_fast",
+        "core:inner_thought",
     ]
 
 
@@ -301,6 +307,8 @@ def test_dynamic_slot_validation_precedes_writes_and_partial_save_is_explicit(
     assert core_phase["payload"]["saved_slots"] == [
         "core:chat",
         "core:vision_chat",
+        "core:chat_fast",
+        "core:inner_thought",
         "plugin:com.example.first:first",
     ]
     assert core_phase["payload"]["failed_slot"]["identity"] == (
@@ -955,3 +963,85 @@ def test_google_probe_uses_full_timeout_without_restarting_request(
         assert result["payload"]["models"] == ["gemini-2.5-flash"]
     else:
         assert result["payload"]["message"] == "OK"
+
+
+def test_personal_model_slots_round_trip_and_reach_runtime(tmp_path: Path) -> None:
+    from app.core_host.inner_thought_settings import load_fast_slot_settings, _load_choice
+
+    root = _root(tmp_path)
+    path = root / "config" / "api.yaml"
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["api_profiles"][0]["models"] += [{"name": "fast-model"}, {"name": "thought-model"}]
+    document["model_slots"]["inner_thought"] = {
+        "profile_id": "fixture", "model": "thought-model", "context_window_tokens": 8192,
+    }
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    applied = []
+    boundary = ProviderSettingsBoundary(GENERATION, CREDENTIAL, root, runtime_apply=lambda: applied.append(True))
+    boundary.enable()
+    snapshot = boundary.handle(_request("get-personal", "settings.provider_model.get", {}))["payload"]
+    slots = {slot["identity"]: dict(slot["selection"]) for slot in snapshot["model_slots"]}
+    assert "core:chat_fast" in slots
+    assert slots["core:inner_thought"]["model"] == "thought-model"
+    draft = {
+        "providers": [{**p, "credential": {"action": "keep", "value": ""}} for p in snapshot["providers"]],
+        "model_slots": slots,
+        "settings": snapshot["settings"],
+    }
+    slots["core:chat_fast"] = {"profile_id": "fixture", "model": "fast-model"}
+    result = boundary.handle(_request("save-personal", "settings.provider_model.save", {"draft": draft}))
+    assert result["ok"] is True, result
+    assert applied == [True]
+    assert load_fast_slot_settings(root).model == "fast-model"
+    assert _load_choice(root).settings.model == "thought-model"
+    assert yaml.safe_load(path.read_text())["model_slots"]["inner_thought"]["context_window_tokens"] == 8192
+    slots["core:inner_thought"] = {"profile_id": "", "model": ""}
+    result = boundary.handle(_request("inherit-personal", "settings.provider_model.save", {"draft": draft}))
+    assert result["ok"] is True, result
+    assert _load_choice(root).source_slot == "chat_fast"
+    assert _load_choice(root).settings.model == "fast-model"
+    before = path.read_bytes()
+    slots["core:chat_fast"] = {"profile_id": "fixture", "model": ""}
+    result = boundary.handle(_request("invalid-personal", "settings.provider_model.save", {"draft": draft}))
+    assert result["ok"] is False
+    assert path.read_bytes() == before
+
+
+def test_provider_hot_apply_updates_side_models_without_resetting_personal_state(tmp_path: Path, monkeypatch) -> None:
+    from app.agent.runtime import AgentRuntime
+    from app.core_host.assistant_adapter import AssistantSession
+    from app.core_host.inner_thought_settings import attach_inner_thought
+    from app.core_host.server import HostConfig, ReadinessController
+    from app.config.core_config_reader import CoreConfigReader
+    from app.config.models import ApiSettings
+
+    root = _root(tmp_path)
+    path = root / "config" / "api.yaml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    doc["api_profiles"][0]["models"] += [{"name": "new-fast"}, {"name": "new-thought"}]
+    doc["model_slots"].update(chat_fast={"profile_id": "fixture", "model": "new-fast"},
+                             inner_thought={"profile_id": "fixture", "model": "new-thought"})
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    settings = ApiSettings(base_url="https://fixture.invalid/v1", api_key="synthetic", model="new-main")
+    provider = OpenAICompatibleClient(settings)
+    runtime = AgentRuntime(provider, "synthetic", character_id="sakura")
+    attach_inner_thought(runtime, root)
+    arbiter = runtime._initiative
+    arbiter._last_user_at = 123.0
+    original_thought = runtime._inner_thought._client
+    session = AssistantSession(character=None, provider=provider, runtime=runtime, pipeline=None)
+    selection = SimpleNamespace(api_settings=settings, vision_api_settings=settings)
+    monkeypatch.setattr(CoreConfigReader, "read", lambda *_: SimpleNamespace(config_problem=None, provider_selection=selection))
+    controller = ReadinessController(HostConfig(RuntimeRoots(root, root), GENERATION, CREDENTIAL))
+    controller._worker = SimpleNamespace()
+    controller._session = session
+    try:
+        controller.apply_provider_configuration()
+        assert runtime._initiative is arbiter
+        assert arbiter._last_user_at == 123.0
+        assert runtime._initiative_client.settings.model == "new-fast"
+        assert runtime._inner_thought._client.settings.model == "new-thought"
+        assert runtime._inner_thought._client is not original_thought
+        assert runtime.vision_api_client.settings.model == "new-main"
+    finally:
+        runtime.close()

@@ -595,8 +595,16 @@ class TestAgentRuntimeBasics:
         ]
         runtime = AgentRuntime(client, _dummy_system_prompt())
 
+        from app.plugins.models import ContextProviderContribution
+        recalls = []
+        runtime.set_context_providers([ContextProviderContribution(
+            provider_id="memory", description="memory", order=1,
+            build_context=lambda request: recalls.append(request) or [],
+        )])
+
         result = runtime.handle_user_message([ChatMessage(role="user", content="hello")])
 
+        assert len(recalls) == 1, "format repair must not perform a second recall"
         assert client.complete_with_tools.call_count == 2
         assert result.reply.segments[0].text == "直したよ。"
         repair_messages = client.complete_with_tools.call_args_list[1].args[1]

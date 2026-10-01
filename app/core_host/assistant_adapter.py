@@ -17,6 +17,7 @@ from app.config.character_loader import (
     load_character_system_prompt,
 )
 from app.config.core_config_reader import CoreConfigReader
+from app.config.models import ApiSettings
 from app.core.cancellation import OperationCancelled
 from app.core.chat_pipeline import ChatPipeline
 from app.core_host.character_presentation import project_character_presentation
@@ -34,6 +35,21 @@ class AssistantSession:
     runtime: AgentRuntime
     pipeline: ChatPipeline
     mcp_provider: object | None = field(default=None, repr=False)
+
+    def refresh_auxiliary_models(self, user_root: Path, vision_settings: ApiSettings | None) -> None:
+        """Called at the existing idle/next-operation settings boundary."""
+        from app.core_host.inner_thought_settings import attach_inner_thought, load_fast_slot_settings
+
+        self.runtime.invalidate_inner_thought()
+        attach_inner_thought(self.runtime, user_root)
+        fast = load_fast_slot_settings(user_root)
+        self.runtime.update_initiative_client(
+            OpenAICompatibleClient(fast, request_attempts=1) if fast is not None else None
+        )
+        self.runtime.vision_api_client = (
+            OpenAICompatibleClient(vision_settings, agent_trace_recorder=self.runtime.agent_trace_recorder)
+            if vision_settings is not None else None
+        )
 
     def wait_prompt_dependencies(
         self,

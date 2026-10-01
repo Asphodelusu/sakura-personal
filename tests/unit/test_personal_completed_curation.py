@@ -27,6 +27,7 @@ def rehearsal(tmp_path, dependencies, monkeypatch):
         def __init__(self):
             super().__init__(work)
             self.events = {}
+            self.model_slot_registrations = []
             self.config = SimpleNamespace(get=lambda: {'personalSnapshot': str(snapshot),
                 'triggerTurns': 1, 'curationProfileId': 'fixture', 'curationModel': 'curator'})
         def on(self, name, callback):
@@ -38,6 +39,7 @@ def rehearsal(tmp_path, dependencies, monkeypatch):
                 return timeline
             if name == 'sakura.host.model_slots':
                 return SimpleNamespace(catalog=lambda: [{'id': 'fixture', 'alias': 'Fixture', 'models': ['curator']}],
+                    register=lambda descriptor, **handlers: self.model_slot_registrations.append((descriptor, handlers)),
                     resolve=lambda _: {'profileId': 'fixture', 'model': 'curator',
                                        'baseUrl': 'https://example.invalid/v1', 'apiKey': 'synthetic', 'timeoutSeconds': 60})
             return super().get(name)
@@ -262,3 +264,31 @@ def test_daily_plugin_rejects_missing_marker_before_model_load(rehearsal):
     with pytest.raises(ValueError, match='PERSONAL_DAILY'):
         plugin.PersonalDailyPlugin().setup(context)
     assert not context.events and not context.tools and calls == []
+
+
+def test_daily_curation_slot_edits_private_config_without_replacing_memory_settings(rehearsal):
+    context, _, _, _ = rehearsal
+    memory = context.root / "data/memory"
+    (memory / '.personal-write-rehearsal.json').unlink()
+    (memory / '.personal-daily.json').write_text(json.dumps({
+        'schemaVersion': 1, 'purpose': 'personal-memory-daily',
+        'root': str(memory.resolve()), 'scopes': ['sakura'],
+    }), encoding='utf-8')
+    values = dict(context.config.get())
+    values["personalReranker"] = "preserve-synthetic-path"
+    context.config = SimpleNamespace(get=lambda: dict(values), update=lambda patch: values.update(patch))
+    start(context, daily=True)
+    assert len(context.model_slot_registrations) == 1
+    descriptor, handlers = context.model_slot_registrations[0]
+    assert descriptor["slotId"] == "curation"
+    assert handlers["load"]() == {"profileId": "fixture", "model": "curator"}
+    assert handlers["save"]({"profileId": "fixture", "model": "other-curator"}) == {"applicationState": "applied"}
+    assert handlers["load"]()["model"] == "other-curator"
+    assert values["personalReranker"] == "preserve-synthetic-path"
+    assert values["triggerTurns"] == 1
+    assert handlers["save"]({"profileId": "", "model": ""}) == {"applicationState": "applied"}
+    assert handlers["load"]() == {"profileId": "", "model": ""}
+    before = dict(values)
+    with pytest.raises(ValueError, match="MODEL_SLOT_SELECTION_INVALID"):
+        handlers["save"]({"profileId": "fixture", "model": ""})
+    assert values == before

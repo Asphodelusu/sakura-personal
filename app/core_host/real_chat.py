@@ -539,6 +539,10 @@ class RealChatBoundary:
                     pipeline_kwargs: dict[str, Any] = {
                         "cancel_checker": execution.cancel.throw_if_cancelled,
                     }
+                    if not screen_attempted and history_projection.last_conversation_at is not None:
+                        pipeline_kwargs["seconds_since_interaction"] = max(
+                            0.0, (datetime.now().astimezone() - history_projection.last_conversation_at).total_seconds()
+                        )
                     if visual_observation_jobs:
                         pipeline_kwargs["visual_observation_jobs"] = visual_observation_jobs
                     if screen_attachment is not None and screen_attachment.observer_context is not None:
@@ -1581,6 +1585,7 @@ class _TurnProjection:
     turns: tuple[_ProjectedTurn, ...]
     dropped: tuple[tuple[str, str, str], ...]
     recent_proactive: tuple[_ProjectedTurn, ...] = ()
+    last_conversation_at: datetime | None = None
 
 
 def assemble_recent_turns(
@@ -1600,6 +1605,7 @@ def assemble_recent_turns(
     turns: list[_ProjectedTurn] = []
     dropped: list[tuple[str, str, str]] = []
     proactive_candidates: list[tuple[datetime, _ProjectedTurn]] = []
+    last_conversation_at: datetime | None = None
     for turn_id, turn_entries in grouped.items():
         kinds = [entry.kind.value for entry in turn_entries]
         if "human" not in kinds:
@@ -1768,6 +1774,14 @@ def assemble_recent_turns(
         except (KeyError, TypeError, ValueError):
             dropped.append((turn_id, "corrupt_or_empty", "conversation"))
             continue
+        if any(entry.kind.value == "human" and entry.origin == "chat" for entry in turn_entries):
+            for entry in turn_entries:
+                if entry.kind.value not in {"human", "assistant"} or entry.origin != "chat":
+                    continue
+                created = _timeline_entry_datetime(entry)
+                if created is not None and created <= reference_time:
+                    if last_conversation_at is None or created > last_conversation_at:
+                        last_conversation_at = created
         turns.append(
             _ProjectedTurn(
                 turn_id=turn_id,
@@ -1781,7 +1795,7 @@ def assemble_recent_turns(
         for created, turn in proactive_candidates
         if created.timestamp() >= cutoff
     )[-RECENT_PROACTIVE_LIMIT:]
-    return _TurnProjection(tuple(turns), tuple(dropped), recent_proactive)
+    return _TurnProjection(tuple(turns), tuple(dropped), recent_proactive, last_conversation_at)
 
 
 def _messages_from_turn_projection(projection: _TurnProjection) -> list[dict[str, Any]]:

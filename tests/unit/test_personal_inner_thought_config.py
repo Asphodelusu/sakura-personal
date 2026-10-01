@@ -159,7 +159,7 @@ def test_hidden_slot_keeps_context_window_and_a_bad_window_stays_invalid(tmp_pat
     assert "inner_thought" in invalid
 
 
-def test_provider_save_keeps_hidden_slots_out_of_public_snapshot(tmp_path: Path) -> None:
+def test_legacy_provider_save_preserves_personal_slots_in_public_snapshot(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _write_api(
         root,
@@ -171,7 +171,7 @@ def test_provider_save_keeps_hidden_slots_out_of_public_snapshot(tmp_path: Path)
     assert saved["model_slots"]["inner_thought"]["model"] == "thought-model"
     assert saved["model_slots"]["chat_fast"]["model"] == "fast-model"
     snapshot = ProviderModelSettingsRepository(root).snapshot()
-    assert set(snapshot["model_slots"]) == {"chat", "vision_chat"}
+    assert set(snapshot["model_slots"]) == {"chat", "vision_chat", "chat_fast", "inner_thought"}
 
 
 def test_migration_copies_inner_thought_without_overwriting_canonical(tmp_path: Path) -> None:

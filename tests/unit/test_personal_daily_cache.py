@@ -25,7 +25,7 @@ class _Host(Context):
 
     def get(self, name):
         if name == "sakura.host.model_slots":
-            return SimpleNamespace(catalog=lambda: [], resolve=lambda _selection: {})
+            return SimpleNamespace(catalog=lambda: [], resolve=lambda _selection: {}, register=lambda *_a, **_kw: None)
         if name == "sakura.host.timeline":
             return SimpleNamespace()
         return super().get(name)

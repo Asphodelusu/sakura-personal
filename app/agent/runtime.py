@@ -333,6 +333,10 @@ class AgentRuntime:
         if clock is not None:
             self._focus_observer.clock = clock
 
+    def update_initiative_client(self, client: object | None) -> None:
+        """Change the model without resetting focus or initiative timing state."""
+        self._initiative_client = client
+
     def note_initiative_user_turn(self) -> None:
         self._initiative.note_user_spoke()
         self._focus_observer.note_user_activity()
@@ -658,7 +662,7 @@ class AgentRuntime:
             interaction_id,
             messages,
             cancel_checker=cancel_checker,
-            turn_tier=turn_tier,
+            turn_tier="fast" if self._intimacy.active else turn_tier,
             proactive_mode=proactive_mode,
         )
 
@@ -913,9 +917,10 @@ class AgentRuntime:
     def _resolve_dialogue_params(self) -> tuple[float, dict[str, Any]]:
         """读取角色对话生成参数，兼容测试桩和外部传入的旧客户端实现。"""
         resolver = getattr(self.api_client, "resolve_dialogue_params", None)
-        if callable(resolver):
-            return resolver()
-        return 0.8, {}
+        temperature, extra = resolver() if callable(resolver) else (0.8, {})
+        if self._intimacy.active:
+            extra = {**extra, "thinking": {"type": "disabled"}}
+        return temperature, extra
 
     def _parse_final_reply_with_retry(
         self,
@@ -987,7 +992,8 @@ class AgentRuntime:
         repair_client = self._client_for_messages(repair_messages)
         repair_snapshot = self.context_orchestrator.build_snapshot(
             repair_request,
-            providers=self.context_providers,
+            # Repair transforms the previous reply; it must not fetch new facts.
+            providers=(),
             session_fragments=self._session_state_fragments(repair_request),
             messages=repair_messages,
             static_prompt=system_prompt,
@@ -1201,11 +1207,11 @@ class AgentRuntime:
         *,
         screen_awareness_mode: bool = False,
         observer_context: Mapping[str, str] | None = None,
+        seconds_since_interaction: float | None = None,
     ) -> AgentResult:
         import app.agent.tool_routing as tool_routing
 
         check_cancelled(cancel_checker)
-        self.join_inner_thought(self._relationship.turn_id, cancel_checker=cancel_checker)
         turn_started_at = time.perf_counter()
         allow_screen_observation = (
             self.model_vision_enabled
@@ -1231,6 +1237,7 @@ class AgentRuntime:
             )
         return self._run_tool_loop(
             _annotate_initial_trace_messages(messages),
+            event_payload={"seconds_since_pet_interaction": seconds_since_interaction},
             allow_screen_observation=allow_screen_observation,
             turn_started_at=turn_started_at,
             screen_awareness_mode=personal_screen,
@@ -1570,7 +1577,8 @@ class AgentRuntime:
         )
         snapshot = self.context_orchestrator.build_snapshot(
             request,
-            providers=self.context_providers,
+            # This snapshot describes an already-built request; it is not an input collector.
+            providers=(),
             session_fragments=(),
             messages=messages,
             static_prompt="",
@@ -1578,6 +1586,11 @@ class AgentRuntime:
             **_client_context_budget_settings(client),
         )
         return PromptTraceMetadata(purpose=purpose, snapshot=snapshot)
+
+    def _user_turn_session_fragments(self, request: ContextRequest, cancel_checker: CancelChecker | None):
+        # Consumed after provider collection, overlapping recall with the existing thought worker.
+        self.join_inner_thought(self._relationship.turn_id, cancel_checker=cancel_checker)
+        yield from self._session_state_fragments(request)
 
     def _run_tool_loop(
         self,
@@ -1679,7 +1692,11 @@ class AgentRuntime:
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
                     providers=self.context_providers,
-                    session_fragments=self._session_state_fragments(request),
+                    session_fragments=(
+                        self._user_turn_session_fragments(request, cancel_checker)
+                        if step_index == 0 and context_source == "chat"
+                        else self._session_state_fragments(request)
+                    ),
                     messages=working_messages,
                     static_prompt=build_prompt.system_prompt,
                     tools=tool_defs,

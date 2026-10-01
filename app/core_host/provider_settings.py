@@ -293,6 +293,18 @@ class ProviderSettingsBoundary:
                 "reasonCode": "READY",
                 "selection": dict(core.get("vision_chat", {})),
             },
+            *[
+                {
+                    "identity": f"core:{name}", "ownerType": "core", "ownerId": "sakura.core",
+                    "slotId": name, "label": label, "description": description,
+                    "modelKind": "chat_completion", "required": False, "order": order,
+                    "reasonCode": "READY", "selection": dict(core.get(name, {})),
+                }
+                for name, label, description, order in (
+                    ("chat_fast", "快速模型", "主动判断与屏幕观察决策；留空继承对话模型。", 21),
+                    ("inner_thought", "内心独白模型", "每轮内心独白；留空继承快速模型，再继承对话模型。", 22),
+                )
+            ],
             *self._plugin_slots(),
         ]
         slots.sort(
@@ -320,10 +332,12 @@ class ProviderSettingsBoundary:
         if not isinstance(raw_slots, Mapping):
             raise ProviderModelSettingsError("MODEL_SLOTS_INVALID", "模型槽配置无效。")
         current = {item["identity"]: item for item in self._snapshot()["model_slots"]}
-        if set(raw_slots) <= {"chat", "vision_chat"}:
+        if set(raw_slots) <= {"chat", "vision_chat", "chat_fast", "inner_thought"}:
             raw_slots = {
                 "core:chat": raw_slots.get("chat", {}),
                 "core:vision_chat": raw_slots.get("vision_chat", {}),
+                **{f"core:{name}": raw_slots.get(name, current[f"core:{name}"]["selection"])
+                   for name in ("chat_fast", "inner_thought")},
                 **{
                     identity: item.get("selection", {})
                     for identity, item in current.items()
@@ -344,7 +358,7 @@ class ProviderSettingsBoundary:
         for identity, value in raw_slots.items():
             slot_field = str(identity)
             allowed_fields = {"profile_id", "model"}
-            if identity == "core:chat":
+            if identity in {"core:chat", "core:chat_fast", "core:inner_thought"}:
                 allowed_fields.add("context_window_tokens")
             if not isinstance(value, Mapping) or set(value) - allowed_fields:
                 raise ProviderModelSettingsError(
@@ -377,7 +391,7 @@ class ProviderSettingsBoundary:
                     field=slot_field,
                 )
             selection: dict[str, Any] = {"profile_id": profile_id, "model": model}
-            if identity == "core:chat":
+            if identity in {"core:chat", "core:chat_fast", "core:inner_thought"}:
                 context_window = value.get("context_window_tokens")
                 if context_window is not None and (
                     isinstance(context_window, bool)
@@ -395,9 +409,11 @@ class ProviderSettingsBoundary:
         core_draft["model_slots"] = {
             "chat": normalized["core:chat"],
             "vision_chat": normalized["core:vision_chat"],
+            "chat_fast": normalized["core:chat_fast"],
+            "inner_thought": normalized["core:inner_thought"],
         }
         core_result = self._repository.save(core_draft)
-        saved_slots = ["core:chat", "core:vision_chat"]
+        saved_slots = ["core:chat", "core:vision_chat", "core:chat_fast", "core:inner_thought"]
         pending = {
             identity: selection
             for identity, selection in normalized.items()

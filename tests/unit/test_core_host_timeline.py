@@ -714,3 +714,32 @@ def _segment(text: str) -> dict[str, object]:
         "portrait": "neutral",
         "suppressTts": False,
     }
+
+
+def test_dialogue_gap_survives_reopen_and_ignores_observation_and_proactive(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from app.agent.context_orchestrator import _builtin_fragments, build_context_request
+
+    now = datetime.now().astimezone()
+    store = TimelineStore(tmp_path / "gap.sqlite3")
+    store.initialize()
+    last = now - timedelta(hours=23)
+    entries = [
+        replace(_entry("h", "conversation", TimelineKind.HUMAN, {"text": "hello"}), created_at=(now - timedelta(days=1)).isoformat()),
+        replace(_entry("a", "conversation", TimelineKind.ASSISTANT, {"segments": [_segment("hi")]}), created_at=last.isoformat()),
+        replace(_entry("p", "alone", TimelineKind.ASSISTANT, {"segments": [_segment("alone")]}, origin="proactive"), created_at=(now - timedelta(minutes=1)).isoformat()),
+        replace(_entry("o", "screen", TimelineKind.OBSERVATION, {"text": "window"}, origin="scheduled_screen"), created_at=(now - timedelta(minutes=1)).isoformat()),
+    ]
+    store.append_many(entries)
+    reopened = TimelineStore(tmp_path / "gap.sqlite3")
+    projection = assemble_recent_turns(reopened.read_context_candidates("sakura", observation_since=now - timedelta(hours=2), proactive_since=now - timedelta(hours=2)), now=now)
+    assert projection.last_conversation_at == last
+    request = build_context_request(
+        [{"role": "user", "content": "back"}], source="chat", mode="normal", event_type="",
+        step_index=0, remaining_steps=0, available_tools=(),
+        event_payload={"seconds_since_pet_interaction": (now - projection.last_conversation_at).total_seconds()},
+    )
+    fragment = next(item for item in _builtin_fragments(request) if item.fragment_id == "runtime.time")
+    assert "23 小时" in fragment.content
+    assert "客观间隔" in fragment.content
+    assert assemble_recent_turns(reopened.read_context_candidates("another", observation_since=now - timedelta(hours=2), proactive_since=now - timedelta(hours=2)), now=now).last_conversation_at is None

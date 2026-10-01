@@ -43,6 +43,7 @@ class ChatPipeline:
         cancel_checker: CancelChecker | None = None,
         screen_awareness_mode: bool = False,
         observer_context: Mapping[str, str] | None = None,
+        seconds_since_interaction: float | None = None,
     ) -> AgentResult:
         binding = getattr(self.agent_runtime, "visual_binding", None)
         log_event(
@@ -55,6 +56,8 @@ class ChatPipeline:
             },
         )
         observer_kwargs = {"observer_context": observer_context} if observer_context is not None else {}
+        if seconds_since_interaction is not None:
+            observer_kwargs["seconds_since_interaction"] = seconds_since_interaction
         result = self._run_traced(
             lambda: self.agent_runtime.handle_user_message(
                 messages,

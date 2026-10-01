@@ -325,6 +325,9 @@ class ReadinessController:
             if not callable(update):
                 raise RuntimeError("PROVIDER_HOT_APPLY_UNAVAILABLE")
             update(config.provider_selection.api_settings)
+            refresh_auxiliary = getattr(session, "refresh_auxiliary_models", None)
+            if callable(refresh_auxiliary):
+                refresh_auxiliary(self._config.user_root, config.provider_selection.vision_api_settings)
             return
 
         if initializer is None:

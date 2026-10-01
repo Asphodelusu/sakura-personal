@@ -76,6 +76,8 @@ class ProviderModelDraft:
     temperature: float | None
     top_p: float | None
     max_tokens: int | None
+    chat_fast: ModelSlotDraft | None = None
+    inner_thought: ModelSlotDraft | None = None
 
 
 def _read_yaml(path: Path, *, missing_ok: bool) -> dict[str, Any]:
@@ -166,12 +168,16 @@ class ProviderModelSettingsRepository:
         ]
         old_slots = old.get("model_slots")
         slots: dict[str, Any] = dict(old_slots) if isinstance(old_slots, Mapping) else {}
-        for name, selection in (("chat", draft.chat), ("vision_chat", draft.vision_chat)):
+        for name, selection in (("chat", draft.chat), ("vision_chat", draft.vision_chat),
+                                ("chat_fast", draft.chat_fast), ("inner_thought", draft.inner_thought)):
+            if selection is None:
+                continue
             existing = slots.get(name)
             merged_slot = dict(existing) if isinstance(existing, Mapping) else {}
             merged_slot.pop("profile_id", None)
             merged_slot.pop("model", None)
-            merged_slot.pop("context_window_tokens", None)
+            if name in {"chat", "vision_chat"} or selection.empty:
+                merged_slot.pop("context_window_tokens", None)
             if not selection.empty:
                 merged_slot.update(_slot_mapping(selection))
             if merged_slot:
@@ -295,7 +301,7 @@ class ProviderModelSettingsRepository:
         if not isinstance(raw, Mapping):
             raise ProviderModelSettingsError("CONFIG_DATA_INVALID", "模型槽配置格式无效。", feature="model.chat_slot")
         result: dict[str, dict[str, str]] = {}
-        for slot in ("chat", "vision_chat"):
+        for slot in ("chat", "vision_chat", "chat_fast", "inner_thought"):
             value = raw.get(slot, {})
             if value is None:
                 value = {}
@@ -305,7 +311,7 @@ class ProviderModelSettingsRepository:
                 "profile_id": _text(value.get("profile_id"), "profile_id", 64),
                 "model": _text(value.get("model"), "model", 256),
             }
-            if slot == "chat":
+            if slot in {"chat", "chat_fast", "inner_thought"}:
                 selection["context_window_tokens"] = _optional_int(
                     value.get("context_window_tokens"),
                     4_096,
@@ -349,12 +355,14 @@ def parse_draft(raw: object) -> ProviderModelDraft:
         ))
 
     raw_slots = raw.get("model_slots", {})
-    if not isinstance(raw_slots, Mapping) or set(raw_slots) - {"chat", "vision_chat"}:
+    if not isinstance(raw_slots, Mapping) or set(raw_slots) - {"chat", "vision_chat", "chat_fast", "inner_thought"}:
         raise ProviderModelSettingsError("MODEL_SLOTS_INVALID", "模型槽配置无效。", feature="model.chat_slot")
     chat = _parse_slot(raw_slots.get("chat"), "chat", allow_context_window=True)
     vision = _parse_slot(raw_slots.get("vision_chat"), "vision_chat")
+    personal = {name: _parse_slot(raw_slots[name], name, allow_context_window=True)
+                for name in ("chat_fast", "inner_thought") if name in raw_slots}
     by_id = {item.id: item for item in providers}
-    for slot_name, slot in (("chat", chat), ("vision_chat", vision)):
+    for slot_name, slot in (("chat", chat), ("vision_chat", vision), *personal.items()):
         if slot.empty:
             continue
         provider = by_id.get(slot.profile_id)
@@ -368,6 +376,8 @@ def parse_draft(raw: object) -> ProviderModelDraft:
         providers=tuple(providers),
         chat=chat,
         vision_chat=vision,
+        chat_fast=personal.get("chat_fast"),
+        inner_thought=personal.get("inner_thought"),
         timeout_seconds=_bounded_int(settings.get("timeout_seconds"), 60, 1, 300, strict=True),
         temperature=_optional_number(settings.get("temperature"), 0.0, 2.0, strict=True),
         top_p=_optional_number(settings.get("top_p"), 0.0, 1.0, strict=True),

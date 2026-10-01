@@ -762,6 +762,10 @@ export function createProviderSettingsFeature({
     if (slot === "core:chat") {
       return null;
     }
+    if (slot === "core:inner_thought") {
+      const fast = readSlotSelection("core:chat_fast");
+      if (fast.profile_id && fast.model) return fast;
+    }
     const chat = readSlotSelection("core:chat");
     return chat.profile_id && chat.model ? chat : null;
   }
@@ -787,6 +791,7 @@ export function createProviderSettingsFeature({
       delete inheritedSlotManualSelections[slot];
     }
     syncSlotInheritState(slot);
+    syncInheritedSlotDisplays();
     refreshDirty();
   }
 
@@ -835,13 +840,13 @@ export function createProviderSettingsFeature({
       enhanceSelect(modelSelect);
       profileSelect.addEventListener("change", () => {
         syncModelOptions(slot.id, "", { preserveMissing: false });
-        if (slot.id === "core:chat") {
+        if (slot.id === "core:chat" || slot.id === "core:chat_fast") {
           syncInheritedSlotDisplays();
         }
         refreshDirty();
       });
       modelSelect.addEventListener("change", () => {
-        if (slot.id === "core:chat") {
+        if (slot.id === "core:chat" || slot.id === "core:chat_fast") {
           syncInheritedSlotDisplays();
         }
         refreshDirty();

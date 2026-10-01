@@ -844,6 +844,26 @@ class SakuraMem0Plugin:
         if self._personal_snapshot is not None:
             if self._personal_daily:
                 self._register_memory_management(context, runtime)
+                config = getattr(context, "config")
+
+                def load_curation_slot() -> dict[str, str]:
+                    values = config.get()
+                    return _parse_model_slot_selection({
+                        "profileId": values.get("curationProfileId", ""),
+                        "model": values.get("curationModel", ""),
+                    })
+
+                def save_curation_slot(selection: Mapping[str, object]) -> dict[str, str]:
+                    parsed = _parse_model_slot_selection(selection)
+                    config.update({"curationProfileId": parsed["profileId"], "curationModel": parsed["model"]})
+                    return {"applicationState": "applied"}
+
+                getattr(context, "get")("sakura.host.model_slots").register(
+                    {"slotId": "curation", "label": "记忆整理模型",
+                     "description": "继承时使用对话模型。", "modelKind": "chat_completion",
+                     "required": False, "order": 30},
+                    load=load_curation_slot, save=save_curation_slot,
+                )
             return
         settings = getattr(context, "get")("sakura.host.settings")
         settings.register(
@@ -1245,8 +1265,10 @@ def _parse_model_slot_selection(value: object) -> dict[str, str]:
     raw = _mapping(value)
     if set(raw) != {"profileId", "model"}:
         raise ValueError("MODEL_SLOT_SELECTION_INVALID")
-    profile_id = str(raw.get("profileId", ""))
-    model = str(raw.get("model", ""))
+    profile_id = raw.get("profileId", "")
+    model = raw.get("model", "")
+    if not isinstance(profile_id, str) or not isinstance(model, str):
+        raise ValueError("MODEL_SLOT_SELECTION_INVALID")
     if len(profile_id) > 64 or len(model) > 256 or bool(profile_id) != bool(model):
         raise ValueError("MODEL_SLOT_SELECTION_INVALID")
     return {"profileId": profile_id, "model": model}

@@ -3,7 +3,7 @@ kind: spec
 status: normative
 audience: maintainer
 source_of_truth: self
-updated: 2026-09-11
+updated: 2026-10-01
 ---
 
 # WP-3S-01：供应商与模型设置纵向链
@@ -18,18 +18,27 @@ updated: 2026-09-11
 ## 设置范围
 
 Runtime v2 canonical 设置页完成 Provider 公开读取、
-凭据动作、模型目录、聊天/视觉模型槽、原子保存、同 generation 热应用和有界网络探测的完整闭环。
+凭据动作、模型目录、聊天/视觉/快速/内心独白模型槽、原子保存、同 generation 热应用和有界网络探测的完整闭环。
 
 生产写入仅允许 `user_root/config/api.yaml` 当前 schema 的以下字段：
 
 - `api_profiles[].{id,alias,base_url,api_key,models[].name}`；
-- `model_slots.chat` 与 `model_slots.vision_chat`；
+- `model_slots.chat`、`model_slots.vision_chat`、`model_slots.chat_fast`、`model_slots.inner_thought`；
 - `llm.{base_url,api_key,model}` 当前聊天槽投影，以及
   `llm.{timeout_seconds,temperature,top_p,max_tokens}` 旧页面已支持的生成参数。
 
 `memory_curation` 模型槽及 TTS/MCP/插件等非目标字段必须逐字节语义保留，不由本 WP 前端开放。写入前必须
 确认 `system_config.yaml.config_version == 1`；任何其他版本、缺失、类型错误或损坏数据都明确拒绝。
 读取不得触发迁移，响应只暴露 `configured`，不返回已保存密钥。
+
+个人快速槽用于主动判断和屏幕观察决策，留空继承聊天槽；内心独白槽留空依次继承快速槽、聊天槽。
+界面继承展示必须与运行时一致。旧调用方省略这两个槽时保留已存选择；只有明确清空才改为继承，
+已有的槽级上下文窗口值不得因保存其他设置而丢失。该设置入口不宣称恢复旧版全部 fast-tier 对话路由。
+
+保存使用既有 idle/下一 operation 热应用边界，同时更新主对话、视觉、快速与独白客户端。
+独白切换复用现有取消、代次与迟到结果隔离，保留独白窗口；快速模型切换保留主动节流和焦点状态。
+个人日用记忆插件也注册 `plugin:sakura.memory.mem0:curation`，从插件配置直接读取、部分更新
+`curationProfileId/curationModel`，不依赖记忆模型加载完成。后续整理作业采用新选择，进行中的作业保持原客户端。
 
 ## 契约
 

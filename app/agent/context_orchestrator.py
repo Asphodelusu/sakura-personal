@@ -53,8 +53,8 @@ class ContextOrchestrator:
         max_tokens: int | None = None,
         model: str = "",
     ) -> ContextSnapshot:
-        fragments = [*_builtin_fragments(request), *session_fragments]
-        fragments.extend(_collect_provider_fragments(request, providers))
+        provider_fragments = _collect_provider_fragments(request, providers)
+        fragments = [*_builtin_fragments(request), *session_fragments, *provider_fragments]
         if context_window_tokens is None:
             return self.policy.select(request, fragments)
         turns, required_tokens, projected_drops = _history_budget_inputs(
@@ -166,11 +166,15 @@ def build_context_request(
 
 
 def _builtin_fragments(request: ContextRequest) -> list[ContextFragment]:
+    from app.agent.time_awareness import format_local_time_context
+
     return [
         ContextFragment(
             fragment_id="runtime.time",
             source="runtime",
-            content=f"当前本地时间：{request.current_time}",
+            content=format_local_time_context(
+                request.current_time, seconds_since_interaction=request.seconds_since_pet_interaction,
+            ),
             trust="trusted",
             priority=100,
             token_budget=128,

@@ -138,6 +138,11 @@ def test_personal_screen_calls_vision_then_text_only_fast(tmp_path: Path, monkey
     adapter = AssistantAdapter(_root(tmp_path), tool_registry=ToolRegistry(), mcp_provider=None)
     readiness = adapter.initialize(Event())
     runtime = readiness.session.runtime
+    from app.plugins.models import ContextProviderContribution
+    recall_calls = []
+    runtime.set_context_providers([ContextProviderContribution(
+        provider_id="memory", description="memory", build_context=lambda request: recall_calls.append(request) or [],
+    )])
     shared_vision_timeout = int(runtime.vision_api_client.settings.timeout_seconds)
     shared_fast_timeout = int(runtime._initiative_client.settings.timeout_seconds)
     try:
@@ -157,6 +162,7 @@ def test_personal_screen_calls_vision_then_text_only_fast(tmp_path: Path, monkey
     finally:
         adapter.close()
 
+    assert recall_calls == [], "trace metadata must not run memory retrieval"
     assert [item["model"] for item in calls] == ["vision-model", "fast-model"]
     assert [item["image"] for item in calls] == [True, False]
     assert calls[0]["window"] == 16000

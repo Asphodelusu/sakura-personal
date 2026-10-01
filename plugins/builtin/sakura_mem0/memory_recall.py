@@ -57,9 +57,11 @@ class MemoryRecallService:
         policy = getattr(self.memory, "recall_policy", None)
         planner = getattr(policy, "plan_query", None)
         query = planner(request) if callable(planner) else _build_memory_query(request)
+        timings = {"query_plan_ms": int((monotonic() - started_at) * 1000)}
         if not query:
             _log_recall_finished(started_at, status="skipped", candidates=0, selected=0)
             return MemoryRecallResult(query="")
+        search_started_at = monotonic()
         try:
             response = self.memory.search_memory(
                 {"query": query, "limit": getattr(policy, "candidates", DEFAULT_MEMORY_RECALL_CANDIDATES)},
@@ -78,6 +80,7 @@ class MemoryRecallService:
                 verbosity=0,
             )
             return MemoryRecallResult(status="failed", query=query)
+        timings["search_ms"] = int((monotonic() - search_started_at) * 1000)
         status = str(response.get("status", "ready"))
         memories = response.get("memories", [])
         if status != "ready" and not memories:
@@ -108,7 +111,8 @@ class MemoryRecallService:
             return MemoryRecallResult(status="failed", query=query)
 
         if policy is not None:
-            return self._recall_with_policy(policy, request, query, memories, started_at)
+            return self._recall_with_policy(policy, request, query, memories, started_at, timings)
+        selection_started_at = monotonic()
         selected = _select_memories(
             memories,
             self.threshold,
@@ -139,12 +143,14 @@ class MemoryRecallService:
             status="ready",
             candidates=len(memories),
             selected=len(fragments),
+            timings={**timings, "selection_ms": int((monotonic() - selection_started_at) * 1000)},
         )
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
 
-    def _recall_with_policy(self, policy, request, query, memories, started_at) -> MemoryRecallResult:
+    def _recall_with_policy(self, policy, request, query, memories, started_at, timings) -> MemoryRecallResult:
         budget = getattr(policy, "budget_seconds", None)
         deadline = {} if budget is None else {"deadline": started_at + float(budget)}
+        selection_started_at = monotonic()
         selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id, **deadline)
         fragments = tuple(
             ContextFragment(
@@ -165,7 +171,8 @@ class MemoryRecallService:
             )
             for index, memory in enumerate(selected)
         )
-        _log_recall_finished(started_at, status="ready", candidates=len(memories), selected=len(fragments))
+        _log_recall_finished(started_at, status="ready", candidates=len(memories), selected=len(fragments),
+                             timings={**timings, "selection_ms": int((monotonic() - selection_started_at) * 1000)})
         return MemoryRecallResult(fragments=fragments, status="ready", query=query)
 
 
@@ -180,6 +187,7 @@ def _log_recall_finished(
     status: str,
     candidates: int,
     selected: int,
+    timings: dict[str, int] | None = None,
 ) -> None:
     log_event(
         "Memory",
@@ -188,6 +196,7 @@ def _log_recall_finished(
             "status": status,
             "candidates": candidates,
             "selected": selected,
+            **(timings or {}),
             "elapsed_ms": int((monotonic() - started_at) * 1000),
         },
         event="memory.recall.finished",

@@ -577,3 +577,25 @@ test("a newer discovery supersedes an older request for the same provider", asyn
   assert.equal(draft.providers[0].models.includes("stale-model"), false);
   ui.feature.dispose();
 });
+
+
+test("inner thought inheritance displays fast selection and saves an empty inherited slot", async () => {
+  const initial = snapshot();
+  initial.model_slots.push(
+    { ...initial.model_slots[1], identity: "core:chat_fast", slotId: "chat_fast", label: "Fast",
+      selection: { profile_id: "fixture", model: "manual-model" } },
+    { ...initial.model_slots[1], identity: "core:inner_thought", slotId: "inner_thought", label: "Thought",
+      selection: { profile_id: "", model: "" } },
+  );
+  const ui = featureFixture(initial);
+  await ui.feature.initialize();
+  const control = (kind, slot) => ui.document.querySelector(`[data-slot-${kind}="core:${slot}"]`);
+  assert.equal(control("model", "inner_thought").value, "manual-model");
+  assert.equal(control("model", "inner_thought").disabled, true);
+  control("model", "chat_fast").value = "third-model";
+  await control("model", "chat_fast").fire("change");
+  assert.equal(control("model", "inner_thought").value, "third-model");
+  await ui.feature.save();
+  const draft = ui.calls.find(([command]) => command === "settings_provider_model_save")[1].draft;
+  assert.deepEqual(draft.model_slots["core:inner_thought"], { profile_id: "", model: "" });
+});
