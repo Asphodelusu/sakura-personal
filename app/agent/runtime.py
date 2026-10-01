@@ -364,10 +364,32 @@ class AgentRuntime:
         loader = getattr(self, "_screen_initiative_loader", None)
         if loader is not None:
             try:
-                enabled, cooldown_seconds = loader()
+                loaded = loader()
+                enabled, cooldown_seconds = loaded[0], loaded[1]
+                silence = loaded[2] if len(loaded) > 2 else None
+                proactive = loaded[3] if len(loaded) > 3 else None
             except Exception:  # noqa: BLE001 - unreadable settings keep the screen quiet
-                enabled, cooldown_seconds = False, 0.0
-            self._initiative.configure_screen(enabled=enabled, cooldown_seconds=cooldown_seconds)
+                enabled, cooldown_seconds, silence, proactive = False, 0.0, None, None
+            self._initiative.configure_screen(
+                enabled=bool(enabled),
+                cooldown_seconds=float(cooldown_seconds),
+                min_silence_after_user=None if silence is None else float(silence),
+            )
+            if isinstance(proactive, Mapping):
+                self._focus_observer.configure(
+                    enabled=bool(proactive.get("enabled", enabled)),
+                    timer_seconds=float(proactive.get("timer_seconds", self._focus_observer.timer_seconds)),
+                    settle_delay=float(proactive.get("focus_settle_delay", self._focus_observer.settle_delay)),
+                    window_switch_enabled=bool(proactive.get("window_switch_enabled", True)),
+                    window_switch_cooldown=float(
+                        proactive.get("window_switch_cooldown", self._focus_observer.window_switch_cooldown)
+                    ),
+                    poll_interval=float(proactive.get("poll_interval", self._focus_observer.poll_interval)),
+                    idle_threshold_seconds=float(
+                        proactive.get("idle_threshold_seconds", self._focus_observer.idle_threshold_seconds)
+                    ),
+                    away_max_seconds=float(proactive.get("away_max_seconds", self._focus_observer.away_max_seconds)),
+                )
         reason = self._initiative.screen_gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
         if self._focus_observer.away_mode and reason != "disabled":
             return "away"
@@ -388,9 +410,38 @@ class AgentRuntime:
         timer_seconds: float,
         blocked_processes: tuple[str, ...] = (),
         blocked_titles: tuple[str, ...] = (),
+        focus_settle_delay: float | None = None,
+        window_switch_enabled: bool | None = None,
+        window_switch_cooldown: float | None = None,
+        poll_interval: float | None = None,
+        idle_threshold_seconds: float | None = None,
+        away_max_seconds: float | None = None,
+        screen_enabled: bool | None = None,
+        cooldown_seconds: float | None = None,
+        min_silence_after_user: float | None = None,
     ) -> dict[str, str]:
         from app.agent.focus_observer import snapshot_from_mapping
 
+        if screen_enabled is not None or cooldown_seconds is not None or min_silence_after_user is not None:
+            self._initiative.configure_screen(
+                enabled=self._initiative.screen_enabled if screen_enabled is None else bool(screen_enabled),
+                cooldown_seconds=(
+                    float(self._initiative.screen_cooldown_seconds or 0.0)
+                    if cooldown_seconds is None
+                    else float(cooldown_seconds)
+                ),
+                min_silence_after_user=min_silence_after_user,
+            )
+        self._focus_observer.configure(
+            enabled=self._focus_observer.enabled,
+            timer_seconds=timer_seconds,
+            settle_delay=focus_settle_delay,
+            window_switch_enabled=window_switch_enabled,
+            window_switch_cooldown=window_switch_cooldown,
+            poll_interval=poll_interval,
+            idle_threshold_seconds=idle_threshold_seconds,
+            away_max_seconds=away_max_seconds,
+        )
         reason = self.screen_gate_reason()
         from app.agent.focus_observer import FocusGate
 
@@ -402,7 +453,16 @@ class AgentRuntime:
             cooldown=reason == "cooldown",
             idle_seconds=self._initiative.current_idle_seconds(),
         )
-        self._focus_observer.configure(enabled=gate.enabled, timer_seconds=timer_seconds)
+        self._focus_observer.configure(
+            enabled=gate.enabled,
+            timer_seconds=timer_seconds,
+            settle_delay=focus_settle_delay,
+            window_switch_enabled=window_switch_enabled,
+            window_switch_cooldown=window_switch_cooldown,
+            poll_interval=poll_interval,
+            idle_threshold_seconds=idle_threshold_seconds,
+            away_max_seconds=away_max_seconds,
+        )
         self._focus_observer.set_diagnostics_path(self._focus_diagnostics_path)
         return self._focus_observer.advance(
             snapshot_from_mapping(snapshot),

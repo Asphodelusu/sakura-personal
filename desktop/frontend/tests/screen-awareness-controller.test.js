@@ -284,3 +284,64 @@ test("private, own, or unchanged screens are skipped quietly until the next inte
     assert.equal(env.sends.length, 1, code);
   }
 });
+
+test("personal polling keeps fractional seconds and does not use the minute scheduler", async () => {
+  const personal = {
+    enabled: true,
+    timerSeconds: 40.5,
+    cooldownSeconds: 600,
+    focusSettleDelay: 15,
+    windowSwitchCooldown: 60,
+    pollIntervalSeconds: 2.5,
+  };
+  const diagnostics = [];
+  const quietCalls = [];
+  const quiet = createScreenAwarenessController({
+    now: () => 0,
+    generationId: () => "generation-a",
+    isIdle: () => true,
+    invoke: async (command) => {
+      quietCalls.push(command);
+      return { count: 1 };
+    },
+    send: async () => {},
+    setInterval: () => 1,
+    clearInterval: () => {},
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  quiet.applySettings(personal);
+  quiet.start();
+  await quiet.tick();
+  assert.equal(diagnostics.includes("screen_awareness.settings.unavailable"), true);
+  assert.equal(quietCalls.includes("capture_screen_awareness_frame"), false);
+
+  const polled = [];
+  const focused = [];
+  const controller = createScreenAwarenessController({
+    now: () => 0,
+    generationId: () => "generation-a",
+    isIdle: () => true,
+    invoke: async (command, args) => {
+      focused.push([command, args]);
+      if (command === "capture_screen_awareness_frame") return { count: 1 };
+      if (command === "attach_screen_awareness_batch") {
+        return { attachmentId: `screen-${"a".repeat(32)}`, count: 1 };
+      }
+      return true;
+    },
+    send: async () => ({ operationId: "op-1" }),
+    setInterval: (_callback, delay) => {
+      polled.push(delay);
+      return 2;
+    },
+    clearInterval: () => {},
+    advanceFocus: async () => ({ action: "capture", trigger: "timer", reason: "ready" }),
+  });
+  controller.applySettings(personal);
+  controller.start();
+  assert.deepEqual(polled, [2500]);
+  await controller.tick();
+  const capture = focused.find(([command]) => command === "capture_screen_awareness_frame");
+  assert.equal(capture[1].payload.batchLimit, 1);
+  assert.equal(capture[1].payload.resolution, "fullscreen");
+});

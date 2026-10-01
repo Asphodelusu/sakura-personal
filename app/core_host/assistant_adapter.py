@@ -115,12 +115,20 @@ def _read_optional_text(path: Path) -> str:
         return ""
 
 
-def _screen_initiative_loader(user_root: Path):
+def _screen_initiative_loader(user_root: Path, *, personal_style: bool):
     from app.config.settings_service import AppSettingsService
 
     service = AppSettingsService(Path(user_root))
 
-    def load() -> tuple[bool, float]:
+    def load() -> tuple[object, ...]:
+        if personal_style:
+            proactive = service.load_proactive_config()
+            return (
+                bool(proactive["enabled"]),
+                float(proactive["cooldown_seconds"]),
+                float(proactive["min_silence_after_user"]),
+                proactive,
+            )
         settings = service.load_screen_awareness_settings().normalized()
         return settings.allows_screen_context(), float(settings.cooldown_minutes * 60)
 
@@ -287,7 +295,9 @@ class AssistantAdapter:
                 decision_client = OpenAICompatibleClient(decision_settings, request_attempts=1)
                 owned.append(decision_client)
             runtime.configure_initiative(initiative, client=decision_client)
-            runtime.configure_screen_initiative(loader=_screen_initiative_loader(self._user_root))
+            runtime.configure_screen_initiative(loader=_screen_initiative_loader(
+                self._user_root, personal_style=profile.system_guards_path is not None,
+            ))
             self._check_active(cancel)
 
             pipeline = ChatPipeline(runtime, finalize_trace_operations=False)

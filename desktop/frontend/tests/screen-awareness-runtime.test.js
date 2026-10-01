@@ -37,6 +37,69 @@ function control() {
   };
 }
 
+function personalSnapshot(settings = {}) {
+  return {
+    schemaVersion: 1,
+    settings: {
+      cooldownSeconds: 600,
+      enabled: true,
+      focusSettleDelay: 15,
+      pollIntervalSeconds: 2.5,
+      timerSeconds: 40.5,
+      windowSwitchCooldown: 60,
+      ...settings,
+    },
+    windowGeneration: 3,
+    coreGenerationId: "generation-a",
+  };
+}
+
+test("personal screen settings keep seconds and hide the periodic controls", async () => {
+  const rows = [
+    { getAttribute: () => "periodic", hidden: false },
+    { getAttribute: () => "personal", hidden: true },
+  ];
+  const controls = {
+    enabled: control(),
+    checkInterval: control(),
+    cooldown: control(),
+    batchLimit: control(),
+    screenResolution: control(),
+    timerSeconds: control(),
+    cooldownSeconds: control(),
+    focusSettleDelay: control(),
+    windowSwitchCooldown: control(),
+    screenAwarenessHint: { hidden: false },
+  };
+  const calls = [];
+  const controller = createScreenAwarenessSettingsController({
+    document: {
+      getElementById: (id) => controls[id],
+      querySelectorAll: () => rows,
+    },
+    enhanceSelect() {},
+    refreshSelect() {},
+    onDirty() {},
+    invoke: async (command, args) => {
+      calls.push([command, args]);
+      return personalSnapshot(args.settings);
+    },
+  });
+  controller.initialize(personalSnapshot());
+  assert.equal(rows[0].hidden, true);
+  assert.equal(rows[1].hidden, false);
+  assert.equal(controls.screenAwarenessHint.hidden, true);
+  assert.equal(controls.timerSeconds.value, "40.5");
+  assert.equal(controller.isDirty(), false);
+  controls.timerSeconds.value = "90.5";
+  assert.equal(controller.isDirty(), true);
+  await controller.save();
+  assert.equal(calls[0][1].settings.timerSeconds, 90.5);
+  assert.equal(calls[0][1].settings.pollIntervalSeconds, 2.5);
+  assert.equal(calls[0][1].settings.checkIntervalMinutes, undefined);
+  assert.throws(() => validateScreenAwarenessSnapshot(personalSnapshot({ timerSeconds: 0 })));
+});
+
 test("screen awareness settings are exact and bounded", () => {
   assert.equal(validateScreenAwarenessSnapshot(snapshot()).settings.checkIntervalMinutes, 20);
   assert.throws(() => validateScreenAwarenessSnapshot(snapshot({ batchLimit: 21 })));

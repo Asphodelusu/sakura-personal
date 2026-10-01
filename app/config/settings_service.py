@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import CharacterRegistry
@@ -27,6 +27,10 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
     SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION,
     ScreenAwarenessSettings,
+)
+from app.perception.proactive_config import (
+    normalize_proactive_config_mapping,
+    resolve_proactive_config_path,
 )
 
 
@@ -304,6 +308,33 @@ class AppSettingsService:
         data["screen_awareness"] = preserved
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_proactive_config(self) -> dict[str, Any]:
+        """Personal observer config. ``proactive.enabled`` wins; the screen switch is only a fallback."""
+        return normalize_proactive_config_mapping(_proactive_source(self._proactive_document()))
+
+    def save_proactive_config(self, updates: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Merge known proactive fields. Unrelated document keys and unknown section keys stay."""
+        incoming = dict(updates) if isinstance(updates, Mapping) else {}
+        path = resolve_proactive_config_path(self.base_dir)
+        if path.exists():
+            data = load_yaml_mapping(path)
+        else:
+            path = self.base_dir / "config" / SYSTEM_CONFIG_FILE
+            data = {"config_version": SYSTEM_CONFIG_VERSION}
+        existing = _proactive_source(data)
+        section = dict(existing)
+        section.update(incoming)
+        normalized = normalize_proactive_config_mapping(section)
+        privacy = _mapping(section.get("privacy"))
+        privacy.update(normalized["privacy"])
+        normalized["privacy"] = privacy
+        preserved = dict(existing)
+        preserved.update(normalized)
+        data["proactive"] = preserved
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_yaml_mapping(path, data)
+        return normalize_proactive_config_mapping(preserved)
+
     def load_bubble_settings(self) -> BubbleSettings:
         ui = self._system_section("ui")
         return BubbleSettings(
@@ -392,6 +423,20 @@ class AppSettingsService:
         if isinstance(version, bool) or not isinstance(version, int) or version != SYSTEM_CONFIG_VERSION:
             raise ValueError("系统配置版本不受支持。")
         return data
+
+    def _proactive_document(self) -> dict[str, Any]:
+        path = resolve_proactive_config_path(self.base_dir)
+        return load_yaml_mapping(path)
+
+
+def _proactive_source(document: Mapping[str, Any]) -> dict[str, Any]:
+    result = _mapping(document.get("proactive"))
+    legacy = _mapping(document.get("screen_awareness"))
+    if "enabled" not in result and "enabled" in legacy:
+        result["enabled"] = _bool_value(legacy.get("enabled"), True)
+    if "privacy" not in result and isinstance(legacy.get("privacy"), dict):
+        result["privacy"] = dict(legacy["privacy"])
+    return result
 
 
 def _mapping(value: Any) -> dict[str, Any]:

@@ -61,9 +61,12 @@ class FocusGate:
 class FocusObserver:
     clock: Callable[[], float] = time.monotonic
     settle_delay: float = FOCUS_SETTLE_DELAY_SECONDS
+    window_switch_enabled: bool = True
     window_switch_cooldown: float = WINDOW_SWITCH_COOLDOWN_SECONDS
     poll_interval: float = POLL_INTERVAL_SECONDS
     timer_seconds: float = 480.0
+    idle_threshold_seconds: float = IDLE_TRIGGER_SECONDS
+    away_max_seconds: float = AWAY_MAX_SECONDS
     enabled: bool = True
     diagnostics_path: Path | None = None
     _scope: str = ""
@@ -86,9 +89,37 @@ class FocusObserver:
     _last_diagnostic_key: tuple[str, str, str] = ("", "", "")
     _diagnostics: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=_DIAGNOSTIC_MEMORY))
 
-    def configure(self, *, enabled: bool, timer_seconds: float) -> None:
+    def configure(
+        self,
+        *,
+        enabled: bool,
+        timer_seconds: float,
+        settle_delay: float | None = None,
+        window_switch_enabled: bool | None = None,
+        window_switch_cooldown: float | None = None,
+        poll_interval: float | None = None,
+        idle_threshold_seconds: float | None = None,
+        away_max_seconds: float | None = None,
+    ) -> None:
         self.enabled = bool(enabled)
         self.timer_seconds = max(1.0, float(timer_seconds))
+        if settle_delay is not None:
+            self.settle_delay = max(0.0, float(settle_delay))
+        if window_switch_enabled is not None:
+            self.window_switch_enabled = bool(window_switch_enabled)
+            if not self.window_switch_enabled:
+                self._pending = None
+                self._deferred = None
+                self._settled_at = 0.0
+                self._ready_trigger = ""
+        if window_switch_cooldown is not None:
+            self.window_switch_cooldown = max(0.0, float(window_switch_cooldown))
+        if poll_interval is not None:
+            self.poll_interval = max(0.0, float(poll_interval))
+        if idle_threshold_seconds is not None:
+            self.idle_threshold_seconds = max(0.0, float(idle_threshold_seconds))
+        if away_max_seconds is not None:
+            self.away_max_seconds = max(0.0, float(away_max_seconds))
 
     def set_diagnostics_path(self, path: Path | None) -> None:
         self.diagnostics_path = path
@@ -266,6 +297,8 @@ class FocusObserver:
         self._current = snap
         self._ready_trigger = ""
         self._emit("focus_app_switch", process=snap.label, trigger="", reason="app_switch")
+        if not self.window_switch_enabled:
+            return
         if self._window_cooled(now):
             self._arm(snap, now)
         else:
@@ -324,14 +357,14 @@ class FocusObserver:
 
     def _collect(self, now: float, *, cooldown: bool, silence: bool, idle_seconds: float) -> list[str]:
         if self._away:
-            if self._away_set_at and now - self._away_set_at >= AWAY_MAX_SECONDS:
+            if self._away_set_at and now - self._away_set_at >= self.away_max_seconds:
                 self._away = False
                 self._away_set_at = 0.0
             else:
                 return []
         if silence:
             return []
-        if idle_seconds < IDLE_TRIGGER_SECONDS:
+        if idle_seconds < self.idle_threshold_seconds:
             self._idle_armed = True
         triggers: list[str] = []
         if self._last_timer_check is None:
@@ -356,7 +389,7 @@ class FocusObserver:
             not triggers
             and not cooldown
             and self._settled_at == 0
-            and idle_seconds >= IDLE_TRIGGER_SECONDS
+            and idle_seconds >= self.idle_threshold_seconds
             and self._idle_armed
         ):
             triggers.append("idle")

@@ -67,15 +67,24 @@ class InitiativeArbiter:
         # None: screen turns keep the ungated CAP-016 behaviour.
         self.screen_cooldown_seconds: float | None = None
         self.screen_enabled = False
+        self._screen_min_silence = float(SCREEN_MIN_SILENCE_AFTER_USER_SECONDS)
         self._last_proactive_at = 0.0
         self._last_screen_silent_at = 0.0
 
     def configure(self, settings: RelationshipInitiativeSettings) -> None:
         self.settings = settings.normalized()
 
-    def configure_screen(self, *, enabled: bool, cooldown_seconds: float) -> None:
+    def configure_screen(
+        self,
+        *,
+        enabled: bool,
+        cooldown_seconds: float,
+        min_silence_after_user: float | None = None,
+    ) -> None:
         self.screen_enabled = bool(enabled)
         self.screen_cooldown_seconds = max(0.0, float(cooldown_seconds))
+        if min_silence_after_user is not None:
+            self._screen_min_silence = max(0.0, float(min_silence_after_user))
 
     @property
     def screen_gated(self) -> bool:
@@ -89,7 +98,7 @@ class InitiativeArbiter:
         if busy:
             return "busy"
         now = self._clock()
-        if now - self._last_user_at < SCREEN_MIN_SILENCE_AFTER_USER_SECONDS:
+        if now - self._last_user_at < self._screen_min_silence:
             return "silence"
         cooldown = float(self.screen_cooldown_seconds or 0.0)
         if self._last_proactive_at and now - self._last_proactive_at < cooldown:

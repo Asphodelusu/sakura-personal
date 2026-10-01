@@ -14,13 +14,24 @@ updated: 2026-10-01
 
 ## 产品行为
 
-- Runtime v2 读取现有 `screen_awareness` 设置：启用、截图间隔、主动发言冷却、单次最多截图和截图
+- 非个人角色读取现有 `screen_awareness` 设置：启用、截图间隔、主动发言冷却、单次最多截图和截图
   分辨率。读取时 `enabled && screen_context_enabled` 合并为一个开关，保存时两个旧字段写成同一值。
-- 缺失配置默认启用、20 分钟截图、10 分钟冷却、最多 6 张、全屏分辨率。范围分别为 1–120 分钟、
+- 非个人角色缺失配置时默认启用、20 分钟截图、10 分钟冷却、最多 6 张、全屏分辨率。范围分别为 1–120 分钟、
   1–120 分钟、1–20 张；分辨率只接受 `fullscreen | 720p | 1080p | 2160p`。
-- 主窗口在接上焦点观察后每 5 秒向 Core 上报前台窗口。Core 以前台应用（进程加窗口句柄）稳定约 15 秒作为主触发；快切重新计时，同一应用只改标题不计为新的停留。检查间隔只在没有切窗触发时补充。忙碌或亲密续写未结束时不消耗已就绪的触发。60 秒内的再次切窗先记下，冷却结束后补评。前台是 Sakura 自己或命中隐私名单时不截图。
+- 带演出约束的个人角色使用 `proactive` 段，不用上面的分钟和攒批字段计时。权威文件是
+  `config/system_config.yaml`；只有该文件不存在时才读 `data/config/system_config.yaml`。
+  `proactive.enabled` 优先，缺这一键时才回退到 `screen_awareness.enabled`。已保存的未知键和未在设置页露出的
+  proactive 字段在保存露出字段时保留，包括继承的隐私名单和隐私段中的未知键。显式空的隐私名单表示清空；
+  Core 焦点门控和外壳采集前检查使用同一份个人隐私配置。游戏 OCR 保持硬停用。
+- 个人设置页编辑启用、补充间隔、开口冷却、焦点停留和切窗冷却，单位是秒。轮询间隔使用 `poll_interval`，
+  不把小数秒折成分钟。内容检查、自适应间隔和评估参数会保留，这一层还没有对应的运行时消费者。
+  关系主动仍使用自己的 `relationship_initiative` 设置。已发布会话用当前角色的个人身份；会话尚未发布时，
+  用已选角色的演出约束路径判断，不因为还没有会话就退回非个人计时。
+- 主窗口在接上焦点观察后按个人 `poll_interval`（默认 5 秒）向 Core 上报前台窗口；非个人角色仍每 5 秒上报。
+  Core 以前台应用（进程加窗口句柄）稳定达到 `focus_settle_delay`（默认 15 秒）作为主触发；快切重新计时，同一应用只改标题不计为新的停留。补充间隔只在没有切窗触发时使用，个人角色用 `timer_seconds`（默认 480 秒），非个人角色用分钟间隔。忙碌或亲密续写未结束时不消耗已就绪的触发。切窗冷却默认 60 秒，冷却内的再次切窗先记下，结束后补评。用户开口后的沉默默认 10 秒，开口冷却默认 600 秒。前台是 Sakura 自己或命中隐私名单时不截图。个人模式如果没有焦点观察路由，就保持安静并报告设置不可用，不退回分钟攒批。
 - 用户发出明确离开、晚安或暂停观察后，屏幕观察和关系主动都不再开口。下一条真实用户消息先记为回来，再按这句话决定是否再次离开。聊睡觉或疑问不算离开。自动屏幕、关系判定和回复修复不会清除离开。离开不写入配置。
-- 未接上焦点观察时，仍使用 10 秒普通轮询：只有 Core ready，距最近输入或手动发送、距上一张截图都达到截图间隔，
+- 个人 `window_switch_enabled=false` 关闭切窗触发，补充计时和空闲触发仍可用。已发布的个人会话不会因尚未生效的角色选择降为上游计时。
+- 非个人角色未接上焦点观察时，仍使用 10 秒普通轮询：只有 Core ready，距最近输入或手动发送、距上一张截图都达到截图间隔，
   且聊天、等待动画、打字机/TTS、手动截图或附件均空闲时才截图；忙时跳过，休眠后不补跑。
 - 每次捕获鼠标所在显示器，按设置等比缩小且不放大，JPEG quality 70。焦点观察在 Core 请求 `capture` 时捕获一张并立即送出。未接上焦点观察时，第一张截图开始冷却；冷却到期后将最新最多 N 张按时间顺序作为一次普通聊天请求发送，然后清空批次。
 - 主动请求生成期间主界面保持原有画面，不显示思考占位符或等待动画；完整回复到达后才直接进入现有的
@@ -61,7 +72,10 @@ updated: 2026-10-01
 - `screen.attachBatch` 返回 `{ attached: true, attachmentId, count }`。
 - Tauri：`settings_screen_awareness_get`、`settings_screen_awareness_save`、
   `capture_screen_awareness_frame`、`observer_focus_advance`、`attach_screen_awareness_batch`、`clear_screen_awareness_batch`。
-- 设置保存成功后发布一次 `sakura://screen-awareness-settings`。事件失败不重试；持久化值在下次启动生效。
+- 设置保存成功后发布一次 `sakura://screen-awareness-settings`。事件载荷就是 `settings` 对象。非个人角色保持
+  `enabled`、`checkIntervalMinutes`、`cooldownMinutes`、`batchLimit`、`resolution`。个人角色改为
+  `enabled`、`timerSeconds`、`cooldownSeconds`、`focusSettleDelay`、`windowSwitchCooldown`、`pollIntervalSeconds`。
+  当前身份与对象不一致时拒绝保存，不写入另一段。事件失败不重试；持久化值在下次启动生效。
 - 主动屏幕感知设置归入“交互”页，不再单列“隐私”导航；设置 capability 在 `interaction` section
   暴露 `privacy.screen_awareness = available`。不修改既有配置键、`chat.send`、聊天事件、TTS 或手动截图公开结构。
 

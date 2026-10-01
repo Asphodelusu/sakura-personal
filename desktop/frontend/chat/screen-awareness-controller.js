@@ -23,7 +23,40 @@ export function createFocusAdvanceCaller({ invoke, generationId } = {}) {
   };
 }
 
+const PERSONAL_BOUNDS = Object.freeze({
+  timerSeconds: [1, 86400],
+  cooldownSeconds: [0, 86400],
+  focusSettleDelay: [0, 3600],
+  windowSwitchCooldown: [0, 86400],
+  pollIntervalSeconds: [0.2, 300],
+});
+
+function isPersonalSettings(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.hasOwn(value, "timerSeconds")
+    && !Object.hasOwn(value, "checkIntervalMinutes"));
+}
+
+function normalizePersonalSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.enabled !== "boolean") {
+    throw new Error("SCREEN_AWARENESS_SETTINGS_INVALID");
+  }
+  const settings = { enabled: value.enabled };
+  for (const [key, bounds] of Object.entries(PERSONAL_BOUNDS)) {
+    const number = Number(value[key]);
+    if (!Number.isFinite(number) || number < bounds[0] || number > bounds[1]) {
+      throw new Error("SCREEN_AWARENESS_SETTINGS_INVALID");
+    }
+    settings[key] = number;
+  }
+  if (Object.keys(value).some((key) => key !== "enabled" && !Object.hasOwn(PERSONAL_BOUNDS, key))) {
+    throw new Error("SCREEN_AWARENESS_SETTINGS_INVALID");
+  }
+  return Object.freeze(settings);
+}
+
 export function normalizeScreenAwarenessSettings(value) {
+  if (isPersonalSettings(value)) return normalizePersonalSettings(value);
   const settings = {
     enabled: value?.enabled === true,
     checkIntervalMinutes: Number(value?.checkIntervalMinutes),
@@ -100,6 +133,28 @@ export function createScreenAwarenessController({
   }
 
   let attemptScope = "";
+  let started = false;
+
+  function personalMode() {
+    return Boolean(settings && Object.hasOwn(settings, "timerSeconds"));
+  }
+
+  function pollDelay() {
+    if (personalMode() && Number.isFinite(settings.pollIntervalSeconds)) {
+      return settings.pollIntervalSeconds * 1000;
+    }
+    return typeof advanceFocus === "function"
+      ? FOCUS_OBSERVER_POLL_INTERVAL_MS
+      : SCREEN_AWARENESS_POLL_INTERVAL_MS;
+  }
+
+  function armTimer() {
+    if (timer !== null) clearInterval(timer);
+    timer = null;
+    if (disposed || !started) return;
+    if (personalMode() && typeof advanceFocus !== "function") return;
+    timer = setInterval(() => { void tick(); }, pollDelay());
+  }
 
   async function report(outcome) {
     if (typeof advanceFocus !== "function" || !outcome) return;
@@ -139,6 +194,12 @@ export function createScreenAwarenessController({
       return;
     }
     if (!settings.enabled || !currentGeneration) return;
+    if (personalMode() && typeof advanceFocus !== "function") {
+      onDiagnostic("screen_awareness.settings.unavailable", {
+        code: "SCREEN_AWARENESS_SETTINGS_UNAVAILABLE",
+      });
+      return;
+    }
     const token = epoch;
     const startedGeneration = generation;
     attemptScope = startedGeneration;
@@ -168,19 +229,24 @@ export function createScreenAwarenessController({
         await report("aborted");
         return;
       }
-      const intervalMs = settings.checkIntervalMinutes * 60_000;
-      if (immediate || (timestamp - lastActivityAt >= intervalMs && timestamp - lastCaptureAt >= intervalMs)) {
+      const batchLimit = personalMode() ? 1 : settings.batchLimit;
+      const resolution = personalMode() ? "fullscreen" : settings.resolution;
+      const intervalMs = personalMode() ? 0 : settings.checkIntervalMinutes * 60_000;
+      const due = personalMode()
+        ? immediate
+        : immediate || (timestamp - lastActivityAt >= intervalMs && timestamp - lastCaptureAt >= intervalMs);
+      if (due) {
         try {
           const result = await invoke("capture_screen_awareness_frame", { payload: {
-            resolution: settings.resolution,
-            batchLimit: settings.batchLimit,
+            resolution,
+            batchLimit,
           } });
           if (!isCurrent(token, startedGeneration)) {
             discardOwnedWork(startedGeneration, null);
             await report("aborted");
             return;
           }
-          if (!Number.isSafeInteger(result?.count) || result.count < 1 || result.count > settings.batchLimit) {
+          if (!Number.isSafeInteger(result?.count) || result.count < 1 || result.count > batchLimit) {
             throw new Error("SCREEN_AWARENESS_CAPTURE_RESPONSE_INVALID");
           }
           captured = true;
@@ -206,7 +272,7 @@ export function createScreenAwarenessController({
         await report("aborted");
         return;
       }
-      if (!immediate && (batchCount === 0 || batchStartedAt === null
+      if (!personalMode() && !immediate && (batchCount === 0 || batchStartedAt === null
           || (batchCount < settings.batchLimit
             && timestamp - batchStartedAt < settings.cooldownMinutes * 60_000))) return;
       if (immediate && batchCount === 0) return;
@@ -246,13 +312,20 @@ export function createScreenAwarenessController({
       settings = normalizeScreenAwarenessSettings(value);
       generation = String(generationId() || "");
       invalidate(settings.enabled ? "settings_changed" : "disabled");
+      if (personalMode() && typeof advanceFocus !== "function") {
+        onDiagnostic("screen_awareness.settings.unavailable", {
+          code: "SCREEN_AWARENESS_SETTINGS_UNAVAILABLE",
+        });
+        if (timer !== null) clearInterval(timer);
+        timer = null;
+        return;
+      }
+      if (started) armTimer();
     },
     start() {
-      if (disposed || timer !== null) return;
-      const delay = typeof advanceFocus === "function"
-        ? FOCUS_OBSERVER_POLL_INTERVAL_MS
-        : SCREEN_AWARENESS_POLL_INTERVAL_MS;
-      timer = setInterval(() => { void tick(); }, delay);
+      if (disposed || started) return;
+      started = true;
+      armTimer();
     },
     tick,
     noteActivity() {

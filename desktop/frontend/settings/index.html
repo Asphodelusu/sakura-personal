@@ -404,29 +404,53 @@
             <div class="setting-row">
               <label class="setting-row-text" for="enabled">
                 <span class="setting-title">启用主动屏幕感知</span>
-                <span class="setting-desc">前台应用稳定约 15 秒后看一眼。没有切窗时，才按下面的间隔补充。忙碌时不消耗这次触发。</span>
+                <span id="screenAwarenessHint" class="setting-desc">前台应用稳定约 15 秒后看一眼。没有切窗时，才按下面的间隔补充。忙碌时不消耗这次触发。</span>
               </label>
               <span class="setting-toggle"><input id="enabled" type="checkbox" /></span>
             </div>
-            <div class="setting-row">
+            <div class="setting-row" data-screen-awareness="periodic">
               <label class="setting-row-text" for="checkInterval">
                 <span class="setting-title">无切窗时的补充间隔</span>
               </label>
               <span class="field-unit"><input id="checkInterval" type="number" step="1" /><span class="unit">分钟</span></span>
             </div>
-            <div class="setting-row">
+            <div class="setting-row" data-screen-awareness="periodic">
               <label class="setting-row-text" for="cooldown">
                 <span class="setting-title">最短搭话间隔</span>
               </label>
               <span class="field-unit"><input id="cooldown" type="number" step="1" /><span class="unit">分钟</span></span>
             </div>
-            <div class="setting-row">
+            <div class="setting-row" data-screen-awareness="periodic">
               <label class="setting-row-text" for="batchLimit">
                 <span class="setting-title">单次最多发送截图</span>
               </label>
               <span class="field-unit"><input id="batchLimit" type="number" step="1" /><span class="unit">张</span></span>
             </div>
-            <div class="setting-row">
+            <div class="setting-row" data-screen-awareness="personal" hidden>
+              <label class="setting-row-text" for="timerSeconds">
+                <span class="setting-title">无切窗时的补充间隔</span>
+              </label>
+              <span class="field-unit"><input id="timerSeconds" type="number" step="any" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row" data-screen-awareness="personal" hidden>
+              <label class="setting-row-text" for="cooldownSeconds">
+                <span class="setting-title">最短搭话间隔</span>
+              </label>
+              <span class="field-unit"><input id="cooldownSeconds" type="number" step="any" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row" data-screen-awareness="personal" hidden>
+              <label class="setting-row-text" for="focusSettleDelay">
+                <span class="setting-title">焦点停留</span>
+              </label>
+              <span class="field-unit"><input id="focusSettleDelay" type="number" step="any" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row" data-screen-awareness="personal" hidden>
+              <label class="setting-row-text" for="windowSwitchCooldown">
+                <span class="setting-title">切窗冷却</span>
+              </label>
+              <span class="field-unit"><input id="windowSwitchCooldown" type="number" step="any" /><span class="unit">秒</span></span>
+            </div>
+            <div class="setting-row" data-screen-awareness="periodic">
               <label class="setting-row-text" for="screenResolution">
                 <span class="setting-title">截图分辨率</span>
               </label>
