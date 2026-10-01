@@ -134,3 +134,62 @@ def test_failed_install_retries_and_close_cancels_and_joins(tmp_path: Path) -> N
     resource.close()
     assert cancelled.wait(1)
     assert resource.load()["bundleResource"]["taskState"] == "cancelled"
+
+
+def test_published_failure_accepts_retry_while_worker_tail_is_still_alive(tmp_path: Path, monkeypatch) -> None:
+    attempts = 0
+    published = threading.Event()
+    release_tail = threading.Event()
+    release_second = threading.Event()
+    second_entered = threading.Event()
+    stale_progress: dict[str, object] = {}
+    real_set_state = TTSBundleResource._set_state
+
+    def hold_terminal_tail(self, state, stage, progress, generation=None):
+        real_set_state(self, state, stage, progress, generation=generation)
+        if state == "failed" and not published.is_set():
+            published.set()
+            release_tail.wait()
+
+    monkeypatch.setattr(TTSBundleResource, "_set_state", hold_terminal_tail)
+
+    def fake_installer(_entry, root, **callbacks):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            stale_progress["call"] = callbacks["on_progress"]
+            raise RuntimeError("fixture failure")
+        callbacks["on_progress"](7)
+        second_entered.set()
+        release_second.wait()
+        return TTSBundleInstallResult(work_dir=root / "tts" / "fixture", provider=_entry.provider)
+
+    resource = TTSBundleResource(
+        user_root=tmp_path,
+        config_get=lambda: {},
+        config_update=lambda _values: None,
+        entry=lambda: ENTRY,
+        custom_endpoint=lambda _values: False,
+        installer=fake_installer,
+    )
+    try:
+        resource.start({})
+        assert published.wait(1)
+        failed = resource.load()["bundleResource"]
+        assert failed["taskState"] == "failed"
+        assert failed["availableActionIds"] == ["retryBundle"]
+        started = resource.start({})
+        assert started["message"] == "已开始安装组件。", started
+        assert second_entered.wait(1)
+        assert attempts == 2
+        duplicate = resource.start({})
+        assert duplicate["message"] == "组件安装已在进行中。"
+        assert attempts == 2
+        stale_progress["call"](80)
+        current = resource.load()["bundleResource"]
+        assert current["taskState"] != "failed"
+        assert current["progress"] == 7
+    finally:
+        release_tail.set()
+        release_second.set()
+        resource.close()

@@ -44,8 +44,10 @@ class TTSBundleResource:
         self._installer = installer
         self._lock = threading.RLock()
         self._cancel = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._workers: list[threading.Thread] = []
         self._closed = False
+        self._active = False
+        self._generation = 0
         self._state = "idle"
         self._stage = ""
         self._progress: int | None = None
@@ -143,26 +145,33 @@ class TTSBundleResource:
         with self._lock:
             if self._closed:
                 raise RuntimeError("TTS_BUNDLE_RESOURCE_STOPPED")
-            if self._thread is not None and self._thread.is_alive():
+            # A published terminal state retires the task even if its thread is
+            # still leaving _run. Only an active task rejects a second click.
+            if self._active:
                 return {"values": self.load(), "message": "组件安装已在进行中。"}
+            self._workers = [worker for worker in self._workers if worker.is_alive()]
+            self._generation += 1
+            generation = self._generation
+            self._active = True
             self._cancel.clear()
             self._state = "queued"
             self._stage = "等待下载"
             self._progress = None
             self._downloaded = 0
             self._total = entry.size
-            self._thread = threading.Thread(
+            worker = threading.Thread(
                 target=self._run,
-                args=(entry,),
+                args=(entry, generation),
                 name=f"tts-bundle-{entry.key}",
                 daemon=True,
             )
-            self._thread.start()
+            self._workers.append(worker)
+            worker.start()
         return {"values": self.load(), "message": "已开始安装组件。"}
 
     def cancel(self, _values: Mapping[str, object]) -> dict[str, object]:
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if self._active:
                 self._cancel.set()
                 message = "正在取消组件安装。"
             else:
@@ -173,55 +182,77 @@ class TTSBundleResource:
         with self._lock:
             self._closed = True
             self._cancel.set()
-            thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            workers = [worker for worker in self._workers if worker is not threading.current_thread()]
+        for worker in workers:
+            worker.join()
 
-    def _run(self, entry: TTSBundleEntry) -> None:
+    def _run(self, entry: TTSBundleEntry, generation: int) -> None:
         try:
-            self._set_state("running", "准备安装", 0)
+            self._set_state("running", "准备安装", 0, generation=generation)
             result = self._installer(
                 entry,
                 self._user_root,
                 check_cancel=self._check_cancel,
-                on_progress=lambda progress: self._set_progress(progress),
-                on_status=lambda status: self._set_stage(status),
-                on_download_progress=self._set_download_progress,
+                on_progress=lambda progress: self._set_progress(progress, generation),
+                on_status=lambda status: self._set_stage(status, generation),
+                on_download_progress=lambda progress: self._set_download_progress(progress, generation),
             )
             patch: dict[str, object] = {"workDir": user_facing_path(result.work_dir)}
             if result.python_path is not None:
                 patch["pythonPath"] = user_facing_path(result.python_path)
             if result.tts_config_path is not None:
                 patch["ttsConfigPath"] = user_facing_path(result.tts_config_path)
+            if not self._is_current(generation):
+                return
             self._config_update(patch)
-            self._set_state("succeeded", "安装完成", 100)
+            self._set_state("succeeded", "安装完成", 100, generation=generation)
         except DownloadCancelledError:
-            self._set_state("cancelled", "已取消", None)
+            self._set_state("cancelled", "已取消", None, generation=generation)
         except Exception:
-            self._set_state("failed", "安装失败", None)
+            self._set_state("failed", "安装失败", None, generation=generation)
+
+    def _is_current(self, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation
 
     def _check_cancel(self) -> None:
         if self._cancel.is_set():
             raise DownloadCancelledError()
 
-    def _set_state(self, state: str, stage: str, progress: int | None) -> None:
+    def _set_state(
+        self,
+        state: str,
+        stage: str,
+        progress: int | None,
+        generation: int | None = None,
+    ) -> None:
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             self._state = state
             self._stage = stage[:240]
             self._progress = progress
+            if state in {"failed", "cancelled", "succeeded"}:
+                self._active = False
 
-    def _set_stage(self, stage: str) -> None:
+    def _set_stage(self, stage: str, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             self._state = "running"
             self._stage = str(stage)[:240]
 
-    def _set_progress(self, progress: int) -> None:
+    def _set_progress(self, progress: int, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             self._state = "running"
             self._progress = max(0, min(100, int(progress)))
 
-    def _set_download_progress(self, progress: TTSBundleDownloadProgress) -> None:
+    def _set_download_progress(self, progress: TTSBundleDownloadProgress, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             self._state = "running"
             self._downloaded = max(0, int(progress.downloaded_bytes))
             self._total = max(0, int(progress.total_bytes))
