@@ -36,14 +36,12 @@ class ProviderSettingsBoundary:
         generation_credential: str,
         app_root: Path,
         *,
-        app_version: str | None = None,
         plugin_application_provider: Callable[[], object | None] | None = None,
         runtime_apply: Callable[[], None] | None = None,
     ) -> None:
         self._generation_id = generation_id
         self._generation_credential = generation_credential
         self._repository = ProviderModelSettingsRepository(app_root)
-        self._app_version = app_version
         self._plugin_application_provider = plugin_application_provider
         self._runtime_apply = runtime_apply
         self._lock = threading.Lock()
@@ -525,7 +523,6 @@ class ProviderSettingsBoundary:
                     model=model,
                     timeout_seconds=timeout,
                 ),
-                app_version=self._app_version,
                 retry_requests=False,
             )
             # Core stdout is reserved for framed protocol bytes.  The shared

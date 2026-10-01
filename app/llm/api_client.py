@@ -11,11 +11,9 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import urlparse, urlunparse
 
-from app.config.app_version import read_app_version
 from app.core.cancellation import CancelChecker, OperationCancelled, cancellable_sleep, check_cancelled
 from app.core_host.runtime_logging import submit_telemetry_model_call
 from app.core.http_client import read_url_cancellable, urlopen_direct_for_loopback
@@ -114,7 +112,6 @@ class OpenAICompatibleClient:
         settings: ApiSettings,
         *,
         agent_trace_recorder: AgentTraceRecorder | None = None,
-        app_version: str | None = None,
         retry_requests: bool = True,
         request_attempts: int | None = None,
     ) -> None:
@@ -126,8 +123,6 @@ class OpenAICompatibleClient:
         self._compatibility_attempts = (
             self._request_attempts if request_attempts is not None else MAX_AUTO_RETRY_ATTEMPTS
         )
-        resolved_version = app_version or read_app_version(Path(__file__).resolve().parents[2])
-        self._app_version = resolved_version.strip().removeprefix("v")
         self._unsupported_chat_params: set[str] = set()
         self._runtime_context_role = "system"
         # 可选事件发射器（由宿主注入），用于派发 llm.request.* 插件事件。
@@ -790,11 +785,9 @@ class OpenAICompatibleClient:
             raise ApiConfigError("缺少 BASE_URL。")
 
     def _request_headers(self, *, json_content: bool = False) -> dict[str, str]:
-        if not self._app_version:
-            raise ApiConfigError("无法读取 Sakura 版本号。")
         headers = {
             "Authorization": f"Bearer {self.settings.api_key}",
-            "User-Agent": f"Sakura/{self._app_version}",
+            "User-Agent": "Sakura",
         }
         if json_content:
             headers["Content-Type"] = "application/json"

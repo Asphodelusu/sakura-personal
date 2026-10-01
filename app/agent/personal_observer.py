@@ -325,7 +325,6 @@ def open_evaluation_client(
     return OpenAICompatibleClient(
         settings,
         agent_trace_recorder=trace_recorder,
-        app_version=getattr(source, "_app_version", None),
         request_attempts=1,
     )
 
