@@ -25,6 +25,7 @@ test("the custom product menu uses the existing Rust action IDs", () => {
     history: "sakura.history.open",
     runtimeLog: "sakura.runtime-log.open",
     settings: "sakura.settings.open",
+    restart: "sakura.app.restart",
     exit: "sakura.app.exit",
   });
 });

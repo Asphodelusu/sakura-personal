@@ -5,6 +5,7 @@ export const PRODUCT_MENU_ACTIONS = Object.freeze({
   history: "sakura.history.open",
   runtimeLog: "sakura.runtime-log.open",
   settings: "sakura.settings.open",
+  restart: "sakura.app.restart",
   exit: "sakura.app.exit",
 });
 

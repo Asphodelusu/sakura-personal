@@ -7838,6 +7838,12 @@ fn handle_product_menu_action(
             result
         }
         product_shell::ProductMenuAction::ExitApp => {
+            app.state::<product_shell::ProductShellState>().cancel_restart();
+            let lifecycle = app.state::<ShellLifecycleState>();
+            request_app_exit(app, &lifecycle)
+        }
+        product_shell::ProductMenuAction::RestartApp => {
+            app.state::<product_shell::ProductShellState>().request_restart();
             let lifecycle = app.state::<ShellLifecycleState>();
             request_app_exit(app, &lifecycle)
         }
@@ -7899,11 +7905,22 @@ fn finish_app_exit(
         handle.request_shutdown().map_err(str::to_string)?;
     }
     app_handle.state::<Arc<capture::CaptureManager>>().observer_sources.shutdown();
-    app_handle.exit(0);
+    app_handle.exit(app_handle.state::<product_shell::ProductShellState>().app_exit_code());
     Ok(())
 }
 
 fn request_app_exit(
+    app_handle: &tauri::AppHandle,
+    lifecycle: &ShellLifecycleState,
+) -> Result<(), String> {
+    let result = request_app_exit_inner(app_handle, lifecycle);
+    if result.is_err() {
+        app_handle.state::<product_shell::ProductShellState>().cancel_restart();
+    }
+    result
+}
+
+fn request_app_exit_inner(
     app_handle: &tauri::AppHandle,
     lifecycle: &ShellLifecycleState,
 ) -> Result<(), String> {
@@ -7963,7 +7980,7 @@ fn request_app_exit(
         return Ok(());
     };
     if let Err(error) = settings.emit(product_shell::SETTINGS_EXIT_REQUESTED_EVENT, revision) {
-        let _ = state.resolve_exit();
+        let _ = state.resolve_exit(false);
         return Err(error.to_string());
     }
 
@@ -7986,7 +8003,7 @@ fn request_app_exit(
             });
         })
         .map_err(|error| {
-            let _ = state.resolve_exit();
+            let _ = state.resolve_exit(false);
             format!("failed to start bounded settings exit wait: {error}")
         })?;
     Ok(())
@@ -8005,7 +8022,7 @@ fn resolve_settings_exit(
         return Err("SETTINGS_WINDOW_REQUIRED".to_string());
     }
     shell.acknowledge_exit(revision)?;
-    if !shell.resolve_exit()? {
+    if !shell.resolve_exit(discard)? {
         return Ok(());
     }
     if !discard {
@@ -8015,14 +8032,18 @@ fn resolve_settings_exit(
     shell.authorize_close()?;
     if let Err(error) = window.destroy() {
         let _ = shell.cancel_close();
+        shell.cancel_restart();
         return Err(error.to_string());
     }
     if let Some(handle) = &lifecycle.handle {
         app_handle.state::<asr::AsrState>().shutdown();
-        handle.request_shutdown().map_err(str::to_string)?;
+        handle.request_shutdown().map_err(|error| {
+            shell.cancel_restart();
+            error.to_string()
+        })?;
     }
     shell.authorize_app_exit()?;
-    app_handle.exit(0);
+    app_handle.exit(shell.app_exit_code());
     Ok(())
 }
 
@@ -8831,6 +8852,7 @@ fn main() {
     ));
     telemetry.submit_app_ready();
 
+    let restart_env = app.env();
     let exit_code = app.run_return(move |app_handle, event| match event {
         tauri::RunEvent::Exit => {
             app_handle.state::<asr::AsrState>().shutdown();
@@ -8875,6 +8897,20 @@ fn main() {
     }
     telemetry.shutdown();
     runtime_log_shutdown.finish();
+    if exit_code == product_shell::APP_RESTART_EXIT_CODE {
+        // Child generations and log writers have stopped; the replacement may now own the lock.
+        drop(_instance_guard);
+        let restarted = tauri::process::current_binary(&restart_env).and_then(|path| {
+            std::process::Command::new(path)
+                .args(restart_env.args_os.iter().skip(1))
+                .spawn()
+        });
+        if let Err(error) = restarted {
+            show_startup_message("Sakura 重启失败", &format!("请重新打开 Sakura。{error}"), true);
+            std::process::exit(1);
+        }
+        return;
+    }
     if exit_code != 0 {
         std::process::exit(exit_code);
     }

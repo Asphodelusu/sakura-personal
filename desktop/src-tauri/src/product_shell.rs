@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -29,6 +30,9 @@ const MENU_OPEN_HISTORY: &str = "sakura.history.open";
 const MENU_OPEN_RUNTIME_LOG: &str = "sakura.runtime-log.open";
 const MENU_OPEN_SETTINGS: &str = "sakura.settings.open";
 const MENU_EXIT_APP: &str = "sakura.app.exit";
+const MENU_RESTART_APP: &str = "sakura.app.restart";
+// Distinct from Tauri's immediate-relaunch sentinel: main must finish Core cleanup first.
+pub const APP_RESTART_EXIT_CODE: i32 = 75;
 const PRODUCT_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
 const PRODUCT_MENU_UNAVAILABLE_REASON: &str = "此功能暂不可用";
 const FIRST_RUN_GUIDE_NAMESPACE: &str = "FIRST_RUN_GUIDE";
@@ -42,6 +46,7 @@ pub enum ProductMenuAction {
     OpenHistory,
     OpenRuntimeLog,
     OpenSettings,
+    RestartApp,
     ExitApp,
 }
 
@@ -54,6 +59,7 @@ impl ProductMenuAction {
             MENU_OPEN_HISTORY => Some(Self::OpenHistory),
             MENU_OPEN_RUNTIME_LOG => Some(Self::OpenRuntimeLog),
             MENU_OPEN_SETTINGS => Some(Self::OpenSettings),
+            MENU_RESTART_APP => Some(Self::RestartApp),
             MENU_EXIT_APP => Some(Self::ExitApp),
             _ => None,
         }
@@ -89,6 +95,7 @@ pub fn product_menu_capability_manifest(
             MENU_OPEN_HISTORY,
             MENU_OPEN_RUNTIME_LOG,
             MENU_OPEN_SETTINGS,
+            MENU_RESTART_APP,
             MENU_EXIT_APP,
         ]
         .into_iter()
@@ -298,9 +305,22 @@ struct SettingsWindowSession {
 pub struct ProductShellState {
     settings: Mutex<SettingsWindowSession>,
     tray_visibility: Mutex<Option<MenuItem<tauri::Wry>>>,
+    restart_requested: AtomicBool,
 }
 
 impl ProductShellState {
+    pub fn request_restart(&self) {
+        self.restart_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancel_restart(&self) {
+        self.restart_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn app_exit_code(&self) -> i32 {
+        if self.restart_requested.load(Ordering::SeqCst) { APP_RESTART_EXIT_CODE } else { 0 }
+    }
+
     fn install_tray_visibility(&self, item: MenuItem<tauri::Wry>) -> Result<(), String> {
         let mut visibility = self
             .tray_visibility
@@ -436,16 +456,20 @@ impl ProductShellState {
             return Ok(false);
         }
         session.exit_pending = false;
+        self.cancel_restart();
         Ok(true)
     }
 
-    pub fn resolve_exit(&self) -> Result<bool, String> {
+    pub fn resolve_exit(&self, proceed: bool) -> Result<bool, String> {
         let mut session = self
             .settings
             .lock()
             .map_err(|_| "settings window state is unavailable".to_string())?;
         let pending = session.exit_pending;
         session.exit_pending = false;
+        if pending && !proceed {
+            self.cancel_restart();
+        }
         Ok(pending)
     }
 
@@ -508,6 +532,8 @@ pub fn install_product_tray(app: &App, pet_visible: bool) -> Result<(), String> 
             .map_err(|error| error.to_string())?;
     let exit = MenuItem::with_id(app, MENU_EXIT_APP, "退出", true, None::<&str>)
         .map_err(|error| error.to_string())?;
+    let restart = MenuItem::with_id(app, MENU_RESTART_APP, "重启 Sakura", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
     let first_separator = PredefinedMenuItem::separator(app).map_err(|error| error.to_string())?;
     let second_separator = PredefinedMenuItem::separator(app).map_err(|error| error.to_string())?;
     let menu = Menu::with_items(
@@ -519,6 +545,7 @@ pub fn install_product_tray(app: &App, pet_visible: bool) -> Result<(), String> 
             &runtime_log,
             &settings,
             &second_separator,
+            &restart,
             &exit,
         ],
     )
@@ -1130,6 +1157,7 @@ mod tests {
                 MENU_OPEN_HISTORY,
                 MENU_OPEN_RUNTIME_LOG,
                 MENU_OPEN_SETTINGS,
+                MENU_RESTART_APP,
                 MENU_EXIT_APP
             ]
         );
@@ -1317,11 +1345,44 @@ mod tests {
         let state = ProductShellState::default();
         assert!(state.begin_exit().unwrap().is_some());
         assert!(state.begin_exit().unwrap().is_none());
-        assert!(state.resolve_exit().unwrap());
-        assert!(!state.resolve_exit().unwrap());
+        assert!(state.resolve_exit(false).unwrap());
+        assert!(!state.resolve_exit(false).unwrap());
         state.authorize_app_exit().unwrap();
         assert!(state.consume_app_exit_authorization().unwrap());
         assert!(!state.consume_app_exit_authorization().unwrap());
+    }
+
+    #[test]
+    fn restart_confirmation_cancel_and_timeout_preserve_the_running_app() {
+        let state = ProductShellState::default();
+        state.request_restart();
+        let first = state.begin_exit().unwrap().unwrap();
+        assert!(state.begin_exit().unwrap().is_none());
+        state.acknowledge_exit(first).unwrap();
+        assert!(!state.cancel_unanswered_exit(first).unwrap());
+        assert_eq!(state.app_exit_code(), APP_RESTART_EXIT_CODE);
+        assert!(state.resolve_exit(false).unwrap());
+        assert_eq!(state.app_exit_code(), 0);
+
+        state.request_restart();
+        let second = state.begin_exit().unwrap().unwrap();
+        assert!(!state.cancel_unanswered_exit(first).unwrap());
+        assert_eq!(state.app_exit_code(), APP_RESTART_EXIT_CODE);
+        assert!(state.cancel_unanswered_exit(second).unwrap());
+        assert_eq!(state.app_exit_code(), 0);
+    }
+
+    #[test]
+    fn confirmed_restart_survives_window_cleanup_but_plain_exit_overrides_it() {
+        let state = ProductShellState::default();
+        state.request_restart();
+        let revision = state.begin_exit().unwrap().unwrap();
+        state.acknowledge_exit(revision).unwrap();
+        assert!(state.resolve_exit(true).unwrap());
+        state.window_destroyed().unwrap();
+        assert_eq!(state.app_exit_code(), APP_RESTART_EXIT_CODE);
+        state.cancel_restart();
+        assert_eq!(state.app_exit_code(), 0);
     }
 
     #[test]
@@ -1340,13 +1401,13 @@ mod tests {
         let first = state.begin_exit().unwrap().unwrap();
         state.acknowledge_exit(first).unwrap();
         assert!(!state.cancel_unanswered_exit(first).unwrap());
-        assert!(state.resolve_exit().unwrap());
+        assert!(state.resolve_exit(false).unwrap());
 
         let second = state.begin_exit().unwrap().unwrap();
         assert!(!state.cancel_unanswered_exit(first).unwrap());
         assert!(state.acknowledge_exit(first).is_err());
         assert!(state.cancel_unanswered_exit(second).unwrap());
-        assert!(!state.resolve_exit().unwrap());
+        assert!(!state.resolve_exit(false).unwrap());
         assert!(state.acknowledge_exit(second).is_err());
     }
 
