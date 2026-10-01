@@ -1557,3 +1557,59 @@ def test_fixed_model_snapshot_checks_sizes_without_reading_weights(tmp_path: Pat
     with pytest.raises(memory_module.MemoryModelImportError) as raised:
         memory_module._validate_fastembed_snapshot_artifacts(snapshot)
     assert raised.value.code == "DOWNLOAD_SIZE_MISMATCH"
+
+
+def test_migrated_curation_selection_reaches_http(tmp_path, monkeypatch):
+    from app.agent.tools import ToolRegistry
+    from app.legacy_import.configuration import migrate_configuration
+    from app.storage.runtime_roots import RuntimeRoots
+    from app.core_host.plugin_runtime_application import PluginRuntimeApplication, _HostServiceAdapter
+    from app.plugins.host_services import HOST_MODEL_SLOTS_SERVICE
+    from test_personal_curation_model_config import _source, _plugin
+
+    source, root = _source(tmp_path, curation={"profile_id": "text", "model": "small-curator"})
+    migrate_configuration(source, root, new_tts_root=tmp_path / "tts")
+    config = _plugin(root)
+    config["triggerTurns"] = 1
+    app = PluginRuntimeApplication(RuntimeRoots(tmp_path / "distribution", root), "a" * 32, ToolRegistry(), [])
+    slots = _HostServiceAdapter(app._host_services, HOST_MODEL_SLOTS_SERVICE)
+    selections, captured = [], []
+    completed = threading.Event()
+
+    def resolve(selection):
+        selections.append(dict(selection))
+        return slots.resolve(selection)
+
+    def fake_urlopen(request, timeout):
+        captured.append((request.full_url, request.get_header("Authorization"), json.loads(request.data), timeout))
+        return io.BytesIO(json.dumps({"choices": [{"message": {"content": '{"operations": []}'}}]}).encode())
+
+    monkeypatch.setattr("plugins.builtin.sakura_mem0.api_client.urlopen_current_proxy", fake_urlopen)
+    boundary = MemoryBoundary(root, "sakura", memory_store=FakeMemoryStore(),
+        curation_config_getter=lambda: config, model_catalog_getter=slots.catalog, model_resolver=resolve)
+    timeline = _timeline(root)
+    mark_processed = boundary._curation_state.mark_timeline_processed
+
+    def mark_and_signal(cursor):
+        mark_processed(cursor)
+        completed.set()
+
+    monkeypatch.setattr(boundary._curation_state, "mark_timeline_processed", mark_and_signal)
+    try:
+        boundary.note_timeline_changed(timeline)
+        assert completed.wait(3), "curation did not commit its cursor"
+        assert selections == [{"profileId": "text", "model": "small-curator"}]
+        assert len(captured) == 1
+        url, auth, body, timeout = captured[0]
+        assert url == "https://example.invalid/v1/chat/completions"
+        assert auth == "Bearer k2"
+        assert body["model"] == "small-curator"
+        assert body["temperature"] == 0.2
+        assert body["response_format"] == {"type": "json_object"}
+        assert body["max_tokens"] == 2000
+        assert body["messages"][0]["role"] == "system"
+        assert "请记住樱花 0" in body["messages"][1]["content"]
+        assert boundary._curation_state.curation_cursor() == timeline.store.latest_cursor("sakura")
+    finally:
+        boundary.close()
+        app.close()

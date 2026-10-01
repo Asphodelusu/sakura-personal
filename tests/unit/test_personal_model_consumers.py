@@ -183,3 +183,57 @@ def test_malformed_fast_slot_does_not_use_chat_fallback(tmp_path):
         assert readiness.session.runtime._initiative_client is None
     finally:
         adapter.close()
+
+
+def test_user_turn_inner_thought_reaches_http_and_main_prompt(tmp_path, monkeypatch):
+    from app.core import runtime_log
+    from app.core_host.real_chat import RealChatBoundary
+    from app.storage.timeline import TimelineStore
+
+    root = _root(tmp_path)
+    marker = "雨なら傘を持てばいい。INNER_HTTP_CAPTURE"
+    calls, events = [], []
+    monkeypatch.setattr(runtime_log, "_EXTERNAL_SINK", None)
+    monkeypatch.setattr(runtime_log, "_load_debug_values", lambda: {"enabled": False})
+
+    def fake_post(self, payload, *, cancel_checker=None):
+        body = json.loads(json.dumps(payload, ensure_ascii=False))
+        calls.append({"body": body, "window": self.settings.context_window_tokens})
+        if body["model"] == "thought-model":
+            content = "interest: mid\n" + marker
+        elif body["model"] == "chat-model":
+            content = REPLY
+        else:
+            raise AssertionError(f"unexpected model: {body['model']}")
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(OpenAICompatibleClient, "_post_chat_completions", fake_post)
+    adapter = AssistantAdapter(root, tool_registry=ToolRegistry(), mcp_provider=None)
+    boundary = None
+    try:
+        session = adapter.initialize(Event()).session
+        assert session is not None
+        timeline = TimelineStore(tmp_path / "inner-evidence.sqlite3")
+        timeline.initialize()
+        generation_id, credential = "00000000-0000-4000-8000-000000004108", "42" * 16
+        boundary = RealChatBoundary(generation_id, credential, root,
+            session_provider=lambda: session, timeline_store=timeline, event_publisher=events.append)
+        request = {"id": "inner-http", "kind": "request", "name": "chat.send",
+            "generationId": generation_id, "generationCredential": credential,
+            "payload": {"operationId": "inner-http", "message": "在吗"}}
+        boundary.reserve_send(request)
+        boundary.handle_send(request)
+        assert events[-1]["name"] == "chat.completed"
+        assert session.runtime._inner_thought.wait_until_idle(2)
+        assert [call["body"]["model"] for call in calls] == ["thought-model", "chat-model"]
+        thought, main = calls
+        assert thought["body"]["temperature"] == 0.9
+        assert thought["body"]["max_tokens"] == 180
+        assert "在吗" in thought["body"]["messages"][1]["content"]
+        assert thought["window"] == 12288  # Binding evidence, not prompt budget consumption.
+        assert marker in json.dumps(main["body"]["messages"], ensure_ascii=False)
+        assert marker not in json.dumps(events[-1]["payload"])
+    finally:
+        if boundary is not None:
+            boundary.close()
+        adapter.close()
