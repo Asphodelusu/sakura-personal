@@ -55,6 +55,7 @@ SUPPORTED_CHAT_COMPLETION_PARAMS = {
     "stream",
     "tools",
     "tool_choice",
+    "thinking",
 }
 
 

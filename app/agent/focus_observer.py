@@ -88,6 +88,11 @@ class FocusObserver:
     _last_busy_log_at: float = 0.0
     _last_diagnostic_key: tuple[str, str, str] = ("", "", "")
     _diagnostics: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=_DIAGNOSTIC_MEMORY))
+    _next_timer_at: float = 0.0
+    _content_quiet_until: float = 0.0
+    _perception_hold: bool = False
+    _perception_settled: bool = False
+    _held_triggers: list[str] = field(default_factory=list)
 
     def configure(
         self,
@@ -141,6 +146,11 @@ class FocusObserver:
         self._idle_armed = True
         self._away = False
         self._away_set_at = 0.0
+        self._next_timer_at = 0.0
+        self._content_quiet_until = 0.0
+        self._perception_hold = False
+        self._perception_settled = False
+        self._held_triggers = []
 
     def advance(
         self,
@@ -197,6 +207,7 @@ class FocusObserver:
             self._was_busy = False
             self._emit("busy_resume", process=current.label if current else "", trigger="", reason="idle")
         self._offered = list(triggers)
+        self._perception_settled = False
         return self._decision("capture", triggers[0], "ready", process=current.label if current else "")
 
     @property
@@ -220,15 +231,20 @@ class FocusObserver:
             self._away_set_at = 0.0
             self._emit("away", process=self._current.label if self._current else "", trigger="", reason="away_off")
 
-    def settle_attempt(self, outcome: str) -> None:
+    def settle_attempt(self, outcome: str, *, personal: bool = False) -> None:
         """Finish a capture offer. Abort keeps the trigger; failure does not count as an evaluation."""
         kind = str(outcome or "").strip()
         now = float(self.clock())
+        if personal and kind == "submitted":
+            self._accept_without_success(now)
+            return
         if kind == "aborted":
+            self._perception_hold = False
             self._offered = []
             self._emit("attempt_aborted", process=self._current.label if self._current else "", trigger="", reason="aborted")
             return
         if kind in {"spoke", "silent"}:
+            self._perception_hold = False
             self._emit("evaluation", process=self._current.label if self._current else "", trigger="", reason=kind)
             if kind == "spoke":
                 self._idle_armed = True
@@ -242,6 +258,98 @@ class FocusObserver:
 
     def diagnostics(self) -> tuple[dict[str, str], ...]:
         return tuple(self._diagnostics)
+
+    @property
+    def next_timer_at(self) -> float:
+        return self._next_timer_at
+
+    @property
+    def content_quiet_until(self) -> float:
+        return self._content_quiet_until
+
+    def focus_identity(self) -> tuple[str, str, str, bool]:
+        current = self._current
+        if current is None:
+            return self._scope, "", "", False
+        return self._scope, current.app_key, current.process, bool(current.own_process)
+
+    def offer_trigger(self) -> str:
+        raw = ""
+        if self._offered:
+            raw = self._offered[0]
+        elif self._held_triggers:
+            raw = self._held_triggers[0]
+        elif self._ready_trigger:
+            raw = self._ready_trigger
+        return raw.split(":", 1)[0]
+
+    def publish_perception(
+        self,
+        *,
+        scope: str,
+        app_key: str,
+        interval: float,
+        content_quiet: float,
+    ) -> bool:
+        """Arm adaptive timing only after validated perception for the same focus."""
+        current_key = self._current.app_key if self._current is not None else ""
+        if scope != self._scope or current_key != app_key:
+            return False
+        now = float(self.clock())
+        self._next_timer_at = now + float(interval)
+        if app_key:
+            self._window_eval_ok_at[app_key] = now + float(interval)
+        quiet_until = now + float(content_quiet)
+        if quiet_until > self._content_quiet_until:
+            self._content_quiet_until = quiet_until
+        self._perception_hold = False
+        self._perception_settled = True
+        self._last_eval_at = now
+        return True
+
+    def release_perception_hold(self) -> None:
+        self._perception_hold = False
+        self._perception_settled = True
+
+    def note_personal_evaluation(
+        self,
+        *,
+        outcome: str,
+        stage: str,
+        elapsed_ms: int,
+        trigger: str,
+        process: str,
+    ) -> None:
+        record = {
+            "kind": "personal_evaluation",
+            "process": process,
+            "trigger": trigger.split(":", 1)[0],
+            "reason": outcome,
+            "stage": stage,
+            "elapsed_ms": str(int(elapsed_ms)),
+        }
+        self._diagnostics.append(record)
+        _append_diagnostic(self.diagnostics_path, record)
+
+    def _accept_without_success(self, now: float) -> None:
+        offered = list(self._offered)
+        if not offered and self._ready_trigger:
+            offered = [self._ready_trigger]
+        self._held_triggers = offered
+        self._offered = []
+        if any(trigger.startswith("window") for trigger in offered):
+            self._ready_trigger = ""
+        if any(trigger == "idle" or trigger.startswith("idle") for trigger in offered):
+            self._idle_armed = False
+        self._last_eval_at = now
+        if not self._perception_settled:
+            self._perception_hold = True
+        self._emit(
+            "evaluation",
+            process=self._current.label if self._current else "",
+            trigger=offered[0].split(":", 1)[0] if offered else "",
+            reason="accepted",
+        )
 
     def _decision(self, action: str, trigger: str, reason: str, *, process: str = "") -> dict[str, str]:
         if action == "capture" or reason in {"privacy", "disabled"}:
@@ -364,6 +472,8 @@ class FocusObserver:
                 return []
         if silence:
             return []
+        if self._perception_hold:
+            return []
         if idle_seconds < self.idle_threshold_seconds:
             self._idle_armed = True
         triggers: list[str] = []
@@ -382,8 +492,12 @@ class FocusObserver:
         if throttle and triggers:
             return triggers
         if not cooldown and self._settled_at == 0 and not self._ready_trigger:
-            last_timer = now if self._last_timer_check is None else self._last_timer_check
-            if now >= last_timer + self.timer_seconds:
+            if self._next_timer_at > 0:
+                due = now >= self._next_timer_at
+            else:
+                last_timer = now if self._last_timer_check is None else self._last_timer_check
+                due = now >= last_timer + self.timer_seconds
+            if due:
                 triggers.append("timer")
         if (
             not triggers

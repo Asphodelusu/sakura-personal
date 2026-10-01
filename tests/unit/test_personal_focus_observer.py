@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.agent.focus_observer import FocusGate, FocusObserver, FocusSnapshot
 from app.agent.runtime import AgentRuntime
 from app.config.relationship_initiative import RelationshipInitiativeSettings
@@ -321,3 +323,66 @@ def test_runtime_advance_uses_the_screen_gate_and_boundary(tmp_path: Path) -> No
     })
     assert response["payload"]["action"] in {"wait", "capture", "hold"}
     assert "title" not in response["payload"]
+
+
+def test_personal_acceptance_waits_for_perception_before_arming_timing() -> None:
+    clock = Clock()
+    item = observer(clock, timer=100)
+    item.advance(snap(1, "editor.exe"), scope="a", gate=gate())
+    clock.now = 100
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == "timer"
+    item.settle_attempt("submitted", personal=True)
+    clock.now = 101
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == ""
+    assert item.next_timer_at == 0
+    assert item.publish_perception(scope="a", app_key="editor.exe|1", interval=600, content_quiet=600)
+    assert item.next_timer_at == 701
+    assert item.content_quiet_until == 701
+    clock.now = 200
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == ""
+    clock.now = 701
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == "timer"
+    assert item.next_timer_at == 701
+    assert not item.publish_perception(scope="other", app_key="editor.exe|1", interval=10, content_quiet=10)
+    assert item.next_timer_at == 701
+
+
+def test_personal_idle_stays_one_shot_and_new_focus_bypasses_cooldown() -> None:
+    clock = Clock()
+    item = observer(clock, timer=10_000)
+    item.advance(snap(1, "editor.exe"), scope="a", gate=gate())
+    clock.now = 30
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=FocusGate(enabled=True, idle_seconds=600))["trigger"] == "idle"
+    item.settle_attempt("submitted", personal=True)
+    clock.now = 31
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=FocusGate(enabled=True, idle_seconds=600))["trigger"] == ""
+    item.release_perception_hold()
+    clock.now = 40
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=FocusGate(enabled=True, cooldown=True, idle_seconds=600))["trigger"] == ""
+
+    clock.now = 100
+    item.advance(snap(2, "browser.exe"), scope="a", gate=gate())
+    clock.now = 120
+    assert item.advance(snap(2, "browser.exe"), scope="a", gate=gate())["trigger"] == "window"
+    assert item.publish_perception(scope="a", app_key="browser.exe|2", interval=600, content_quiet=600)
+    clock.now = 121
+    item.advance(snap(3, "notes.exe"), scope="a", gate=FocusGate(enabled=True, cooldown=True))
+    clock.now = 190
+    assert item.advance(snap(3, "notes.exe"), scope="a", gate=FocusGate(enabled=True, cooldown=True))["trigger"] == "window"
+
+
+@pytest.mark.parametrize("accepted_first", [True, False])
+def test_failed_perception_cannot_be_held_again_by_late_acceptance(accepted_first) -> None:
+    clock = Clock()
+    item = observer(clock, timer=100)
+    item.advance(snap(1, "editor.exe"), scope="a", gate=gate())
+    clock.now = 100
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == "timer"
+    if accepted_first:
+        item.settle_attempt("submitted", personal=True)
+    item.release_perception_hold()
+    if not accepted_first:
+        item.settle_attempt("submitted", personal=True)
+    assert item.next_timer_at == 0
+    clock.now = 500
+    assert item.advance(snap(1, "editor.exe"), scope="a", gate=gate())["trigger"] == "timer"

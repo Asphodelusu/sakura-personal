@@ -171,6 +171,9 @@ class AgentRuntime:
 
         self._focus_observer = FocusObserver()
         self._focus_diagnostics_path: Path | None = None
+        from app.agent.sensory_impression import SensoryImpressionStore
+
+        self._sensory = SensoryImpressionStore()
 
     @property
     def context_orchestrator(self) -> ContextOrchestrator:
@@ -249,6 +252,7 @@ class AgentRuntime:
         )
 
     def close(self) -> None:
+        self._sensory.clear()
         self._inner_thought.close()
         self._relationship.close()
 
@@ -337,13 +341,17 @@ class AgentRuntime:
         """Real user text: clear leave first, then this message may start it again."""
         from app.agent.away import message_implies_away
 
+        self._sensory.note_user_fact()
         self.note_initiative_user_turn()
         if message_implies_away(text):
             self._focus_observer.set_away_mode(True)
+            self._sensory.clear()
 
     def set_screen_away(self, enabled: bool) -> None:
         """Explicit leave. Input idle does not enter or leave this state."""
         self._focus_observer.set_away_mode(bool(enabled))
+        if enabled:
+            self._sensory.clear()
 
     def configure_screen_initiative(
         self,
@@ -473,7 +481,7 @@ class AgentRuntime:
         )
 
     def settle_focus_attempt(self, outcome: str) -> None:
-        self._focus_observer.settle_attempt(outcome)
+        self._focus_observer.settle_attempt(outcome, personal=bool(self._personal_style))
 
     def settle_screen_observation(self, *, spoke: bool, relationship_motive: bool) -> None:
         if spoke:
@@ -625,6 +633,7 @@ class AgentRuntime:
             system_prompt=self.system_prompt,
             appraisal_sink=self._relationship.accept_appraisal,
             mood_provider=self.continuity_mood,
+            impression_provider=self._sensory.get_for_chat,
         )
 
     def start_inner_thought(
@@ -724,6 +733,9 @@ class AgentRuntime:
         lore = self._lore_fragment(request)
         if lore is not None:
             fragments.append(lore)
+        impression = self._impression_fragment(request)
+        if impression is not None:
+            fragments.append(impression)
         media = self._media_fragment(request)
         if media is not None:
             fragments.append(media)
@@ -745,6 +757,24 @@ class AgentRuntime:
             if message.role in {"user", "assistant"} and message.content.strip()
         ]
         return build_lore_context_fragment(current_input, self._lore_index, history=history)
+
+    def _impression_fragment(self, request: ContextRequest) -> ContextFragment | None:
+        if getattr(request, "source", "chat") != "chat" or getattr(request, "mode", "normal") != "normal":
+            return None
+        block = self._sensory.format_chat_block()
+        if not block:
+            return None
+        return ContextFragment(
+            fragment_id="sensory_impression",
+            source="sensory_impression",
+            content=block,
+            trust="untrusted",
+            priority=40,
+            token_budget=220,
+            sensitivity="private",
+            cache_scope="turn",
+            required=False,
+        )
 
     def _media_fragment(self, request: ContextRequest) -> ContextFragment | None:
         if getattr(request, "source", "chat") != "chat" or getattr(request, "mode", "normal") != "normal":
@@ -1185,6 +1215,8 @@ class AgentRuntime:
             },
         )
         personal_screen = bool(screen_awareness_mode and self._personal_style)
+        if personal_screen:
+            return self._run_personal_screen(messages, cancel_checker=cancel_checker)
         return self._run_tool_loop(
             _annotate_initial_trace_messages(messages),
             allow_screen_observation=allow_screen_observation,
@@ -1198,6 +1230,333 @@ class AgentRuntime:
             progress_callback=progress_callback,
             cancel_checker=cancel_checker,
         )
+
+    def _run_personal_screen(
+        self,
+        messages: list[ChatMessage],
+        *,
+        cancel_checker: CancelChecker | None,
+    ) -> AgentResult:
+        """Vision packet, then one text-only fast decision. Repair is the only extra call."""
+        from app.agent.personal_observer import (
+            FAST_DECISION_MAX_TOKENS,
+            FAST_DECISION_TEMPERATURE,
+            content_quiet_for,
+            decision_system,
+            decision_user_text,
+            image_parts,
+            open_evaluation_client,
+            parse_perception,
+            parse_speech_decision,
+            perception_system,
+            vision_user_text,
+        )
+        from app.llm.chat_reply import ChatReply
+
+        started = time.perf_counter()
+        scope, app_key, process, _own = self._focus_observer.focus_identity()
+        frozen = (scope, app_key)
+        trigger = self._focus_observer.offer_trigger()
+        attempt = self._initiative.begin_attempt()
+        published = False
+        stage = "preflight"
+
+        def owned() -> str:
+            try:
+                check_cancelled(cancel_checker)
+            except OperationCancelled:
+                return "cancelled"
+            if not self._initiative.is_current(attempt):
+                return "stale"
+            current_scope, current_key, _process, own_process = self._focus_observer.focus_identity()
+            if own_process or (current_scope, current_key) != frozen:
+                return "stale"
+            return "ok"
+
+        def finish(outcome: str, reply: ChatReply | None = None, visual: dict[str, Any] | None = None) -> AgentResult:
+            if outcome == "stale":
+                reply = None
+                visual = None
+            elapsed = int((time.perf_counter() - started) * 1000)
+            self._focus_observer.note_personal_evaluation(
+                outcome=outcome,
+                stage=stage,
+                elapsed_ms=elapsed,
+                trigger=trigger,
+                process=process,
+            )
+            log_event(
+                "PersonalObserver",
+                "个人屏幕评估",
+                {
+                    "outcome": outcome,
+                    "stage": stage,
+                    "elapsed_ms": elapsed,
+                    "trigger": trigger,
+                    "process": process,
+                },
+            )
+            if not published:
+                self._focus_observer.release_perception_hold()
+            return AgentResult(reply=reply or ChatReply([]), visual_observation=visual)
+
+        try:
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok":
+                return finish("stale")
+            config = self._personal_proactive_config()
+            images = image_parts(messages)
+            vision = self._vision_api_client
+            if not isinstance(vision, OpenAICompatibleClient) or not images:
+                stage = "vision"
+                return finish("silent")
+            low = float(config.get("adaptive_interval_min", 300.0))
+            high = float(config.get("adaptive_interval_max", 1800.0))
+            timer_seconds = float(config.get("timer_seconds", 480.0))
+            timeout_seconds = float(config.get("request_timeout", 60.0))
+            temperature = float(config.get("eval_temperature", 0.7))
+            max_tokens = int(config.get("max_tokens", 1024))
+            try:
+                idle_s = max(0, int(self._initiative.current_idle_seconds()))
+            except Exception:  # noqa: BLE001 - a missing idle clock only omits the thin field
+                idle_s = 0
+            stage = "vision"
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok":
+                return finish("stale")
+            vision_client = open_evaluation_client(
+                vision,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_recorder=self.agent_trace_recorder,
+            )
+            vision_messages: list[ChatMessage] = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": vision_user_text(
+                                process_name=process,
+                                trigger=trigger,
+                                idle_s=idle_s,
+                                impression=self._sensory.get_for_observer(),
+                            ),
+                        },
+                        *images,
+                    ],
+                }
+            ]
+            try:
+                vision_turn = vision_client.complete_with_tools(
+                    perception_system(self.system_prompt),
+                    vision_messages,
+                    tools=[],
+                    tool_choice="none",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking={"type": "disabled"},
+                    structured_response=True,
+                    trace_metadata=self._personal_trace(
+                        vision_client, vision_messages, "personal_screen_perception"
+                    ),
+                    cancel_checker=cancel_checker,
+                )
+            except OperationCancelled:
+                raise
+            except ApiRequestError:
+                return finish("silent")
+            packet = parse_perception(
+                str(getattr(vision_turn, "content", "") or ""),
+                low=low,
+                high=high,
+                timer_seconds=timer_seconds,
+            )
+            if packet is None:
+                return finish("silent")
+            packet = replace(
+                packet,
+                process_name=process,
+                triggers=(trigger,) if trigger else (),
+                idle_s=idle_s,
+            )
+            stage = "perception"
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok" or packet.suggested_interval is None:
+                return finish("stale" if state != "ok" else "silent")
+            published = self._focus_observer.publish_perception(
+                scope=scope,
+                app_key=app_key,
+                interval=float(packet.suggested_interval),
+                content_quiet=content_quiet_for(float(packet.suggested_interval), config),
+            )
+            visual = {"summary": packet.visual_summary, "confidence": "medium"} if packet.visual_summary else None
+            if not published:
+                return finish("stale", visual=visual)
+            fast_source = self._initiative_client
+            if not isinstance(fast_source, OpenAICompatibleClient):
+                stage = "decision"
+                return finish("silent", visual=visual)
+            stage = "decision"
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok":
+                return finish("stale", visual=visual)
+            fast_client = open_evaluation_client(
+                fast_source,
+                timeout_seconds=timeout_seconds,
+                temperature=FAST_DECISION_TEMPERATURE,
+                max_tokens=FAST_DECISION_MAX_TOKENS,
+                trace_recorder=self.agent_trace_recorder,
+            )
+            user_text = decision_user_text(
+                packet,
+                messages,
+                impression=self._sensory.get_for_observer(),
+                chronology=self._sensory.chronology_evidence(),
+                relationship_motive=bool(self._intimacy.active and self._intimacy_guide),
+            )
+            decision_prompt = decision_system(self.system_prompt)
+            fast_messages: list[ChatMessage] = [{"role": "user", "content": user_text}]
+            try:
+                fast_turn = fast_client.complete_with_tools(
+                    decision_prompt,
+                    fast_messages,
+                    tools=[],
+                    tool_choice="none",
+                    temperature=FAST_DECISION_TEMPERATURE,
+                    max_tokens=FAST_DECISION_MAX_TOKENS,
+                    thinking={"type": "disabled"},
+                    structured_response=True,
+                    trace_metadata=self._personal_trace(
+                        fast_client, fast_messages, "personal_screen_decision"
+                    ),
+                    cancel_checker=cancel_checker,
+                )
+            except OperationCancelled:
+                raise
+            except ApiRequestError:
+                return finish("silent", visual=visual)
+            decision = parse_speech_decision(str(getattr(fast_turn, "content", "") or ""))
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok":
+                return finish("stale", visual=visual)
+            if decision is not None and decision.summary:
+                self._sensory.update(
+                    decision.summary,
+                    spoken=bool(decision.should_speak),
+                    window_hint=process,
+                )
+            if decision is None or not decision.accepted or not decision.should_speak:
+                return finish("silent", visual=visual)
+            raw_reply = json.dumps(
+                {
+                    "segments": [
+                        {
+                            "ja": decision.comment,
+                            "zh": decision.translation,
+                            "tone": decision.tone or "中性",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+            stage = "repair"
+            try:
+                reply = self._parse_final_reply_with_retry(
+                    decision_prompt,
+                    [traced_message({"role": "user", "content": user_text}, "observation_input")],
+                    raw_reply,
+                    cancel_checker=cancel_checker,
+                )
+            except OperationCancelled:
+                raise
+            except ApiRequestError:
+                return finish("silent", visual=visual)
+            state = owned()
+            if state == "cancelled":
+                raise OperationCancelled()
+            if state != "ok":
+                return finish("stale", visual=visual)
+            spoken = [
+                segment
+                for segment in reply.segments
+                if segment.text.strip() and segment.translation.strip()
+            ]
+            if not spoken:
+                return finish("silent", visual=visual)
+            stage = "decision"
+            return finish("speak", reply=reply, visual=visual)
+        except OperationCancelled:
+            self._focus_observer.release_perception_hold()
+            elapsed = int((time.perf_counter() - started) * 1000)
+            self._focus_observer.note_personal_evaluation(
+                outcome="cancelled",
+                stage=stage,
+                elapsed_ms=elapsed,
+                trigger=trigger,
+                process=process,
+            )
+            log_event(
+                "PersonalObserver",
+                "个人屏幕评估",
+                {
+                    "outcome": "cancelled",
+                    "stage": stage,
+                    "elapsed_ms": elapsed,
+                    "trigger": trigger,
+                    "process": process,
+                },
+            )
+            raise
+
+    def _personal_proactive_config(self) -> dict[str, Any]:
+        from app.perception.proactive_config import normalize_proactive_config_mapping
+
+        loader = getattr(self, "_screen_initiative_loader", None)
+        if callable(loader):
+            try:
+                loaded = loader()
+            except Exception:  # noqa: BLE001 - the bound loader already fails closed
+                loaded = ()
+            if isinstance(loaded, tuple) and len(loaded) > 3 and isinstance(loaded[3], Mapping):
+                return dict(loaded[3])
+        return normalize_proactive_config_mapping(None)
+
+    def _personal_trace(self, client: OpenAICompatibleClient, messages: list[ChatMessage], purpose: str) -> PromptTraceMetadata:
+        from app.agent.context_orchestrator import build_context_request
+
+        request = build_context_request(
+            messages,
+            source="event",
+            mode="screen_awareness",
+            event_type="personal_screen",
+            step_index=0,
+            remaining_steps=0,
+            available_tools=(),
+            character_id=self.character_id,
+            character_name=self.character_name,
+        )
+        snapshot = self.context_orchestrator.build_snapshot(
+            request,
+            providers=self.context_providers,
+            session_fragments=(),
+            messages=messages,
+            static_prompt="",
+            tools=(),
+            **_client_context_budget_settings(client),
+        )
+        return PromptTraceMetadata(purpose=purpose, snapshot=snapshot)
 
     def _run_tool_loop(
         self,

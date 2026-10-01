@@ -56,9 +56,9 @@ class InnerThoughtCoordinator:
         self._active: _Work | None = None
         self._worker: Thread | None = None
         self._appraisal_sink: AppraisalSink | None = None
-        self._incomplete_logged = False
         self._turn_interest: str | None = None
         self._mood_provider: Callable[[], str] | None = None
+        self._impression_provider: Callable[[], str] | None = None
 
     def configure(
         self,
@@ -71,6 +71,7 @@ class InnerThoughtCoordinator:
         system_prompt: str,
         appraisal_sink: AppraisalSink | None,
         mood_provider: Callable[[], str] | None = None,
+        impression_provider: Callable[[], str] | None = None,
     ) -> None:
         with self._lock:
             if self._closed:
@@ -82,22 +83,12 @@ class InnerThoughtCoordinator:
             self._character_name = str(character_name or "")
             self._system_prompt = str(system_prompt or "")
             self._appraisal_sink = appraisal_sink
+            self._impression_provider = impression_provider
             self._window.configure(max(1, int(settings.window_size or 1)))
             incoming = str(character_id or "").strip()
             if incoming != self._character_id:
                 self._retire(clear_window=True)
                 self._character_id = incoming
-            if not self._incomplete_logged:
-                self._incomplete_logged = True
-                log_event(
-                    "InnerThought",
-                    "内心独白上下文不完整",
-                    {
-                        "code": "INNER_THOUGHT_CONTEXT_INCOMPLETE",
-                        "missing": ["sensory_impression"],
-                    },
-                    severity="info",
-                )
 
     def note_character(
         self,
@@ -158,6 +149,7 @@ class InnerThoughtCoordinator:
                 "recent_dialogue": format_recent_dialogue(messages),
                 "previous": self._window.items(),
                 "mood_provider": self._mood_provider,
+                "impression_provider": self._impression_provider,
             }
             client = self._client
             worker = Thread(
@@ -278,6 +270,13 @@ class InnerThoughtCoordinator:
                     cancel_checker()
 
             mood_summary = ""
+            sensory_impression = ""
+            impression_provider = snapshot.get("impression_provider")
+            if callable(impression_provider):
+                try:
+                    sensory_impression = str(impression_provider() or "")
+                except Exception:  # noqa: BLE001 - a missing impression leaves the thought unscoped
+                    sensory_impression = ""
             mood_provider = snapshot.get("mood_provider")
             if callable(mood_provider):
                 try:
@@ -291,7 +290,7 @@ class InnerThoughtCoordinator:
                 character_excerpt=str(snapshot["character_excerpt"]),
                 mood_summary=mood_summary,
                 recent_dialogue=str(snapshot["recent_dialogue"]),
-                sensory_impression="",
+                sensory_impression=sensory_impression,
                 previous_thoughts=tuple(snapshot["previous"]),
                 cancel_checker=_cancel,
             )

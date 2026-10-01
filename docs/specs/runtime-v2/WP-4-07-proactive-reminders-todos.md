@@ -24,7 +24,7 @@ updated: 2026-10-01
   proactive 字段在保存露出字段时保留，包括继承的隐私名单和隐私段中的未知键。显式空的隐私名单表示清空；
   Core 焦点门控和外壳采集前检查使用同一份个人隐私配置。游戏 OCR 保持硬停用。
 - 个人设置页编辑启用、补充间隔、开口冷却、焦点停留和切窗冷却，单位是秒。轮询间隔使用 `poll_interval`，
-  不把小数秒折成分钟。内容检查、自适应间隔和评估参数会保留，这一层还没有对应的运行时消费者。
+  不把小数秒折成分钟。内容安静、自适应间隔和评估温度、max_tokens、request_timeout 由个人定时观察消费。
   关系主动仍使用自己的 `relationship_initiative` 设置。已发布会话用当前角色的个人身份；会话尚未发布时，
   用已选角色的演出约束路径判断，不因为还没有会话就退回非个人计时。
 - 主窗口在接上焦点观察后按个人 `poll_interval`（默认 5 秒）向 Core 上报前台窗口；非个人角色仍每 5 秒上报。
@@ -66,8 +66,10 @@ updated: 2026-10-01
   `screen_awareness.focus.advance`、
   `screen.attachBatch { resources: ScreenResourceDescriptor[1..20] }`。
 - `screen_awareness.focus.advance` 接收 `{ busy, scope, snapshot?, outcome? }`。`scope` 固定为本次尝试开始时的 Core generation id；不属于当前代次的请求返回 `wait/stale_scope`，不改变 runtime。`snapshot` 含 hwnd、pid、process、title、ownProcess。响应只有 `{ action, trigger, reason }`，不回传标题。`action` 为 `capture`、`hold` 或 `wait`。
-- `outcome` 只接受 `aborted | failed | privacy | unchanged | self | submitted`。结算请求只结束已提出的捕获尝试，不再读取前台窗口或提出新捕获。`submitted` 表示请求已送出，模型实际开口或沉默由 Core 回复链结算；`aborted` 保留触发，捕获失败不计为成功评估。
-- 个人角色的定时观察使用可沉默的屏幕提示。模型可以返回 `{"silent": true, "segments": []}`。
+- `outcome` 只接受 `aborted | failed | privacy | unchanged | self | submitted`。结算请求只结束已提出的捕获尝试，不再读取前台窗口或提出新捕获。`submitted` 表示请求已送出。非个人角色仍在此时推进补充计时和同应用再看。个人角色的 `submitted` 只消费这一次触发，不提前推进补充计时、同应用再看或内容安静；这些成功计时只在视觉感知通过校验、且焦点与代次仍是送出时的那一个之后写入。失败、取消或焦点已变不写入。`aborted` 保留触发，捕获失败不计为成功评估。
+- 个人定时观察不走普通工具循环。视觉请求只带截图和进程、触发、空闲、短印象这些薄元数据，使用 proactive 的评估温度、max_tokens 和 request_timeout，并关闭思考；不把 UIA 正文放进视觉请求。感知无效或为空时保持沉默，不再调用快模型。快模型不接收图片，上下文是本轮观测包、最多 1200 字可见摘录、最近六轮真实对话、最多三条主动交流、仍有效的短印象，以及角色身份和行为。屏幕文字不能写成用户发言。关系主动仍用自己的温度和长度；观察决策固定 0.5 / 1024，并关闭思考。除既有译文修复外，不再发起第三次普通对话。`should_speak` 为假、未配置、无法解析，或开口文本为空、不是短对白时，都不显示、不播 TTS、不写 ASSISTANT。沉默可以另写一条有界的语义 OBSERVATION。
+- 短时屏幕印象属于当前 runtime，不落盘。保存 1200 秒、最多 400 字；普通对话只注入截断到 160 字的投影。离开、会话退休和关闭时清除。此后的真实用户发言会让更早的印象退出后续观察决策，并在决策上下文里写明两边的时间。自动观察不因此去读本机媒体。
+- 诊断只记 outcome、stage、耗时、trigger 和 process。不记窗口标题、UIA 正文、base64 或决策评论。游戏 OCR 保持硬停用。
 - 可选诊断：在用户根创建 `logs/observer-diagnostics.enabled`，或设置 `SAKURA_OBSERVER_DIAGNOSTICS=1`。Core 追加 `logs/observer-diagnostics.jsonl`。`python tools/observer_diagnostics.py --file <path>` 跟随该文件。默认不打开窗口，也不写入标题或画面正文。
 - `screen.attachBatch` 返回 `{ attached: true, attachmentId, count }`。
 - Tauri：`settings_screen_awareness_get`、`settings_screen_awareness_save`、
@@ -94,5 +96,5 @@ updated: 2026-10-01
 
 ## 非目标
 
-CAP-017 提醒与待办不属于本 WP，保持未排期。本 WP 不实现 Scheduler、提醒、待办、视觉摘要、磁盘批次、
+CAP-017 提醒与待办不属于本 WP，保持未排期。本 WP 不实现 Scheduler、提醒、待办、落盘视觉档案、磁盘批次、
 额外 Worker、自动恢复、自愈、任务图、lease、outbox、ack、补跑或通用主动事件协议，也不为这些能力预留接口。
