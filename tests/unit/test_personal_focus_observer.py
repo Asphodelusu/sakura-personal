@@ -136,6 +136,16 @@ def test_privacy_and_own_process_do_not_capture_or_record_the_title() -> None:
     assert own["reason"] == "self_window"
 
 
+def test_first_scope_bind_keeps_a_goodbye_and_a_later_scope_clears_it() -> None:
+    clock = Clock()
+    item = observer(clock)
+    item.set_away_mode(True)
+    assert item.advance(snap(1, "editor.exe"), scope="generation-a", gate=gate())["reason"] == "away"
+    assert item.away_mode is True
+    assert item.advance(snap(1, "editor.exe"), scope="generation-b", gate=gate())["reason"] != "away"
+    assert item.away_mode is False
+
+
 def test_scope_change_drops_a_pending_dwell() -> None:
     clock = Clock()
     item = observer(clock)

@@ -69,7 +69,9 @@ def load_fast_slot_settings(user_root: Path) -> ApiSettings | None:
         raw = load_yaml_mapping(service.api_config_path)
     except (OSError, UnicodeError, ValueError):
         return None
-    selections, _invalid = _selections(raw.get("model_slots"))
+    selections, invalid = _selections(raw.get("model_slots"))
+    if MODEL_SLOT_CHAT_FAST in invalid:
+        return None
     resolved = resolve_model_slot(profiles, selections, MODEL_SLOT_CHAT_FAST, base)
     return resolved.settings if resolved is not None else None
 
@@ -110,7 +112,20 @@ def _selections(raw: object) -> tuple[ModelSelectionSettings, frozenset[str]]:
             invalid.add(name)
             parsed[name] = None
             continue
-        parsed[name] = ModelSlotSelection(profile_id=profile_id.strip(), model=model.strip())
+        context_window = value.get("context_window_tokens")
+        if context_window is not None and (
+            isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+            or not 4_096 <= context_window <= 2_000_000
+        ):
+            invalid.add(name)
+            parsed[name] = None
+            continue
+        parsed[name] = ModelSlotSelection(
+            profile_id=profile_id.strip(),
+            model=model.strip(),
+            context_window_tokens=context_window if isinstance(context_window, int) else None,
+        )
     chat = parsed.get("chat") or ModelSlotSelection()
     return (
         ModelSelectionSettings(

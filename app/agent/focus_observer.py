@@ -121,7 +121,12 @@ class FocusObserver:
         blocked_titles: tuple[str, ...] = (),
     ) -> dict[str, str]:
         if scope != self._scope:
+            preserve_away = self._scope == "" and self._away
+            away_at = self._away_set_at
             self.reset(scope)
+            if preserve_away:
+                self._away = True
+                self._away_set_at = away_at
         now = float(self.clock())
         if snapshot is not None and snapshot.changed_at <= 0:
             snapshot = FocusSnapshot(
@@ -162,6 +167,10 @@ class FocusObserver:
             self._emit("busy_resume", process=current.label if current else "", trigger="", reason="idle")
         self._offered = list(triggers)
         return self._decision("capture", triggers[0], "ready", process=current.label if current else "")
+
+    @property
+    def away_mode(self) -> bool:
+        return self._away
 
     def set_away_mode(self, enabled: bool) -> None:
         now = float(self.clock())

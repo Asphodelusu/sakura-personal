@@ -214,6 +214,15 @@ class AssistantAdapter:
                 app_version=read_app_version(self._roots.distribution_root),
             )
             owned.append(provider)
+            vision_client = None
+            vision_settings = config.provider_selection.vision_api_settings
+            if vision_settings is not None:
+                vision_client = OpenAICompatibleClient(
+                    vision_settings,
+                    agent_trace_recorder=trace_recorder,
+                    app_version=read_app_version(self._roots.distribution_root),
+                )
+                owned.append(vision_client)
             self._check_active(cancel)
 
             system_prompt = load_character_system_prompt(profile)
@@ -232,6 +241,7 @@ class AssistantAdapter:
                 strict_provider_errors=True,
                 runtime_loop_settings=runtime_loop_settings,
                 agent_trace_recorder=trace_recorder,
+                vision_api_client=vision_client,
             )
             owned.append(runtime)
             self._check_active(cancel)
@@ -272,7 +282,7 @@ class AssistantAdapter:
 
             attach_inner_thought(runtime, self._user_root)
             decision_settings = load_fast_slot_settings(self._user_root)
-            decision_client = provider
+            decision_client = None
             if decision_settings is not None:
                 decision_client = OpenAICompatibleClient(decision_settings, request_attempts=1)
                 owned.append(decision_client)

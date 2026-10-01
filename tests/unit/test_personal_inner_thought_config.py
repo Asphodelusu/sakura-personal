@@ -140,6 +140,25 @@ def test_attach_uses_dedicated_client_and_invalid_selection_makes_zero_calls(tmp
     assert runtime.api_client is main_client
 
 
+def test_hidden_slot_keeps_context_window_and_a_bad_window_stays_invalid(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _write_api(
+        root,
+        inner={"profile_id": "fixture", "model": "thought-model", "context_window_tokens": 12288},
+        fast={"profile_id": "fixture", "model": "fast-model", "context_window_tokens": 8192},
+    )
+    runtime = AgentRuntime(object(), "system", character_id="sakura", character_name="Sakura")
+    attach_inner_thought(runtime, root)
+    client = runtime._inner_thought._client
+    assert client is not None
+    assert client.settings.model == "thought-model"
+    assert client.settings.context_window_tokens == 12288
+    from app.core_host.inner_thought_settings import _selections
+
+    _parsed, invalid = _selections({"inner_thought": {"profile_id": "fixture", "model": "thought-model", "context_window_tokens": 10}})
+    assert "inner_thought" in invalid
+
+
 def test_provider_save_keeps_hidden_slots_out_of_public_snapshot(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _write_api(

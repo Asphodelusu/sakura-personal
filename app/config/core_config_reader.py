@@ -12,6 +12,7 @@ import yaml
 from app.config.model_slots import resolve_model_slot
 from app.config.models import (
     MODEL_SLOT_CHAT,
+    MODEL_SLOT_VISION_CHAT,
     ApiConfigProfile,
     ModelSelectionSettings,
     ModelSlotSelection,
@@ -35,6 +36,7 @@ class StableReadinessError:
 @dataclass(frozen=True)
 class ProviderSelection:
     api_settings: ClientApiSettings = field(repr=False)
+    vision_api_settings: ClientApiSettings | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -389,6 +391,19 @@ class CoreConfigReader:
         if resolved is None:
             return _problem_result_with_character(config_dir, "PROVIDER_SETUP_REQUIRED")
         settings = resolved.settings
+        vision_settings = None
+        if selections.vision_chat is not None and selections.vision_chat.configured:
+            try:
+                vision_resolved = resolve_model_slot(
+                    profiles,
+                    selections,
+                    MODEL_SLOT_VISION_CHAT,
+                    base_settings,
+                )
+            except Exception:
+                return _problem_result_with_character(config_dir, "CONFIG_DATA_INVALID")
+            if vision_resolved is not None and vision_resolved.source_slot == MODEL_SLOT_VISION_CHAT:
+                vision_settings = vision_resolved.settings
         if not settings.base_url.strip() or not settings.api_key.strip() or not settings.model.strip():
             return _problem_result_with_character(config_dir, "PROVIDER_SETUP_REQUIRED")
         problem = _validate_provider_url(settings.base_url)
@@ -401,5 +416,8 @@ class CoreConfigReader:
 
         return CoreConfigReadResult(
             current_character_id=current_character_id,
-            provider_selection=ProviderSelection(api_settings=settings),
+            provider_selection=ProviderSelection(
+                api_settings=settings,
+                vision_api_settings=vision_settings,
+            ),
         )

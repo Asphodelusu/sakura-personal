@@ -333,6 +333,14 @@ class AgentRuntime:
         self._initiative.note_user_spoke()
         self._focus_observer.note_user_activity()
 
+    def note_user_message(self, text: str) -> None:
+        """Real user text: clear leave first, then this message may start it again."""
+        from app.agent.away import message_implies_away
+
+        self.note_initiative_user_turn()
+        if message_implies_away(text):
+            self._focus_observer.set_away_mode(True)
+
     def set_screen_away(self, enabled: bool) -> None:
         """Explicit leave. Input idle does not enter or leave this state."""
         self._focus_observer.set_away_mode(bool(enabled))
@@ -360,7 +368,10 @@ class AgentRuntime:
             except Exception:  # noqa: BLE001 - unreadable settings keep the screen quiet
                 enabled, cooldown_seconds = False, 0.0
             self._initiative.configure_screen(enabled=enabled, cooldown_seconds=cooldown_seconds)
-        return self._initiative.screen_gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+        reason = self._initiative.screen_gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+        if self._focus_observer.away_mode and reason != "disabled":
+            return "away"
+        return reason
 
     def set_focus_diagnostics_path(self, path: object | None) -> None:
         from pathlib import Path
@@ -421,7 +432,10 @@ class AgentRuntime:
             self._silent_reply_allowed = False
 
     def initiative_gate_reason(self) -> str:
-        return self._initiative.gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+        reason = self._initiative.gate_reason(continuation=self._intimacy.active and bool(self._intimacy_guide))
+        if self._focus_observer.away_mode and reason != "disabled":
+            return "away"
+        return reason
 
     def relationship_facts(self) -> str:
         """Standing relationship facts from context providers; no memory search is run."""
@@ -650,6 +664,9 @@ class AgentRuntime:
         lore = self._lore_fragment(request)
         if lore is not None:
             fragments.append(lore)
+        media = self._media_fragment(request)
+        if media is not None:
+            fragments.append(media)
         drive = self._relationship.fragment()
         if drive is not None:
             fragments.append(drive)
@@ -668,6 +685,15 @@ class AgentRuntime:
             if message.role in {"user", "assistant"} and message.content.strip()
         ]
         return build_lore_context_fragment(current_input, self._lore_index, history=history)
+
+    def _media_fragment(self, request: ContextRequest) -> ContextFragment | None:
+        if getattr(request, "source", "chat") != "chat" or getattr(request, "mode", "normal") != "normal":
+            return None
+        from app.agent.local_context import build_media_context_fragment
+
+        return build_media_context_fragment(
+            str(getattr(request, "current_input", "") or ""),
+        )
 
     def _history_digest_fragments(
         self,

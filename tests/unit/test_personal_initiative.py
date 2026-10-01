@@ -209,6 +209,19 @@ def test_user_turn_during_decision_discards_the_result() -> None:
     assert runtime.run_relationship_initiative([], relationship_facts="") is None
 
 
+def test_explicit_away_blocks_relationship_initiative_until_a_real_return() -> None:
+    runtime, clock = _runtime(None)
+    runtime.configure_screen_initiative(enabled=True, cooldown_seconds=600)
+    runtime.note_user_message("晚安")
+    assert runtime.initiative_gate_reason() == "away"
+    assert runtime.screen_gate_reason() == "away"
+    assert runtime.run_relationship_initiative([], relationship_facts="") is None
+    runtime.note_user_message("我还在，失眠了想聊天")
+    clock.now += 301
+    assert runtime.initiative_gate_reason() == "eligible"
+    assert runtime.screen_gate_reason() == "eligible"
+
+
 def test_relationship_facts_keep_only_the_standing_profile() -> None:
     from app.llm.prompts.types import ContextFragment
     from app.plugins.models import ContextProviderContribution

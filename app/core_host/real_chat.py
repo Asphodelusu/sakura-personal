@@ -518,7 +518,7 @@ class RealChatBoundary:
                     or screen_attachment.source != "screen_awareness"
                 )
                 if relationship_user_turn:
-                    _note_initiative_user_turn(runtime)
+                    _note_user_message(runtime, message)
                     _note_intimacy_user_turn(runtime, message)
                     _begin_relationship_user_turn(runtime, operation_id)
                     _start_inner_thought(
@@ -1441,6 +1441,14 @@ def _settle_screen_observation(runtime: object | None, *, spoke: bool, relations
             settle(spoke=spoke, relationship_motive=relationship_motive)
         except Exception:  # noqa: BLE001 - timing bookkeeping must not fail the turn
             pass
+
+
+def _note_user_message(runtime: object | None, text: str) -> None:
+    note = getattr(runtime, "note_user_message", None)
+    if callable(note):
+        note(text)
+        return
+    _note_initiative_user_turn(runtime)
 
 
 def _note_initiative_user_turn(runtime: object | None) -> None:
