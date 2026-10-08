@@ -1607,8 +1607,14 @@ mod tests {
         assert_eq!(screen_observation_block(&privacy, None, 7), None);
         let snapshot = focus_advance_snapshot(Some(&window(8, "editor.exe", "notes.txt")), 7)
             .expect("snapshot");
-        assert_eq!(snapshot.get("title").and_then(|value| value.as_str()), Some("notes.txt"));
-        assert_eq!(snapshot.get("ownProcess").and_then(|value| value.as_bool()), Some(false));
+        assert_eq!(
+            snapshot.get("title").and_then(|value| value.as_str()),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            snapshot.get("ownProcess").and_then(|value| value.as_bool()),
+            Some(false)
+        );
         assert!(focus_advance_snapshot(None, 7).is_none());
     }
 

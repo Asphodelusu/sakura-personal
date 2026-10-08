@@ -7838,12 +7838,14 @@ fn handle_product_menu_action(
             result
         }
         product_shell::ProductMenuAction::ExitApp => {
-            app.state::<product_shell::ProductShellState>().cancel_restart();
+            app.state::<product_shell::ProductShellState>()
+                .cancel_restart();
             let lifecycle = app.state::<ShellLifecycleState>();
             request_app_exit(app, &lifecycle)
         }
         product_shell::ProductMenuAction::RestartApp => {
-            app.state::<product_shell::ProductShellState>().request_restart();
+            app.state::<product_shell::ProductShellState>()
+                .request_restart();
             let lifecycle = app.state::<ShellLifecycleState>();
             request_app_exit(app, &lifecycle)
         }
@@ -7904,8 +7906,15 @@ fn finish_app_exit(
         app_handle.state::<asr::AsrState>().shutdown();
         handle.request_shutdown().map_err(str::to_string)?;
     }
-    app_handle.state::<Arc<capture::CaptureManager>>().observer_sources.shutdown();
-    app_handle.exit(app_handle.state::<product_shell::ProductShellState>().app_exit_code());
+    app_handle
+        .state::<Arc<capture::CaptureManager>>()
+        .observer_sources
+        .shutdown();
+    app_handle.exit(
+        app_handle
+            .state::<product_shell::ProductShellState>()
+            .app_exit_code(),
+    );
     Ok(())
 }
 
@@ -7915,7 +7924,9 @@ fn request_app_exit(
 ) -> Result<(), String> {
     let result = request_app_exit_inner(app_handle, lifecycle);
     if result.is_err() {
-        app_handle.state::<product_shell::ProductShellState>().cancel_restart();
+        app_handle
+            .state::<product_shell::ProductShellState>()
+            .cancel_restart();
     }
     result
 }
@@ -8906,7 +8917,11 @@ fn main() {
                 .spawn()
         });
         if let Err(error) = restarted {
-            show_startup_message("Sakura 重启失败", &format!("请重新打开 Sakura。{error}"), true);
+            show_startup_message(
+                "Sakura 重启失败",
+                &format!("请重新打开 Sakura。{error}"),
+                true,
+            );
             std::process::exit(1);
         }
         return;

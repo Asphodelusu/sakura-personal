@@ -108,7 +108,7 @@ def test_ungrounded_forged_transient_or_undated_writes_are_refused() -> None:
 
 def test_updates_run_before_adds_and_a_completed_promise_is_not_re_added() -> None:
     store = _Store([{"id": "m1", "content": "我答应下次由我主动邀请他看电影", "layer": "episodic",
-                     "metadata": {"memory_kind": "commitment", "event_time": "2026-10-05"}}])
+                     "metadata": {"memory_kind": "commitment", "event_time": (datetime.now().astimezone() + timedelta(days=7)).date().isoformat()}}])
     result = _curate(store, _Api([
         {"op": "add", "content": "我承诺下次由我主动邀请他看电影", "layer": "episodic", "evidence": "一起看电影吧"},
         {"op": "update", "id": "m1", "content": "约定已完成。我主动邀请他明天晚上八点一起看电影",
@@ -172,3 +172,17 @@ def test_superseding_marks_only_similar_volatile_statuses() -> None:
     assert "valid_until" in store.records["old"]["metadata"]
     assert "valid_until" not in store.records["other"]["metadata"]
     assert "valid_until" not in store.records["fact"]["metadata"]
+
+
+def test_review_mark_preserves_current_content_and_skips_deleted_memories() -> None:
+    store = _Store([
+        {"id": "updated", "content": "old promise"},
+        {"id": "deleted", "content": "removed promise"},
+    ])
+    review = store.list_memories()
+    store.update_memory({"id": "updated", "content": "completed promise"})
+    store.delete_memory({"id": "deleted"})
+    assert discipline.mark_reviewed(store, review) == 1
+    assert store.records["updated"]["content"] == "completed promise"
+    assert store.records["updated"]["metadata"]["expiry_reviewed"] is True
+    assert "deleted" not in store.records

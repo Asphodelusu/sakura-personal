@@ -289,6 +289,8 @@ def test_mem0_model_slot_saves_in_one_phase_without_restarting_plugin(
         assert saved["payload"]["saved_slots"] == [
             "core:chat",
             "core:vision_chat",
+            "core:chat_fast",
+            "core:inner_thought",
             "plugin:sakura.memory.mem0:curation"
         ]
         after = first_application.application.public_snapshot()

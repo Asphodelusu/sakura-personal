@@ -421,8 +421,12 @@ def format_review(memories):
 
 
 def mark_reviewed(store, memories):
+    current = {item["id"]: item for item in store.list_memories()}
     marked = 0
-    for memory in memories:
+    for previous in memories:
+        memory = current.get(previous["id"])
+        if memory is None:
+            continue
         store.update_memory({"id": memory["id"], "content": str(memory.get("content") or ""),
                              "expiry_reviewed": True}, allow_sensitive=True)
         marked += 1

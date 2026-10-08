@@ -1,8 +1,9 @@
 //! Bounded foreground-only sources for the personal Observer.
 
 use crate::capture::{ForegroundWindow, PhysicalRect};
+#[cfg(any(windows, test))]
+use std::collections::VecDeque;
 use std::{
-    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
@@ -12,7 +13,9 @@ use std::{
 
 const SOURCE_BUDGET: Duration = Duration::from_millis(200);
 const TEXT_LIMIT: usize = 2000;
+#[cfg(any(windows, test))]
 const CONTROL_LIMIT: usize = 500;
+#[cfg(any(windows, test))]
 const DEPTH_LIMIT: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +124,7 @@ pub fn foreground_target() -> Option<ForegroundTarget> {
     None
 }
 
+#[cfg(windows)]
 fn rect_from_edges(left: i32, top: i32, right: i32, bottom: i32) -> Option<PhysicalRect> {
     let width = u32::try_from(i64::from(right) - i64::from(left)).ok()?;
     let height = u32::try_from(i64::from(bottom) - i64::from(top)).ok()?;
@@ -156,11 +160,13 @@ impl Budget {
     }
 }
 
+#[cfg(any(windows, test))]
 struct ControlMetadata {
     password: bool,
     offscreen: bool,
     bounds: PhysicalRect,
 }
+#[cfg(any(windows, test))]
 trait VisibleTree {
     type Node;
     fn root(&mut self, target: &ForegroundTarget, budget: &Budget) -> Option<Self::Node>;
@@ -170,6 +176,7 @@ trait VisibleTree {
         -> Vec<Self::Node>;
 }
 
+#[cfg(any(windows, test))]
 fn collect_visible_text(
     tree: &mut impl VisibleTree,
     target: &ForegroundTarget,

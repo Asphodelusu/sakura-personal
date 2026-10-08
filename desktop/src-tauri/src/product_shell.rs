@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -318,7 +318,11 @@ impl ProductShellState {
     }
 
     pub fn app_exit_code(&self) -> i32 {
-        if self.restart_requested.load(Ordering::SeqCst) { APP_RESTART_EXIT_CODE } else { 0 }
+        if self.restart_requested.load(Ordering::SeqCst) {
+            APP_RESTART_EXIT_CODE
+        } else {
+            0
+        }
     }
 
     fn install_tray_visibility(&self, item: MenuItem<tauri::Wry>) -> Result<(), String> {

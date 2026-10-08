@@ -257,7 +257,7 @@ def test_open_time_rotation_reads_the_new_file_from_the_start(tmp_path: Path, mo
         if self == path and not swapped:
             swapped = True
             if self.exists():
-                self.unlink()
+                self.rename(tmp_path / "rotated.jsonl")
             self.write_bytes(new_line)
         if self.name == "gone.jsonl":
             raise FileNotFoundError(self)

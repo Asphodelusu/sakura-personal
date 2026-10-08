@@ -547,6 +547,9 @@ def test_run_host_raises_first_cleanup_failure_and_attaches_sanitized_later_note
     second = ValueError("PRIVATE_WRITER_CLOSE")
 
     class Dispatcher:
+        def published_session(self):
+            return None
+
         def __init__(self, _config: HostConfig) -> None:
             pass
 
@@ -586,6 +589,9 @@ def test_run_host_preserves_primary_failure_and_attempts_every_cleanup(
     primary = OSError("PRIVATE_PRIMARY")
 
     class Dispatcher:
+        def published_session(self):
+            return None
+
         def __init__(self, _config: HostConfig) -> None:
             pass
 
@@ -627,6 +633,9 @@ def test_run_host_writer_failure_keeps_dispatcher_then_writer_cleanup_order(
     writer_failure = WriterError("TRANSPORT_WRITE_FAILED", "sanitized")
 
     class Dispatcher:
+        def published_session(self):
+            return None
+
         def __init__(self, _config: HostConfig) -> None:
             pass
 
@@ -771,6 +780,9 @@ def test_real_writer_failure_is_observed_before_waiting_for_peer_eof(
             return None
 
     class Dispatcher:
+        def published_session(self):
+            return None
+
         def __init__(self, _config: HostConfig) -> None:
             pass
 
