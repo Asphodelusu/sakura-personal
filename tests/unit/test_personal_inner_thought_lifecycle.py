@@ -477,7 +477,11 @@ def test_recall_overlaps_thought_and_current_thought_reaches_main_prompt(tmp_pat
     entered, release = Event(), Event()
     contexts = []
     runtime, boundary, events, _ = _core(tmp_path, _BlockingClient([], entered, release), _MainClient(contexts))
-    def recall(_request):
+    def recall(request):
+        # The thought worker first asks the same provider for standing mood.
+        # Only chat recall overlaps the model call; mood must not await itself.
+        if request.source != "chat":
+            return []
         assert entered.wait(1)
         release.set()
         return []
