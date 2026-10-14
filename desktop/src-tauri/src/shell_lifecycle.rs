@@ -1679,7 +1679,9 @@ mod tests {
             &repository_root.join("tests/fixtures/runtime_v2/wp_3_01/ready"),
             &user_root,
         );
-        let user_root = user_root.canonicalize().expect("canonical crash fixture root");
+        let user_root = user_root
+            .canonicalize()
+            .expect("canonical crash fixture root");
         let executable_directory = std::env::current_exe()
             .expect("test executable")
             .parent()
