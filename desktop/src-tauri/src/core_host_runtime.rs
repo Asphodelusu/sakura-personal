@@ -1340,14 +1340,7 @@ impl ConcurrentRequestHandle {
         };
         // Routine observations are diagnostic traffic, not user-visible activity.
         // Failed responses and transport errors retain their original severity.
-        let severity = if event == "ipc.request.completed"
-            && matches!(
-                name,
-                "asr.input.availability"
-                    | "asr.input.poll"
-                    | "asr.input.capture_status"
-                    | "studio.visual.catalog"
-            ) {
+        let severity = if event == "ipc.request.completed" && routine_completion(name, elapsed_ms) {
             Severity::Debug
         } else {
             severity
@@ -1400,6 +1393,22 @@ impl ConcurrentRequestHandle {
                 })
                 .attributes(attributes),
         );
+    }
+}
+
+/// Observer focus polls every few seconds; a slow poll is still worth seeing.
+const FOCUS_POLL_SLOW_MS: u128 = 1_000;
+
+/// Successful polling that would otherwise flood the user log.
+/// Observer actions are logged separately as `screen.focus.advance`.
+fn routine_completion(name: &str, elapsed_ms: u128) -> bool {
+    match name {
+        "asr.input.availability"
+        | "asr.input.poll"
+        | "asr.input.capture_status"
+        | "studio.visual.catalog" => true,
+        "screen_awareness.focus.advance" => elapsed_ms < FOCUS_POLL_SLOW_MS,
+        _ => false,
     }
 }
 
@@ -2601,10 +2610,11 @@ mod tests {
 
     use super::{
         core_host_process_request, drain_stderr, hello_payload, lifecycle_test_lock,
-        stderr_diagnostic_summary, CoreHostRuntime, CoreSnapshotCache, ShutdownPolicy,
-        StderrDrainState, StderrDrainStats, StderrDrainer, StderrLogSink, StderrRedactor,
-        MIN_PROTOCOL_MINOR, OPTIONAL_CAPABILITIES, PRODUCTION_SHUTDOWN_POLICY, PROTOCOL_MAJOR,
-        PROTOCOL_MINOR, REQUIRED_CAPABILITIES, STDERR_CACHE_LIMIT,
+        routine_completion, stderr_diagnostic_summary, CoreHostRuntime, CoreSnapshotCache,
+        ShutdownPolicy, StderrDrainState, StderrDrainStats, StderrDrainer, StderrLogSink,
+        StderrRedactor, FOCUS_POLL_SLOW_MS, MIN_PROTOCOL_MINOR, OPTIONAL_CAPABILITIES,
+        PRODUCTION_SHUTDOWN_POLICY, PROTOCOL_MAJOR, PROTOCOL_MINOR, REQUIRED_CAPABILITIES,
+        STDERR_CACHE_LIMIT,
     };
 
     const GENERATION_ID: &str = "00000000-0000-4000-8000-000000001c01";
@@ -4380,6 +4390,27 @@ mod tests {
     }
 
     #[test]
+    fn only_fast_focus_polls_are_routine() {
+        assert!(routine_completion("screen_awareness.focus.advance", 0));
+        assert!(routine_completion(
+            "screen_awareness.focus.advance",
+            FOCUS_POLL_SLOW_MS - 1
+        ));
+        assert!(!routine_completion(
+            "screen_awareness.focus.advance",
+            FOCUS_POLL_SLOW_MS
+        ));
+        assert!(routine_completion("asr.input.poll", 60_000));
+        for command in [
+            "chat.send",
+            "screen_awareness.privacy.get",
+            "tts.playback.observe",
+        ] {
+            assert!(!routine_completion(command, 0), "{command}");
+        }
+    }
+
+    #[test]
     fn polling_logs_are_debug_while_rejections_and_deadlines_remain_visible() {
         use crate::runtime_log::{RuntimeLogConfig, Severity, Verbosity};
         let _test_lock = lifecycle_test_lock();
@@ -4411,6 +4442,7 @@ mod tests {
                 "asr.input.poll",
                 "asr.input.capture_status",
                 "studio.visual.catalog",
+                "screen_awareness.focus.advance",
             ] {
                 handle.log_request(
                     Severity::Info,

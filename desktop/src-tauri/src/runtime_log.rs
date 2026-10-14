@@ -3023,6 +3023,8 @@ fn forbidden_key(key: &str) -> bool {
             | "static_prompt_tokens"
             | "tool_schema_estimated_tokens"
             | "tool_schema_tokens"
+            // Recall stage duration; the `query` marker below is for query text.
+            | "query_plan_ms"
     ) {
         return false;
     }
@@ -3275,6 +3277,7 @@ fn normalize_key(value: &str) -> String {
         .replace("receivedprocessms", "received_process_ms")
         .replace("elapsedms", "elapsed_ms")
         .replace("durationms", "duration_ms")
+        .replace("queryplanms", "query_plan_ms")
         .replace("epochms", "epoch_ms")
         .replace("eventdelayms", "event_delay_ms")
         .replace("eventperfms", "event_perf_ms")
@@ -3896,6 +3899,29 @@ mod tests {
             assert!(!serialized.contains(private));
         }
         assert!(fs::read_to_string(path).unwrap().contains("软件仍可记录"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_recall_stage_durations_stay_while_query_text_is_redacted() {
+        let root = temp_root("recall-durations");
+        let path = root.join("logs/sakura-runtime.log");
+        let log = RuntimeLogService::start_with_config(test_config(path.clone()));
+        let context = CoreLogContext {
+            generation_id: "generation-one".into(),
+            generation_number: 1,
+            core_pid: 42,
+        };
+        let wire = json!({"severity":"info", "verbosity":"info", "channel":"memory",
+            "event":"memory.recall.finished", "custom":true, "plugin_id":"sakura.memory.mem0",
+            "message":"记忆召回完成", "attributes":{"query_plan_ms":1234, "search_ms":130,
+                "selection_ms":900, "query":"PRIVATE QUERY TEXT"}});
+        assert!(log.submit_core_bridge(&wire.to_string(), &context).unwrap());
+        log.drain_and_shutdown_for_test();
+        let plugins = fs::read_to_string(path.with_file_name("sakura-plugins.log")).unwrap();
+        assert!(plugins.contains("query_plan_ms=1234"), "{plugins}");
+        assert!(plugins.contains("search_ms=130") && plugins.contains("selection_ms=900"));
+        assert!(!plugins.contains("PRIVATE QUERY TEXT"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -35,9 +35,16 @@ updated: 2026-10-14
 个人 Observer 的视觉、决策请求已经明确构造输入；Trace 元数据不得为了记录请求而再次收集 providers。
 正常聊天的长期记忆召回保持有效，不以禁用记忆或加长插件期限掩盖迟返。
 记忆完成日志仅增加 query-plan、search、selection 耗时，不记录查询或记忆正文。
+`query_plan_ms` 是阶段耗时，不属于查询正文；日志脱敏不得因其名称含 query 而丢弃。
 
 ## 旁路模型请求不消耗思考预算
 
 独白、记忆检索改写和关系主动判定只需短文本或短 JSON，沿用旧版显式发送 `thinking: disabled`。
 默认思考的快速模型会把这些请求的小上限耗在推理上，返回空正文后静默退化为无独白、启发式查询或沉默。
 Core 客户端在端点明确拒绝该字段时省略并记住，后续请求不再携带；记忆插件窄客户端对 Google 兼容层直接省略。主对话的思考策略不变。
+
+## 日志降噪
+
+Observer 每轮 `screen_awareness.focus.advance` 的成功 IPC 完成记录降为 debug，默认不写入用户日志；
+耗时达到 1 秒、失败、取消和 `screen.focus.advance` 的 capture/hold/读取正文行为仍按原级别记录。
+需要逐次轮询诊断时设置 `SAKURA_RUNTIME_V2_LOG_LEVEL=debug`。轮询与聚焦语义不变。
