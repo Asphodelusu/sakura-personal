@@ -122,7 +122,9 @@ def test_generation_uses_supported_params_and_skips_without_client() -> None:
     )
     assert result.text == "静か。"
     assert seen["kwargs"]["max_tokens"] == DEFAULT_INNER_THOUGHT_MAX_TOKENS
-    assert set(seen["kwargs"]) <= {"temperature", "max_tokens", "cancel_checker"}
+    # 默认思考的快速模型会把 180 token 全耗在推理上，独白正文为空；旧版同样显式关闭。
+    assert seen["kwargs"]["thinking"] == {"type": "disabled"}
+    assert set(seen["kwargs"]) <= {"temperature", "max_tokens", "thinking", "cancel_checker"}
     assert should_generate_inner_thought(
         InnerThoughtSettings(enabled=False),
         api_client=Client(),

@@ -676,6 +676,7 @@ class OpenAICompatibleClient:
                 if (
                     _is_response_format_unsupported_error(exc)
                     or _is_temperature_unsupported_error(exc)
+                    or _is_thinking_unsupported_error(exc)
                     or _is_runtime_context_role_unsupported_error(exc)
                 ):
                     self._trace_local.request_diagnostic.update(
@@ -733,6 +734,24 @@ class OpenAICompatibleClient:
                             **diagnostic_attributes(
                                 exc,
                                 reason_code="MODEL_REQUEST_FAILED",
+                                stage="request",
+                            ),
+                        },
+                    )
+                    continue
+                if "thinking" in fallback_payload and _is_thinking_unsupported_error(exc):
+                    fallback_kind = "thinking"
+                    self._unsupported_chat_params.add("thinking")
+                    fallback_payload.pop("thinking", None)
+                    log_event(
+                        "API",
+                        "端点不支持 thinking 参数，已省略后重试",
+                        {
+                            "attempt": attempt,
+                            "max_attempts": self._request_attempts,
+                            **diagnostic_attributes(
+                                exc,
+                                reason_code="MODEL_PARAMETER_UNSUPPORTED",
                                 stage="request",
                             ),
                         },
@@ -1544,6 +1563,25 @@ def _value_contains_json_keyword(value: Any) -> bool:
 def _is_response_format_unsupported_error(exc: ApiRequestError) -> bool:
     text = str(exc).lower()
     return "response_format" in text or "json_object" in text or "json schema" in text
+
+
+def _is_thinking_unsupported_error(exc: ApiRequestError) -> bool:
+    """Google 等兼容层会拒绝 DeepSeek 风格 thinking 字段。"""
+    text = str(exc).lower()
+    if "thinking" not in text:
+        return False
+    markers = (
+        "unknown name",
+        "unknown field",
+        "cannot find field",
+        "unrecognized",
+        "not support",
+        "unsupported",
+        "unexpected",
+        "does not exist",
+        "invalid json payload",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _is_temperature_unsupported_error(exc: ApiRequestError) -> bool:

@@ -596,7 +596,13 @@ class AgentRuntime:
         )
         try:
             check_cancelled(cancel_checker)
-            raw = complete(system, messages, temperature=DECISION_TEMPERATURE, max_tokens=DECISION_MAX_TOKENS)
+            raw = complete(
+                system,
+                messages,
+                temperature=DECISION_TEMPERATURE,
+                max_tokens=DECISION_MAX_TOKENS,
+                thinking={"type": "disabled"},
+            )
             check_cancelled(cancel_checker)
             decision = parse_relationship_decision(raw)
         except OperationCancelled:

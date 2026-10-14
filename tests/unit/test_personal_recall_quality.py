@@ -168,11 +168,16 @@ def test_heuristic_query_keeps_the_intent_and_resolves_a_reference() -> None:
     assert query.startswith("那个后来呢\n今天好累")
     assert "屏幕" not in query
 
+    seen = {}
+
     class Client:
-        def complete_raw(self, *_args, **_kwargs):
+        def complete_raw(self, *_args, **kwargs):
+            seen.update(kwargs)
             return '{"query": "芙莉莲的后续", "entities": ["葬送的芙莉莲"]}'
 
     assert plan_query(request, Client()) == "芙莉莲的后续\n关键实体：葬送的芙莉莲"
+    # 改写只输出短 JSON；默认思考会耗尽 120 token 并拖到预算后退回启发式。
+    assert seen["thinking"] == {"type": "disabled"}
 
     class Broken:
         def complete_raw(self, *_args, **_kwargs):

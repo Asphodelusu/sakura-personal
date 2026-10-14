@@ -95,6 +95,7 @@ def model_query(request, client):
             temperature=0.2,
             max_tokens=REWRITE_MAX_TOKENS,
             response_format={"type": "json_object"},
+            thinking={"type": "disabled"},
         )
     except Exception:
         return ""

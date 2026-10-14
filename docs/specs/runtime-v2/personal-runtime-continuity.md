@@ -3,7 +3,7 @@ kind: spec
 status: normative
 audience: maintainer
 source_of_truth: self
-updated: 2026-10-01
+updated: 2026-10-14
 ---
 
 # 个人运行时的连续性与等待边界
@@ -35,3 +35,9 @@ updated: 2026-10-01
 个人 Observer 的视觉、决策请求已经明确构造输入；Trace 元数据不得为了记录请求而再次收集 providers。
 正常聊天的长期记忆召回保持有效，不以禁用记忆或加长插件期限掩盖迟返。
 记忆完成日志仅增加 query-plan、search、selection 耗时，不记录查询或记忆正文。
+
+## 旁路模型请求不消耗思考预算
+
+独白、记忆检索改写和关系主动判定只需短文本或短 JSON，沿用旧版显式发送 `thinking: disabled`。
+默认思考的快速模型会把这些请求的小上限耗在推理上，返回空正文后静默退化为无独白、启发式查询或沉默。
+Core 客户端在端点明确拒绝该字段时省略并记住，后续请求不再携带；记忆插件窄客户端对 Google 兼容层直接省略。主对话的思考策略不变。
