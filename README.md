@@ -1,111 +1,43 @@
-<div align="center">
+# Sakura Desktop Pet — Personal Edition
 
-# Sakura Desktop Pet
+基于 [Rvosy/Sakura](https://github.com/Rvosy/Sakura) 的个人维护分支，由 [Asphodelusu](https://github.com/Asphodelusu) 维护。当前源码版本为 **1.1.1-personal.2**，以仓库 [VERSION](VERSION) 为准。
 
-### 一个能主动感知屏幕内容与系统事件的通用桌宠 Agent 框架
+本分支以个人版的角色设定、关系连续性、记忆和聚焦观察行为为基准，采用上游 Tauri 桌面外壳与 Python Core 架构。上游架构或 UI 更新不代表自动采用上游的人格、记忆或主动感知策略。
 
-[![Release](https://img.shields.io/github/v/release/Rvosy/sakura)](https://github.com/Rvosy/sakura/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](docs/userdocs/SETUP.md)
-[![Downloads](https://img.shields.io/github/downloads/Rvosy/sakura/total)](https://github.com/Rvosy/sakura/releases)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/github/license/Rvosy/sakura)](LICENSE)
+[English](docs/README.en.md) · [文档总览](docs/README.md) · [个人迁移对账](docs/records/audits/PERSONAL_MIGRATION_STATUS.md)
 
-[English](docs/README.en.md) [安装教程](docs/userdocs/SETUP.md) [API配置教程](docs/userdocs/API_CONFIG.md)  [插件开发文档](docs/devdocs/SAKURA_PLUGIN_SDK.md)  [技术文档](docs/devdocs/TECHNICAL_README.md)
+## 当前状态
 
-</div>
+旧 Qt 个人版保存在 `dev5`；新架构在 `dev6` 开发。GitHub 默认分支 `main`、候选分支与本机日用安装可能处于不同提交，源码版本号相同也不代表安装内容相同。
 
-> 当前源码版本为 `1.1.0`，重点更新插件系统并加入语音输入插件；正式安装包与发布说明见 [Releases](https://github.com/Rvosy/sakura/releases)，版本变化见 [更新日志](docs/CHANGELOG.md)。
+**迁移尚未全部完成。** 普通聊天 fast-tier 自动分流、亲密轻量召回及旧版流式进度/异步字幕方案仍存在差异。具体证据、未部署修复和待核实项见[迁移对账](docs/records/audits/PERSONAL_MIGRATION_STATUS.md)，不能把旧版特性清单视为新版验收结果。
 
-最近推完水晶社的新作，~~推完自动变成学姐的狗~~，已经变成学姐的形状了，夜里辗转反侧怎么都睡不着。便以学姐的名字 **Sakura** 命名这个项目，开发了这个桌宠 Agent 框架。
+## 个人版的主要方向
 
-Sakura 最大的特点：**她会主动来找你**。
+- **人格与关系连续性**：保留角色卡、系统约束、关系指引、lore，以及按角色持久化的关系状态；分离时间与互动结算有独立运行链路。
+- **个人长期记忆**：SQLite 历史、BGE/BM25 检索、精排与个人整理逻辑。配置、索引和模型规模需要按个人入口适配，不能直接用同 ID 的上游插件覆盖。
+- **聚焦 Observer**：以窗口聚焦时长、正文变化和两阶段评估为主要路径；不是仅用固定间隔截图替代旧版观察行为。
+- **对话与语音**：GPT-SoVITS、逐段译文检查、内心独白与关系主动判定。存在调用链不等于每个模型与每种场景都已完成真人验收。
+- **桌面体验**：采用 Tauri 外壳，保留个人模型设置与重启入口。新架构的回复显示和首段语音等待仍需继续完善。
 
-传统聊天机器人是一扇门，你不敲，它永远不会开。Sakura 更像一个窝在你屏幕角落的人——你不用一直陪她说话，但她会看你在做什么。觉得该开口了，就自己凑过来。
+## 使用与更新
 
-比如你在打游戏，死了好几回。她瞥一眼屏幕，小声说：「已经第三次了喔……要不我帮你查查攻略？」你一点头，她就真的打开浏览器搜一圈，还把重点贴进备忘录。
+本分支主要面向 Windows 个人使用。上游 [Releases](https://github.com/Rvosy/Sakura/releases) 提供的是**上游版本**，不包含本分支的个人迁移成果，不能作为个人版更新包直接覆盖安装。
 
-再比如你在看着其他角色的图，她发现后会立刻吃醋：「又在看别人啦？」然后软磨硬泡让你多看几眼她的立绘。你要是冷落她太久，她还会鼓着脸生气：「都不理我了啊……」
+已有个人安装应使用其现有启动入口。源码 checkout 不包含个人凭据、角色私有内容、记忆库及完整模型资源；不要把源码压缩包当作可直接运行的个人发行包。开发准备与架构说明见[贡献指南](.github/CONTRIBUTING.md)和[技术文档](docs/devdocs/TECHNICAL_README.md)。继承的安装与功能指南可能描述上游通用行为，个人差异以迁移对账及对应个人契约为准。
 
-**角色卡**驱动她的对话风格、表情和语音，而**内置的 Agent 引擎**给了她真正的工具能力：浏览器操作、屏幕截图、文件读取、Web 搜索、提醒、长期记忆……
+更新前区分代码、配置与个人数据。不要为同步架构重置记忆库、覆盖角色卡，或将上游插件默认配置当作个人配置的权威来源。
 
-简单说：**一个完全由你定制的、会吃醋会操心会主动找你的桌面角色 Agent。**
+## 文档与来源
 
-## 效果预览
+- [个人迁移对账与已知缺口](docs/records/audits/PERSONAL_MIGRATION_STATUS.md)
+- [个人运行时连续性契约](docs/specs/runtime-v2/personal-runtime-continuity.md)
+- [API 配置说明](docs/userdocs/API_CONFIG.md)
+- [运行日志与故障排查](docs/userdocs/RUNTIME_LOG_TROUBLESHOOTING.md)
+- [插件 SDK](docs/devdocs/SAKURA_PLUGIN_SDK.md)
+- [更新日志](docs/CHANGELOG.md)：其中上游历史条目不等于个人版部署记录。
 
-<div align="center">
-
-![Sakura 预览](docs/userdocs/assets/sakura_01.webp)
-![N.A.V.I. 预览](docs/userdocs/assets/navi_01.webp)
-
-</div>
-
-## 快速开始
-
-推荐直接使用 **Release 里的最新版本**，不要只下载 GitHub 页面上的源码压缩包。
-
-> **平台提醒：** Windows 版本是当前主要测试目标。Mac 和 Linux 用户请先看 [完整安装指南](docs/userdocs/SETUP.md)。
-
-1. 从 [Releases 页面](https://github.com/Rvosy/sakura/releases) 下载适合当前平台的正式产物，不要下载 GitHub 自动生成的源码压缩包
-2. Runtime v2 的 Windows Setup 可直接安装；Portable ZIP 解压后运行 `sakura.exe`
-3. 仍使用 `0.9.8` 时按该版本 Release 中随包提供的旧入口操作，不要从当前开发分支复制脚本
-
-遇到问题、使用 Mac/Linux、或想了解更多配置项，请看 **[完整安装指南](docs/userdocs/SETUP.md)**。
-
-## 功能特性
-
-**角色与外观**
-- 角色包驱动 — `.char` 一键导入，角色卡、立绘、GPT-SoVITS 语音权重一体打包；UI 主题色跟随角色
-- 角色工作室 — 主 Tauri 应用内的独立窗口，可从设置页新建、编辑、发布并导出 `.char` 角色包
-- 首次启动引导 — 先选择或导入角色，再配置 API 供应商和模型；已有配置不会重复触发
-- 外观效果 — 支持纯色 / 高斯模糊 / 亚克力 / macOS 原生毛玻璃（NSVisualEffectView），气泡与输入栏位置、大小可调
-
-**主动感知**
-- 屏幕观察 — 定期截图生成视觉摘要并纳入上下文，也可随时按需截图；间隔与冷却时间可配置
-- 框选截图 — 可从输入栏截取指定区域，随下一条消息一起发送；支持分辨率选择、高 DPI 和混合缩放多显示器
-- 主动发言 — 周期性评估是否需要开口，不用你先说话她就会自己凑过来
-
-**对话体验**
-
-- 分段双语回复 — 模型输出日文原文 + 中文字幕 + 语气标签 + 立绘指令，字幕、表情、语音同步驱动
-- 本地快速接话 — 正式回复生成期间先给出符合角色语气的短回应，可选本地模型增强和语音
-- 打字机动效 — 逐字渲染，长回复在固定高度气泡内滚动，不扰动桌宠布局
-- 输入框动效 — 胶囊形高斯模糊背景，发送等待期间有状态提示
-
-**工具能力**
-- 内置工具 — 屏幕截图、打开网页、待办、提醒（支持「3 分钟后」等相对时间）、笔记读写
-- 长期记忆 — 分层保存人物信息、经历、任务和操作习惯；支持自动整理、相关记忆召回和手动编辑
-- 工具执行 — 用户发起的工具调用在参数校验后直接执行，插件与 Sakura 具有相同的本机权限，只安装可信代码
-- 多模型配置 — 可保存多套 API 供应商，并分别给聊天、视觉和记忆整理选择模型
-
-**语音（TTS）**
-- GPT-SoVITS 适配 — 内置连接插件；服务本体、运行环境、模型和角色语音由用户另行安装
-- 外置服务 — 可接入自部署的 GPT-SoVITS 实例，macOS / AMD 用户同样可用
-
-**插件与扩展**
-- MCP Server — 任意 MCP Server 均可接入，内置 Web 搜索 MCP
-- 本地插件 — 五个默认插件随程序分发；Playwright 作为可选插件单独安装，优先调用系统 Chrome/Edge，
-  不附带 Chromium
-- 手机网页端 — 可选插件允许手机发送文字和图片，并与桌面端共用当前角色、历史和长期记忆
-
-**调试与历史**
-- GUI 运行日志 — 实时查看 Agent 决策与工具调用过程
-- 聊天历史 — 可浏览和搜索历史对话
-- 应用更新 — Windows Setup 与 macOS 使用签名的 Tauri Updater；Windows Portable 提示下载新版 ZIP
-
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [安装与配置指南](docs/userdocs/SETUP.md) | 完整安装步骤、角色包获取、语音配置、版本更新 |
-| [API 配置教程](docs/userdocs/API_CONFIG.md) | Base URL、API Key、模型选择和中转站配置 |
-| [聊天、截图与屏幕感知](docs/userdocs/CHAT_SCREEN_AND_CONTEXT.md) | 普通聊天、手动截图、主动感知和上下文行为 |
-| [匿名统计与远程诊断](docs/userdocs/REMOTE_DIAGNOSTICS_AND_TELEMETRY.md) | 默认状态、发送范围、关闭方式、诊断 ID 与数据删除 |
-| [macOS 安装指南](docs/userdocs/MACOS_SETUP.md) | Apple Silicon/Rosetta、SSL 证书、GPT-SoVITS 语音 |
-| [技术讲解 README](docs/devdocs/TECHNICAL_README.md) | 运行时架构、启动流程、项目结构、配置项 |
-| [插件 SDK 文档](docs/devdocs/SAKURA_PLUGIN_SDK.md) | 插件开发入口 |
-| [文档总览](docs/README.md) | 按用户文档、开发文档、spec、ADR、plan、record 和 archive 分类的完整目录 |
-| [贡献指南](.github/CONTRIBUTING.md) | 开发环境、分支规范、测试和 PR 要求 |
-| [更新日志](docs/CHANGELOG.md) | 各版本的用户可见变化与升级提醒 |
+新架构分支从上游历史建立，再移植个人能力，未将旧个人分支的完整提交历史合入。因此 GitHub 默认分支的贡献统计不能代表全部个人开发工作。旧个人提交保留在 `dev5`，旧 main 另存于 `archive/main-before-runtime-v2-20261008`。本项目保留上游与第三方的作者署名和许可。
 
 ## 致谢与开源许可说明
 
@@ -126,13 +58,3 @@ Copyright © 2026 Rvosy
 Sakura 在此基础上进行了适配和修改，用于提供 Playwright 浏览器自动化能力。
 
 感谢所有开源项目作者和贡献者。
-
-## Star History
-
-<a href="https://star-history.dera.page/#Rvosy/Sakura&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=Rvosy/Sakura&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=Rvosy/Sakura&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=Rvosy/Sakura&type=date&legend=top-left" />
- </picture>
-</a>
