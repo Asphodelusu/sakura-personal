@@ -199,6 +199,47 @@ def test_complete_raw_remembers_temperature_unsupported(monkeypatch) -> None:  #
     assert "temperature" not in calls[2]
 
 
+def test_complete_raw_omits_thinking_after_provider_rejects_the_field(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[dict[str, Any]] = []
+    # 侧路客户端只有一次请求预算：本次失败，但记住不支持，后续请求不再携带。
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="compatible-model"),
+        request_attempts=1,
+    )
+
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(payload))
+        if "thinking" in payload:
+            raise ApiRequestError('Invalid JSON payload received. Unknown name "thinking": Cannot find field.')
+        return {"choices": [{"message": {"content": "OK"}}]}
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    with pytest.raises(ApiRequestError):
+        client.complete_raw("system", [{"role": "user", "content": "one"}], thinking={"type": "disabled"})
+    assert client.complete_raw("system", [{"role": "user", "content": "two"}], thinking={"type": "disabled"}) == "OK"
+
+    assert "thinking" in calls[0]
+    assert "thinking" not in calls[1]
+
+
+def test_thinking_value_errors_are_not_mistaken_for_an_unsupported_field(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[dict[str, Any]] = []
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="compatible-model"),
+    )
+
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(payload))
+        raise ApiRequestError("rate limited")
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    with pytest.raises(ApiRequestError, match="rate limited"):
+        client.complete_raw("system", [{"role": "user", "content": "one"}], thinking={"type": "disabled"})
+    assert len(calls) == 1 and "thinking" in calls[0]
+
+
 def test_update_settings_clears_cached_unsupported_params(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[dict[str, Any]] = []
     client = OpenAICompatibleClient(

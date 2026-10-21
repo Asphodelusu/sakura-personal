@@ -510,7 +510,7 @@ class PersonalRecallPolicy:
         rescored.sort(key=lambda item: item["rerankScore"], reverse=True)
         return rescored
 
-    def select(self, query, memories, limit, *, excluded_turn_id="", deadline=None):
+    def select(self, query, memories, limit, *, excluded_turn_id="", deadline=None, semantic_limit=None):
         now = self._clock()
         include_expired = query_looks_past(query)
         memories = self.rerank(query, [item for item in memories if isinstance(item, dict)], deadline=deadline)
@@ -550,7 +550,7 @@ class PersonalRecallPolicy:
                     continue
                 reflections += 1
             selected.append(item)
-            if len(selected) >= limit:
+            if len(selected) >= (limit if semantic_limit is None else min(limit, semantic_limit)):
                 break
         selected = self._merge_due_commitments(selected, now, limit)
         if self._record_access and tracker is not None:

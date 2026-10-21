@@ -193,6 +193,11 @@ class AgentRuntime:
     def vision_api_client(self, client: OpenAICompatibleClient | None) -> None:
         self._vision_api_client = client
 
+    def _context_mode(self, *, screen_awareness: bool = False) -> str:
+        if screen_awareness:
+            return "screen_awareness"
+        return "intimacy" if self._intimacy.active and self._intimacy_guide else "normal"
+
     def _client_for_messages(self, messages: list[ChatMessage]) -> OpenAICompatibleClient:
         """根据消息是否含图片，返回 vision 或 text API client。
 
@@ -596,7 +601,13 @@ class AgentRuntime:
         )
         try:
             check_cancelled(cancel_checker)
-            raw = complete(system, messages, temperature=DECISION_TEMPERATURE, max_tokens=DECISION_MAX_TOKENS)
+            raw = complete(
+                system,
+                messages,
+                temperature=DECISION_TEMPERATURE,
+                max_tokens=DECISION_MAX_TOKENS,
+                thinking={"type": "disabled"},
+            )
             check_cancelled(cancel_checker)
             decision = parse_relationship_decision(raw)
         except OperationCancelled:
@@ -875,7 +886,7 @@ class AgentRuntime:
         request = build_context_request(
             messages,
             source=source,
-            mode=mode,
+            mode=self._context_mode(screen_awareness=mode == "screen_awareness"),
             event_type=event_type,
             step_index=0,
             remaining_steps=0,
@@ -1664,7 +1675,7 @@ class AgentRuntime:
                 request = build_context_request(
                     working_messages,
                     source=context_source,
-                    mode="screen_awareness" if screen_awareness_mode else "normal",
+                    mode=self._context_mode(screen_awareness=screen_awareness_mode),
                     event_type=event_type,
                     step_index=step_index,
                     remaining_steps=loop_settings.max_agent_steps_per_turn - step_index - 1,
@@ -2120,7 +2131,7 @@ class AgentRuntime:
             final_request = build_context_request(
                 working_messages,
                 source=context_source,
-                mode="screen_awareness" if screen_awareness_mode else "normal",
+                mode=self._context_mode(screen_awareness=screen_awareness_mode),
                 event_type=event_type,
                 step_index=loop_settings.max_agent_steps_per_turn,
                 remaining_steps=0,
@@ -2205,7 +2216,7 @@ class AgentRuntime:
                     fallback_request = build_context_request(
                         fallback_messages,
                         source=context_source,
-                        mode="screen_awareness" if screen_awareness_mode else "normal",
+                        mode=self._context_mode(screen_awareness=screen_awareness_mode),
                         event_type=event_type,
                         step_index=loop_settings.max_agent_steps_per_turn,
                         remaining_steps=0,

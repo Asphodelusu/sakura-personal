@@ -124,3 +124,210 @@ def test_memory_metadata_keeps_kind_time_and_emotion() -> None:
     assert metadata["emotion"] == "happy"
     assert metadata["volatile"] is True
     assert metadata["status"] == "released"
+
+
+def test_closed_scheduler_does_not_start_or_consume_interval(tmp_path):
+    calls = []
+    scheduler = ReflectionScheduler(tmp_path, store_factory=lambda: calls.append('store'),
+                                    client_factory=lambda: calls.append('client'))
+    scheduler.close()
+    assert scheduler.maybe_start() is False
+    scheduler.run_once()
+    assert calls == []
+    assert not ReflectionStateStore(tmp_path).snapshot().last_reflection_at
+
+
+def test_shutdown_cancels_inflight_reply_before_writing(tmp_path):
+    import threading
+
+    entered, cancelled = threading.Event(), threading.Event()
+    store = _Store(_facts())
+
+    class BlockingClient:
+        closed = False
+
+        def complete_raw(self, *_args, cancel_checker=None, **_kwargs):
+            entered.set()
+            assert cancelled.wait(5)
+            # Even a transport that returns a late reply must not write it.
+            return _reply('late reflection')
+
+        def close(self):
+            self.closed = True
+
+    client = BlockingClient()
+    scheduler = ReflectionScheduler(tmp_path, store_factory=lambda: store,
+                                    client_factory=lambda: client)
+    assert scheduler.maybe_start()
+    assert entered.wait(5)
+    original_join = scheduler.join
+
+    def release_then_join(timeout=None):
+        cancelled.set()
+        original_join(timeout)
+
+    scheduler.join = release_then_join
+    try:
+        scheduler.close()
+        assert store.created == []
+        assert client.closed
+        assert not ReflectionStateStore(tmp_path).snapshot().last_reflection_at
+        assert scheduler.maybe_start() is False
+    finally:
+        cancelled.set()
+        original_join(5)
+
+
+def test_personal_boundary_stops_reflection_before_closing_shared_store():
+    import threading
+    from types import SimpleNamespace
+    from plugins.builtin.sakura_mem0.personal_runtime import PersonalRecallBoundary
+
+    events = []
+    boundary = object.__new__(PersonalRecallBoundary)
+    boundary._lock = threading.Lock()
+    boundary._closed = False
+    boundary._status = 'ready'
+    boundary._pending_timeline = object()
+    boundary._thread = SimpleNamespace(join=lambda: events.append('loader'))
+    boundary._reflection = SimpleNamespace(close=lambda: events.append('reflection'))
+    boundary.recall_policy = SimpleNamespace(close=lambda: events.append('recall'))
+    boundary._curation = SimpleNamespace(close=lambda: events.append('store'))
+    boundary._records = object()
+
+    boundary.close()
+
+    assert events == ['loader', 'reflection', 'recall', 'store']
+    assert boundary._closed and boundary._records is None
+
+
+def test_reflection_admission_excludes_curation_and_model_tasks(tmp_path, monkeypatch):
+    import pytest
+    from test_core_host_memory import FakeMemoryStore, _boundary, _timeline
+    from plugins.builtin.sakura_mem0.boundary import MemoryBoundaryError
+
+    owner = _boundary(tmp_path, FakeMemoryStore(), config={'triggerTurns': 1})
+    timeline = _timeline(tmp_path)
+    started = []
+    monkeypatch.setattr(owner, '_start_curation', lambda *args: started.append(args))
+    try:
+        assert owner.try_begin_reflection()
+        assert not owner.try_begin_reflection()
+        owner.note_timeline_changed(timeline)
+        assert started == []
+        with pytest.raises(MemoryBoundaryError) as error:
+            owner.begin_model_download('model-task')
+        assert error.value.code == 'MEMORY_TASK_BUSY'
+        owner.finish_reflection()
+        assert len(started) == 1
+        assert not owner.try_begin_reflection()
+    finally:
+        owner.close()
+    assert not owner.try_begin_reflection()
+
+
+def test_reflection_releases_admission_after_failure(tmp_path):
+    from test_core_host_memory import FakeMemoryStore, _boundary
+
+    owner = _boundary(tmp_path, FakeMemoryStore())
+    class BrokenClient:
+        def complete_raw(self, *_args, **_kwargs):
+            raise TimeoutError()
+
+    scheduler = ReflectionScheduler(tmp_path, store_factory=lambda: _Store(_facts()),
+                                    client_factory=BrokenClient,
+                                    try_begin=owner.try_begin_reflection,
+                                    finish=owner.finish_reflection)
+    try:
+        assert scheduler.maybe_start()
+        scheduler.join(5)
+        assert owner.try_begin_reflection()
+        owner.finish_reflection()
+        scheduler.close()
+        assert not scheduler.maybe_start()
+        assert owner.try_begin_reflection()
+        owner.finish_reflection()
+    finally:
+        owner.close()
+
+
+def test_thread_start_failure_releases_reflection_admission(tmp_path, monkeypatch):
+    import pytest
+    from test_core_host_memory import FakeMemoryStore, _boundary
+    from plugins.builtin.sakura_mem0 import personal_reflection
+
+    owner = _boundary(tmp_path, FakeMemoryStore())
+    scheduler = ReflectionScheduler(tmp_path, store_factory=lambda: _Store(_facts()),
+                                    client_factory=lambda: _Client(_reply()),
+                                    try_begin=owner.try_begin_reflection,
+                                    finish=owner.finish_reflection)
+    def fail_start(_thread):
+        raise RuntimeError('synthetic thread start failure')
+    monkeypatch.setattr(personal_reflection.threading.Thread, 'start', fail_start)
+    try:
+        with pytest.raises(RuntimeError, match='synthetic thread start failure'):
+            scheduler.maybe_start()
+        scheduler.close()
+        assert owner.try_begin_reflection()
+        owner.finish_reflection()
+    finally:
+        owner.close()
+
+
+def test_personal_close_does_not_restart_deferred_curation(tmp_path, monkeypatch):
+    import threading
+    from test_core_host_memory import FakeMemoryStore, _boundary, _timeline
+    from plugins.builtin.sakura_mem0.personal_runtime import PersonalRecallBoundary
+
+    owner = _boundary(tmp_path, FakeMemoryStore(), config={'triggerTurns': 1})
+    personal = object.__new__(PersonalRecallBoundary)
+    personal._lock = threading.RLock()
+    personal._closed = True
+    personal._curation = owner
+    started = []
+    monkeypatch.setattr(owner, '_start_curation', lambda *args: started.append(args))
+    try:
+        assert owner.try_begin_reflection()
+        owner.note_timeline_changed(_timeline(tmp_path))
+        personal._finish_reflection()
+        assert started == []
+    finally:
+        owner.close()
+
+
+def test_cancelled_meta_reflection_preserves_completed_first_order(tmp_path):
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    reflections = [{'content': f'感想{index}', 'category': 'reflection'} for index in range(6)]
+    store = _Store([*_facts(), *reflections])
+    class Client:
+        calls = 0
+        def complete_raw(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _reply()
+            entered.set()
+            assert release.wait(5)
+            return _reply('late meta reflection')
+
+    scheduler = ReflectionScheduler(tmp_path, store_factory=lambda: store,
+                                    client_factory=Client, clock=lambda: NOW)
+    assert scheduler.maybe_start()
+    assert entered.wait(5)
+    original_join = scheduler.join
+    def release_then_join(timeout=None):
+        release.set()
+        original_join(timeout)
+    scheduler.join = release_then_join
+    try:
+        scheduler.close()
+        saved = ReflectionStateStore(tmp_path).snapshot()
+        assert saved.total_reflections == 1
+        assert saved.last_reflection_at == NOW.isoformat()
+        assert saved.meta_reflection_source_count == 0
+        assert saved.total_meta_created == 0 and saved.last_meta_reflection_at == ''
+        assert store.created == []
+    finally:
+        release.set()
+        original_join(5)

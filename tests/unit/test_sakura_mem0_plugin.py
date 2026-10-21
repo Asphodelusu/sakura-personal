@@ -82,6 +82,40 @@ def test_mem0_api_client_normalizes_google_openai_url_without_replay(
     }
 
 
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("https://api.example.com/v1", {"type": "disabled"}),
+        # Google 兼容层拒绝 DeepSeek 风格字段，旧版同样直接省略。
+        ("https://generativelanguage.googleapis.com/v1beta", None),
+    ],
+)
+def test_mem0_api_client_forwards_thinking_except_to_google(
+    monkeypatch: pytest.MonkeyPatch, base_url: str, expected: object
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr("plugins.builtin.sakura_mem0.api_client.urlopen_current_proxy", fake_urlopen)
+    client = OpenAICompatibleClient(ApiSettings(base_url=base_url, api_key="key", model="fast"))
+
+    assert client.complete_raw("system", [{"role": "user", "content": "q"}], thinking={"type": "disabled"}) == "{}"
+    assert captured[0].get("thinking") == expected
+
+
 def test_mem0_api_client_caps_each_curation_job_at_two_http_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -259,7 +259,8 @@ def test_user_turn_appraisal_is_private_and_survives_later_chat_failure(tmp_path
     assert THOUGHT in contexts[0]
     assert "runtime.inner_thought" not in json.dumps(events[-1]["payload"])
     assert THOUGHT not in json.dumps(events[-1]["payload"])
-    assert set(thought_kwargs[0]) <= {"temperature", "max_tokens", "cancel_checker"}
+    assert thought_kwargs[0]["thinking"] == {"type": "disabled"}
+    assert set(thought_kwargs[0]) <= {"temperature", "max_tokens", "thinking", "cancel_checker"}
     keys = json.loads(path.read_text(encoding="utf-8"))["settled_keys"]
     assert sum(key.endswith(":op-ok:appraisal") for key in keys) == 1
     assert sum(key.endswith(":op-ok:effect") for key in keys) == 1
@@ -476,7 +477,11 @@ def test_recall_overlaps_thought_and_current_thought_reaches_main_prompt(tmp_pat
     entered, release = Event(), Event()
     contexts = []
     runtime, boundary, events, _ = _core(tmp_path, _BlockingClient([], entered, release), _MainClient(contexts))
-    def recall(_request):
+    def recall(request):
+        # The thought worker first asks the same provider for standing mood.
+        # Only chat recall overlaps the model call; mood must not await itself.
+        if request.source != "chat":
+            return []
         assert entered.wait(1)
         release.set()
         return []

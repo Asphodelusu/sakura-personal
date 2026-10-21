@@ -126,6 +126,8 @@ class PersonalRecallBoundary:
             memory_dir,
             store_factory=lambda: PersonalCurationStore(self._records, self.scope),
             client_factory=self._reflection_client,
+            try_begin=self._try_begin_reflection,
+            finish=self._finish_reflection,
         ) if daily and curation_options is not None else None
         self._thread = threading.Thread(target=self._load, args=(memory_dir, snapshot),
                                         name="sakura-personal-memory-load", daemon=True)
@@ -343,6 +345,16 @@ class PersonalRecallBoundary:
             curation = self._curation if self._status == "ready" else None
         return curation.fast_completion_client(timeout_seconds=2) if curation is not None else None
 
+    def _try_begin_reflection(self):
+        with self._lock:
+            return bool(not self._closed and self._status == "ready"
+                        and self._curation is not None and self._curation.try_begin_reflection())
+
+    def _finish_reflection(self):
+        with self._lock:
+            if self._curation is not None:
+                self._curation.finish_reflection(resume=not self._closed)
+
     def _reflection_client(self):
         with self._lock:
             curation = self._curation if self._status == "ready" and not self._closed else None
@@ -393,7 +405,7 @@ class PersonalRecallBoundary:
             self._pending_timeline = None
         self._thread.join()
         if self._reflection is not None:
-            self._reflection.join(timeout=5)
+            self._reflection.close()
         self.recall_policy.close()
         # Do not hold the recall lock while joining the curation worker.
         if self._curation is not None:

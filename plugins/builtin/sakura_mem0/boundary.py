@@ -133,6 +133,7 @@ class MemoryBoundary:
         self._message = "长期记忆系统正在初始化。"
         self._curation_cancel = threading.Event()
         self._curation_active = False
+        self._reflection_active = False
         self._profile_maintenance = None
         self._curation_request_fuse_open = False
         self._pending_timeline: object | None = None
@@ -571,7 +572,7 @@ class MemoryBoundary:
             else f"memory-model-{uuid.uuid4().hex}"
         )
         with self._lock:
-            if self._curation_active or self._model_task_active:
+            if self._curation_active or self._model_task_active or self._reflection_active:
                 raise MemoryBoundaryError(
                     "MEMORY_TASK_BUSY",
                     "已有记忆后台任务正在运行。",
@@ -612,6 +613,23 @@ class MemoryBoundary:
 
         return check_cancelled
 
+    def try_begin_reflection(self) -> bool:
+        """Share admission with curation and model maintenance; never queue a reflection."""
+        with self._lock:
+            if (self._closed or self._store_failed or self._status != "ready"
+                    or self._curation_active or self._model_task_active or self._reflection_active):
+                return False
+            self._reflection_active = True
+            return True
+
+    def finish_reflection(self, *, resume: bool = True) -> None:
+        with self._lock:
+            self._reflection_active = False
+            pending = self._pending_timeline if resume and not self._closed else None
+            self._pending_timeline = None
+        if pending is not None:
+            self.note_timeline_changed(pending)
+
     def note_timeline_changed(self, timeline: object) -> None:
         """Catch up committed Timeline entries and schedule at most one curation job."""
 
@@ -623,7 +641,7 @@ class MemoryBoundary:
                 or self._curation_request_fuse_open
             ):
                 return
-            if self._curation_active or self._model_task_active:
+            if self._curation_active or self._model_task_active or self._reflection_active:
                 self._pending_timeline = timeline
                 return
             try:
@@ -920,7 +938,7 @@ class MemoryBoundary:
     ) -> None:
         status = self.status()["status"]
         with self._lock:
-            task_busy = self._curation_active or self._model_task_active
+            task_busy = self._curation_active or self._model_task_active or self._reflection_active
         if status in {"read_only", "failed", "stopped"}:
             raise MemoryBoundaryError(
                 "MEMORY_READ_ONLY", "记忆当前不可写。", feature=feature

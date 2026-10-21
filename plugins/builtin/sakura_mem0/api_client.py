@@ -55,6 +55,7 @@ class OpenAICompatibleClient:
         temperature: float = 0.2,
         response_format: Mapping[str, Any] | None = None,
         max_tokens: int | None = None,
+        thinking: Mapping[str, Any] | None = None,
         cancel_checker: CancelChecker | None = None,
         trace_metadata: object | None = None,
     ) -> str:
@@ -74,6 +75,9 @@ class OpenAICompatibleClient:
             payload["response_format"] = dict(response_format)
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
+        # Google 兼容层拒绝 DeepSeek 风格的 thinking 字段。
+        if thinking is not None and urlparse(base).netloc.lower() != "generativelanguage.googleapis.com":
+            payload["thinking"] = dict(thinking)
         request = urllib.request.Request(
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

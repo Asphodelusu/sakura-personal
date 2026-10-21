@@ -10,6 +10,8 @@ updated: 2026-09-06
 
 第一次使用 Sakura，先看安装指南。想写插件或参与开发，可以直接进入开发者文档。
 
+本仓库是 Personal Edition。先看[个人迁移对账](records/audits/PERSONAL_MIGRATION_STATUS.md)与[项目主页](../README.md)。以下通用指南继承自上游，不能作为个人功能已完整迁移或已部署的证明。
+
 ## 使用 Sakura
 
 - [更新日志](CHANGELOG.md)

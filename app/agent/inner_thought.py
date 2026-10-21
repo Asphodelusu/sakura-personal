@@ -183,6 +183,8 @@ def generate_inner_thought(
             [{"role": "user", "content": user_prompt}],
             temperature=0.9,
             max_tokens=DEFAULT_INNER_THOUGHT_MAX_TOKENS,
+            # 默认思考的快速模型会把短上限全耗在推理上，返回空正文。
+            thinking={"type": "disabled"},
         )
         if cancel_checker is not None:
             cancel_checker()

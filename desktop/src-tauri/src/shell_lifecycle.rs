@@ -1667,10 +1667,21 @@ mod tests {
             .join("../..")
             .canonicalize()
             .expect("repository root");
-        let user_root = repository_root
-            .join("tests/fixtures/runtime_v2/wp_3_01/ready")
+        let user_root = std::env::temp_dir().join(format!(
+            "sakura-core-crash-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        copy_fixture_tree(
+            &repository_root.join("tests/fixtures/runtime_v2/wp_3_01/ready"),
+            &user_root,
+        );
+        let user_root = user_root
             .canonicalize()
-            .expect("ready Assistant fixture");
+            .expect("canonical crash fixture root");
         let executable_directory = std::env::current_exe()
             .expect("test executable")
             .parent()
@@ -1682,7 +1693,7 @@ mod tests {
             executable_directory,
             resource_directory: repository_root.clone(),
             explicit_development_root: Some(repository_root),
-            user_root,
+            user_root: user_root.clone(),
         });
         let handle = session.handle();
         let first = wait_for_stable_generation(&handle, 1);
@@ -1762,6 +1773,7 @@ mod tests {
         session
             .shutdown_and_join()
             .expect("recovered lifecycle should reclaim all resources");
+        std::fs::remove_dir_all(user_root).expect("temporary crash fixture cleanup");
     }
 
     #[test]

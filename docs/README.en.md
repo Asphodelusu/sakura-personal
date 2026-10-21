@@ -10,6 +10,8 @@ updated: 2026-08-26
 
 The user guides are maintained in Chinese. Start with the installation guide, then open the guide for the feature you need.
 
+This is the Personal Edition maintained by Asphodelusu, based on Rvosy/Sakura. The source version is 1.1.1-personal.2. Personal behavior takes precedence over upstream defaults. See the [migration audit](records/audits/PERSONAL_MIGRATION_STATUS.md) (Chinese) for implemented paths, deployment boundaries and known gaps. Upstream releases are not Personal Edition update packages. The guides below include inherited upstream behavior; they are not a claim of complete personal feature parity.
+
 ## Use Sakura
 
 - [Changelog](CHANGELOG.md)

@@ -61,10 +61,11 @@ class MemoryRecallService:
         if not query:
             _log_recall_finished(started_at, status="skipped", candidates=0, selected=0)
             return MemoryRecallResult(query="")
+        light_mode = policy is not None and request.mode == "intimacy"
         search_started_at = monotonic()
         try:
             response = self.memory.search_memory(
-                {"query": query, "limit": getattr(policy, "candidates", DEFAULT_MEMORY_RECALL_CANDIDATES)},
+                {"query": query, "limit": 3 if light_mode else getattr(policy, "candidates", DEFAULT_MEMORY_RECALL_CANDIDATES)},
                 wait=False,
             )
         except Exception as exc:  # noqa: BLE001 - 记忆故障不得阻断普通聊天
@@ -151,7 +152,9 @@ class MemoryRecallService:
         budget = getattr(policy, "budget_seconds", None)
         deadline = {} if budget is None else {"deadline": started_at + float(budget)}
         selection_started_at = monotonic()
-        selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id, **deadline)
+        selection = {"semantic_limit": 2} if request.mode == "intimacy" else {}
+        selected = policy.select(query, memories, self.limit, excluded_turn_id=request.current_turn_id,
+                                 **deadline, **selection)
         fragments = tuple(
             ContextFragment(
                 fragment_id=f"memory.{memory['id'] or index}",

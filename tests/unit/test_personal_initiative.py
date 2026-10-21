@@ -154,6 +154,7 @@ class _DecisionClient:
 
     def complete_raw(self, system_prompt, messages, temperature=0.8, **kwargs):
         self.calls.append((system_prompt, messages))
+        self.kwargs = kwargs
         return self.text
 
 
@@ -178,6 +179,8 @@ def test_runtime_speaks_when_eligible_and_decision_says_so() -> None:
 
     assert reply is not None and reply.segments[0].text == "\u306d\u3048"
     assert runtime.initiative_gate_reason() == "cooldown"
+    # \u7ed3\u6784\u5316 JSON \u5224\u5b9a\u7684 512 token \u4e0a\u9650\u4e0d\u80fd\u5148\u88ab\u9ed8\u8ba4\u601d\u8003\u8017\u5c3d\u3002
+    assert client.kwargs["thinking"] == {"type": "disabled"}
 
 
 def test_runtime_stays_silent_without_calling_the_model_when_gated() -> None:

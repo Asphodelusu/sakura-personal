@@ -824,6 +824,8 @@ context_host.register(
 request 使用 snake_case，常用字段有 `current_input`、`character_id`、`current_turn_id`、`source`、`mode`、
 `recent_messages`、`available_tools`、`visual_summaries`、`screen_context_available` 和 `current_time`。
 
+个人版的 `mode` 可为 `normal`、`screen_awareness` 或 `intimacy`。后者由 Core 的已有亲密模式状态生成，供个人记忆贡献者选择轻量召回；它不授予工具或存储权限。屏幕观察优先使用 `screen_awareness`。不处理该模式的贡献者可继续使用普通路径。
+
 一次最多返回 16 个 fragment。`content` 必填并最多保留 8192 个字符；`priority` 范围为 0–100，
 `budgetHint` 范围为 1–4096；`sensitivity` 可为 `public`、`private` 或 `sensitive`。Host 会把插件内容标为
 untrusted，并按全局 Prompt 预算决定是否采用。不要把完整数据库、长期历史或无关资料每轮都塞进 Prompt。

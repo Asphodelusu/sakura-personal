@@ -1231,7 +1231,7 @@ def _context_request(value: object) -> ContextRequest:
         ),
         mode=(
             raw.get("mode")
-            if raw.get("mode") in {"normal", "screen_awareness"}
+            if raw.get("mode") in {"normal", "screen_awareness", "intimacy"}
             else "normal"
         ),
         event_type=str(raw.get("event_type", ""))[:64],

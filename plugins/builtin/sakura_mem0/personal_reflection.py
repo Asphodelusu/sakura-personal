@@ -13,10 +13,10 @@ from pathlib import Path
 
 if __package__:
     from .personal_recall import is_meta_reflection, is_reflection
-    from .support import atomic_write_text, log_event
+    from .support import OperationCancelled, atomic_write_text, check_cancelled, log_event
 else:
     from personal_recall import is_meta_reflection, is_reflection
-    from support import atomic_write_text, log_event
+    from support import OperationCancelled, atomic_write_text, check_cancelled, log_event
 
 MIN_REFLECTION_INTERVAL_HOURS = 8
 MIN_MEMORIES_FOR_REFLECTION = 5
@@ -160,14 +160,18 @@ def _bounded(value, default):
 
 
 class PersonalReflector:
-    def __init__(self, client, store):
+    def __init__(self, client, store, *, cancel_checker=None):
         self._client = client
+        self._cancel_checker = cancel_checker
         self._store = store
 
     def _complete(self, system_prompt, user_prompt):
+        check_cancelled(self._cancel_checker)
         messages = [{"role": "user", "content": user_prompt}]
         raw = self._client.complete_raw(system_prompt, messages, temperature=0.3,
-                                        response_format={"type": "json_object"}, max_tokens=800)
+                                        response_format={"type": "json_object"}, max_tokens=800,
+                                        cancel_checker=self._cancel_checker)
+        check_cancelled(self._cancel_checker)
         parsed = _parse(raw)
         if parsed is not None:
             return parsed
@@ -177,13 +181,16 @@ class PersonalReflector:
             temperature=0,
             response_format={"type": "json_object"},
             max_tokens=800,
+            cancel_checker=self._cancel_checker,
         )
+        check_cancelled(self._cancel_checker)
         return _parse(raw) or []
 
     def _write(self, items, *, limit, kind, existing):
         created = skipped = 0
         hashes = {hashlib.md5(text.encode()).hexdigest() for text in existing}
         for item in items[:limit]:
+            check_cancelled(self._cancel_checker)
             content = str(item.get("content") or "").strip()
             digest = hashlib.md5(content.encode()).hexdigest()
             if digest in hashes or any(_similar(content, other) >= NEAR_DUPLICATE_SIMILARITY for other in existing):
@@ -204,6 +211,7 @@ class PersonalReflector:
         return created, skipped
 
     def reflect(self):
+        check_cancelled(self._cancel_checker)
         memories = self._store.list_memories(limit=None)
         if len(memories) < MIN_MEMORIES_FOR_REFLECTION:
             return 0, 0, True
@@ -231,6 +239,7 @@ class PersonalReflector:
         return created, skipped, created == 0 and skipped == 0
 
     def reflect_meta(self):
+        check_cancelled(self._cancel_checker)
         memories = self._store.list_memories(limit=None)
         first_order = [memory for memory in memories if is_reflection(memory) and not is_meta_reflection(memory)]
         if len(first_order) < MIN_REFLECTIONS_FOR_META:
@@ -255,31 +264,55 @@ class PersonalReflector:
 class ReflectionScheduler:
     """Starts at most one background reflection pass when the interval has elapsed."""
 
-    def __init__(self, memory_dir, *, store_factory, client_factory, clock=None):
+    def __init__(self, memory_dir, *, store_factory, client_factory, clock=None,
+                 try_begin=None, finish=None):
+        self._try_begin = try_begin or (lambda: True)
+        self._finish = finish or (lambda: None)
         self._state = ReflectionStateStore(memory_dir)
         self._store_factory = store_factory
         self._client_factory = client_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self._thread = None
+        self._cancel = threading.Event()
 
     def maybe_start(self):
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if self._cancel.is_set() or (self._thread is not None and self._thread.is_alive()):
                 return False
             if not reflection_due(self._state.snapshot(), now=self._clock()):
                 return False
-            self._thread = threading.Thread(target=self.run_once, name="sakura-personal-reflection", daemon=True)
-            self._thread.start()
+            if not self._try_begin():
+                return False
+            self._thread = threading.Thread(target=self._run_admitted, name="sakura-personal-reflection", daemon=True)
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self._finish()
+                raise
             return True
 
+    def _check_cancelled(self):
+        if self._cancel.is_set():
+            raise OperationCancelled()
+
     def run_once(self):
+        if self._cancel.is_set() or not self._try_begin():
+            return
+        self._run_admitted()
+
+    def _run_admitted(self):
+        client = None
         try:
+            self._check_cancelled()
             client = self._client_factory()
             if client is None:
                 return
-            reflector = PersonalReflector(client, self._store_factory())
+            self._check_cancelled()
+            reflector = PersonalReflector(client, self._store_factory(), cancel_checker=self._check_cancelled)
             created, skipped, empty = reflector.reflect()
+            self._check_cancelled()
             state = self._state.snapshot()
             state.last_reflection_at = self._clock().isoformat()
             state.last_reflection_count = created
@@ -294,6 +327,7 @@ class ReflectionScheduler:
                         if is_reflection(memory) and not is_meta_reflection(memory))
             if count >= MIN_REFLECTIONS_FOR_META and count - state.meta_reflection_source_count >= META_TRIGGER_EVERY:
                 meta_created, _meta_skipped, source_count = reflector.reflect_meta()
+                self._check_cancelled()
                 state = self._state.snapshot()
                 state.last_meta_reflection_at = self._clock().isoformat()
                 state.meta_reflection_source_count = source_count
@@ -301,7 +335,11 @@ class ReflectionScheduler:
                 self._state.save(state)
             log_event("Memory", "独处反思完成", {"created": created, "skipped": skipped, "empty": empty},
                       event="memory.personal.reflection_finished", severity="info")
+        except OperationCancelled:
+            return
         except Exception as exc:
+            if self._cancel.is_set():
+                return
             log_event("Memory", "独处反思失败", {"code": "PERSONAL_REFLECTION_FAILED", "error_type": type(exc).__name__},
                       event="memory.personal.reflection_failed", severity="warning")
             try:
@@ -310,6 +348,22 @@ class ReflectionScheduler:
                 self._state.save(state)
             except Exception:
                 pass
+
+        finally:
+            try:
+                if client is not None:
+                    close = getattr(client, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                self._finish()
+
+    def close(self):
+        # The owner must retain its store until the worker has stopped. A
+        # cancellation skips repair/meta requests and discards late responses.
+        with self._lock:
+            self._cancel.set()
+        self.join()
 
     def join(self, timeout=None):
         with self._lock:
