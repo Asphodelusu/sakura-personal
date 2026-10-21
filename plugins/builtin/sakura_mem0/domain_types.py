@@ -20,7 +20,7 @@ class ContextRequest:
     human_entry_id: str = ""
     observation_entry_ids: tuple[str, ...] = ()
     source: Literal["chat", "event"] = "chat"
-    mode: Literal["normal", "screen_awareness"] = "normal"
+    mode: Literal["normal", "screen_awareness", "intimacy"] = "normal"
     event_type: str = ""
     step_index: int = 0
     remaining_steps: int = 0
