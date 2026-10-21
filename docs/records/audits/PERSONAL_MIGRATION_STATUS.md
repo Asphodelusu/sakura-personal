@@ -63,6 +63,10 @@ updated: 2026-10-21
 | 到期提醒 | 旧窗口轮询 ReminderStore 并投递提醒 | app/agent/reminders.py 保留 due_reminders/mark_completed 定义，但未找到生产调用；runtime 的 reminder_due 分支不足以构成到期触发闭环 | 缺失，存储存在不等于可用 |
 | 个人反思 | 旧窗口定时反思 | plugins/builtin/sakura_mem0/personal_runtime.py 创建 ReflectionScheduler 并调用 maybe_start，关闭时 join | 有运行消费者；触发节奏与旧版是否等价仍需核对 |
 
+补充宿主证据：app/core_host/tools.py 的实际 builtin registry 仅注册 get_current_time；app/core_host/real_chat.py 的外部 event 校验仅接受 update_available，旧 reminder_due 分支并未构成新版可用入口。
+
+反思与整理也不是全等价：personal_runtime.py 的 note_timeline_changed 才检查 reflection.maybe_start；整理按 Timeline 证据 turn 阈值触发，未恢复旧窗口每分钟 timer/idle 检查。核心实现保留，但空闲时的触发节奏属于部分迁移。
+
 以上是源码证据，不是本轮真人测试结果。普通聊天路由、亲密召回、接话和提醒需要补实现，不能仅更新文档就标记迁移完成。
 
 ## 后续对账顺序
